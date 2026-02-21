@@ -10,8 +10,12 @@
  */
 
 import { pipeline, compileDsl, recipes } from './index.js'
-import { readFileSync, writeFileSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import nativeBinding from './native.js'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 function usage() {
   process.stderr.write(`Usage: tranfi [OPTIONS] PIPELINE
@@ -40,8 +44,61 @@ Options:
 `)
 }
 
+function findAppDir () {
+  // Try known locations relative to this file
+  const candidates = [
+    resolve(__dirname, '../../../app/dist'),     // dev: js/src/ → ../../app/dist
+    resolve(__dirname, '../app'),                 // npm package: src/ → ../app/
+  ]
+  for (const dir of candidates) {
+    if (existsSync(resolve(dir, 'index.html'))) return dir
+  }
+  return null
+}
+
+async function serveCommand (argv) {
+  const { startServer } = await import('./server.js')
+  let dataDir = '.'
+  let appDir = null
+  let port = 3000
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '-d' || arg === '--data') dataDir = argv[++i]
+    else if (arg === '-a' || arg === '--app') appDir = argv[++i]
+    else if (arg === '-p' || arg === '--port') port = parseInt(argv[++i], 10)
+    else if (arg === '-h' || arg === '--help') {
+      process.stderr.write(`Usage: tranfi serve [OPTIONS]
+
+Serve the tranfi app with a native backend.
+
+Options:
+  -d, --data DIR   Data directory (default: .)
+  -a, --app DIR    App dist directory (auto-detect)
+  -p, --port PORT  Port (default: 3000)
+  -h, --help       Show this help
+`)
+      process.exit(0)
+    }
+  }
+
+  if (!appDir) appDir = findAppDir()
+  if (!appDir) {
+    process.stderr.write('error: app directory not found. Use --app to specify it.\n')
+    process.exit(1)
+  }
+
+  startServer({ port, dataDir: resolve(dataDir), appDir: resolve(appDir) })
+}
+
 async function main() {
   const argv = process.argv.slice(2)
+
+  // Check for serve subcommand
+  if (argv[0] === 'serve') {
+    return serveCommand(argv.slice(1))
+  }
+
   let pipelineFile = null
   let pipelineText = null
   let inputFile = null

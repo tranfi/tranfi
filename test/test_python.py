@@ -7,6 +7,7 @@ Run: cd tranfi-core && python -m pytest test/test_python.py -v
 
 import os
 import sys
+import pytest
 
 # Add the Python package to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'py'))
@@ -462,6 +463,199 @@ def test_recipe_pipeline_csv2json():
     result = tf.pipeline('csv2json').run(input=data)
     assert '"name"' in result.output_text
     assert '"Alice"' in result.output_text
+
+
+# --- Server tests ---
+
+import threading
+import shutil
+import tempfile
+import json as json_mod
+import urllib.request
+
+def _find_app_dir():
+    app_dist = os.path.join(os.path.dirname(__file__), '..', '..', 'app', 'dist')
+    if os.path.isfile(os.path.join(app_dist, 'index.html')):
+        return os.path.abspath(app_dist)
+    return None
+
+APP_DIR = _find_app_dir()
+skip_no_app = pytest.mark.skipif(APP_DIR is None, reason='app/dist/ not found')
+
+
+def test_serve_csv_to_html():
+    from tranfi.cli import _csv_to_html
+    html = _csv_to_html('name,age\nAlice,30\nBob,25\n', 'Test')
+    assert '<table' in html
+    assert 'Alice' in html
+    assert 'Bob' in html
+    assert 'Test' in html
+    assert '2 rows' in html
+
+
+def test_serve_csv_to_html_empty():
+    from tranfi.cli import _csv_to_html
+    assert _csv_to_html('', 'X') == ''
+    assert _csv_to_html(None, 'X') == ''
+
+
+@skip_no_app
+def test_serve_api_endpoints():
+    """Start the server in a thread and test all API endpoints."""
+    from http.server import HTTPServer
+    from tranfi.cli import _csv_to_html, _ffi
+    import io, socket
+
+    data_dir = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(data_dir, 'test.csv'), 'w') as f:
+            f.write('name,age\nAlice,30\nBob,25\nCharlie,35\n')
+
+        # Find a free port
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('', 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        # Suppress server stderr output
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+
+        # Import and call serve_command internals — build the server inline
+        from tranfi.cli import serve_command
+        import types
+        args = types.SimpleNamespace(data=data_dir, app=APP_DIR, port=port)
+
+        # Start server in thread
+        server_obj = [None]
+
+        def run():
+            # We duplicate serve_command logic to get the server object
+            import urllib.parse as up
+            from http.server import BaseHTTPRequestHandler
+
+            app_dir = APP_DIR
+            with open(os.path.join(app_dir, 'index.html'), 'r') as f:
+                index_html = f.read()
+            config = "<script>window.__TRANFI_SERVER__={api:'/api'}</script>"
+            index_html = index_html.replace('</head>', config + '</head>')
+            index_html_bytes = index_html.encode('utf-8')
+            data_extensions = {'.csv', '.jsonl', '.tsv', '.txt', '.json'}
+            CHAN_MAIN, CHAN_STATS, CHUNK_SIZE = 0, 2, 64 * 1024
+
+            class H(BaseHTTPRequestHandler):
+                def log_message(self, fmt, *a): pass
+                def _json(self, d, s=200):
+                    b = json_mod.dumps(d).encode()
+                    self.send_response(s)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                def do_GET(self):
+                    p = up.urlparse(self.path)
+                    params = up.parse_qs(p.query)
+                    if p.path == '/api/version':
+                        return self._json({'version': _ffi.version()})
+                    if p.path == '/api/files':
+                        files = [{'name': n, 'size': os.path.getsize(os.path.join(data_dir, n))}
+                                 for n in sorted(os.listdir(data_dir))
+                                 if os.path.splitext(n)[1].lower() in data_extensions]
+                        return self._json({'files': files})
+                    if p.path == '/api/file':
+                        name = params.get('name', [None])[0]
+                        head = int(params.get('head', ['20'])[0])
+                        if not name or '..' in name or '/' in name:
+                            return self._json({'error': 'bad name'}, 400)
+                        full = os.path.join(data_dir, name)
+                        if not os.path.isfile(full):
+                            return self._json({'error': 'not found'}, 404)
+                        with open(full) as f:
+                            lines = f.read().split('\n')
+                        return self._json({'preview': '\n'.join(lines[:head]), 'lines': len(lines)})
+                    if p.path == '/api/recipes':
+                        n = _ffi.recipe_count()
+                        return self._json({'recipes': [{'name': _ffi.recipe_name(i)} for i in range(n)]})
+                    # static
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.send_header('Content-Length', str(len(index_html_bytes)))
+                    self.end_headers()
+                    self.wfile.write(index_html_bytes)
+                def do_POST(self):
+                    if up.urlparse(self.path).path != '/api/run':
+                        return self._json({'error': 'not found'}, 404)
+                    body = json_mod.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                    fn, dsl = body.get('file'), body.get('dsl')
+                    if not fn or not dsl:
+                        return self._json({'error': 'missing fields'}, 400)
+                    full = os.path.join(data_dir, fn)
+                    if not os.path.isfile(full):
+                        return self._json({'error': 'not found'}, 404)
+                    plan = _ffi.compile_dsl(dsl)
+                    h = _ffi.pipeline_create_from_json(plan)
+                    try:
+                        with open(full, 'rb') as f:
+                            while True:
+                                chunk = f.read(CHUNK_SIZE)
+                                if not chunk: break
+                                _ffi.pipeline_push(h, chunk)
+                        _ffi.pipeline_finish(h)
+                        parts = []
+                        while True:
+                            d = _ffi.pipeline_pull(h, CHAN_MAIN)
+                            if not d: break
+                            parts.append(d)
+                        output = b''.join(parts).decode()
+                        self._json({'output': _csv_to_html(output, 'Output'), 'stats': ''})
+                    finally:
+                        _ffi.pipeline_free(h)
+
+            srv = HTTPServer(('', port), H)
+            server_obj[0] = srv
+            srv.serve_forever()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        import time; time.sleep(0.3)
+
+        base = f'http://localhost:{port}'
+
+        def get(path):
+            return json_mod.loads(urllib.request.urlopen(f'{base}{path}').read())
+
+        def post(path, data):
+            req = urllib.request.Request(f'{base}{path}',
+                data=json_mod.dumps(data).encode(),
+                headers={'Content-Type': 'application/json'})
+            return json_mod.loads(urllib.request.urlopen(req).read())
+
+        # Test endpoints
+        v = get('/api/version')
+        assert 'version' in v
+
+        files = get('/api/files')
+        assert any(f['name'] == 'test.csv' for f in files['files'])
+
+        preview = get('/api/file?name=test.csv&head=2')
+        assert 'Alice' in preview['preview']
+
+        recipes = get('/api/recipes')
+        assert len(recipes['recipes']) > 0
+
+        result = post('/api/run', {'file': 'test.csv', 'dsl': 'csv | filter "age > 28" | csv'})
+        assert 'Alice' in result['output']
+        assert 'Charlie' in result['output']
+        assert 'Bob' not in result['output']
+
+        # index.html has config
+        html = urllib.request.urlopen(base).read().decode()
+        assert '__TRANFI_SERVER__' in html
+
+        server_obj[0].shutdown()
+    finally:
+        sys.stderr = old_stderr
+        shutil.rmtree(data_dir)
 
 
 if __name__ == '__main__':

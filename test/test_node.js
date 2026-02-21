@@ -541,6 +541,109 @@ await test('pipeline("csv2json") recipe', async () => {
   assert(result.outputText.includes('"Alice"'), 'should have "Alice"')
 })
 
+// Server tests
+console.log('\nServer:')
+
+import { startServer } from '../js/src/server.js'
+import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs'
+
+const testDataDir = '/tmp/tranfi-test-serve'
+const testAppDir = join(__dirname, '..', '..', 'app', 'dist')
+const hasApp = existsSync(join(testAppDir, 'index.html'))
+
+if (hasApp) {
+  // Set up test data
+  if (existsSync(testDataDir)) rmSync(testDataDir, { recursive: true })
+  mkdirSync(testDataDir, { recursive: true })
+  writeFileSync(join(testDataDir, 'test.csv'), 'name,age\nAlice,30\nBob,25\nCharlie,35\n')
+  writeFileSync(join(testDataDir, 'data.jsonl'), '{"x":1}\n{"x":2}\n')
+
+  const server = startServer({ port: 0, dataDir: testDataDir, appDir: testAppDir })
+  const addr = server.address()
+  const base = `http://localhost:${addr.port}`
+
+  await test('GET /api/version', async () => {
+    const res = await fetch(`${base}/api/version`)
+    const data = await res.json()
+    assert(data.version, 'should have version')
+  })
+
+  await test('GET /api/files', async () => {
+    const res = await fetch(`${base}/api/files`)
+    const data = await res.json()
+    assert(Array.isArray(data.files), 'should have files array')
+    const names = data.files.map(f => f.name)
+    assert(names.includes('test.csv'), 'should include test.csv')
+    assert(names.includes('data.jsonl'), 'should include data.jsonl')
+  })
+
+  await test('GET /api/file preview', async () => {
+    const res = await fetch(`${base}/api/file?name=test.csv&head=2`)
+    const data = await res.json()
+    assert(data.preview.includes('name,age'), 'should have header')
+    assert(data.preview.includes('Alice'), 'should have first row')
+    assert(!data.preview.includes('Charlie'), 'should not have third row')
+  })
+
+  await test('GET /api/file rejects ..', async () => {
+    const res = await fetch(`${base}/api/file?name=../etc/passwd`)
+    const data = await res.json()
+    assert(data.error, 'should return error')
+  })
+
+  await test('POST /api/run passthrough', async () => {
+    const res = await fetch(`${base}/api/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: 'test.csv', dsl: 'csv | csv' })
+    })
+    const data = await res.json()
+    assert(data.output.includes('Alice'), 'output should have Alice')
+    assert(data.output.includes('Bob'), 'output should have Bob')
+    assert(data.output.includes('Charlie'), 'output should have Charlie')
+  })
+
+  await test('POST /api/run filter', async () => {
+    const res = await fetch(`${base}/api/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: 'test.csv', dsl: 'csv | filter "age > 28" | csv' })
+    })
+    const data = await res.json()
+    assert(data.output.includes('Alice'), 'output should have Alice (30)')
+    assert(data.output.includes('Charlie'), 'output should have Charlie (35)')
+    assert(!data.output.includes('Bob'), 'output should not have Bob (25)')
+  })
+
+  await test('POST /api/run missing file', async () => {
+    const res = await fetch(`${base}/api/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: 'nope.csv', dsl: 'csv | csv' })
+    })
+    const data = await res.json()
+    assert(data.error, 'should return error for missing file')
+  })
+
+  await test('GET /api/recipes', async () => {
+    const res = await fetch(`${base}/api/recipes`)
+    const data = await res.json()
+    assert(Array.isArray(data.recipes), 'should have recipes array')
+    assert(data.recipes.length > 0, 'should have recipes')
+  })
+
+  await test('index.html has server config', async () => {
+    const res = await fetch(base)
+    const html = await res.text()
+    assert(html.includes('__TRANFI_SERVER__'), 'should inject server config')
+  })
+
+  server.close()
+  rmSync(testDataDir, { recursive: true })
+} else {
+  console.log('  (skipped — app/dist/ not found)')
+}
+
 console.log(`\n====================`)
 console.log(`${passed}/${tests} tests passed`)
 process.exit(passed === tests ? 0 : 1)
