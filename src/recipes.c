@@ -55,6 +55,10 @@ static const recipe_entry recipes[] = {
     {"csv2tsv",     "csv | csv delimiter=\"\t\"",
      "Convert CSV to TSV"},
 
+    /* ---- Display ---- */
+    {"look",        "csv | table",
+     "Pretty-print as Markdown table"},
+
     /* ---- Analysis ---- */
     {"histogram",   "csv | stats hist | csv",
      "Distribution histograms"},

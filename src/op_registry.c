@@ -327,6 +327,7 @@ static tf_arg_desc csv_decode_args[] = {
     {"delimiter", "string", false, "\",\""},
     {"header",    "bool",   false, "true"},
     {"batch_size","int",    false, "1024"},
+    {"repair",    "bool",   false, "false"},
 };
 
 static tf_arg_desc csv_encode_args[] = {
@@ -503,6 +504,29 @@ static tf_arg_desc join_args[] = {
     {"how", "string", false, "\"inner\""},
 };
 
+static tf_arg_desc stack_args[] = {
+    {"file", "string", true, NULL},
+    {"tag", "string", false, NULL},
+    {"tag_value", "string", false, NULL},
+};
+
+static tf_arg_desc lead_args[] = {
+    {"column", "string", true, NULL},
+    {"offset", "int", false, "1"},
+    {"result", "string", false, NULL},
+};
+
+static tf_arg_desc date_trunc_args[] = {
+    {"column", "string", true, NULL},
+    {"trunc", "string", true, NULL},
+    {"result", "string", false, NULL},
+};
+
+static tf_arg_desc table_encode_args[] = {
+    {"max_width", "int", false, "40"},
+    {"max_rows", "int", false, "0"},
+};
+
 static tf_op_entry builtin_ops[] = {
     {
         .name = "codec.csv.decode",
@@ -510,7 +534,7 @@ static tf_op_entry builtin_ops[] = {
         .tier = TF_TIER_CORE,
         .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
         .args = csv_decode_args,
-        .n_args = 3,
+        .n_args = 4,
         .infer_schema = infer_schema_unknown,
         .create_native = (void *(*)(const cJSON *))tf_csv_decoder_create,
     },
@@ -920,6 +944,46 @@ static tf_op_entry builtin_ops[] = {
         .n_args = 3,
         .infer_schema = infer_schema_passthrough,  /* schema depends on lookup file */
         .create_native = (void *(*)(const cJSON *))tf_join_create,
+    },
+    {
+        .name = "stack",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_FS | TF_CAP_DETERMINISTIC,
+        .args = stack_args,
+        .n_args = 3,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_stack_create,
+    },
+    {
+        .name = "lead",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = lead_args,
+        .n_args = 3,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_lead_create,
+    },
+    {
+        .name = "date-trunc",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = date_trunc_args,
+        .n_args = 3,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_date_trunc_create,
+    },
+    {
+        .name = "codec.table.encode",
+        .kind = TF_OP_ENCODER,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = table_encode_args,
+        .n_args = 2,
+        .infer_schema = infer_schema_sink,
+        .create_native = (void *(*)(const cJSON *))tf_table_encoder_create,
     },
 };
 

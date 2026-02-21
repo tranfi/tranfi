@@ -844,5 +844,370 @@ class TestRecipes:
             assert name in CSV_DF['name'].values
 
 
+# ---------------------------------------------------------------------------
+# 11. CSV Repair
+# ---------------------------------------------------------------------------
+
+CSV_MALFORMED_SHORT = (
+    b'name,age,city\n'
+    b'Alice,30,NY\n'
+    b'Bob,25\n'
+    b'Charlie,35,SF\n'
+)
+
+CSV_MALFORMED_LONG = (
+    b'name,age,city\n'
+    b'Alice,30,NY\n'
+    b'Bob,25,LA,extra1,extra2\n'
+    b'Charlie,35,SF\n'
+)
+
+
+class TestCSVRepair:
+    def test_repair_short_rows(self):
+        """Short rows should be padded with empty fields."""
+        result = run_tf([
+            tf.codec.csv(repair=True),
+            tf.codec.csv_encode(),
+        ], data=CSV_MALFORMED_SHORT)
+        assert len(result) == 3
+        bob = result[result['name'] == 'Bob'].iloc[0]
+        # Short row padded — city should be empty/NaN
+        assert pd.isna(bob['city']) or str(bob['city']).strip() == ''
+
+    def test_repair_long_rows(self):
+        """Long rows should be truncated to header column count."""
+        result = run_tf([
+            tf.codec.csv(repair=True),
+            tf.codec.csv_encode(),
+        ], data=CSV_MALFORMED_LONG)
+        assert len(result) == 3
+        assert list(result.columns) == ['name', 'age', 'city']
+        bob = result[result['name'] == 'Bob'].iloc[0]
+        assert str(bob['city']) == 'LA'
+
+    def test_repair_preserves_good_data(self):
+        """Repair mode should not alter well-formed data."""
+        result_repair = run_tf([
+            tf.codec.csv(repair=True),
+            tf.codec.csv_encode(),
+        ])
+        result_normal = run_tf([
+            tf.codec.csv(),
+            tf.codec.csv_encode(),
+        ])
+        assert_df_equal(result_repair, result_normal)
+
+
+# ---------------------------------------------------------------------------
+# 12. Stack (vertical concat)
+# ---------------------------------------------------------------------------
+
+CSV_STACK_A = (
+    b'name,age\n'
+    b'Alice,30\n'
+    b'Bob,25\n'
+)
+
+CSV_STACK_B = (
+    b'name,age\n'
+    b'Charlie,35\n'
+    b'Diana,28\n'
+)
+
+
+class TestStack:
+    @pytest.fixture(autouse=True)
+    def setup_files(self, tmp_path):
+        self.file_b = str(tmp_path / 'b.csv')
+        with open(self.file_b, 'wb') as f:
+            f.write(CSV_STACK_B)
+
+    def test_stack_row_count(self):
+        """Stacked output should have rows from both files."""
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.stack(self.file_b),
+            tf.codec.csv_encode(),
+        ], data=CSV_STACK_A)
+        df_a = pd.read_csv(io.BytesIO(CSV_STACK_A))
+        df_b = pd.read_csv(io.BytesIO(CSV_STACK_B))
+        assert len(result) == len(df_a) + len(df_b)
+
+    def test_stack_values(self):
+        """All names from both files should appear."""
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.stack(self.file_b),
+            tf.codec.csv_encode(),
+        ], data=CSV_STACK_A)
+        names = set(result['name'])
+        assert names == {'Alice', 'Bob', 'Charlie', 'Diana'}
+
+    def test_stack_vs_pandas_concat(self):
+        """Stack output should match pandas concat."""
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.stack(self.file_b),
+            tf.codec.csv_encode(),
+        ], data=CSV_STACK_A)
+        df_a = pd.read_csv(io.BytesIO(CSV_STACK_A))
+        df_b = pd.read_csv(io.BytesIO(CSV_STACK_B))
+        expected = pd.concat([df_a, df_b], ignore_index=True)
+        assert_df_equal(result, expected, check_order=False)
+
+
+# ---------------------------------------------------------------------------
+# 13. Table encoder (pretty-print)
+# ---------------------------------------------------------------------------
+
+class TestTableEncoder:
+    def test_table_output_format(self):
+        """Table output should have Markdown table structure."""
+        data = b'name,age\nAlice,30\nBob,25\n'
+        raw = run_tf_raw([
+            tf.codec.csv(),
+            tf.codec.table_encode(),
+        ], data=data)
+        lines = raw.strip().split('\n')
+        assert len(lines) == 4  # header + separator + 2 data rows
+        assert lines[0].startswith('|')
+        assert lines[1].startswith('|')
+        assert '---' in lines[1]
+        assert 'Alice' in lines[2]
+        assert 'Bob' in lines[3]
+
+    def test_table_all_rows_present(self):
+        """All data rows should appear in table output."""
+        raw = run_tf_raw([
+            tf.codec.csv(),
+            tf.codec.table_encode(),
+        ])
+        for name in CSV_DF['name']:
+            assert name in raw
+
+    def test_table_column_alignment(self):
+        """All rows should have the same number of pipe separators."""
+        data = b'name,age,city\nAlice,30,NY\nBob,25,LA\n'
+        raw = run_tf_raw([
+            tf.codec.csv(),
+            tf.codec.table_encode(),
+        ], data=data)
+        lines = raw.strip().split('\n')
+        pipe_counts = [line.count('|') for line in lines]
+        # All lines should have same number of pipes
+        assert len(set(pipe_counts)) == 1
+
+    def test_recipe_look(self):
+        """The 'look' recipe should produce table output."""
+        p = tf.pipeline('look')
+        raw = p.run(input=CSV_DATA).output_text
+        assert '|' in raw
+        assert '---' in raw
+        for name in CSV_DF['name']:
+            assert name in raw
+
+
+# ---------------------------------------------------------------------------
+# 14. Expression Functions
+# ---------------------------------------------------------------------------
+
+class TestExprFunctions:
+    def test_sign(self):
+        data = b'x\n-5\n0\n7\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({'s': tf.expr("sign(col('x'))")}),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert list(result['s'].astype(int)) == [-1, 0, 1]
+
+    def test_nullif(self):
+        data = b'x\nbar\nfoo\nbaz\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({'y': tf.expr("nullif(col('x'), 'foo')")}),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert str(result.iloc[0]['y']) == 'bar'
+        assert pd.isna(result.iloc[1]['y']) or str(result.iloc[1]['y']).strip() == ''
+        assert str(result.iloc[2]['y']) == 'baz'
+
+    def test_initcap(self):
+        data = b'name\nalice smith\nbob jones\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({'cap': tf.expr("initcap(col('name'))")}),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert list(result['cap']) == ['Alice Smith', 'Bob Jones']
+
+    def test_left_right(self):
+        data = b'word\nhello\nworld\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({
+                'l': tf.expr("left(col('word'), 3)"),
+                'r': tf.expr("right(col('word'), 3)"),
+            }),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert list(result['l']) == ['hel', 'wor']
+        assert list(result['r']) == ['llo', 'rld']
+
+    def test_replace_expr(self):
+        data = b'city\nNew York\nLos Angeles\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({'short': tf.expr("replace(col('city'), 'New ', 'N')")}),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert str(result.iloc[0]['short']) == 'NYork'
+
+    def test_pow_sqrt(self):
+        data = b'x\n4\n9\n16\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({
+                'sq': tf.expr("pow(col('x'), 2)"),
+                'rt': tf.expr("sqrt(col('x'))"),
+            }),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert abs(float(result.iloc[0]['sq']) - 16) < 1e-6
+        assert abs(float(result.iloc[0]['rt']) - 2) < 1e-6
+        assert abs(float(result.iloc[1]['rt']) - 3) < 1e-6
+
+    def test_log_exp(self):
+        import math
+        data = b'x\n1\n2.718281828\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({
+                'lg': tf.expr("log(col('x'))"),
+                'ex': tf.expr("exp(col('x'))"),
+            }),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert abs(float(result.iloc[0]['lg']) - 0) < 1e-4
+        assert abs(float(result.iloc[1]['lg']) - 1) < 1e-4
+        assert abs(float(result.iloc[0]['ex']) - math.e) < 1e-4
+
+    def test_mod(self):
+        data = b'x\n10\n7\n15\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({'m': tf.expr("mod(col('x'), 3)")}),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert list(result['m'].astype(int)) == [1, 1, 0]
+
+    def test_greatest_least(self):
+        data = b'a,b,c\n3,1,2\n5,8,4\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({
+                'mx': tf.expr("greatest(col('a'), col('b'), col('c'))"),
+                'mn': tf.expr("least(col('a'), col('b'), col('c'))"),
+            }),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert list(result['mx'].astype(int)) == [3, 8]
+        assert list(result['mn'].astype(int)) == [1, 4]
+
+    def test_aliases(self):
+        data = b'word\nhello\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({
+                's': tf.expr("substr(col('word'), 1, 3)"),
+                'l': tf.expr("length(col('word'))"),
+            }),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert str(result.iloc[0]['s']) == 'ell'
+        assert int(result.iloc[0]['l']) == 5
+
+
+# ---------------------------------------------------------------------------
+# 15. Lead operator
+# ---------------------------------------------------------------------------
+
+class TestLead:
+    def test_lead_basic(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.lead('val', offset=1, result='next_val'),
+            tf.codec.csv_encode(),
+        ], data=CSV_NUMERIC)
+        df = pd.read_csv(io.BytesIO(CSV_NUMERIC))
+        assert len(result) == len(df)
+        # First 4 rows should have lead values
+        for i in range(len(df) - 1):
+            assert abs(float(result.iloc[i]['next_val']) - df.iloc[i + 1]['val']) < 1e-6
+        # Last row should have NaN
+        assert pd.isna(result.iloc[-1]['next_val'])
+
+    def test_lead_offset_2(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.lead('val', offset=2, result='lead2'),
+            tf.codec.csv_encode(),
+        ], data=CSV_NUMERIC)
+        df = pd.read_csv(io.BytesIO(CSV_NUMERIC))
+        assert len(result) == len(df)
+        for i in range(len(df) - 2):
+            assert abs(float(result.iloc[i]['lead2']) - df.iloc[i + 2]['val']) < 1e-6
+        # Last 2 rows should have NaN
+        assert pd.isna(result.iloc[-1]['lead2'])
+        assert pd.isna(result.iloc[-2]['lead2'])
+
+    def test_lead_vs_pandas_shift(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.lead('val', offset=1, result='next_val'),
+            tf.codec.csv_encode(),
+        ], data=CSV_NUMERIC)
+        df = pd.read_csv(io.BytesIO(CSV_NUMERIC))
+        expected = df['val'].shift(-1)
+        for i in range(len(df) - 1):
+            assert abs(float(result.iloc[i]['next_val']) - expected.iloc[i]) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 16. Date truncation
+# ---------------------------------------------------------------------------
+
+class TestDateTrunc:
+    def test_trunc_to_month(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.date_trunc('date', 'month', result='month_start'),
+            tf.codec.csv_encode(),
+        ], data=CSV_WITH_DATES)
+        # 2024-03-15 → 2024-03-01, 2023-12-01 → 2023-12-01, 2024-07-22 → 2024-07-01
+        expected = ['2024-03-01', '2023-12-01', '2024-07-01']
+        assert list(result['month_start']) == expected
+
+    def test_trunc_to_year(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.date_trunc('date', 'year', result='year_start'),
+            tf.codec.csv_encode(),
+        ], data=CSV_WITH_DATES)
+        expected = ['2024-01-01', '2023-01-01', '2024-01-01']
+        assert list(result['year_start']) == expected
+
+    def test_trunc_preserves_rows(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.date_trunc('date', 'month'),
+            tf.codec.csv_encode(),
+        ], data=CSV_WITH_DATES)
+        assert len(result) == 3
+        assert 'id' in result.columns
+        assert 'value' in result.columns
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -960,23 +960,214 @@ static eval_val eval_func(const char *name, eval_val *args, int n_args) {
         return val_null();
     }
 
-    /* min(a, b) */
-    if (strcmp(name, "min") == 0 && n_args == 2) {
-        if (!is_numeric(args[0]) || !is_numeric(args[1])) return val_null();
-        double a = to_double(args[0]), b = to_double(args[1]);
-        if (args[0].tag == VAL_INT && args[1].tag == VAL_INT)
-            return val_int(args[0].i < args[1].i ? args[0].i : args[1].i);
-        return val_float(a < b ? a : b);
+    /* min(a, b, ...) / least(a, b, ...) — variadic minimum */
+    if ((strcmp(name, "min") == 0 || strcmp(name, "least") == 0) && n_args >= 2) {
+        int all_int = 1;
+        for (int i = 0; i < n_args; i++) {
+            if (!is_numeric(args[i])) return val_null();
+            if (args[i].tag != VAL_INT) all_int = 0;
+        }
+        if (all_int) {
+            int64_t result = args[0].i;
+            for (int i = 1; i < n_args; i++)
+                if (args[i].i < result) result = args[i].i;
+            return val_int(result);
+        }
+        double result = to_double(args[0]);
+        for (int i = 1; i < n_args; i++) {
+            double v = to_double(args[i]);
+            if (v < result) result = v;
+        }
+        return val_float(result);
     }
 
-    /* max(a, b) */
-    if (strcmp(name, "max") == 0 && n_args == 2) {
-        if (!is_numeric(args[0]) || !is_numeric(args[1])) return val_null();
-        double a = to_double(args[0]), b = to_double(args[1]);
-        if (args[0].tag == VAL_INT && args[1].tag == VAL_INT)
-            return val_int(args[0].i > args[1].i ? args[0].i : args[1].i);
-        return val_float(a > b ? a : b);
+    /* max(a, b, ...) / greatest(a, b, ...) — variadic maximum */
+    if ((strcmp(name, "max") == 0 || strcmp(name, "greatest") == 0) && n_args >= 2) {
+        int all_int = 1;
+        for (int i = 0; i < n_args; i++) {
+            if (!is_numeric(args[i])) return val_null();
+            if (args[i].tag != VAL_INT) all_int = 0;
+        }
+        if (all_int) {
+            int64_t result = args[0].i;
+            for (int i = 1; i < n_args; i++)
+                if (args[i].i > result) result = args[i].i;
+            return val_int(result);
+        }
+        double result = to_double(args[0]);
+        for (int i = 1; i < n_args; i++) {
+            double v = to_double(args[i]);
+            if (v > result) result = v;
+        }
+        return val_float(result);
     }
+
+    /* sign(x) — returns -1, 0, or 1 */
+    if (strcmp(name, "sign") == 0 && n_args == 1) {
+        if (args[0].tag == VAL_INT)
+            return val_int(args[0].i > 0 ? 1 : (args[0].i < 0 ? -1 : 0));
+        if (args[0].tag == VAL_FLOAT)
+            return val_int(args[0].f > 0 ? 1 : (args[0].f < 0 ? -1 : 0));
+        return val_null();
+    }
+
+    /* nullif(a, b) — returns NULL if a == b, else a */
+    if (strcmp(name, "nullif") == 0 && n_args == 2) {
+        if (args[0].tag == VAL_NULL && args[1].tag == VAL_NULL) return val_null();
+        if (args[0].tag == VAL_INT && args[1].tag == VAL_INT)
+            return args[0].i == args[1].i ? val_null() : args[0];
+        if (is_numeric(args[0]) && is_numeric(args[1]))
+            return to_double(args[0]) == to_double(args[1]) ? val_null() : args[0];
+        if (args[0].tag == VAL_STR && args[1].tag == VAL_STR)
+            return strcmp(args[0].s, args[1].s) == 0 ? val_null() : args[0];
+        return args[0];
+    }
+
+    /* initcap(s) — title case */
+    if (strcmp(name, "initcap") == 0 && n_args == 1) {
+        if (args[0].tag == VAL_NULL) return val_null();
+        char tmp[64];
+        const char *s = val_to_str(args[0], tmp, sizeof(tmp));
+        char *out = scratch_alloc();
+        int word_start = 1;
+        size_t i;
+        for (i = 0; s[i] && i < SCRATCH_SLOT_SIZE - 1; i++) {
+            if (isspace((unsigned char)s[i]) || s[i] == '_' || s[i] == '-') {
+                out[i] = s[i];
+                word_start = 1;
+            } else if (word_start) {
+                out[i] = (char)toupper((unsigned char)s[i]);
+                word_start = 0;
+            } else {
+                out[i] = (char)tolower((unsigned char)s[i]);
+            }
+        }
+        out[i] = '\0';
+        return val_str(out);
+    }
+
+    /* left(s, n) — first n characters */
+    if (strcmp(name, "left") == 0 && n_args == 2) {
+        if (args[0].tag == VAL_NULL) return val_null();
+        if (args[0].tag != VAL_STR) return val_null();
+        int64_t n = args[1].tag == VAL_INT ? args[1].i : (int64_t)args[1].f;
+        if (n < 0) n = 0;
+        size_t slen = strlen(args[0].s);
+        size_t take = (size_t)n < slen ? (size_t)n : slen;
+        char *out = scratch_alloc();
+        if (take >= SCRATCH_SLOT_SIZE) take = SCRATCH_SLOT_SIZE - 1;
+        memcpy(out, args[0].s, take);
+        out[take] = '\0';
+        return val_str(out);
+    }
+
+    /* right(s, n) — last n characters */
+    if (strcmp(name, "right") == 0 && n_args == 2) {
+        if (args[0].tag == VAL_NULL) return val_null();
+        if (args[0].tag != VAL_STR) return val_null();
+        int64_t n = args[1].tag == VAL_INT ? args[1].i : (int64_t)args[1].f;
+        if (n < 0) n = 0;
+        size_t slen = strlen(args[0].s);
+        size_t take = (size_t)n < slen ? (size_t)n : slen;
+        char *out = scratch_alloc();
+        if (take >= SCRATCH_SLOT_SIZE) take = SCRATCH_SLOT_SIZE - 1;
+        memcpy(out, args[0].s + slen - take, take);
+        out[take] = '\0';
+        return val_str(out);
+    }
+
+    /* replace(s, old, new) — string replace */
+    if (strcmp(name, "replace") == 0 && n_args == 3) {
+        if (args[0].tag == VAL_NULL) return val_null();
+        if (args[0].tag != VAL_STR || args[1].tag != VAL_STR || args[2].tag != VAL_STR)
+            return val_null();
+        const char *s = args[0].s;
+        const char *old_s = args[1].s;
+        const char *new_s = args[2].s;
+        size_t old_len = strlen(old_s);
+        size_t new_len = strlen(new_s);
+        if (old_len == 0) return args[0];
+        char *out = scratch_alloc();
+        size_t pos = 0;
+        while (*s && pos < SCRATCH_SLOT_SIZE - 1) {
+            const char *found = strstr(s, old_s);
+            if (!found) {
+                size_t rest = strlen(s);
+                if (pos + rest >= SCRATCH_SLOT_SIZE) rest = SCRATCH_SLOT_SIZE - 1 - pos;
+                memcpy(out + pos, s, rest);
+                pos += rest;
+                break;
+            }
+            size_t before = (size_t)(found - s);
+            if (pos + before >= SCRATCH_SLOT_SIZE) before = SCRATCH_SLOT_SIZE - 1 - pos;
+            memcpy(out + pos, s, before);
+            pos += before;
+            if (pos + new_len >= SCRATCH_SLOT_SIZE) break;
+            memcpy(out + pos, new_s, new_len);
+            pos += new_len;
+            s = found + old_len;
+        }
+        out[pos] = '\0';
+        return val_str(out);
+    }
+
+    /* pow(x, y) */
+    if (strcmp(name, "pow") == 0 && n_args == 2) {
+        if (!is_numeric(args[0]) || !is_numeric(args[1])) return val_null();
+        return val_float(pow(to_double(args[0]), to_double(args[1])));
+    }
+
+    /* sqrt(x) */
+    if (strcmp(name, "sqrt") == 0 && n_args == 1) {
+        if (!is_numeric(args[0])) return val_null();
+        double v = to_double(args[0]);
+        if (v < 0) return val_null();
+        return val_float(sqrt(v));
+    }
+
+    /* log(x) — natural log */
+    if (strcmp(name, "log") == 0 && n_args == 1) {
+        if (!is_numeric(args[0])) return val_null();
+        double v = to_double(args[0]);
+        if (v <= 0) return val_null();
+        return val_float(log(v));
+    }
+
+    /* exp(x) */
+    if (strcmp(name, "exp") == 0 && n_args == 1) {
+        if (!is_numeric(args[0])) return val_null();
+        return val_float(exp(to_double(args[0])));
+    }
+
+    /* mod(a, b) — modulo */
+    if (strcmp(name, "mod") == 0 && n_args == 2) {
+        if (!is_numeric(args[0]) || !is_numeric(args[1])) return val_null();
+        if (args[0].tag == VAL_INT && args[1].tag == VAL_INT) {
+            if (args[1].i == 0) return val_null();
+            return val_int(args[0].i % args[1].i);
+        }
+        double b = to_double(args[1]);
+        if (b == 0.0) return val_null();
+        return val_float(fmod(to_double(args[0]), b));
+    }
+
+    /* ---- Aliases ---- */
+
+    /* substr → slice */
+    if (strcmp(name, "substr") == 0 && n_args >= 2)
+        return eval_func("slice", args, n_args);
+
+    /* length → len */
+    if (strcmp(name, "length") == 0 && n_args == 1)
+        return eval_func("len", args, n_args);
+
+    /* lpad → pad_left */
+    if (strcmp(name, "lpad") == 0 && n_args >= 2)
+        return eval_func("pad_left", args, n_args);
+
+    /* rpad → pad_right */
+    if (strcmp(name, "rpad") == 0 && n_args >= 2)
+        return eval_func("pad_right", args, n_args);
 
     return val_null(); /* unknown function */
 }

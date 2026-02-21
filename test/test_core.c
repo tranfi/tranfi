@@ -769,7 +769,7 @@ static void test_registry_capabilities(void) {
 
 static void test_registry_count_and_iterate(void) {
     size_t count = tf_op_registry_count();
-    assert(count == 41);  /* 6 codecs + 35 transforms */
+    assert(count == 45);  /* 7 codecs + 38 transforms */
     for (size_t i = 0; i < count; i++) {
         const tf_op_entry *e = tf_op_registry_get(i);
         assert(e != NULL);
@@ -2454,7 +2454,7 @@ static void test_registry_new_ops(void) {
 
 static void test_registry_count_updated(void) {
     size_t count = tf_op_registry_count();
-    assert(count == 41);  /* 6 codecs + 35 transforms */
+    assert(count == 45);  /* 7 codecs + 38 transforms */
 }
 
 /* ================================================================
@@ -2835,7 +2835,7 @@ static void test_recipe_roundtrip(void) {
 }
 
 static void test_recipe_count(void) {
-    assert(tf_recipe_count() == 20);
+    assert(tf_recipe_count() == 21);
 }
 
 static void test_recipe_find(void) {

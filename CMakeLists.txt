@@ -47,6 +47,10 @@ set(CORE_SOURCES
     src/op_grep.c
     src/op_pivot.c
     src/op_join.c
+    src/op_stack.c
+    src/op_lead.c
+    src/op_date_trunc.c
+    src/codec_table.c
     src/ir.c
     src/ir_serialize.c
     src/ir_validate.c

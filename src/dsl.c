@@ -249,6 +249,10 @@ static char *resolve_codec(const char *name, int is_first, int is_last) {
         if (is_last)  return strdup("codec.text.encode");
         return NULL;
     }
+    if (strcmp(name, "table") == 0) {
+        if (is_last) return strdup("codec.table.encode");
+        return NULL;
+    }
 
     return NULL; /* not a codec */
 }
@@ -753,6 +757,60 @@ static cJSON *build_join_args(const token_list *tokens, char **error) {
     return args;
 }
 
+static cJSON *build_stack_args(const token_list *tokens, char **error) {
+    /* stack file.csv [--tag source] */
+    if (tokens->count < 2) {
+        set_error(error, "stack requires a file path");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "file", tokens->items[1]);
+    for (size_t i = 2; i < tokens->count; i++) {
+        if (strcmp(tokens->items[i], "--tag") == 0 && i + 1 < tokens->count) {
+            cJSON_AddStringToObject(args, "tag", tokens->items[i + 1]);
+            i++;
+        }
+    }
+    return args;
+}
+
+static cJSON *build_lead_args(const token_list *tokens, char **error) {
+    /* lead column [offset] [result_name] */
+    if (tokens->count < 2) {
+        set_error(error, "lead requires a column name");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (tokens->count >= 3) {
+        /* Check if next arg is numeric (offset) or a name (result) */
+        char *end;
+        long off = strtol(tokens->items[2], &end, 10);
+        if (*end == '\0') {
+            cJSON_AddNumberToObject(args, "offset", off);
+            if (tokens->count >= 4)
+                cJSON_AddStringToObject(args, "result", tokens->items[3]);
+        } else {
+            cJSON_AddStringToObject(args, "result", tokens->items[2]);
+        }
+    }
+    return args;
+}
+
+static cJSON *build_date_trunc_args(const token_list *tokens, char **error) {
+    /* date-trunc column granularity [result_name] */
+    if (tokens->count < 3) {
+        set_error(error, "date-trunc requires column and granularity");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    cJSON_AddStringToObject(args, "trunc", tokens->items[2]);
+    if (tokens->count >= 4)
+        cJSON_AddStringToObject(args, "result", tokens->items[3]);
+    return args;
+}
+
 /* ---- Main parser ---- */
 
 tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
@@ -899,6 +957,15 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "join") == 0) {
             args = build_join_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "stack") == 0) {
+            args = build_stack_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "lead") == 0) {
+            args = build_lead_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "date-trunc") == 0) {
+            args = build_date_trunc_args(&tokens, error);
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else {
             /* Unknown op — pass through with codec-style args, let validation catch it */

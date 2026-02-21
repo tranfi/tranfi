@@ -210,6 +210,13 @@ tf_step *tf_datetime_create(const cJSON *args);
 tf_step *tf_grep_create(const cJSON *args);
 tf_step *tf_pivot_create(const cJSON *args);
 tf_step *tf_join_create(const cJSON *args);
+tf_step *tf_stack_create(const cJSON *args);
+tf_step *tf_lead_create(const cJSON *args);
+tf_step *tf_date_trunc_create(const cJSON *args);
+
+/* ---- Table encoder ---- */
+
+tf_encoder *tf_table_encoder_create(const cJSON *args);
 
 /* ---- Expression evaluator ---- */
 

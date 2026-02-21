@@ -15,62 +15,79 @@ Pipelines are `source | transform... | sink`. Codecs (`csv`, `jsonl`) auto-resol
 
 | Codec | Options |
 |-------|---------|
-| `csv` | `delimiter=;` `header=false` |
+| `csv` | `delimiter=;` `header=false` `repair` |
 | `jsonl` | |
 | `text` | `batch_size=1024` |
+| `table` | `max_width=40` `max_rows=0` |
 
-Cross-codec: `csv | ... | jsonl`. The `text` codec splits on newlines into a single `_line` column — no field parsing, no type detection.
+Cross-codec: `csv | ... | jsonl`. The `text` codec splits on newlines into a single `_line` column — no field parsing, no type detection. The `table` codec outputs a Markdown-formatted table (like `csvlook`). Use `csv repair` to auto-fix malformed rows (pad short, truncate long).
 
 ### Transforms
 
-| Transform | Syntax | Description |
-|-----------|--------|-------------|
-| `filter` | `filter "col(age) > 25"` | Keep rows matching expression |
-| `select` | `select name,age` | Keep/reorder columns |
-| `rename` | `rename name=full_name` | Rename columns |
-| `head` | `head 10` | First N rows |
-| `tail` | `tail 10` | Last N rows |
-| `skip` | `skip 5` | Skip first N rows |
-| `derive` | `derive total=col(price)*col(qty)` | Computed columns |
-| `sort` | `sort age` / `sort -age` | Sort (prefix `-` for desc) |
-| `unique` | `unique name,city` | Deduplicate |
-| `stats` | `stats` / `stats count,sum` | Column statistics |
-| `validate` | `validate "col(age) > 0"` | Add `_valid` column, keep all rows |
-| `trim` | `trim name,city` | Strip whitespace |
-| `fill-null` | `fill-null age=0 city=unknown` | Replace nulls |
-| `fill-down` | `fill-down city` | Forward-fill nulls |
-| `cast` | `cast age=int score=float` | Type conversion |
-| `clip` | `clip score 0 100` | Clamp to [min, max] |
-| `replace` | `replace name Alice Alicia` | String find/replace (or `--regex`) |
-| `hash` | `hash name,city` | DJB2 hash (`_hash` column) |
-| `bin` | `bin age 18,30,50` | Discretize into bins |
-| `step` | `step price running-sum cumsum` | Running agg (cumsum, delta, lag, ratio) |
-| `window` | `window price 3 avg price_ma3` | Sliding window (avg, sum, min, max) |
-| `explode` | `explode tags ,` | Split string into rows |
-| `split` | `split name " " first,last` | Split column into columns |
-| `unpivot` | `unpivot jan,feb,mar` | Wide to long |
-| `top` | `top 10 score` | Top N by column |
-| `sample` | `sample 100` | Reservoir sampling |
-| `group-agg` | `group-agg city sum:price:total` | Group by + aggregate |
-| `frequency` | `frequency city` | Value counts |
-| `grep` | `grep error` / `grep -r "^err"` | Substring or regex filter (`-v` invert, `-r` regex) |
-| `datetime` | `datetime date year,month,day` | Extract date parts |
-| `flatten` | `flatten` | Flatten nested columns |
+| Transform | Syntax | SQL equivalent |
+|-----------|--------|---------------|
+| `filter` | `filter "col(age) > 25"` | `WHERE age > 25` |
+| `select` | `select name,age` | `SELECT name, age` |
+| `rename` | `rename name=full_name` | `SELECT name AS full_name` |
+| `head` | `head 10` | `LIMIT 10` |
+| `tail` | `tail 10` | `ORDER BY rowid DESC LIMIT 10` |
+| `skip` | `skip 5` | `OFFSET 5` |
+| `derive` | `derive total=col(price)*col(qty)` | `SELECT *, price*qty AS total` |
+| `sort` | `sort age` / `sort -age` | `ORDER BY age` / `ORDER BY age DESC` |
+| `unique` | `unique name,city` | `SELECT DISTINCT` |
+| `stats` | `stats` / `stats count,sum` | `SELECT COUNT(*), SUM(x), AVG(x)...` |
+| `validate` | `validate "col(age) > 0"` | `SELECT *, (age > 0) AS _valid` |
+| `trim` | `trim name,city` | `SELECT TRIM(name), TRIM(city)` |
+| `fill-null` | `fill-null age=0 city=unknown` | `COALESCE(age, 0)` |
+| `fill-down` | `fill-down city` | `LAST_VALUE(city IGNORE NULLS) OVER (...)` |
+| `cast` | `cast age=int score=float` | `CAST(age AS INT)` |
+| `clip` | `clip score 0 100` | `GREATEST(0, LEAST(100, score))` |
+| `replace` | `replace name Alice Alicia` | `REPLACE(name, 'Alice', 'Alicia')` |
+| `hash` | `hash name,city` | — |
+| `bin` | `bin age 18,30,50` | `CASE WHEN age < 18 THEN ... END` |
+| `step` | `step price running-sum cumsum` | `SUM(price) OVER (ROWS UNBOUNDED PRECEDING)` |
+| `lead` | `lead price 1 next_price` | `LEAD(price, 1) OVER (ORDER BY ...)` |
+| `window` | `window price 3 avg price_ma3` | `AVG(price) OVER (ROWS 2 PRECEDING)` |
+| `explode` | `explode tags ,` | `CROSS JOIN UNNEST(SPLIT(tags, ','))` |
+| `split` | `split name " " first,last` | `SPLIT_PART(name, ' ', 1) AS first` |
+| `unpivot` | `unpivot jan,feb,mar` | `UNPIVOT (value FOR variable IN (...))` |
+| `pivot` | `pivot metric value sum` | `PIVOT (SUM(value) FOR metric IN (...))` |
+| `top` | `top 10 score` | `ORDER BY score DESC LIMIT 10` |
+| `sample` | `sample 100` | `TABLESAMPLE` / reservoir sampling |
+| `group-agg` | `group-agg city sum:price:total` | `SELECT city, SUM(price) AS total GROUP BY city` |
+| `frequency` | `frequency city` | `SELECT city, COUNT(*) GROUP BY city ORDER BY 2 DESC` |
+| `grep` | `grep error` / `grep -r "^err"` | `WHERE col LIKE '%error%'` / `REGEXP_LIKE` |
+| `datetime` | `datetime date year,month,day` | `EXTRACT(YEAR FROM date)` |
+| `date-trunc` | `date-trunc ts month` | `DATE_TRUNC('month', ts)` |
+| `join` | `join lookup.csv on=city` | `JOIN lookup ON city = city` |
+| `stack` | `stack other.csv` | `UNION ALL` |
+| `flatten` | `flatten` | — |
 
 Aliases: `reorder` (select), `dedup` (unique).
 
 ### Expressions
 
 Used in `filter`, `derive`, `validate`:
-- Columns: `col(name)` or `col('name')`
-- Arithmetic: `+` `-` `*` `/`
-- Comparisons: `>` `>=` `<` `<=` `==` `!=`
-- Logic: `and` `or` `not`
-- Literals, parentheses
-- String: `upper()` `lower()` `len()` `trim()` `concat()` `slice()` `pad_left()` `pad_right()`
-- Predicates: `starts_with()` `ends_with()` `contains()`
-- Conditional: `if(cond, then, else)` `coalesce(a, b, ...)`
-- Math: `abs()` `round()` `floor()` `ceil()` `min()` `max()`
+
+| Category | Functions | SQL equivalent |
+|----------|-----------|---------------|
+| Columns | `col(name)` | `name` |
+| Arithmetic | `+` `-` `*` `/` | same |
+| Comparison | `>` `>=` `<` `<=` `==` `!=` | same |
+| Logic | `and` `or` `not` | `AND` `OR` `NOT` |
+| String | `upper()` `lower()` `initcap()` | `UPPER` `LOWER` `INITCAP` |
+| | `len()` `trim()` `left()` `right()` | `LENGTH` `TRIM` `LEFT` `RIGHT` |
+| | `concat(a, b, ...)` `replace(s, old, new)` | `CONCAT` `REPLACE` |
+| | `slice(s, start, len)` | `SUBSTRING(s, start, len)` |
+| | `pad_left(s, w)` `pad_right(s, w)` | `LPAD` `RPAD` |
+| Predicates | `starts_with()` `ends_with()` `contains()` | `LIKE 'x%'` `LIKE '%x'` `LIKE '%x%'` |
+| Conditional | `if(cond, then, else)` | `CASE WHEN ... THEN ... ELSE ... END` |
+| | `coalesce(a, b, ...)` `nullif(a, b)` | `COALESCE` `NULLIF` |
+| Math | `abs()` `round()` `floor()` `ceil()` `sign()` | `ABS` `ROUND` `FLOOR` `CEIL` `SIGN` |
+| | `pow(x, y)` `sqrt()` `log()` `exp()` `mod(a, b)` | `POWER` `SQRT` `LN` `EXP` `MOD` |
+| | `greatest(a, b, ...)` `least(a, b, ...)` | `GREATEST` `LEAST` |
+
+Aliases: `substr`=`slice`, `length`=`len`, `lpad`=`pad_left`, `rpad`=`pad_right`, `min`=`least`, `max`=`greatest`.
 
 ### Examples
 

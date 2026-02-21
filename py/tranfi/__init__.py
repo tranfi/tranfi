@@ -43,7 +43,7 @@ class codec:
     """Codec step constructors."""
 
     @staticmethod
-    def csv(delimiter=',', header=True, batch_size=1024, encode=False):
+    def csv(delimiter=',', header=True, batch_size=1024, encode=False, repair=False):
         """CSV codec. Use encode=True for encoding (output), False for decoding (input)."""
         args = {}
         if delimiter != ',':
@@ -52,6 +52,8 @@ class codec:
             args['header'] = False
         if batch_size != 1024:
             args['batch_size'] = batch_size
+        if repair:
+            args['repair'] = True
         op = 'codec.csv.encode' if encode else 'codec.csv.decode'
         return {'op': op, 'args': args}
 
@@ -105,6 +107,16 @@ class codec:
     def text_encode():
         """Text line encoder."""
         return {'op': 'codec.text.encode', 'args': {}}
+
+    @staticmethod
+    def table_encode(max_width=40, max_rows=0):
+        """Pretty-print Markdown table encoder."""
+        args = {}
+        if max_width != 40:
+            args['max_width'] = max_width
+        if max_rows != 0:
+            args['max_rows'] = max_rows
+        return {'op': 'codec.table.encode', 'args': args}
 
 
 class ops:
@@ -336,6 +348,32 @@ class ops:
     def flatten():
         """Flatten nested columns (passthrough for already-flat data)."""
         return {'op': 'flatten', 'args': {}}
+
+    @staticmethod
+    def stack(file, tag=None, tag_value=None):
+        """Vertically concatenate another CSV file. Example: tf.ops.stack('other.csv', tag='source')"""
+        args = {'file': file}
+        if tag is not None:
+            args['tag'] = tag
+        if tag_value is not None:
+            args['tag_value'] = tag_value
+        return {'op': 'stack', 'args': args}
+
+    @staticmethod
+    def lead(column, offset=1, result=None):
+        """Lookahead: access value N rows ahead. Example: tf.ops.lead('price', 1, 'next_price')"""
+        args = {'column': column, 'offset': offset}
+        if result is not None:
+            args['result'] = result
+        return {'op': 'lead', 'args': args}
+
+    @staticmethod
+    def date_trunc(column, trunc, result=None):
+        """Truncate date/timestamp to granularity. Example: tf.ops.date_trunc('ts', 'month')"""
+        args = {'column': column, 'trunc': trunc}
+        if result is not None:
+            args['result'] = result
+        return {'op': 'date-trunc', 'args': args}
 
 
 class io:

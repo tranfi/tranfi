@@ -414,6 +414,7 @@ typedef struct {
     char      delimiter;
     int       has_header;
     size_t    batch_size;
+    int       repair;     /* if true, pad short rows and truncate long rows */
 
     /* Line accumulator: incoming bytes are appended, complete lines extracted */
     tf_buffer line_buf;
@@ -717,6 +718,21 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
         return TF_OK;
     }
 
+    /* --- Repair mode: normalize field count to match header --- */
+    if (st->repair && n_fields != st->n_cols) {
+        if (n_fields < st->n_cols) {
+            /* Pad short row with empty fields */
+            for (size_t i = n_fields; i < st->n_cols && i < MAX_COLS; i++) {
+                st->fields[i].ptr = "";
+                st->fields[i].len = 0;
+            }
+            n_fields = st->n_cols;
+        } else {
+            /* Truncate long row */
+            n_fields = st->n_cols;
+        }
+    }
+
     /* --- Ensure we have a batch --- */
     if (!st->batch) {
         if (st->types_frozen) {
@@ -879,6 +895,7 @@ tf_decoder *tf_csv_decoder_create(const cJSON *args) {
     st->delimiter = ',';
     st->has_header = 1;
     st->batch_size = DEFAULT_BATCH_SIZE;
+    st->repair = 0;
 
     if (args) {
         cJSON *d = cJSON_GetObjectItemCaseSensitive(args, "delimiter");
@@ -892,6 +909,10 @@ tf_decoder *tf_csv_decoder_create(const cJSON *args) {
         cJSON *bs = cJSON_GetObjectItemCaseSensitive(args, "batch_size");
         if (cJSON_IsNumber(bs) && bs->valueint > 0)
             st->batch_size = (size_t)bs->valueint;
+
+        cJSON *rep = cJSON_GetObjectItemCaseSensitive(args, "repair");
+        if (cJSON_IsBool(rep))
+            st->repair = cJSON_IsTrue(rep);
     }
 
     tf_buffer_init(&st->line_buf);
