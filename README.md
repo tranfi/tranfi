@@ -286,12 +286,53 @@ Run benchmarks: `./build/bench 1000000`
 
 ## Architecture
 
-```
-L3 (DSL / JSON / Python / JS)  →  L2 (IR: validated, schema-inferred)  →  L1 (native C pipeline)
+```mermaid
+graph TB
+  subgraph "App (Vue + Vite)"
+    APP["app/src/"]
+    CHECK{"__TRANFI_SERVER__?"}
+    APP --> CHECK
+    CHECK -->|yes| SERVER_MODE["Server mode<br/>POST /api/run"]
+    CHECK -->|no| WASM_MODE["WASM mode<br/>Web Worker"]
+  end
+
+  subgraph "Vite Build → app/dist/"
+    DIST_HTML["index.html"]
+    DIST_JS["assets/index-*.js<br/><small>Vue + Vuetify + JSEE</small>"]
+    DIST_WASM["wasm/tranfi-runner.js<br/>wasm/tranfi_core.js"]
+  end
+
+  APP -->|"vite build"| DIST_HTML
+  APP -->|"vite build"| DIST_JS
+  APP -->|"vite build"| DIST_WASM
+
+  subgraph "Deployment targets"
+    GH["GitHub Pages<br/><small>browser WASM, full dist/</small>"]
+    PIP["pip install tranfi<br/><small>dist/ minus wasm/</small>"]
+    NPM["npm install tranfi<br/><small>dist/ minus wasm/</small>"]
+    HTML["Export HTML<br/><small>self-contained .html</small>"]
+  end
+
+  DIST_HTML & DIST_JS & DIST_WASM --> GH
+  DIST_HTML & DIST_JS --> PIP
+  DIST_HTML & DIST_JS --> NPM
+  DIST_JS & DIST_WASM --> HTML
+
+  subgraph "Runtime"
+    GH -->|WASM in worker| WASM_RT["C core → WASM"]
+    PIP -->|"tranfi serve"| PY_RT["C core → Python"]
+    NPM -->|"tranfi serve"| NODE_RT["C core → N-API"]
+    HTML -->|WASM in worker| WASM_RT
+  end
+
+  subgraph "Core"
+    direction LR
+    L3["L3: DSL / JSON / Python / JS"] --> L2["L2: IR validation + schema"] --> L1["L1: C11 streaming runtime"]
+  end
 ```
 
 - **L3**: Pipe DSL, JSON plans, Python/JS/R builder APIs
-- **L2**: Op registry, validation, schema inference
+- **L2**: Op registry, validation, schema inference, IR→SQL transpiler
 - **L1**: Streaming C11 runtime with columnar batches, side channels
 
 Data model: columnar batches with typed columns (`bool`, `int64`, `float64`, `string`) and per-cell null bitmaps.
@@ -352,11 +393,11 @@ node test/test_node.js   # Node.js tests (inc. SQL transpiler, DuckDB, WASM)
 ## Project structure
 
 ```
-src/                 C11 core (40 operators, 3 codecs, DSL parser, IR, compiler)
-js/                  Node.js N-API + WASM bindings
-py/                  Python ctypes bindings
+src/                 C11 core (40 operators, 3 codecs, DSL parser, IR→SQL transpiler)
+app/                 Vue + Vite frontend (WASM mode + server mode)
+js/                  Node.js N-API + WASM bindings (full API docs)
+py/                  Python ctypes bindings (full API docs)
 r/                   R bindings
-browser/             Browser playground
 bench/               Benchmarks
 test/                Tests (C, Python, Node.js)
 Makefile             Build orchestration

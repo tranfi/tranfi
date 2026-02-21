@@ -1,0 +1,88 @@
+name: Deploy site to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - 'js/README.md'
+      - 'py/README.md'
+      - 'app/**'
+      - 'src/**'
+      - 'scripts/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.51
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build C core
+        run: |
+          mkdir -p build
+          cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+
+      - name: Build WASM
+        run: |
+          mkdir -p build-wasm
+          cd build-wasm
+          emcmake cmake .. -DCMAKE_BUILD_TYPE=Release
+          emmake make tranfi_wasm -j$(nproc)
+          cp tranfi_core.js ../js/wasm/
+
+      - name: Prepare app
+        run: |
+          mkdir -p app/public/wasm
+          cp js/wasm/tranfi_core.js app/public/wasm/
+
+      - name: Install app dependencies
+        working-directory: app
+        run: npm ci
+
+      - uses: actions/configure-pages@v4
+        id: pages
+
+      - name: Build app
+        working-directory: app
+        run: npx vite build
+        env:
+          VITE_BASE: ${{ steps.pages.outputs.base_path }}/app/
+
+      - name: Install site dependencies
+        run: npm ci
+
+      - name: Build site
+        run: node scripts/build-site.js --out _site --base ${{ steps.pages.outputs.base_path }}/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

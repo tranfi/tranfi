@@ -1,5 +1,6 @@
 # Build
 build/
+_site/
 build-wasm/
 build-release/
 *.o
@@ -22,8 +23,7 @@ __pycache__/
 dist/
 *.whl
 
-# App bundled binaries (build artifacts / vendored)
-app/public/lib/
+# App build artifacts
 app/public/wasm/tranfi_core.js
 
 # Node

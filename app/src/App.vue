@@ -1,10 +1,12 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
-import { BlockList, BlockCard, useBlockList } from '@statsim/block-editor'
+import { BlockList, BlockCard, useBlockList } from './lib/block-editor/index.js'
 import { compileToSchema, compileToServerSchema } from './lib/compile-schema.js'
 import { compileToDsl } from './lib/compile-dsl.js'
 import { blockTypes, blockTypeMap } from './lib/block-types.js'
 import { createBlock } from './lib/block-factory.js'
+import JSEE from '@jseeio/jsee'
+import jseeSource from '@jseeio/jsee/dist/jsee.js?raw'
 
 // Codecs
 import TfBlockCsvDecode from './components/blocks/TfBlockCsvDecode.vue'
@@ -131,12 +133,6 @@ watch(dsl, (val) => {
 })
 
 async function initJsee() {
-  const JSEE = window.JSEE
-  if (!JSEE) {
-    error.value = 'JSEE library not loaded'
-    return
-  }
-
   const schema = compileToSchema(dsl.value)
   jseeInstance = new JSEE({
     schema,
@@ -149,12 +145,6 @@ async function initJsee() {
 }
 
 async function initJseeServer() {
-  const JSEE = window.JSEE
-  if (!JSEE) {
-    error.value = 'JSEE library not loaded'
-    return
-  }
-
   const api = window.__TRANFI_SERVER__.api || '/api'
   try {
     const res = await fetch(`${api}/files`)
@@ -185,12 +175,13 @@ async function downloadHtml() {
   // Build a clean schema with the current DSL baked in
   const schema = compileToSchema(dsl.value)
 
-  // Fetch the JSEE runtime, model code, and imports
-  const [jseeCode, runnerCode, coreCode] = await Promise.all([
-    fetch('/lib/jsee.js').then(r => r.text()),
-    fetch('/wasm/tranfi-runner.js').then(r => r.text()),
-    fetch('/wasm/tranfi_core.js').then(r => r.text())
+  // Fetch model code and WASM core for embedding in standalone HTML
+  const base = import.meta.env.BASE_URL || '/'
+  const [runnerCode, coreCode] = await Promise.all([
+    fetch(`${base}wasm/tranfi-runner.js`).then(r => r.text()),
+    fetch(`${base}wasm/tranfi_core.js`).then(r => r.text())
   ])
+  const jseeCode = jseeSource
 
   const html = `<!DOCTYPE html>
 <html lang="en">

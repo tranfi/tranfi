@@ -1,5 +1,9 @@
 {
+  "type": "module",
   "dependencies": {
     "online-stats": "^1.5.0"
+  },
+  "devDependencies": {
+    "marked": "^17.0.3"
   }
 }

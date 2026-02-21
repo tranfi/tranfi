@@ -6,15 +6,17 @@
  * - Server mode: POST model sending { file, dsl } to /api/run
  */
 
+const base = import.meta.env.BASE_URL || '/'
+
 export function compileToSchema (dsl, options = {}) {
   return {
     model: {
       type: 'async-function',
-      url: '/wasm/tranfi-runner.js',
+      url: `${base}wasm/tranfi-runner.js`,
       name: 'tranfiRunner',
       worker: true,
       timeout: options.timeout || 120000,
-      imports: ['/wasm/tranfi_core.js']
+      imports: [`${base}wasm/tranfi_core.js`]
     },
     inputs: [
       { name: 'file', type: 'file', stream: true },

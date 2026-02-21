@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: all build test clean wasm app
+.PHONY: all build test clean wasm app site
 .PHONY: build-c build-node build-wasm
 .PHONY: test-c test-python test-node test-parity
 .PHONY: publish-python publish-node publish-github
@@ -46,14 +46,14 @@ test-parity: build-c
 # --- App targets ---
 
 app: build-wasm
-	@mkdir -p app/public/wasm app/public/lib
+	@mkdir -p app/public/wasm
 	@cp js/wasm/tranfi_core.js app/public/wasm/tranfi_core.js
 	@echo "  WASM copied to app/public/wasm/"
-	@if [ ! -f app/public/lib/jsee.js ]; then \
-		echo "  WARNING: app/public/lib/jsee.js missing — build @jseeio/jsee and copy dist/jsee.js here"; \
-	else \
-		echo "  jsee.js OK"; \
-	fi
+
+site: app
+	@cd app && npx vite build 2>&1 | tail -1
+	@node scripts/build-site.js --out _site --base /
+	@echo "  Site OK → _site/"
 
 # --- Publish targets ---
 
