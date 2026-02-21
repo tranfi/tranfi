@@ -1,0 +1,30 @@
+{
+  "name": "tranfi",
+  "version": "0.1.0",
+  "description": "Streaming ETL language + runtime",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./wasm": "./wasm/tranfi_core.js"
+  },
+  "files": [
+    "src/",
+    "wasm/",
+    "binding.gyp",
+    "core/include/",
+    "core/src/",
+    "core/vendor/",
+    "bindings/"
+  ],
+  "scripts": {
+    "install": "node-gyp rebuild || true",
+    "build:native": "node-gyp rebuild",
+    "build:wasm": "bash ../../scripts/build-wasm.sh",
+    "test": "node ../../test/test_node.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "node-gyp": "^10.0.0"
+  }
+}
