@@ -20,7 +20,16 @@ def _find_lib():
     if env_path and os.path.isfile(env_path):
         return env_path
 
-    # 2. Check relative to this file (development layout)
+    # 2. Try the installed _native extension module (pip install)
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec('tranfi._native')
+        if spec and spec.origin:
+            return spec.origin
+    except (ImportError, ValueError):
+        pass
+
+    # 3. Check relative to this file (development layout)
     this_dir = os.path.dirname(os.path.abspath(__file__))
     system = platform.system()
 
@@ -42,7 +51,7 @@ def _find_lib():
         if os.path.isfile(resolved):
             return resolved
 
-    # 3. Try system library path
+    # 4. Try system library path
     found = ctypes.util.find_library('tranfi')
     if found:
         return found

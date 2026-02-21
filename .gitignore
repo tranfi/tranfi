@@ -27,6 +27,9 @@ packages/js/build/
 packages/js/wasm/
 js/csrc/
 js/build/
+py/csrc/
+py/build/
+py/*.egg-info/
 
 # OS
 .DS_Store
