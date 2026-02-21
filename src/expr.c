@@ -337,10 +337,11 @@ static tf_expr *parse_atom(parser_state *p) {
             return e;
         }
 
-        /* Bare identifier without parens — not valid in our grammar */
-        free(name);
-        p->pos = start; /* rewind */
-        return NULL;
+        /* Bare identifier — treat as column reference */
+        tf_expr *e = make_expr(EXPR_COL_REF);
+        if (!e) { free(name); return NULL; }
+        e->col_name = name;
+        return e;
     }
 
     return NULL; /* parse error */
