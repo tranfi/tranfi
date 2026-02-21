@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tranfi"
-version = "0.1.0"
+version = "0.1.1"
 description = "Streaming ETL language + runtime"
 license = {text = "MIT"}
 requires-python = ">=3.8"
