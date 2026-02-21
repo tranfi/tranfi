@@ -2,6 +2,7 @@ SHELL := /bin/bash
 .PHONY: all build test clean wasm
 .PHONY: build-c build-node build-wasm
 .PHONY: test-c test-python test-node test-parity
+.PHONY: publish-python publish-node
 
 all: build test
 
@@ -41,6 +42,16 @@ test-node: build-node
 test-parity: build-c
 	@source $$HOME/tools/miniconda3/etc/profile.d/conda.sh && conda activate base && \
 		TRANFI_LIB_PATH=build/libtranfi.so python -m pytest test/test_parity.py -v --tb=short
+
+# --- Publish targets ---
+
+publish-python:
+	@source $$HOME/tools/miniconda3/etc/profile.d/conda.sh && conda activate base && \
+		cd py && rm -rf csrc dist && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && \
+		python -m build --sdist && twine upload dist/*.tar.gz
+
+publish-node: build-wasm
+	@source $$HOME/.nvm/nvm.sh && cd js && npm publish
 
 # --- Clean ---
 
