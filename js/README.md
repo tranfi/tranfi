@@ -277,6 +277,63 @@ for (const r of await recipes()) {
 }
 ```
 
+## DuckDB engine
+
+Run pipelines on DuckDB instead of the native C streaming core. The DSL is transpiled to SQL in C, then executed by DuckDB.
+
+```bash
+npm install duckdb
+```
+
+```js
+import { pipeline, compileToSql } from 'tranfi'
+
+// Run a pipeline via DuckDB
+const result = await pipeline('csv | filter "age > 25" | sort -age | csv', { engine: 'duckdb' })
+  .run({ inputFile: 'data.csv' })
+
+// Or with string/Buffer input
+const result2 = await pipeline('csv | head 10 | csv', { engine: 'duckdb' })
+  .run({ input: csvString })
+```
+
+### SQL transpilation
+
+Generate SQL directly from DSL strings:
+
+```js
+const sql = await compileToSql('csv | filter "col(age) > 25" | sort -age | head 10 | csv')
+console.log(sql)
+// WITH
+//   step_1 AS (SELECT * FROM input_data WHERE ("age" > 25)),
+//   step_2 AS (SELECT * FROM step_1 ORDER BY "age" DESC LIMIT 10)
+// SELECT * FROM step_2
+```
+
+### Browser (WASM + DuckDB-WASM)
+
+In the browser, use `@duckdb/duckdb-wasm` with the tranfi WASM module:
+
+```js
+import createTranfi from 'tranfi/wasm'
+import * as duckdb from '@duckdb/duckdb-wasm'
+
+const tf = await createTranfi()
+
+// SQL generation (synchronous, no DuckDB needed)
+const sql = tf.compileToSql('csv | filter "age > 25" | csv')
+
+// Full execution with DuckDB-WASM
+const db = new duckdb.AsyncDuckDB(...)
+await db.instantiate(...)
+
+const result = await tf.runDuckDB(db, 'csv | filter "age > 25" | csv', csvData)
+console.log(result.outputText)  // CSV output
+console.log(result.rows)        // Array of row objects
+```
+
+`runDuckDB` accepts string, `Uint8Array`, or `File` objects as data input.
+
 ## Advanced
 
 ### DSL compilation
@@ -325,10 +382,12 @@ The package automatically selects the best backend:
 
 1. **N-API** (Node.js) -- native C addon, fastest, used when available
 2. **WASM** (browsers/fallback) -- same C core compiled to WebAssembly, ~313 KB single-file
+3. **DuckDB** (opt-in) -- SQL execution via `{ engine: 'duckdb' }`, requires `npm install duckdb`
 
 ```js
 // Force WASM backend (e.g., for testing)
-import { loadWasm } from 'tranfi/wasm'
+import createTranfi from 'tranfi/wasm'
+const tf = await createTranfi()
 ```
 
 ## Architecture

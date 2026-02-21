@@ -19,12 +19,12 @@
  *   const result2 = await p2.run({ inputFile: './data.csv' })
  */
 
-import { Pipeline, PipelineResult, compileDsl, loadRecipe, saveRecipe, recipes } from './pipeline.js'
+import { Pipeline, PipelineResult, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes } from './pipeline.js'
 
-export { Pipeline, PipelineResult, compileDsl, loadRecipe, saveRecipe, recipes }
+export { Pipeline, PipelineResult, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes }
 
-export function pipeline(steps) {
-  return new Pipeline(steps)
+export function pipeline(steps, { engine } = {}) {
+  return new Pipeline(steps, { engine })
 }
 
 export function param(name, defaultValue) {

@@ -281,6 +281,38 @@ for r in tf.recipes():
     print(f"{r['name']:15} {r['description']}")
 ```
 
+## DuckDB engine
+
+Run pipelines on DuckDB instead of the native C streaming core. The DSL is transpiled to SQL in C, then executed by DuckDB.
+
+```bash
+pip install tranfi[duckdb]
+```
+
+```python
+# Run a pipeline via DuckDB
+result = tf.pipeline('csv | filter "age > 25" | sort -age | csv', engine='duckdb')
+result.run(input_file='data.csv')
+
+# Or with bytes input
+result = tf.pipeline('csv | head 10 | csv', engine='duckdb').run(input=csv_bytes)
+```
+
+### SQL transpilation
+
+Generate SQL directly from DSL strings:
+
+```python
+sql = tf.compile_to_sql('csv | filter "col(age) > 25" | sort -age | head 10 | csv')
+print(sql)
+# WITH
+#   step_1 AS (SELECT * FROM input_data WHERE ("age" > 25)),
+#   step_2 AS (SELECT * FROM step_1 ORDER BY "age" DESC LIMIT 10)
+# SELECT * FROM step_2
+```
+
+Use this to run queries with your own DuckDB connection, or any SQL engine that supports CTE syntax.
+
 ## Advanced
 
 ### DSL compilation

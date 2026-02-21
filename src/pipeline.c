@@ -282,6 +282,25 @@ void tf_pipeline_free(tf_pipeline *p) {
     free(p);
 }
 
+char *tf_compile_to_sql(const char *dsl, size_t len, char **error) {
+    if (error) *error = NULL;
+    tf_ir_plan *plan = tf_dsl_parse(dsl, len, error);
+    if (!plan) return NULL;
+    if (tf_ir_validate(plan) != TF_OK) {
+        if (error) { free(*error); *error = strdup(plan->error ? plan->error : "validation failed"); }
+        tf_ir_plan_destroy(plan);
+        return NULL;
+    }
+    tf_ir_infer_schema(plan);
+    char *sql = tf_ir_to_sql(plan, error);
+    tf_ir_plan_destroy(plan);
+    return sql;
+}
+
+char *tf_ir_plan_to_sql(const tf_ir_plan *plan, char **error) {
+    return tf_ir_to_sql(plan, error);
+}
+
 char *tf_compile_dsl(const char *dsl, size_t len, char **error) {
     if (error) *error = NULL;
     tf_ir_plan *plan = tf_dsl_parse(dsl, len, error);

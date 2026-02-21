@@ -4,7 +4,7 @@
  * Run: node test/test_node.js
  */
 
-import { pipeline, codec, ops, expr, compileDsl, loadRecipe, saveRecipe, recipes } from '../js/src/index.js'
+import { pipeline, codec, ops, expr, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes } from '../js/src/index.js'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 
@@ -642,6 +642,163 @@ if (hasApp) {
   rmSync(testDataDir, { recursive: true })
 } else {
   console.log('  (skipped — app/dist/ not found)')
+}
+
+// ---- SQL Transpiler ----
+
+console.log('\nSQL Transpiler:')
+
+await test('compileToSql basic', async () => {
+  const sql = await compileToSql('csv | head 10 | csv')
+  assert(sql.includes('LIMIT 10'), 'should have LIMIT')
+})
+
+await test('compileToSql filter', async () => {
+  const sql = await compileToSql('csv | filter "col(\'age\') > 25" | csv')
+  assert(sql.includes('WHERE'), 'should have WHERE')
+  assert(sql.includes('"age"'), 'should quote column')
+})
+
+await test('compileToSql select', async () => {
+  const sql = await compileToSql('csv | select name,age | csv')
+  assert(sql.includes('"name"'), 'should have name')
+  assert(sql.includes('"age"'), 'should have age')
+})
+
+await test('compileToSql derive', async () => {
+  const sql = await compileToSql("csv | derive total=col('a')+col('b') | csv")
+  assert(sql.includes('"total"'), 'should have derived column')
+})
+
+// ---- DuckDB Engine ----
+
+let hasDuckDB = false
+try {
+  const { createRequire } = await import('module')
+  const req = createRequire(join(__dirname, '..', 'js', 'package.json'))
+  req('duckdb')
+  hasDuckDB = true
+} catch {}
+
+if (hasDuckDB) {
+  console.log('\nDuckDB Engine:')
+
+  const csvData = 'name,age,score\nAlice,30,85\nBob,20,92\nCharlie,35,78\nDiana,22,95\nEve,28,88\n'
+
+  await test('duckdb filter', async () => {
+    const r = await pipeline('csv | filter "col(\'age\') > 25" | csv', { engine: 'duckdb' })
+      .run({ input: csvData })
+    const text = r.outputText
+    assert(text.includes('Alice'), 'should have Alice')
+    assert(text.includes('Charlie'), 'should have Charlie')
+    assert(!text.includes('Bob'), 'should not have Bob')
+  })
+
+  await test('duckdb select', async () => {
+    const r = await pipeline('csv | select name,age | csv', { engine: 'duckdb' })
+      .run({ input: csvData })
+    assert(r.outputText.includes('name,age'), 'should have header')
+    assert(!r.outputText.includes('score'), 'should not have score')
+  })
+
+  await test('duckdb head', async () => {
+    const r = await pipeline('csv | head 3 | csv', { engine: 'duckdb' })
+      .run({ input: csvData })
+    const lines = r.outputText.trim().split('\n')
+    assert(lines.length === 4, `should have 4 lines (header + 3), got ${lines.length}`)
+  })
+
+  await test('duckdb sort', async () => {
+    const r = await pipeline('csv | sort age | csv', { engine: 'duckdb' })
+      .run({ input: csvData })
+    const lines = r.outputText.trim().split('\n')
+    assert(lines[1].includes('Bob'), 'first row should be Bob (youngest)')
+  })
+
+  await test('duckdb derive', async () => {
+    const r = await pipeline("csv | derive age_x2=col('age')*2 | select name,age_x2 | csv", { engine: 'duckdb' })
+      .run({ input: csvData })
+    assert(r.outputText.includes('age_x2'), 'should have derived column')
+    assert(r.outputText.includes('60'), 'Alice 30*2=60')
+  })
+
+  await test('duckdb rename', async () => {
+    const r = await pipeline('csv | rename age=years | csv', { engine: 'duckdb' })
+      .run({ input: csvData })
+    const header = r.outputText.split('\n')[0]
+    assert(header.includes('years'), 'should have years')
+    assert(!header.includes('age'), 'should not have age in header')
+  })
+
+  await test('duckdb unique', async () => {
+    const data = 'name,city\nAlice,NYC\nBob,LA\nCharlie,NYC\nDiana,LA\n'
+    const r = await pipeline('csv | unique city | csv', { engine: 'duckdb' })
+      .run({ input: data })
+    const lines = r.outputText.trim().split('\n')
+    assert(lines.length === 3, `should have 3 lines (header + 2 cities), got ${lines.length}`)
+  })
+
+  await test('duckdb parity with native', async () => {
+    const dsl = 'csv | filter "col(\'age\') > 25" | select name,age | csv'
+    const native = await pipeline(dsl).run({ input: csvData })
+    const duck = await pipeline(dsl, { engine: 'duckdb' }).run({ input: csvData })
+    const nativeRows = new Set(native.outputText.trim().split('\n').slice(1))
+    const duckRows = new Set(duck.outputText.trim().split('\n').slice(1))
+    assert(nativeRows.size === duckRows.size, 'same number of rows')
+    for (const row of nativeRows) {
+      assert(duckRows.has(row), `duck should have row: ${row}`)
+    }
+  })
+} else {
+  console.log('\nDuckDB Engine:')
+  console.log('  (skipped — duckdb not installed)')
+}
+
+// ---- WASM wrapper ----
+
+console.log('\nWASM Wrapper:')
+
+let createTranfi = null
+try {
+  const mod = await import('../js/wasm/index.js')
+  createTranfi = mod.default
+} catch {}
+
+if (createTranfi) {
+  const tf = await createTranfi()
+
+  await test('wasm version', async () => {
+    const v = tf.version()
+    assert(v === '0.1.0', `expected 0.1.0, got ${v}`)
+  })
+
+  await test('wasm compileToSql', async () => {
+    const sql = tf.compileToSql('csv | filter "col(\'age\') > 25" | csv')
+    assert(sql.includes('WHERE'), 'should have WHERE')
+    assert(sql.includes('"age"'), 'should quote column')
+  })
+
+  await test('wasm run native', async () => {
+    const result = tf.run('csv | filter "col(\'age\') > 25" | csv',
+      'name,age\nAlice,30\nBob,20\nCharlie,35\n')
+    assert(result.outputText.includes('Alice'), 'should have Alice')
+    assert(result.outputText.includes('Charlie'), 'should have Charlie')
+    assert(!result.outputText.includes('Bob'), 'should not have Bob')
+  })
+
+  await test('wasm compileDsl', async () => {
+    const json = tf.compileDsl('csv | head 5 | csv')
+    const plan = JSON.parse(json)
+    assert(plan.steps.length === 3, 'should have 3 steps')
+  })
+
+  await test('wasm recipes', async () => {
+    const r = tf.recipes()
+    assert(r.length > 0, 'should have recipes')
+    assert(r[0].name, 'recipe should have name')
+  })
+} else {
+  console.log('  (skipped — wasm/index.js not found)')
 }
 
 console.log(`\n====================`)

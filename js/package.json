@@ -9,26 +9,49 @@
   },
   "exports": {
     ".": "./src/index.js",
-    "./wasm": "./wasm/tranfi_core.js"
+    "./wasm": "./wasm/index.js"
   },
   "files": [
     "src/",
     "wasm/",
     "csrc/",
+    "app/",
     "napi_api.c",
     "binding.gyp",
     "README.md"
   ],
   "scripts": {
-    "prepack": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/",
+    "prepack": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && rm -rf app && cp -r ../app/dist app && rm -rf app/wasm app/lib",
     "install": "node-gyp rebuild 2>/dev/null || true",
     "build:native": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && node-gyp rebuild",
     "test": "node ../test/test_node.js"
   },
-  "keywords": ["etl", "csv", "streaming", "data", "pipeline", "transform"],
+  "peerDependencies": {
+    "duckdb": ">=1.0.0",
+    "@duckdb/duckdb-wasm": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "duckdb": {
+      "optional": true
+    },
+    "@duckdb/duckdb-wasm": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "etl",
+    "csv",
+    "streaming",
+    "data",
+    "pipeline",
+    "transform"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/tranfi/tranfi"
+  },
+  "devDependencies": {
+    "duckdb": "^1.4.4"
   }
 }

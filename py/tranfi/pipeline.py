@@ -56,7 +56,9 @@ class PipelineResult:
 class Pipeline:
     """A configured pipeline ready to run."""
 
-    def __init__(self, steps: list = None, *, recipe: str = None):
+    def __init__(self, steps: list = None, *, recipe: str = None, engine: str = None, dsl: str = None):
+        self._engine = engine
+        self._dsl = dsl
         if recipe is not None:
             if os.path.isfile(recipe):
                 with open(recipe, 'r') as f:
@@ -85,6 +87,9 @@ class Pipeline:
         Returns:
             PipelineResult with output, errors, stats, samples.
         """
+        if self._engine and self._engine != 'native':
+            return self._run_engine(input=input, input_file=input_file)
+
         plan_json = self._to_plan_json()
         handle = _ffi.pipeline_create(plan_json)
 
@@ -110,8 +115,14 @@ class Pipeline:
         finally:
             _ffi.pipeline_free(handle)
 
+    def _run_engine(self, *, input: bytes = None, input_file: str = None) -> PipelineResult:
+        """Run pipeline via an alternative engine (e.g. duckdb)."""
+        from .engines import get_engine
+        engine = get_engine(self._engine)
+        return engine.run(self._dsl, input=input, input_file=input_file)
 
-def pipeline(steps=None, *, recipe: str = None) -> Pipeline:
+
+def pipeline(steps=None, *, recipe: str = None, engine: str = None) -> Pipeline:
     """Create a pipeline from step list, DSL string, recipe name, or recipe file.
 
     Examples:
@@ -119,19 +130,22 @@ def pipeline(steps=None, *, recipe: str = None) -> Pipeline:
         tf.pipeline('csv | head 10 | csv')
         tf.pipeline('preview')  # built-in recipe
         tf.pipeline(recipe='/path/to/recipe.tranfi')
+        tf.pipeline('csv | filter "age > 25" | csv', engine='duckdb')
     """
     if recipe is not None:
-        return Pipeline(recipe=recipe)
+        return Pipeline(recipe=recipe, engine=engine)
     if isinstance(steps, str):
         # Check if it's a built-in recipe name (no pipes, no braces)
         s = steps.strip()
         if '|' not in s and not s.startswith('{'):
-            dsl = _ffi.recipe_find_dsl(s)
-            if dsl:
-                return Pipeline(recipe=_ffi.compile_dsl(dsl))
+            found_dsl = _ffi.recipe_find_dsl(s)
+            if found_dsl:
+                return Pipeline(recipe=_ffi.compile_dsl(found_dsl), engine=engine, dsl=found_dsl)
         # DSL string or JSON
-        return Pipeline(recipe=_ffi.compile_dsl(s) if not s.startswith('{') else s)
-    return Pipeline(steps, recipe=recipe)
+        if not s.startswith('{'):
+            return Pipeline(recipe=_ffi.compile_dsl(s), engine=engine, dsl=s)
+        return Pipeline(recipe=s, engine=engine)
+    return Pipeline(steps, recipe=recipe, engine=engine)
 
 
 def param(name: str, default=None):

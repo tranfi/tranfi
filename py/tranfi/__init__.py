@@ -17,6 +17,7 @@ Usage:
 
 from .pipeline import (pipeline, param, expr, Pipeline, PipelineResult,
                        load_recipe, save_recipe, compile_dsl)
+from ._ffi import compile_to_sql
 from ._ffi import version
 from . import _ffi
 

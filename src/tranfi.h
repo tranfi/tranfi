@@ -94,6 +94,12 @@ tf_pipeline *tf_pipeline_create_from_ir(const tf_ir_plan *plan);
 /* Compile a DSL string to a JSON recipe. Caller frees with tf_string_free(). */
 char *tf_compile_dsl(const char *dsl, size_t len, char **error);
 
+/* Compile a DSL string directly to SQL. Caller frees with tf_string_free(). */
+char *tf_compile_to_sql(const char *dsl, size_t len, char **error);
+
+/* Convert an IR plan to SQL. Caller frees with tf_string_free(). */
+char *tf_ir_plan_to_sql(const tf_ir_plan *plan, char **error);
+
 /* Free a string returned by tf_compile_dsl or tf_ir_plan_to_json. */
 void tf_string_free(char *s);
 

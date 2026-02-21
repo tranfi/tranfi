@@ -86,6 +86,44 @@ const result2 = await pipeline([
 ]).run({ inputFile: 'data.csv' })
 ```
 
+### DuckDB engine
+
+Tranfi pipelines can run on DuckDB instead of the native C core. The DSL is transpiled to SQL in C, so it works across all targets.
+
+```python
+# Python
+pip install tranfi[duckdb]
+
+result = tf.pipeline('csv | filter "age > 25" | sort -age | csv', engine='duckdb')
+  .run(input_file='data.csv')
+```
+
+```js
+// Node.js
+npm install duckdb
+
+const result = await pipeline('csv | filter "age > 25" | sort -age | csv', { engine: 'duckdb' })
+  .run({ inputFile: 'data.csv' })
+```
+
+```js
+// Browser (WASM)
+import createTranfi from 'tranfi/wasm'
+
+const tf = await createTranfi()
+const result = await tf.runDuckDB(duckdbInstance, 'csv | filter "age > 25" | csv', csvData)
+```
+
+The `compileToSql` function is available on all targets for direct SQL generation:
+
+```python
+sql = tf.compile_to_sql('csv | filter "age > 25" | sort -age | head 10 | csv')
+# WITH
+#   step_1 AS (SELECT * FROM input_data WHERE ("age" > 25)),
+#   step_2 AS (SELECT * FROM step_1 ORDER BY "age" DESC LIMIT 10)
+# SELECT * FROM step_2
+```
+
 ## Pipe DSL
 
 Pipelines are `source | transform... | sink`. Codecs (`csv`, `jsonl`) auto-resolve by position.
@@ -307,8 +345,8 @@ Or individually:
 
 ```bash
 ./build/test_core        # 126 C core tests
-python -m pytest test/   # 118 Python tests
-node test/test_node.js   # 41 Node.js tests
+python -m pytest test/   # Python tests (inc. DuckDB engine)
+node test/test_node.js   # Node.js tests (inc. SQL transpiler, DuckDB, WASM)
 ```
 
 ## Project structure

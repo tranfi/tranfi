@@ -202,6 +202,38 @@ static napi_value napi_compile_dsl(napi_env env, napi_callback_info info) {
     return result;
 }
 
+/* compileToSql(dslString: string) → string (SQL query) */
+static napi_value napi_compile_to_sql(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 1) {
+        napi_throw_error(env, NULL, "compileToSql requires DSL string");
+        return NULL;
+    }
+
+    size_t str_len;
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], NULL, 0, &str_len));
+    char *dsl = malloc(str_len + 1);
+    NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], dsl, str_len + 1, &str_len));
+
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(dsl, str_len, &error);
+    free(dsl);
+
+    if (!sql) {
+        napi_throw_error(env, NULL, error ? error : "SQL compilation failed");
+        free(error);
+        return NULL;
+    }
+
+    napi_value result;
+    NAPI_CALL(env, napi_create_string_utf8(env, sql, strlen(sql), &result));
+    tf_string_free(sql);
+    return result;
+}
+
 /* recipeCount() → number */
 static napi_value napi_recipe_count(napi_env env, napi_callback_info info) {
     (void)info;
@@ -280,13 +312,14 @@ static napi_value init(napi_env env, napi_value exports) {
         {"version",           NULL, napi_tranfi_version,     NULL, NULL, NULL, napi_default, NULL},
         {"error",             NULL, napi_tranfi_error,       NULL, NULL, NULL, napi_default, NULL},
         {"compileDsl",        NULL, napi_compile_dsl,        NULL, NULL, NULL, napi_default, NULL},
+        {"compileToSql",      NULL, napi_compile_to_sql,     NULL, NULL, NULL, napi_default, NULL},
         {"recipeCount",       NULL, napi_recipe_count,       NULL, NULL, NULL, napi_default, NULL},
         {"recipeName",        NULL, napi_recipe_name,        NULL, NULL, NULL, napi_default, NULL},
         {"recipeDsl",         NULL, napi_recipe_dsl,         NULL, NULL, NULL, napi_default, NULL},
         {"recipeDescription", NULL, napi_recipe_description, NULL, NULL, NULL, napi_default, NULL},
         {"recipeFindDsl",     NULL, napi_recipe_find_dsl,    NULL, NULL, NULL, napi_default, NULL},
     };
-    NAPI_CALL(env, napi_define_properties(env, exports, 13, props));
+    NAPI_CALL(env, napi_define_properties(env, exports, 14, props));
     return exports;
 }
 

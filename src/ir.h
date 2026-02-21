@@ -133,6 +133,7 @@ void        tf_ir_plan_free(tf_ir_plan *plan);
 
 tf_ir_plan *tf_ir_from_json(const char *json, size_t len, char **error);
 char       *tf_ir_to_json(const tf_ir_plan *plan);
+char       *tf_ir_to_sql(const tf_ir_plan *plan, char **error);
 
 /* ---- IR passes ---- */
 

@@ -53,6 +53,7 @@ set(CORE_SOURCES
     src/codec_table.c
     src/ir.c
     src/ir_serialize.c
+    src/ir_sql.c
     src/ir_validate.c
     src/ir_schema.c
     src/op_registry.c

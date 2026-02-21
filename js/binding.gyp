@@ -52,6 +52,7 @@
         "csrc/op_date_trunc.c",
         "csrc/ir.c",
         "csrc/ir_serialize.c",
+        "csrc/ir_sql.c",
         "csrc/ir_validate.c",
         "csrc/ir_schema.c",
         "csrc/op_registry.c",

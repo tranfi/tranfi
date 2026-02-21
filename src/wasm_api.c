@@ -111,6 +111,19 @@ char *wasm_compile_dsl(const char *dsl, int len) {
     return json;
 }
 
+/*
+ * wasm_compile_to_sql — compile DSL to SQL query string.
+ *
+ * Returns heap-allocated SQL string (caller must free), or NULL on error.
+ */
+EXPORT
+char *wasm_compile_to_sql(const char *dsl, int len) {
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(dsl, (size_t)len, &error);
+    free(error);
+    return sql;
+}
+
 EXPORT
 const char *wasm_version(void) {
     return tf_version();

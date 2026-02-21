@@ -116,6 +116,11 @@ def _load_lib():
     _lib.tf_string_free.argtypes = [ctypes.c_void_p]
     _lib.tf_string_free.restype = None
 
+    # tf_compile_to_sql
+    _lib.tf_compile_to_sql.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                                        ctypes.POINTER(ctypes.c_char_p)]
+    _lib.tf_compile_to_sql.restype = ctypes.c_void_p
+
     # tf_ir_plan_from_json
     _lib.tf_ir_plan_from_json.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
                                            ctypes.POINTER(ctypes.c_char_p)]
@@ -266,6 +271,20 @@ def recipe_find_dsl(name: str) -> str:
     lib = _load_lib()
     s = lib.tf_recipe_find_dsl(name.encode('utf-8'))
     return s.decode('utf-8') if s else ''
+
+
+def compile_to_sql(dsl: str) -> str:
+    """Compile a DSL string to a SQL query string."""
+    lib = _load_lib()
+    data = dsl.encode('utf-8')
+    error = ctypes.c_char_p()
+    ptr = lib.tf_compile_to_sql(data, len(data), ctypes.byref(error))
+    if not ptr:
+        msg = error.value.decode('utf-8') if error.value else 'unknown error'
+        raise RuntimeError(f"SQL compile failed: {msg}")
+    result = ctypes.string_at(ptr).decode('utf-8')
+    lib.tf_string_free(ptr)
+    return result
 
 
 def pipeline_create_from_json(plan_json: str) -> int:

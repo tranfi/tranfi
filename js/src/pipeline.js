@@ -126,6 +126,20 @@ async function getBackend() {
       const result = wasm.ccall('wasm_recipe_find_dsl', 'string', ['number'], [ptr])
       wasm._free(ptr)
       return result || null
+    },
+    compileToSql(dsl) {
+      const len = wasm.lengthBytesUTF8(dsl)
+      const ptr = wasm._malloc(len + 1)
+      wasm.stringToUTF8(dsl, ptr, len + 1)
+      const resultPtr = wasm.ccall('wasm_compile_to_sql', 'number', ['number', 'number'], [ptr, len])
+      wasm._free(ptr)
+      if (!resultPtr) {
+        const err = wasm.ccall('wasm_pipeline_error', 'string', ['number'], [-1])
+        throw new Error(`SQL compile failed: ${err || 'unknown error'}`)
+      }
+      const sql = wasm.UTF8ToString(resultPtr)
+      wasm._free(resultPtr)
+      return sql
     }
   }
 
@@ -156,7 +170,8 @@ export class PipelineResult {
 
 
 export class Pipeline {
-  constructor(steps, { planJson } = {}) {
+  constructor(steps, { planJson, engine } = {}) {
+    this._engine = engine || null
     if (planJson) {
       this._planJson = planJson
       this._dsl = null
@@ -187,6 +202,10 @@ export class Pipeline {
   }
 
   async run({ input, inputFile } = {}) {
+    if (this._engine && this._engine !== 'native') {
+      return this._runEngine({ input, inputFile })
+    }
+
     const backend = await getBackend()
     const planJson = await this._toPlanJson(backend)
     const handle = backend.createPipeline(planJson)
@@ -216,11 +235,24 @@ export class Pipeline {
       backend.free(handle)
     }
   }
+
+  async _runEngine({ input, inputFile } = {}) {
+    const { getEngine } = await import('./engines/duckdb.js')
+    const engine = getEngine(this._engine)
+    const dsl = this._dsl
+    if (!dsl) throw new Error('DuckDB engine requires a DSL string pipeline')
+    return engine.run(dsl, { input, inputFile })
+  }
 }
 
 export async function compileDsl(dsl) {
   const backend = await getBackend()
   return backend.compileDsl(dsl)
+}
+
+export async function compileToSql(dsl) {
+  const backend = await getBackend()
+  return backend.compileToSql(dsl)
 }
 
 export async function loadRecipe(source) {
