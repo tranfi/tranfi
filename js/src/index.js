@@ -38,11 +38,12 @@ export function expr(text) {
 }
 
 export const codec = {
-  csv({ delimiter = ',', header = true, batchSize = 1024 } = {}) {
+  csv({ delimiter = ',', header = true, batchSize = 1024, repair = false } = {}) {
     const args = {}
     if (delimiter !== ',') args.delimiter = delimiter
     if (!header) args.header = false
     if (batchSize !== 1024) args.batch_size = batchSize
+    if (repair) args.repair = true
     return { op: 'codec.csv.decode', args }
   },
 
@@ -82,6 +83,13 @@ export const codec = {
 
   textEncode() {
     return { op: 'codec.text.encode', args: {} }
+  },
+
+  tableEncode({ maxWidth = 40, maxRows = 0 } = {}) {
+    const args = {}
+    if (maxWidth !== 40) args.max_width = maxWidth
+    if (maxRows !== 0) args.max_rows = maxRows
+    return { op: 'codec.table.encode', args }
   }
 }
 
@@ -261,6 +269,26 @@ export const ops = {
 
   flatten() {
     return { op: 'flatten', args: {} }
+  },
+
+  stack(file, { tag, tagValue } = {}) {
+    const args = { file }
+    if (tag) args.tag = tag
+    if (tagValue) args.tag_value = tagValue
+    return { op: 'stack', args }
+  },
+
+  lead(column, { offset = 1, result } = {}) {
+    const args = { column }
+    if (offset !== 1) args.offset = offset
+    if (result) args.result = result
+    return { op: 'lead', args }
+  },
+
+  dateTrunc(column, trunc, { result } = {}) {
+    const args = { column, trunc }
+    if (result) args.result = result
+    return { op: 'date-trunc', args }
   }
 }
 

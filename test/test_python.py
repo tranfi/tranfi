@@ -432,7 +432,7 @@ def test_pipeline_recipe_kwarg():
 
 def test_recipes_list():
     r = tf.recipes()
-    assert len(r) == 20
+    assert len(r) == 21
     names = [x['name'] for x in r]
     assert 'profile' in names
     assert 'preview' in names

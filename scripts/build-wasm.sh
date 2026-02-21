@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build WASM binary and copy to packages/js/wasm/
+# Build WASM binary and copy to js/wasm/
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,9 +20,13 @@ cd "$ROOT/build-wasm"
 emcmake cmake .. -DCMAKE_BUILD_TYPE=Release
 emmake make tranfi_wasm -j"$(nproc)"
 
-echo "Copying to packages/js/wasm/..."
-mkdir -p "$ROOT/packages/js/wasm"
-cp tranfi_core.js tranfi_core.wasm "$ROOT/packages/js/wasm/"
+echo "Copying to js/wasm/..."
+mkdir -p "$ROOT/js/wasm"
+cp tranfi_core.js "$ROOT/js/wasm/"
+# SINGLE_FILE mode embeds WASM in JS — no separate .wasm file
+if [ -f tranfi_core.wasm ]; then
+  cp tranfi_core.wasm "$ROOT/js/wasm/"
+fi
 
-echo "Done. Files:"
-ls -lh "$ROOT/packages/js/wasm/tranfi_core."*
+echo "Done."
+ls -lh "$ROOT/js/wasm/tranfi_core."*

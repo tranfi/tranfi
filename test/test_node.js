@@ -397,6 +397,68 @@ await test('text + head', async () => {
   assert(!text.includes('line3'), 'should not have line3')
 })
 
+console.log('\nNew Ops (Phase 2):')
+
+await test('lead offset 1', async () => {
+  const p = pipeline([
+    codec.csv(),
+    ops.lead('val', { result: 'next_val' }),
+    codec.csvEncode(),
+  ])
+  const result = await p.run({ input: 'val\n10\n20\n30\n' })
+  const text = result.outputText
+  assert(text.includes('next_val'), 'should have next_val column')
+  assert(text.includes('20'), 'first row lead should be 20')
+})
+
+await test('lead offset 2', async () => {
+  const p = pipeline([
+    codec.csv(),
+    ops.lead('val', { offset: 2, result: 'val_lead2' }),
+    codec.csvEncode(),
+  ])
+  const result = await p.run({ input: 'val\n10\n20\n30\n40\n' })
+  const text = result.outputText
+  assert(text.includes('val_lead2'), 'should have val_lead2 column')
+  assert(text.includes('30'), 'first row lead2 should be 30')
+})
+
+await test('date-trunc to month', async () => {
+  const p = pipeline([
+    codec.csv(),
+    ops.dateTrunc('date', 'month'),
+    codec.csvEncode(),
+  ])
+  const result = await p.run({ input: 'date\n2024-03-15\n2024-03-28\n' })
+  const text = result.outputText
+  assert(text.includes('2024-03-01'), 'should truncate to 2024-03-01')
+  assert(!text.includes('2024-03-15'), 'should not have original date')
+})
+
+await test('table encode', async () => {
+  const p = pipeline([
+    codec.csv(),
+    codec.tableEncode(),
+  ])
+  const result = await p.run({ input: 'name,age\nAlice,30\nBob,25\n' })
+  const text = result.outputText
+  assert(text.includes('|'), 'should have pipe separators')
+  assert(text.includes('name'), 'should have name')
+  assert(text.includes('Alice'), 'should have Alice')
+})
+
+await test('csv repair', async () => {
+  const p = pipeline([
+    codec.csv({ repair: true }),
+    codec.csvEncode(),
+  ])
+  const result = await p.run({ input: 'a,b,c\n1,2\n4,5,6\n' })
+  const text = result.outputText
+  const lines = text.trim().split('\n')
+  assert(lines.length === 3, 'should have all rows')
+  assert(lines[1].split(',').length === 3, 'short row should be padded')
+})
+
 console.log('\nRecipes:')
 
 await test('compileDsl', async () => {
@@ -445,9 +507,9 @@ await test('loadRecipe from object', async () => {
 // Built-in recipes tests
 console.log('\nBuilt-in Recipes:')
 
-await test('recipes() returns 20 entries', async () => {
+await test('recipes() returns 21 entries', async () => {
   const r = await recipes()
-  assert(r.length === 20, `expected 20 recipes, got ${r.length}`)
+  assert(r.length === 21, `expected 21 recipes, got ${r.length}`)
   const names = r.map(x => x.name)
   assert(names.includes('profile'), 'should include profile')
   assert(names.includes('csv2json'), 'should include csv2json')
