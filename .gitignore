@@ -22,15 +22,21 @@ __pycache__/
 dist/
 *.whl
 
+# App bundled binaries (build artifacts / vendored)
+app/public/lib/
+app/public/wasm/tranfi_core.js
+
 # Node
 node_modules/
 packages/js/build/
 packages/js/wasm/
 js/csrc/
 js/build/
+js/app/
 py/csrc/
 py/build/
 py/*.egg-info/
+py/tranfi/app/
 
 # OS
 .DS_Store

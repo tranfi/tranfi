@@ -47,7 +47,7 @@ Options:
 function findAppDir () {
   // Try known locations relative to this file
   const candidates = [
-    resolve(__dirname, '../../../app/dist'),     // dev: js/src/ → ../../app/dist
+    resolve(__dirname, '../../app/dist'),          // dev: js/src/ → ../../app/dist
     resolve(__dirname, '../app'),                 // npm package: src/ → ../app/
   ]
   for (const dir of candidates) {

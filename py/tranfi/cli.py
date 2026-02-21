@@ -453,8 +453,8 @@ def _find_app_dir():
     """Try to find the app dist directory."""
     cli_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(cli_dir, '..', '..', '..', 'app', 'dist'),  # dev: py/tranfi/ → ../../app/dist
-        os.path.join(cli_dir, '..', '..', 'app', 'dist'),
+        os.path.join(cli_dir, 'app'),                       # pip install: bundled in package
+        os.path.join(cli_dir, '..', '..', 'app', 'dist'),   # dev: py/tranfi/ → ../../app/dist
     ]
     for d in candidates:
         d = os.path.abspath(d)

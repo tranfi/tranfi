@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: all build test clean wasm
+.PHONY: all build test clean wasm app
 .PHONY: build-c build-node build-wasm
 .PHONY: test-c test-python test-node test-parity
 .PHONY: publish-python publish-node publish-github
@@ -43,11 +43,24 @@ test-parity: build-c
 	@source $$HOME/tools/miniconda3/etc/profile.d/conda.sh && conda activate base && \
 		TRANFI_LIB_PATH=build/libtranfi.so python -m pytest test/test_parity.py -v --tb=short
 
+# --- App targets ---
+
+app: build-wasm
+	@mkdir -p app/public/wasm app/public/lib
+	@cp js/wasm/tranfi_core.js app/public/wasm/tranfi_core.js
+	@echo "  WASM copied to app/public/wasm/"
+	@if [ ! -f app/public/lib/jsee.js ]; then \
+		echo "  WARNING: app/public/lib/jsee.js missing — build @jseeio/jsee and copy dist/jsee.js here"; \
+	else \
+		echo "  jsee.js OK"; \
+	fi
+
 # --- Publish targets ---
 
 publish-python:
 	@source $$HOME/tools/miniconda3/etc/profile.d/conda.sh && conda activate base && \
 		cd py && rm -rf csrc dist && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && \
+		rm -rf tranfi/app && cp -r ../app/dist tranfi/app && rm -rf tranfi/app/wasm tranfi/app/lib && \
 		python -m build --sdist && twine upload dist/*.tar.gz
 
 publish-node: build-wasm

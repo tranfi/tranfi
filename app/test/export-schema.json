@@ -1,0 +1,18 @@
+{
+  "model": {
+    "type": "async-function",
+    "url": "../public/wasm/tranfi-runner.js",
+    "name": "tranfiRunner",
+    "worker": true,
+    "timeout": 120000,
+    "imports": ["../public/wasm/tranfi_core.js"]
+  },
+  "inputs": [
+    { "name": "file", "type": "file", "stream": true },
+    { "name": "dsl", "type": "string", "default": "csv | head 3 | csv" }
+  ],
+  "outputs": [
+    { "name": "output", "type": "html" },
+    { "name": "stats", "type": "html" }
+  ]
+}
