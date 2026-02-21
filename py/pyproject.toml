@@ -11,6 +11,9 @@ requires-python = ">=3.8"
 keywords = ["etl", "csv", "streaming", "data", "pipeline", "transform"]
 readme = "README.md"
 
+[project.scripts]
+tranfi = "tranfi.cli:main"
+
 [project.urls]
 Repository = "https://github.com/tranfi/tranfi"
 

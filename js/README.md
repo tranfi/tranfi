@@ -36,6 +36,23 @@ npm install tranfi
 
 Uses N-API natively in Node.js, falls back to WASM in browsers automatically.
 
+## CLI
+
+Installing the package also provides the `tranfi` command:
+
+```bash
+# Via npx (no install)
+echo 'name,age\nAlice,30\nBob,25' | npx tranfi 'csv | filter "age > 25" | csv'
+
+# Or install globally
+npm i -g tranfi
+tranfi 'csv | filter "age > 25" | sort -age | csv' < data.csv
+tranfi profile < data.csv
+tranfi -R  # list recipes
+```
+
+Run `tranfi -h` for all options.
+
 ## Quick start
 
 ### Two APIs

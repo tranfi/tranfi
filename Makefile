@@ -2,7 +2,7 @@ SHELL := /bin/bash
 .PHONY: all build test clean wasm
 .PHONY: build-c build-node build-wasm
 .PHONY: test-c test-python test-node test-parity
-.PHONY: publish-python publish-node
+.PHONY: publish-python publish-node publish-github
 
 all: build test
 
@@ -52,6 +52,9 @@ publish-python:
 
 publish-node: build-wasm
 	@source $$HOME/.nvm/nvm.sh && cd js && npm publish
+
+publish-github:
+	@bash scripts/release.sh
 
 # --- Clean ---
 

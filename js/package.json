@@ -4,6 +4,9 @@
   "description": "Streaming ETL language + runtime",
   "type": "module",
   "main": "src/index.js",
+  "bin": {
+    "tranfi": "src/cli.js"
+  },
   "exports": {
     ".": "./src/index.js",
     "./wasm": "./wasm/tranfi_core.js"

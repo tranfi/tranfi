@@ -4,7 +4,86 @@ Streaming ETL language in C11. Pipe DSL, push/pull API, columnar batches, 40 bui
 
 ```bash
 printf "name,age\nAlice,30\nBob,25\nCharlie,35\n" \
-  | tranfi 'csv | filter "col(age) > 25" | sort -age | csv'
+  | tranfi 'csv | filter "age > 25" | sort -age | csv'
+```
+
+## Install
+
+**pip** (compiles C core on install):
+
+```bash
+pip install tranfi
+```
+
+**npm** (compiles native addon, falls back to WASM):
+
+```bash
+npm install tranfi
+```
+
+**Binary** (prebuilt, no dependencies):
+
+```bash
+curl -fsSL https://github.com/tranfi/tranfi/releases/latest/download/tranfi-linux-x64.tar.gz \
+  | tar xz && sudo mv tranfi-linux-x64 /usr/local/bin/tranfi
+```
+
+## Quick start
+
+### CLI
+
+```bash
+# Filter and sort
+tranfi 'csv | filter "age > 25" | sort -age | csv' < data.csv
+
+# Built-in recipe
+tranfi profile < data.csv
+
+# File I/O
+tranfi -i input.csv -o output.csv 'csv | select name,age | csv'
+
+# Compile to JSON plan
+tranfi -j 'csv | head 10 | csv'
+
+# List recipes
+tranfi -R
+```
+
+### Python ([full docs](py/))
+
+```python
+import tranfi as tf
+
+# DSL string
+result = tf.pipeline('csv | filter "age > 25" | sort -age | csv').run(input_file='data.csv')
+print(result.output_text)
+
+# Builder API
+result = tf.pipeline([
+    tf.codec.csv(),
+    tf.ops.filter(tf.expr("col('age') > 25")),
+    tf.ops.sort(['-age']),
+    tf.codec.csv_encode(),
+]).run(input_file='data.csv')
+```
+
+### Node.js ([full docs](js/))
+
+```js
+import { pipeline, codec, ops, expr } from 'tranfi'
+
+// DSL string
+const result = await pipeline('csv | filter "age > 25" | sort -age | csv')
+  .run({ inputFile: 'data.csv' })
+console.log(result.outputText)
+
+// Builder API
+const result2 = await pipeline([
+  codec.csv(),
+  ops.filter(expr("col('age') > 25")),
+  ops.sort(['-age']),
+  codec.csvEncode(),
+]).run({ inputFile: 'data.csv' })
 ```
 
 ## Pipe DSL
@@ -194,54 +273,29 @@ Or manually:
 cd build && cmake .. -DBUILD_TESTING=ON && make && ./test_core
 ```
 
+## CLI reference
+
+```
+tranfi [OPTIONS] PIPELINE
+
+Options:
+  -f FILE   Read pipeline from file
+  -i FILE   Read input from file instead of stdin
+  -o FILE   Write output to file instead of stdout
+  -j        Compile only, output JSON plan
+  -p        Show progress on stderr
+  -q        Quiet mode (suppress stats)
+  -v        Show version
+  -R        List built-in recipes
+```
+
+Install via `pip install tranfi`, `npm i -g tranfi`, or download a binary from [releases](https://github.com/tranfi/tranfi/releases).
+
 ## Bindings
 
-### Python
-
-```python
-import tranfi as tf
-
-result = tf.pipeline([
-    tf.codec.csv(),
-    tf.ops.filter(tf.expr("col('age') > 25")),
-    tf.ops.frequency(['city']),
-    tf.codec.csv_encode(),
-]).run(input_file='data.csv')
-
-print(result.output_text)
-```
-
-See [py/](py/) for the full API.
-
-### Node.js / WASM
-
-```js
-import { pipeline, codec, ops, expr } from 'tranfi'
-
-const result = await pipeline([
-  codec.csv(),
-  ops.filter(expr("col('age') > 25")),
-  ops.frequency(['city']),
-  codec.csvEncode(),
-]).run({ inputFile: 'data.csv' })
-
-console.log(result.outputText)
-```
-
-See [js/](js/) for the full API. Uses N-API natively, falls back to WASM in browsers.
-
-### R
-
-See [r/](r/).
-
-## CLI
-
-```bash
-tranfi 'csv | filter "col(age) > 25" | csv' < input.csv > output.csv
-tranfi -i input.csv -o output.csv 'csv | sort -age | csv'
-tranfi -p 'csv | stats | csv' < big.csv       # progress on stderr
-tranfi -j 'csv | head 10 | csv'               # output IR as JSON
-```
+- **Python**: `pip install tranfi` — [full API docs](py/)
+- **Node.js / WASM**: `npm install tranfi` — [full API docs](js/)
+- **R**: see [r/](r/)
 
 ## Testing
 
@@ -252,9 +306,9 @@ make test                # all tests (C + Python + Node.js)
 Or individually:
 
 ```bash
-./build/test_core        # 104 C core tests
-python -m pytest test/   # 28 Python binding tests
-node test/test_node.js   # 28 Node.js binding tests
+./build/test_core        # 126 C core tests
+python -m pytest test/   # 118 Python tests
+node test/test_node.js   # 41 Node.js tests
 ```
 
 ## Project structure

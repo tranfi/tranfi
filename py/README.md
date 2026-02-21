@@ -40,6 +40,26 @@ cd build && cmake .. && make
 pip install -e py/
 ```
 
+## CLI
+
+Installing the package also installs the `tranfi` command:
+
+```bash
+# Filter and sort
+tranfi 'csv | filter "age > 25" | sort -age | csv' < data.csv
+
+# Built-in recipe
+tranfi profile < data.csv
+
+# File I/O
+tranfi -i input.csv -o output.csv 'csv | select name,age | csv'
+
+# List recipes
+tranfi -R
+```
+
+Run `tranfi -h` for all options.
+
 ## Quick start
 
 ### Two APIs
