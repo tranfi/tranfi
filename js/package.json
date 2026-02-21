@@ -11,20 +11,21 @@
   "files": [
     "src/",
     "wasm/",
+    "csrc/",
+    "napi_api.c",
     "binding.gyp",
-    "core/include/",
-    "core/src/",
-    "core/vendor/",
-    "bindings/"
+    "README.md"
   ],
   "scripts": {
-    "install": "node-gyp rebuild || true",
-    "build:native": "node-gyp rebuild",
-    "build:wasm": "bash ../../scripts/build-wasm.sh",
-    "test": "node ../../test/test_node.js"
+    "prepack": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/",
+    "install": "node-gyp rebuild 2>/dev/null || true",
+    "build:native": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && node-gyp rebuild",
+    "test": "node ../test/test_node.js"
   },
+  "keywords": ["etl", "csv", "streaming", "data", "pipeline", "transform"],
   "license": "MIT",
-  "devDependencies": {
-    "node-gyp": "^10.0.0"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tranfi/tranfi"
   }
 }

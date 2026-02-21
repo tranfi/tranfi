@@ -16,7 +16,7 @@ build-c:
 	@echo "  C core OK"
 
 build-node: build-c
-	@source $$HOME/.nvm/nvm.sh && cd js && npx node-gyp rebuild 2>&1 | tail -1
+	@source $$HOME/.nvm/nvm.sh && cd js && npm run build:native 2>&1 | tail -1
 	@echo "  Node.js N-API OK"
 
 build-wasm:

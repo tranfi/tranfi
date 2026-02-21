@@ -25,6 +25,8 @@ dist/
 node_modules/
 packages/js/build/
 packages/js/wasm/
+js/csrc/
+js/build/
 
 # OS
 .DS_Store
