@@ -17,9 +17,11 @@
 #include "ir.h"
 #include "dsl.h"
 #include "recipes.h"
+#include "report.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define READ_BUF_SIZE (64 * 1024)
 #define PULL_BUF_SIZE (64 * 1024)
@@ -51,6 +53,7 @@ static void usage(const char *prog) {
         "  -j        Output plan as JSON (compile only, don't execute)\n"
         "  -p, --progress  Show progress on stderr\n"
         "  -q        Quiet mode (suppress stats on stderr)\n"
+        "  --raw     Force raw CSV stats output (disable report formatting)\n"
         "  -v        Show version\n"
         "  -R, --recipes  List built-in recipes\n"
         "  -h        Show this help\n"
@@ -103,6 +106,7 @@ int main(int argc, char **argv) {
     int json_mode = 0;
     int quiet = 0;
     int progress = 0;
+    int raw_stats = 0;
 
     /* Parse options */
     int argi = 1;
@@ -129,6 +133,8 @@ int main(int argc, char **argv) {
             quiet = 1;
         } else if (strcmp(opt, "-p") == 0 || strcmp(opt, "--progress") == 0) {
             progress = 1;
+        } else if (strcmp(opt, "--raw") == 0) {
+            raw_stats = 1;
         } else if (strcmp(opt, "-f") == 0) {
             argi++;
             if (argi >= argc) {
@@ -259,15 +265,27 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Decide whether to buffer output for report formatting.
+     * When stdout is a TTY and --raw is not set, buffer main output
+     * and try to render it as a rich report. Falls back to raw CSV
+     * if the output doesn't look like a stats table. */
+    int try_report = !raw_stats && !output_file && isatty(STDOUT_FILENO);
+
     /* Stream input → pipeline → output */
     uint8_t read_buf[READ_BUF_SIZE];
     size_t nread;
     size_t total_bytes = 0;
 
+    /* Output buffer (used when try_report is true) */
+    size_t out_cap = PULL_BUF_SIZE;
+    size_t out_len = 0;
+    char *out_buf = try_report ? malloc(out_cap) : NULL;
+
     while ((nread = fread(read_buf, 1, sizeof(read_buf), fin)) > 0) {
         if (tf_pipeline_push(p, read_buf, nread) != TF_OK) {
             fprintf(stderr, "error: %s\n",
                     tf_pipeline_error(p) ? tf_pipeline_error(p) : "push failed");
+            free(out_buf);
             if (fin != stdin) fclose(fin);
             if (fout != stdout) fclose(fout);
             tf_pipeline_free(p);
@@ -280,7 +298,20 @@ int main(int argc, char **argv) {
         uint8_t pull_buf[PULL_BUF_SIZE];
         size_t n;
         while ((n = tf_pipeline_pull(p, TF_CHAN_MAIN, pull_buf, sizeof(pull_buf))) > 0) {
-            fwrite(pull_buf, 1, n, fout);
+            if (try_report && out_buf) {
+                while (out_len + n > out_cap) {
+                    out_cap *= 2;
+                    char *tmp = realloc(out_buf, out_cap);
+                    if (!tmp) { free(out_buf); out_buf = NULL; break; }
+                    out_buf = tmp;
+                }
+                if (out_buf) {
+                    memcpy(out_buf + out_len, pull_buf, n);
+                    out_len += n;
+                }
+            } else {
+                fwrite(pull_buf, 1, n, fout);
+            }
         }
 
         /* Show progress */
@@ -295,6 +326,7 @@ int main(int argc, char **argv) {
     if (tf_pipeline_finish(p) != TF_OK) {
         fprintf(stderr, "error: %s\n",
                 tf_pipeline_error(p) ? tf_pipeline_error(p) : "finish failed");
+        free(out_buf);
         if (fin != stdin) fclose(fin);
         if (fout != stdout) fclose(fout);
         tf_pipeline_free(p);
@@ -305,8 +337,33 @@ int main(int argc, char **argv) {
     uint8_t pull_buf[PULL_BUF_SIZE];
     size_t n;
     while ((n = tf_pipeline_pull(p, TF_CHAN_MAIN, pull_buf, sizeof(pull_buf))) > 0) {
-        fwrite(pull_buf, 1, n, fout);
+        if (try_report && out_buf) {
+            while (out_len + n > out_cap) {
+                out_cap *= 2;
+                char *tmp = realloc(out_buf, out_cap);
+                if (!tmp) { free(out_buf); out_buf = NULL; break; }
+                out_buf = tmp;
+            }
+            if (out_buf) {
+                memcpy(out_buf + out_len, pull_buf, n);
+                out_len += n;
+            }
+        } else {
+            fwrite(pull_buf, 1, n, fout);
+        }
     }
+
+    /* Try report formatting, fall back to raw */
+    if (try_report && out_buf && out_len > 0) {
+        char *report = tf_report_format(out_buf, out_len, 1);
+        if (report) {
+            fwrite(report, 1, strlen(report), fout);
+            free(report);
+        } else {
+            fwrite(out_buf, 1, out_len, fout);
+        }
+    }
+    free(out_buf);
     fflush(fout);
 
     if (progress) {

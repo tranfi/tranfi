@@ -85,6 +85,61 @@ const compilers = {
     if (!a.column) return null
     return `step ${a.column} ${a.op || 'running-sum'}`
   },
+  'onehot'(a) {
+    if (!a.column) return null
+    const p = [`onehot ${a.column}`]
+    if (a.drop) p.push('--drop')
+    return p.join(' ')
+  },
+  'label-encode'(a) {
+    if (!a.column) return null
+    const p = [`label-encode ${a.column}`]
+    if (a.result) p.push(a.result)
+    return p.join(' ')
+  },
+  'ewma'(a) {
+    if (!a.column) return null
+    const p = [`ewma ${a.column} ${a.alpha || 0.3}`]
+    if (a.result) p.push(a.result)
+    return p.join(' ')
+  },
+  'diff'(a) {
+    if (!a.column) return null
+    const p = [`diff ${a.column}`]
+    if (a.order && a.order > 1) p.push(String(a.order))
+    if (a.result) p.push(a.result)
+    return p.join(' ')
+  },
+  'anomaly'(a) {
+    if (!a.column) return null
+    const p = [`anomaly ${a.column}`]
+    if (a.threshold && a.threshold !== 3) p.push(String(a.threshold))
+    if (a.result) p.push(a.result)
+    return p.join(' ')
+  },
+  'split-data'(a) {
+    const p = [`split-data ${a.ratio || 0.8}`]
+    if (a.seed && a.seed !== 42) p.push(`--seed ${a.seed}`)
+    return p.join(' ')
+  },
+  'interpolate'(a) {
+    if (!a.column) return null
+    const p = [`interpolate ${a.column}`]
+    if (a.method && a.method !== 'linear') p.push(a.method)
+    return p.join(' ')
+  },
+  'normalize'(a) {
+    if (!a.columns) return null
+    const p = [`normalize ${a.columns}`]
+    if (a.method && a.method !== 'minmax') p.push(a.method)
+    return p.join(' ')
+  },
+  'acf'(a) {
+    if (!a.column) return null
+    const p = [`acf ${a.column}`]
+    if (a.lags && a.lags !== 20) p.push(String(a.lags))
+    return p.join(' ')
+  },
   'join'(a) {
     if (!a.file || !a.key) return null
     const p = [`join ${a.file} ${a.key}`]

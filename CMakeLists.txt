@@ -50,6 +50,15 @@ set(CORE_SOURCES
     src/op_stack.c
     src/op_lead.c
     src/op_date_trunc.c
+    src/op_onehot.c
+    src/op_label_encode.c
+    src/op_ewma.c
+    src/op_diff.c
+    src/op_anomaly.c
+    src/op_split_data.c
+    src/op_interpolate.c
+    src/op_normalize.c
+    src/op_acf.c
     src/codec_table.c
     src/ir.c
     src/ir_serialize.c
@@ -60,6 +69,7 @@ set(CORE_SOURCES
     src/compiler.c
     src/dsl.c
     src/recipes.c
+    src/report.c
 )
 
 # Static library (used by all targets)

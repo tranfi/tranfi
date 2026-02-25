@@ -1,10 +1,9 @@
 # tranfi
 
-Streaming ETL language in C11. Pipe DSL, push/pull API, columnar batches, 40 built-in operators. Bindings for Python, Node.js, R, and WASM.
+Streaming ETL language in C11. Pipe DSL, push/pull API, columnar batches, 50 built-in operators. Bindings for Python, Node.js, R, and WASM.
 
 ```bash
-printf "name,age\nAlice,30\nBob,25\nCharlie,35\n" \
-  | tranfi 'csv | filter "age > 25" | sort -age | csv'
+tranfi 'csv | filter "age > 25" | sort -name | derive label=if(col(age)>30,"senior","junior") | csv' < people.csv
 ```
 
 ## Install
@@ -179,6 +178,15 @@ Cross-codec: `csv | ... | jsonl`. The `text` codec splits on newlines into a sin
 | `join` | `join lookup.csv on=city` | `JOIN lookup ON city = city` |
 | `stack` | `stack other.csv` | `UNION ALL` |
 | `flatten` | `flatten` | — |
+| `ewma` | `ewma price 0.3` | — |
+| `diff` | `diff price` / `diff price 2` | — |
+| `anomaly` | `anomaly price 3.0` | — |
+| `interpolate` | `interpolate price linear` | — |
+| `normalize` | `normalize price,score minmax` | — |
+| `label-encode` | `label-encode city` | — |
+| `onehot` | `onehot city` / `onehot city --drop` | — |
+| `split-data` | `split-data 0.8` | — |
+| `acf` | `acf price 20` | — |
 
 Aliases: `reorder` (select), `dedup` (unique).
 
@@ -243,6 +251,16 @@ tranfi 'csv | filter "col(age) > 25" | jsonl'
 # Text mode — line-oriented, no CSV parsing
 tranfi 'text | grep error | text' < server.log
 tranfi 'text | grep -v debug | head 100 | text' < app.log
+
+# Data prep: smoothing, differencing, anomaly detection
+tranfi 'csv | ewma price 0.3 | diff price | anomaly price 3.0 | csv'
+
+# ML preprocessing: encode, normalize, split
+tranfi 'csv | label-encode city | onehot color --drop | normalize score minmax | split-data 0.8 | csv'
+
+# Time series: interpolate nulls, autocorrelation
+tranfi 'csv | interpolate price linear | csv'
+tranfi 'csv | acf price 20 | csv'
 ```
 
 ## Benchmarks
@@ -385,7 +403,7 @@ make test                # all tests (C + Python + Node.js)
 Or individually:
 
 ```bash
-./build/test_core        # 126 C core tests
+./build/test_core        # 140 C core tests
 python -m pytest test/   # Python tests (inc. DuckDB engine)
 node test/test_node.js   # Node.js tests (inc. SQL transpiler, DuckDB, WASM)
 ```
@@ -393,7 +411,7 @@ node test/test_node.js   # Node.js tests (inc. SQL transpiler, DuckDB, WASM)
 ## Project structure
 
 ```
-src/                 C11 core (40 operators, 3 codecs, DSL parser, IR→SQL transpiler)
+src/                 C11 core (50 operators, 3 codecs, DSL parser, IR→SQL transpiler)
 app/                 Vue + Vite frontend (WASM mode + server mode)
 js/                  Node.js N-API + WASM bindings (full API docs)
 py/                  Python ctypes bindings (full API docs)

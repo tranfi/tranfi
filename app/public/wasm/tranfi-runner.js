@@ -87,40 +87,42 @@ function pipelineFree (handle) {
   wasm.ccall('wasm_pipeline_free', null, ['number'], [handle])
 }
 
-function esc (s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+function csvParseLine (line) {
+  var fields = []
+  var i = 0, len = line.length
+  while (i < len) {
+    if (line[i] === '"') {
+      i++ // skip opening quote
+      var start = i
+      while (i < len) {
+        if (line[i] === '"') {
+          if (i + 1 < len && line[i + 1] === '"') { i += 2; continue }
+          break
+        }
+        i++
+      }
+      fields.push(line.slice(start, i).replace(/""/g, '"'))
+      if (i < len) i++ // skip closing quote
+      if (i < len && line[i] === ',') i++ // skip comma
+    } else {
+      var start = i
+      while (i < len && line[i] !== ',') i++
+      fields.push(line.slice(start, i).trim())
+      if (i < len) i++ // skip comma
+    }
+  }
+  return fields
 }
 
-function csvToHtml (csv, label) {
-  if (!csv || !csv.trim()) return ''
-  const lines = csv.trim().split('\n')
-  const header = lines[0].split(',')
-  const body = lines.slice(1)
-  const maxRows = 500
-  const truncated = body.length > maxRows
-  const displayBody = truncated ? body.slice(0, maxRows) : body
-
-  let h = `<div style="font-size:12px;color:#888;margin-bottom:6px">`
-  h += `${esc(label)} (${body.length} rows${truncated ? ', showing first ' + maxRows : ''})</div>`
-  h += '<div style="overflow-x:auto;max-height:500px;overflow-y:auto">'
-  h += '<table style="width:100%;border-collapse:collapse;font-size:13px;font-family:monospace">'
-  h += '<thead><tr>'
-  for (const col of header) {
-    h += '<th style="padding:6px 12px;text-align:left;border-bottom:2px solid #ddd;'
-    h += 'background:#f8f8f8;font-weight:600;position:sticky;top:0">'
-    h += esc(col.trim()) + '</th>'
+function csvToTable (csv, label) {
+  if (!csv || !csv.trim()) return null
+  var lines = csv.trim().split('\n')
+  var columns = csvParseLine(lines[0])
+  var rows = []
+  for (var r = 1; r < lines.length; r++) {
+    if (lines[r].trim()) rows.push(csvParseLine(lines[r]))
   }
-  h += '</tr></thead><tbody>'
-  for (const row of displayBody) {
-    h += '<tr>'
-    for (const cell of row.split(',')) {
-      h += '<td style="padding:4px 12px;text-align:left;border-bottom:1px solid #eee">'
-      h += esc(cell.trim()) + '</td>'
-    }
-    h += '</tr>'
-  }
-  h += '</tbody></table></div>'
-  return h
+  return { columns: columns, rows: rows, label: label }
 }
 
 // JSEE model function — set on worker global
@@ -173,8 +175,8 @@ self.tranfiRunner = async function tranfiRunner (inputs, ctx) {
     }
 
     const result = {}
-    if (output) result.output = csvToHtml(output, 'Output')
-    if (stats) result.stats = csvToHtml(stats, 'Stats')
+    if (output) result.output = csvToTable(output, 'Output')
+    if (stats) result.stats = csvToTable(stats, 'Stats')
 
     ctx.log('Pipeline complete')
     return result

@@ -18,13 +18,20 @@ export function compileToSchema (dsl, options = {}) {
       timeout: options.timeout || 120000,
       imports: [`${base}wasm/tranfi_core.js`]
     },
+    render: {
+      type: 'function',
+      url: `${base}wasm/tranfi-viz.js`,
+      name: 'tranfiViz'
+    },
     inputs: [
       { name: 'file', type: 'file', stream: true },
       { name: 'dsl', type: 'string', default: dsl || 'csv | csv', display: false }
     ],
     outputs: [
-      { name: 'output', type: 'html' },
-      { name: 'stats', type: 'html' }
+      { name: 'output', type: 'table' },
+      { name: 'stats', type: 'table' },
+      { name: 'profile', type: 'function' },
+      { name: 'chart', type: 'function' }
     ],
     design: {
       framework: 'bulma'
@@ -38,13 +45,20 @@ export function compileToServerSchema (dsl, files, options = {}) {
       type: 'post',
       url: `${options.api || '/api'}/run`
     },
+    render: {
+      type: 'function',
+      url: `${base}wasm/tranfi-viz.js`,
+      name: 'tranfiViz'
+    },
     inputs: [
       { name: 'file', type: 'select', options: files, default: files[0] || '' },
       { name: 'dsl', type: 'string', default: dsl || 'csv | csv', display: false }
     ],
     outputs: [
-      { name: 'output', type: 'html' },
-      { name: 'stats', type: 'html' }
+      { name: 'output', type: 'table' },
+      { name: 'stats', type: 'table' },
+      { name: 'profile', type: 'function' },
+      { name: 'chart', type: 'function' }
     ],
     design: {
       framework: 'bulma'

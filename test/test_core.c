@@ -769,7 +769,7 @@ static void test_registry_capabilities(void) {
 
 static void test_registry_count_and_iterate(void) {
     size_t count = tf_op_registry_count();
-    assert(count == 45);  /* 7 codecs + 38 transforms */
+    assert(count == 54);  /* 7 codecs + 47 transforms */
     for (size_t i = 0; i < count; i++) {
         const tf_op_entry *e = tf_op_registry_get(i);
         assert(e != NULL);
@@ -2454,7 +2454,7 @@ static void test_registry_new_ops(void) {
 
 static void test_registry_count_updated(void) {
     size_t count = tf_op_registry_count();
-    assert(count == 45);  /* 7 codecs + 38 transforms */
+    assert(count == 54);  /* 7 codecs + 47 transforms */
 }
 
 /* ================================================================
@@ -2913,6 +2913,226 @@ static void test_recipe_run_dedup(void) {
 }
 
 /* ================================================================
+ * Data Prep & Time Series Ops
+ * ================================================================ */
+
+static tf_pipeline *pipeline_from_dsl(const char *dsl) {
+    char *json = tf_compile_dsl(dsl, strlen(dsl), NULL);
+    if (!json) return NULL;
+    tf_pipeline *p = tf_pipeline_create(json, strlen(json));
+    tf_string_free(json);
+    return p;
+}
+
+/* Helper: run DSL pipeline and return output as string. Caller uses stack buf. */
+static size_t run_dsl(const char *dsl, const char *input,
+                      char *out, size_t outsz) {
+    tf_pipeline *p = pipeline_from_dsl(dsl);
+    assert(p != NULL);
+    assert(tf_pipeline_push(p, (const uint8_t *)input, strlen(input)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, (uint8_t *)out, outsz - 1);
+    out[n] = '\0';
+    tf_pipeline_free(p);
+    return n;
+}
+
+/* Helper: get Nth line (0-based) from output string */
+static const char *get_line(const char *s, int n) {
+    for (int i = 0; i < n; i++) {
+        s = strchr(s, '\n');
+        if (!s) return NULL;
+        s++;
+    }
+    return s;
+}
+
+/* Helper: check that line N starts with prefix */
+static int line_starts_with(const char *output, int lineno, const char *prefix) {
+    const char *line = get_line(output, lineno);
+    if (!line) return 0;
+    return strncmp(line, prefix, strlen(prefix)) == 0;
+}
+
+static void test_pipeline_ewma(void) {
+    char out[2048];
+    run_dsl("csv | ewma x 0.5 | csv", "x\n10\n20\n30\n", out, sizeof(out));
+    /* header: x,x_ewma */
+    assert(line_starts_with(out, 0, "x,x_ewma"));
+    /* ewma(0.5): row1=10, row2=0.5*20+0.5*10=15, row3=0.5*30+0.5*15=22.5 */
+    assert(line_starts_with(out, 1, "10,10"));
+    assert(line_starts_with(out, 2, "20,15"));
+    assert(line_starts_with(out, 3, "30,22.5"));
+}
+
+static void test_pipeline_diff(void) {
+    char out[2048];
+    run_dsl("csv | diff x | csv", "x\n10\n13\n18\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,x_diff"));
+    /* row1: null (no prev), row2: 13-10=3, row3: 18-13=5 */
+    assert(line_starts_with(out, 1, "10,"));
+    assert(line_starts_with(out, 2, "13,3"));
+    assert(line_starts_with(out, 3, "18,5"));
+}
+
+static void test_pipeline_diff_order2(void) {
+    char out[2048];
+    run_dsl("csv | diff x 2 | csv", "x\n1\n3\n7\n13\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,x_diff"));
+    /* order-2 diff: null, null, 7-2*3+1=2, 13-2*7+3=2 */
+    assert(line_starts_with(out, 3, "7,2"));
+    assert(line_starts_with(out, 4, "13,2"));
+}
+
+static void test_pipeline_label_encode(void) {
+    char out[2048];
+    run_dsl("csv | label-encode city | csv",
+            "city\nParis\nLondon\nParis\nBerlin\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "city,city_encoded"));
+    /* Paris=0, London=1, Paris=0, Berlin=2 */
+    assert(line_starts_with(out, 1, "Paris,0"));
+    assert(line_starts_with(out, 2, "London,1"));
+    assert(line_starts_with(out, 3, "Paris,0"));
+    assert(line_starts_with(out, 4, "Berlin,2"));
+}
+
+static void test_pipeline_anomaly(void) {
+    char out[2048];
+    run_dsl("csv | anomaly x 2 | csv",
+            "x\n10\n11\n9\n10\n11\n10\n100\n10\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,x_anomaly"));
+    /* Normal values get 0, outlier 100 gets 1 */
+    assert(line_starts_with(out, 1, "10,0"));
+    assert(line_starts_with(out, 2, "11,0"));
+    assert(line_starts_with(out, 7, "100,1"));
+    assert(line_starts_with(out, 8, "10,0"));
+}
+
+static void test_pipeline_split_data(void) {
+    char out[2048];
+    run_dsl("csv | split-data 0.5 | csv",
+            "x\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,_split"));
+    /* With seed=42, ratio=0.5, should get a mix of train/test */
+    assert(strstr(out, "train") != NULL);
+    assert(strstr(out, "test") != NULL);
+    /* Deterministic: same seed should give same split */
+    char out2[2048];
+    run_dsl("csv | split-data 0.5 | csv",
+            "x\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n", out2, sizeof(out2));
+    assert(strcmp(out, out2) == 0);
+}
+
+static void test_pipeline_onehot(void) {
+    char out[2048];
+    run_dsl("csv | onehot color | csv",
+            "name,color\nA,red\nB,blue\nC,red\nD,green\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "name,color,color_red,color_blue,color_green"));
+    /* A,red  → 1,0,0 */
+    assert(line_starts_with(out, 1, "A,red,1,0,0"));
+    /* B,blue → 0,1,0 */
+    assert(line_starts_with(out, 2, "B,blue,0,1,0"));
+    /* C,red  → 1,0,0 */
+    assert(line_starts_with(out, 3, "C,red,1,0,0"));
+    /* D,green → 0,0,1 */
+    assert(line_starts_with(out, 4, "D,green,0,0,1"));
+}
+
+static void test_pipeline_onehot_drop(void) {
+    char out[2048];
+    run_dsl("csv | onehot color --drop | csv",
+            "name,color\nA,red\nB,blue\n", out, sizeof(out));
+    /* Original "color" column should be dropped */
+    assert(line_starts_with(out, 0, "name,color_red,color_blue"));
+    assert(line_starts_with(out, 1, "A,1,0"));
+    assert(line_starts_with(out, 2, "B,0,1"));
+}
+
+static void test_pipeline_interpolate_forward(void) {
+    char out[2048];
+    run_dsl("csv | interpolate x forward | csv",
+            "x\n10\n\n\n20\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x"));
+    /* Forward fill: 10, 10, 10, 20 */
+    assert(line_starts_with(out, 1, "10"));
+    assert(line_starts_with(out, 2, "10"));
+    assert(line_starts_with(out, 3, "10"));
+    assert(line_starts_with(out, 4, "20"));
+}
+
+static void test_pipeline_interpolate_linear(void) {
+    char out[2048];
+    run_dsl("csv | interpolate x linear | csv",
+            "x\n10\n\n\n40\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x"));
+    /* Linear: 10, 20, 30, 40 */
+    assert(line_starts_with(out, 1, "10"));
+    assert(line_starts_with(out, 2, "20"));
+    assert(line_starts_with(out, 3, "30"));
+    assert(line_starts_with(out, 4, "40"));
+}
+
+static void test_pipeline_normalize_minmax(void) {
+    char out[2048];
+    run_dsl("csv | normalize x | csv", "x\n0\n50\n100\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x"));
+    /* minmax: 0→0, 50→0.5, 100→1 */
+    assert(line_starts_with(out, 1, "0"));
+    assert(line_starts_with(out, 2, "0.5"));
+    assert(line_starts_with(out, 3, "1"));
+}
+
+static void test_pipeline_normalize_zscore(void) {
+    char out[2048];
+    run_dsl("csv | normalize x zscore | csv",
+            "x\n10\n20\n30\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x"));
+    /* zscore of [10,20,30]: mean=20, std=10 → -1, 0, 1 */
+    assert(strstr(out, "-1") != NULL);
+    /* Middle value should be 0 */
+    assert(line_starts_with(out, 2, "0"));
+}
+
+static void test_pipeline_acf(void) {
+    char out[2048];
+    run_dsl("csv | acf x 3 | csv",
+            "x\n1\n2\n3\n4\n5\n6\n7\n8\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "lag,acf"));
+    /* lag 0 → acf = 1.0 */
+    assert(line_starts_with(out, 1, "0,1"));
+    /* lag 1 → acf = 0.7 */
+    assert(line_starts_with(out, 2, "1,0.7"));
+    /* 4 rows total: lag 0,1,2,3 */
+    assert(line_starts_with(out, 4, "3,"));
+}
+
+static void test_dsl_data_prep_ops(void) {
+    /* Test that all new ops can be parsed from DSL */
+    const char *dsls[] = {
+        "csv | ewma x 0.3 | csv",
+        "csv | diff x | csv",
+        "csv | diff x 2 | csv",
+        "csv | label-encode city | csv",
+        "csv | anomaly x 2.5 | csv",
+        "csv | split-data 0.8 | csv",
+        "csv | onehot city | csv",
+        "csv | onehot city --drop | csv",
+        "csv | interpolate x linear | csv",
+        "csv | interpolate x forward | csv",
+        "csv | normalize x,y | csv",
+        "csv | normalize x,y zscore | csv",
+        "csv | acf x 20 | csv",
+    };
+    size_t n = sizeof(dsls) / sizeof(dsls[0]);
+    for (size_t i = 0; i < n; i++) {
+        char *err = NULL;
+        tf_ir_plan *plan = tf_dsl_parse(dsls[i], strlen(dsls[i]), &err);
+        assert(plan != NULL);
+        tf_ir_plan_free(plan);
+    }
+}
+
+/* ================================================================
  * Main
  * ================================================================ */
 
@@ -3097,6 +3317,22 @@ int main(void) {
     TEST(test_recipe_accessors);
     TEST(test_recipe_run_preview);
     TEST(test_recipe_run_dedup);
+
+    printf("\nData Prep & Time Series:\n");
+    TEST(test_pipeline_ewma);
+    TEST(test_pipeline_diff);
+    TEST(test_pipeline_diff_order2);
+    TEST(test_pipeline_label_encode);
+    TEST(test_pipeline_anomaly);
+    TEST(test_pipeline_split_data);
+    TEST(test_pipeline_onehot);
+    TEST(test_pipeline_onehot_drop);
+    TEST(test_pipeline_interpolate_forward);
+    TEST(test_pipeline_interpolate_linear);
+    TEST(test_pipeline_normalize_minmax);
+    TEST(test_pipeline_normalize_zscore);
+    TEST(test_pipeline_acf);
+    TEST(test_dsl_data_prep_ops);
 
     printf("\n==================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

@@ -16,7 +16,8 @@ export default defineConfig(({ mode }) => ({
     alias: {
       '@statsim/block-editor': resolve(__dirname, 'src/lib/block-editor/index.js')
     },
-    dedupe: ['vue', 'vuetify', 'vuedraggable']
+    dedupe: ['vue', 'vuetify', 'vuedraggable'],
+    preserveSymlinks: true
   },
   optimizeDeps: {
     exclude: ['tranfi'],

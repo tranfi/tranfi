@@ -213,6 +213,15 @@ tf_step *tf_join_create(const cJSON *args);
 tf_step *tf_stack_create(const cJSON *args);
 tf_step *tf_lead_create(const cJSON *args);
 tf_step *tf_date_trunc_create(const cJSON *args);
+tf_step *tf_onehot_create(const cJSON *args);
+tf_step *tf_label_encode_create(const cJSON *args);
+tf_step *tf_ewma_create(const cJSON *args);
+tf_step *tf_diff_create(const cJSON *args);
+tf_step *tf_anomaly_create(const cJSON *args);
+tf_step *tf_split_data_create(const cJSON *args);
+tf_step *tf_interpolate_create(const cJSON *args);
+tf_step *tf_normalize_create(const cJSON *args);
+tf_step *tf_acf_create(const cJSON *args);
 
 /* ---- Table encoder ---- */
 

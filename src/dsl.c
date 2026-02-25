@@ -811,6 +811,165 @@ static cJSON *build_date_trunc_args(const token_list *tokens, char **error) {
     return args;
 }
 
+static cJSON *build_onehot_args(const token_list *tokens, char **error) {
+    /* onehot column [--drop] */
+    if (tokens->count < 2) {
+        set_error(error, "onehot requires a column name");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    for (size_t i = 2; i < tokens->count; i++) {
+        if (strcmp(tokens->items[i], "--drop") == 0)
+            cJSON_AddBoolToObject(args, "drop", 1);
+    }
+    return args;
+}
+
+static cJSON *build_label_encode_args(const token_list *tokens, char **error) {
+    /* label-encode column [result_name] */
+    if (tokens->count < 2) {
+        set_error(error, "label-encode requires a column name");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (tokens->count >= 3)
+        cJSON_AddStringToObject(args, "result", tokens->items[2]);
+    return args;
+}
+
+static cJSON *build_ewma_args(const token_list *tokens, char **error) {
+    /* ewma column alpha [result_name] */
+    if (tokens->count < 3) {
+        set_error(error, "ewma requires column and alpha");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    cJSON_AddNumberToObject(args, "alpha", atof(tokens->items[2]));
+    if (tokens->count >= 4)
+        cJSON_AddStringToObject(args, "result", tokens->items[3]);
+    return args;
+}
+
+static cJSON *build_diff_args(const token_list *tokens, char **error) {
+    /* diff column [order] [result_name] */
+    if (tokens->count < 2) {
+        set_error(error, "diff requires a column name");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (tokens->count >= 3) {
+        char *end;
+        long order = strtol(tokens->items[2], &end, 10);
+        if (*end == '\0') {
+            cJSON_AddNumberToObject(args, "order", order);
+            if (tokens->count >= 4)
+                cJSON_AddStringToObject(args, "result", tokens->items[3]);
+        } else {
+            cJSON_AddStringToObject(args, "result", tokens->items[2]);
+        }
+    }
+    return args;
+}
+
+static cJSON *build_anomaly_args(const token_list *tokens, char **error) {
+    /* anomaly column [threshold] [result_name] */
+    if (tokens->count < 2) {
+        set_error(error, "anomaly requires a column name");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (tokens->count >= 3) {
+        char *end;
+        double thresh = strtod(tokens->items[2], &end);
+        if (*end == '\0') {
+            cJSON_AddNumberToObject(args, "threshold", thresh);
+            if (tokens->count >= 4)
+                cJSON_AddStringToObject(args, "result", tokens->items[3]);
+        } else {
+            cJSON_AddStringToObject(args, "result", tokens->items[2]);
+        }
+    }
+    return args;
+}
+
+static cJSON *build_split_data_args(const token_list *tokens, char **error) {
+    /* split-data [ratio] [--seed N] [result_name] */
+    (void)error;
+    cJSON *args = cJSON_CreateObject();
+    size_t idx = 1;
+    if (idx < tokens->count) {
+        char *end;
+        double ratio = strtod(tokens->items[idx], &end);
+        if (*end == '\0') {
+            cJSON_AddNumberToObject(args, "ratio", ratio);
+            idx++;
+        }
+    }
+    while (idx < tokens->count) {
+        if (strcmp(tokens->items[idx], "--seed") == 0 && idx + 1 < tokens->count) {
+            cJSON_AddNumberToObject(args, "seed", atoi(tokens->items[idx + 1]));
+            idx += 2;
+        } else {
+            cJSON_AddStringToObject(args, "result", tokens->items[idx]);
+            idx++;
+        }
+    }
+    return args;
+}
+
+static cJSON *build_interpolate_args(const token_list *tokens, char **error) {
+    /* interpolate column [method] */
+    if (tokens->count < 2) {
+        set_error(error, "interpolate requires a column name");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (tokens->count >= 3)
+        cJSON_AddStringToObject(args, "method", tokens->items[2]);
+    return args;
+}
+
+static cJSON *build_normalize_args(const token_list *tokens, char **error) {
+    /* normalize col1,col2,... [method] */
+    if (tokens->count < 2) {
+        set_error(error, "normalize requires column names");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    /* Parse comma-separated columns */
+    cJSON *cols = cJSON_CreateArray();
+    char *dup = strdup(tokens->items[1]);
+    char *tok = strtok(dup, ",");
+    while (tok) {
+        cJSON_AddItemToArray(cols, cJSON_CreateString(tok));
+        tok = strtok(NULL, ",");
+    }
+    free(dup);
+    cJSON_AddItemToObject(args, "columns", cols);
+    if (tokens->count >= 3)
+        cJSON_AddStringToObject(args, "method", tokens->items[2]);
+    return args;
+}
+
+static cJSON *build_acf_args(const token_list *tokens, char **error) {
+    /* acf column [lags] */
+    if (tokens->count < 2) {
+        set_error(error, "acf requires a column name");
+        return NULL;
+    }
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (tokens->count >= 3)
+        cJSON_AddNumberToObject(args, "lags", atoi(tokens->items[2]));
+    return args;
+}
+
 /* ---- Main parser ---- */
 
 tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
@@ -966,6 +1125,32 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "date-trunc") == 0) {
             args = build_date_trunc_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "onehot") == 0) {
+            args = build_onehot_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "label-encode") == 0) {
+            args = build_label_encode_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "ewma") == 0) {
+            args = build_ewma_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "diff") == 0) {
+            args = build_diff_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "anomaly") == 0) {
+            args = build_anomaly_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "split-data") == 0) {
+            args = build_split_data_args(&tokens, error);
+        } else if (strcmp(op_name, "interpolate") == 0) {
+            args = build_interpolate_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "normalize") == 0) {
+            args = build_normalize_args(&tokens, error);
+            if (!args) { free(resolved); tl_free(&tokens); goto fail; }
+        } else if (strcmp(op_name, "acf") == 0) {
+            args = build_acf_args(&tokens, error);
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else {
             /* Unknown op — pass through with codec-style args, let validation catch it */

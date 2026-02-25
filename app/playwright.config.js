@@ -2,15 +2,19 @@ import { defineConfig } from '@playwright/test'
 
 export default defineConfig({
   testDir: './test',
-  testMatch: '**/*.spec.js',
-  timeout: 60000,
+  testMatch: '**/*.e2e.js',
+  timeout: 30000,
+  retries: 0,
   use: {
-    headless: true,
-    browserName: 'chromium'
+    baseURL: 'http://localhost:5199',
+    headless: true
   },
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium' } }
+  ],
   webServer: {
-    command: 'npx vite preview --port 4173',
-    port: 4173,
+    command: 'npx vite --port 5199',
+    port: 5199,
     reuseExistingServer: true,
     timeout: 15000
   }

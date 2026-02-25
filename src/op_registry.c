@@ -522,6 +522,55 @@ static tf_arg_desc date_trunc_args[] = {
     {"result", "string", false, NULL},
 };
 
+static tf_arg_desc onehot_args[] = {
+    {"column", "string", true, NULL},
+    {"drop", "bool", false, "false"},
+};
+
+static tf_arg_desc label_encode_args[] = {
+    {"column", "string", true, NULL},
+    {"result", "string", false, NULL},
+};
+
+static tf_arg_desc ewma_args[] = {
+    {"column", "string", true, NULL},
+    {"alpha", "float", true, NULL},
+    {"result", "string", false, NULL},
+};
+
+static tf_arg_desc diff_args[] = {
+    {"column", "string", true, NULL},
+    {"order", "int", false, "1"},
+    {"result", "string", false, NULL},
+};
+
+static tf_arg_desc anomaly_args[] = {
+    {"column", "string", true, NULL},
+    {"threshold", "float", false, "3.0"},
+    {"result", "string", false, NULL},
+};
+
+static tf_arg_desc split_data_args[] = {
+    {"ratio", "float", false, "0.8"},
+    {"result", "string", false, "\"_split\""},
+    {"seed", "int", false, "42"},
+};
+
+static tf_arg_desc interpolate_args[] = {
+    {"column", "string", true, NULL},
+    {"method", "string", false, "\"linear\""},
+};
+
+static tf_arg_desc normalize_args[] = {
+    {"columns", "string[]", true, NULL},
+    {"method", "string", false, "\"minmax\""},
+};
+
+static tf_arg_desc acf_args[] = {
+    {"column", "string", true, NULL},
+    {"lags", "int", false, "20"},
+};
+
 static tf_arg_desc table_encode_args[] = {
     {"max_width", "int", false, "40"},
     {"max_rows", "int", false, "0"},
@@ -974,6 +1023,96 @@ static tf_op_entry builtin_ops[] = {
         .n_args = 3,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_date_trunc_create,
+    },
+    {
+        .name = "onehot",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = onehot_args,
+        .n_args = 2,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_onehot_create,
+    },
+    {
+        .name = "label-encode",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = label_encode_args,
+        .n_args = 2,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_label_encode_create,
+    },
+    {
+        .name = "ewma",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = ewma_args,
+        .n_args = 3,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_ewma_create,
+    },
+    {
+        .name = "diff",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = diff_args,
+        .n_args = 3,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_diff_create,
+    },
+    {
+        .name = "anomaly",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = anomaly_args,
+        .n_args = 3,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_anomaly_create,
+    },
+    {
+        .name = "split-data",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE,
+        .args = split_data_args,
+        .n_args = 3,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_split_data_create,
+    },
+    {
+        .name = "interpolate",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = interpolate_args,
+        .n_args = 2,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_interpolate_create,
+    },
+    {
+        .name = "normalize",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = normalize_args,
+        .n_args = 2,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_normalize_create,
+    },
+    {
+        .name = "acf",
+        .kind = TF_OP_TRANSFORM,
+        .tier = TF_TIER_CORE,
+        .caps = TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
+        .args = acf_args,
+        .n_args = 2,
+        .infer_schema = infer_schema_passthrough,
+        .create_native = (void *(*)(const cJSON *))tf_acf_create,
     },
     {
         .name = "codec.table.encode",
