@@ -5,17 +5,17 @@
  * Install: npm install duckdb
  */
 
-import { writeFile, unlink } from 'fs/promises'
-import { tmpdir } from 'os'
-import { join } from 'path'
-import { randomBytes } from 'crypto'
-import { PipelineResult } from '../pipeline.js'
+const { writeFile, unlink } = require('fs/promises')
+const { tmpdir } = require('os')
+const { join } = require('path')
+const { randomBytes } = require('crypto')
+const { PipelineResult } = require('../pipeline.js')
 
 let _compileToSql = null
 
 async function getCompileToSql() {
   if (_compileToSql) return _compileToSql
-  const { compileToSql } = await import('../pipeline.js')
+  const { compileToSql } = require('../pipeline.js')
   _compileToSql = compileToSql
   return _compileToSql
 }
@@ -24,7 +24,7 @@ class DuckDBEngine {
   async run(dsl, { input, inputFile } = {}) {
     let duckdb
     try {
-      duckdb = (await import('duckdb')).default || await import('duckdb')
+      duckdb = require('duckdb')
     } catch {
       throw new Error(
         "DuckDB engine requires the 'duckdb' package. " +
@@ -100,10 +100,12 @@ function rowsToCsv(rows) {
 
 let _engine = null
 
-export function getEngine(name) {
+function getEngine(name) {
   if (name === 'duckdb') {
     if (!_engine) _engine = new DuckDBEngine()
     return _engine
   }
   throw new Error(`Unknown engine: '${name}'. Available: 'native', 'duckdb'`)
 }
+
+module.exports = { getEngine }

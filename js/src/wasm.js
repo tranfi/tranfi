@@ -5,15 +5,17 @@
 
 let instance = null
 
-export async function loadWasm() {
+async function loadWasm() {
   if (instance) return instance
 
-  // Try to load the WASM module
-  const { default: createTranfi } = await import('../wasm/tranfi_core.js')
+  // Load the WASM module
+  const createTranfi = require('../wasm/tranfi_core.js')
   instance = await createTranfi()
   return instance
 }
 
-export function getWasm() {
+function getWasm() {
   return instance
 }
+
+module.exports = { loadWasm, getWasm }

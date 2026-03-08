@@ -4,11 +4,9 @@
  * Run: node test/test_node.js
  */
 
-import { pipeline, codec, ops, expr, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes } from '../js/src/index.js'
-import { fileURLToPath } from 'url'
-import { dirname, join } from 'path'
+const { pipeline, codec, ops, expr, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes } = require('../js/src/index.js')
+const { join } = require('path')
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, 'fixtures')
 
 let tests = 0
@@ -32,6 +30,8 @@ function assert(cond, msg) {
 }
 
 // ---- Tests ----
+
+async function main() {
 
 console.log('Tranfi Node.js Tests')
 console.log('====================\n')
@@ -482,7 +482,7 @@ await test('saveRecipe + loadRecipe', async () => {
   const result = await p.run({ input: 'x\n1\n2\n3\n' })
   assert(result.outputText.includes('1'), 'should have row 1')
   assert(!result.outputText.includes('3'), 'should not have row 3')
-  const { unlinkSync } = await import('fs')
+  const { unlinkSync } = require('fs')
   unlinkSync(path)
 })
 
@@ -544,8 +544,8 @@ await test('pipeline("csv2json") recipe', async () => {
 // Server tests
 console.log('\nServer:')
 
-import { startServer } from '../js/src/server.js'
-import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs'
+const { startServer } = require('../js/src/server.js')
+const { writeFileSync, mkdirSync, rmSync, existsSync } = require('fs')
 
 const testDataDir = '/tmp/tranfi-test-serve'
 const testAppDir = join(__dirname, '..', '..', 'app', 'dist')
@@ -674,9 +674,7 @@ await test('compileToSql derive', async () => {
 
 let hasDuckDB = false
 try {
-  const { createRequire } = await import('module')
-  const req = createRequire(join(__dirname, '..', 'js', 'package.json'))
-  req('duckdb')
+  require('duckdb')
   hasDuckDB = true
 } catch {}
 
@@ -760,8 +758,7 @@ console.log('\nWASM Wrapper:')
 
 let createTranfi = null
 try {
-  const mod = await import('../js/wasm/index.js')
-  createTranfi = mod.default
+  createTranfi = require('../js/wasm/index.js')
 } catch {}
 
 if (createTranfi) {
@@ -804,3 +801,10 @@ if (createTranfi) {
 console.log(`\n====================`)
 console.log(`${passed}/${tests} tests passed`)
 process.exit(passed === tests ? 0 : 1)
+
+} // end main
+
+main().catch(err => {
+  process.stderr.write(`error: ${err.message}\n`)
+  process.exit(1)
+})

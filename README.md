@@ -69,7 +69,7 @@ result = tf.pipeline([
 ### Node.js ([full docs](js/))
 
 ```js
-import { pipeline, codec, ops, expr } from 'tranfi'
+const { pipeline, codec, ops, expr } = require('tranfi')
 
 // DSL string
 const result = await pipeline('csv | filter "age > 25" | sort -age | csv')
@@ -101,13 +101,14 @@ result = tf.pipeline('csv | filter "age > 25" | sort -age | csv', engine='duckdb
 // Node.js
 npm install duckdb
 
+const { pipeline } = require('tranfi')
 const result = await pipeline('csv | filter "age > 25" | sort -age | csv', { engine: 'duckdb' })
   .run({ inputFile: 'data.csv' })
 ```
 
 ```js
 // Browser (WASM)
-import createTranfi from 'tranfi/wasm'
+const createTranfi = require('tranfi/wasm')
 
 const tf = await createTranfi()
 const result = await tf.runDuckDB(duckdbInstance, 'csv | filter "age > 25" | csv', csvData)

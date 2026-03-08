@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "tranfi"
 version = "0.1.1"
 description = "Streaming ETL language + runtime"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 requires-python = ">=3.8"
 keywords = ["etl", "csv", "streaming", "data", "pipeline", "transform"]
 readme = "README.md"

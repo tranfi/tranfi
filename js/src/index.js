@@ -2,7 +2,7 @@
  * tranfi — Streaming ETL language + runtime.
  *
  * Usage:
- *   import { pipeline, codec, ops, expr } from 'tranfi'
+ *   const { pipeline, codec, ops, expr } = require('tranfi')
  *
  *   const p = pipeline([
  *     codec.csv({ delimiter: ',' }),
@@ -19,25 +19,23 @@
  *   const result2 = await p2.run({ inputFile: './data.csv' })
  */
 
-import { Pipeline, PipelineResult, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes } from './pipeline.js'
+const { Pipeline, PipelineResult, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes } = require('./pipeline.js')
 
-export { Pipeline, PipelineResult, compileDsl, compileToSql, loadRecipe, saveRecipe, recipes }
-
-export function pipeline(steps, { engine } = {}) {
+function pipeline(steps, { engine } = {}) {
   return new Pipeline(steps, { engine })
 }
 
-export function param(name, defaultValue) {
+function param(name, defaultValue) {
   const result = { param: name }
   if (defaultValue !== undefined) result.default = defaultValue
   return result
 }
 
-export function expr(text) {
+function expr(text) {
   return text
 }
 
-export const codec = {
+const codec = {
   csv({ delimiter = ',', header = true, batchSize = 1024, repair = false } = {}) {
     const args = {}
     if (delimiter !== ',') args.delimiter = delimiter
@@ -93,7 +91,7 @@ export const codec = {
   }
 }
 
-export const ops = {
+const ops = {
   filter(expression) {
     return { op: 'filter', args: { expr: expression } }
   },
@@ -292,7 +290,7 @@ export const ops = {
   }
 }
 
-export const io = {
+const io = {
   read: {
     file(path) {
       return { op: 'io.read.file', args: { path } }
@@ -303,4 +301,20 @@ export const io = {
       return { op: 'io.write.stdout', args: {} }
     }
   }
+}
+
+module.exports = {
+  Pipeline,
+  PipelineResult,
+  compileDsl,
+  compileToSql,
+  loadRecipe,
+  saveRecipe,
+  recipes,
+  pipeline,
+  param,
+  expr,
+  codec,
+  ops,
+  io
 }

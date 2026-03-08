@@ -2,14 +2,20 @@
   "name": "tranfi",
   "version": "0.1.0",
   "description": "Streaming ETL language + runtime",
-  "type": "module",
+  "type": "commonjs",
   "main": "src/index.js",
   "bin": {
     "tranfi": "src/cli.js"
   },
   "exports": {
-    ".": "./src/index.js",
-    "./wasm": "./wasm/index.js"
+    ".": {
+      "require": "./src/index.js",
+      "default": "./src/index.js"
+    },
+    "./wasm": {
+      "require": "./wasm/index.js",
+      "default": "./wasm/index.js"
+    }
   },
   "files": [
     "src/",
@@ -18,7 +24,8 @@
     "app/",
     "napi_api.c",
     "binding.gyp",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "prepack": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && rm -rf app && cp -r ../app/dist app && rm -rf app/wasm app/lib",
@@ -46,7 +53,7 @@
     "pipeline",
     "transform"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/tranfi/tranfi"

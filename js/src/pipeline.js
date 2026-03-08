@@ -4,9 +4,9 @@
  * Tries native N-API addon first, falls back to WASM.
  */
 
-import { readFile, writeFile } from 'fs/promises'
-import { existsSync } from 'fs'
-import nativeBinding from './native.js'
+const { readFile, writeFile } = require('fs/promises')
+const { existsSync } = require('fs')
+const nativeBinding = require('./native.js')
 
 // Channel IDs (match tranfi.h)
 const CHAN_MAIN = 0
@@ -32,7 +32,7 @@ async function getBackend() {
   }
 
   // Fall back to WASM
-  const { loadWasm } = await import('./wasm.js')
+  const { loadWasm } = require('./wasm.js')
   const wasm = await loadWasm()
 
   _backend = {
@@ -147,7 +147,7 @@ async function getBackend() {
 }
 
 
-export class PipelineResult {
+class PipelineResult {
   constructor(output, errors, stats, samples) {
     this.output = output
     this.errors = errors
@@ -169,7 +169,7 @@ export class PipelineResult {
 }
 
 
-export class Pipeline {
+class Pipeline {
   constructor(steps, { planJson, engine } = {}) {
     this._engine = engine || null
     if (planJson) {
@@ -237,7 +237,7 @@ export class Pipeline {
   }
 
   async _runEngine({ input, inputFile } = {}) {
-    const { getEngine } = await import('./engines/duckdb.js')
+    const { getEngine } = require('./engines/duckdb.js')
     const engine = getEngine(this._engine)
     const dsl = this._dsl
     if (!dsl) throw new Error('DuckDB engine requires a DSL string pipeline')
@@ -245,17 +245,17 @@ export class Pipeline {
   }
 }
 
-export async function compileDsl(dsl) {
+async function compileDsl(dsl) {
   const backend = await getBackend()
   return backend.compileDsl(dsl)
 }
 
-export async function compileToSql(dsl) {
+async function compileToSql(dsl) {
   const backend = await getBackend()
   return backend.compileToSql(dsl)
 }
 
-export async function loadRecipe(source) {
+async function loadRecipe(source) {
   let planJson
   if (typeof source === 'object' && source.steps) {
     planJson = JSON.stringify(source)
@@ -267,11 +267,11 @@ export async function loadRecipe(source) {
   return new Pipeline(null, { planJson })
 }
 
-export async function saveRecipe(steps, path) {
+async function saveRecipe(steps, path) {
   await writeFile(path, JSON.stringify({ steps }))
 }
 
-export async function recipes() {
+async function recipes() {
   const backend = await getBackend()
   const n = backend.recipeCount()
   const result = []
@@ -283,4 +283,14 @@ export async function recipes() {
     })
   }
   return result
+}
+
+module.exports = {
+  Pipeline,
+  PipelineResult,
+  compileDsl,
+  compileToSql,
+  loadRecipe,
+  saveRecipe,
+  recipes
 }

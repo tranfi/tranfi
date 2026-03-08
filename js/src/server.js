@@ -6,12 +6,12 @@
  * built-in http, fs, path, url modules only.
  */
 
-import { createServer } from 'http'
-import { readFileSync, readdirSync, statSync, readFile as readFileCb, existsSync } from 'fs'
-import { join, extname, resolve, basename } from 'path'
-import { URL } from 'url'
-import { pipeline, recipes } from './index.js'
-import nativeBinding from './native.js'
+const { createServer } = require('http')
+const { readFileSync, readdirSync, statSync, readFile: readFileCb, existsSync } = require('fs')
+const { join, extname, resolve, basename } = require('path')
+const { URL } = require('url')
+const { pipeline, recipes } = require('./index.js')
+const nativeBinding = require('./native.js')
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -101,7 +101,7 @@ function isSafeName (name) {
   return name && !name.includes('..') && !name.includes('/') && !name.includes('\\')
 }
 
-export function startServer ({ port = 3000, dataDir, appDir }) {
+function startServer ({ port = 3000, dataDir, appDir }) {
   dataDir = resolve(dataDir)
   appDir = resolve(appDir)
 
@@ -275,3 +275,5 @@ function serveStatic (res, appDir, pathname, indexHtml) {
     res.end(data)
   })
 }
+
+module.exports = { startServer }

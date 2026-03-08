@@ -9,13 +9,10 @@
  *   tranfi profile < data.csv
  */
 
-import { pipeline, compileDsl, recipes } from './index.js'
-import { readFileSync, writeFileSync, existsSync } from 'fs'
-import { resolve, dirname } from 'path'
-import { fileURLToPath } from 'url'
-import nativeBinding from './native.js'
-
-const __dirname = dirname(fileURLToPath(import.meta.url))
+const { pipeline, compileDsl, recipes } = require('./index.js')
+const { readFileSync, writeFileSync, existsSync } = require('fs')
+const { resolve, dirname } = require('path')
+const nativeBinding = require('./native.js')
 
 function usage() {
   process.stderr.write(`Usage: tranfi [OPTIONS] PIPELINE
@@ -47,8 +44,8 @@ Options:
 function findAppDir () {
   // Try known locations relative to this file
   const candidates = [
-    resolve(__dirname, '../../app/dist'),          // dev: js/src/ → ../../app/dist
-    resolve(__dirname, '../app'),                 // npm package: src/ → ../app/
+    resolve(__dirname, '../../app/dist'),          // dev: js/src/ -> ../../app/dist
+    resolve(__dirname, '../app'),                 // npm package: src/ -> ../app/
   ]
   for (const dir of candidates) {
     if (existsSync(resolve(dir, 'index.html'))) return dir
@@ -57,7 +54,7 @@ function findAppDir () {
 }
 
 async function serveCommand (argv) {
-  const { startServer } = await import('./server.js')
+  const { startServer } = require('./server.js')
   let dataDir = '.'
   let appDir = null
   let port = 3000
