@@ -30,8 +30,18 @@ if (!fs.existsSync(wasmFile)) {
   run('bash', [path.join(repoDir, 'scripts', 'build-wasm.sh')], repoDir, env)
 }
 
-const appSource = path.join(repoDir, 'app', 'dist')
+const appDir = path.join(repoDir, 'app')
+const appPublicWasmDir = path.join(appDir, 'public', 'wasm')
+const appSource = path.join(appDir, 'dist')
 const appDest = path.join(pkgDir, 'app')
+
+fs.mkdirSync(appPublicWasmDir, { recursive: true })
+fs.copyFileSync(wasmFile, path.join(appPublicWasmDir, 'tranfi_core.js'))
+
+if (fs.existsSync(path.join(appDir, 'package.json'))) {
+  run('npm', ['run', 'build'], appDir)
+}
+
 if (fs.existsSync(appSource)) {
   fs.rmSync(appDest, { recursive: true, force: true })
   fs.cpSync(appSource, appDest, { recursive: true })
