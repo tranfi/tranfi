@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 /**
- * build-site.js — Render README files to a static site.
+ * build-site.js -- Render README files to a static site.
  *
  * Usage: node scripts/build-site.js [--out _site] [--base /]
  *
  * Renders:
- *   README.md    → _site/index.html
- *   js/README.md → _site/js/index.html
- *   py/README.md → _site/py/index.html
+ *   README.md    -> _site/index.html
+ *   js/README.md -> _site/js/index.html
+ *   py/README.md -> _site/py/index.html
  *
  * If app/dist/ exists, copies it to _site/app/
  */
 
-import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from 'fs'
-import { dirname, resolve } from 'path'
-import { Marked } from 'marked'
+'use strict'
+
+const { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } = require('fs')
+const { dirname, resolve } = require('path')
+const { Marked } = require('marked')
 
 const args = process.argv.slice(2)
 let outDir = '_site'
@@ -25,15 +27,15 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === '--base') base = args[++i]
 }
 
-const root = resolve(dirname(new URL(import.meta.url).pathname), '..')
+const root = resolve(__dirname, '..')
 const out = resolve(root, outDir)
 
 const marked = new Marked()
 
 const pages = [
   { src: 'README.md', dest: 'index.html', title: 'tranfi' },
-  { src: 'js/README.md', dest: 'js/index.html', title: 'tranfi — Node.js / WASM' },
-  { src: 'py/README.md', dest: 'py/index.html', title: 'tranfi — Python' }
+  { src: 'js/README.md', dest: 'js/index.html', title: 'tranfi -- Node.js / WASM' },
+  { src: 'py/README.md', dest: 'py/index.html', title: 'tranfi -- Python' }
 ]
 
 function template (title, body, currentPath) {
@@ -113,7 +115,7 @@ for (const page of pages) {
     return `<pre class="mermaid">\n${code}</pre>`
   })
 
-  // Fix relative links: (py/) → (base + py/), (js/) → (base + js/)
+  // Fix relative links: (py/) -> (base + py/), (js/) -> (base + js/)
   if (base !== '/') {
     md = md.replace(/\]\((?!http|#|\/)(.*?)\)/g, `](${base}$1)`)
   }
@@ -125,7 +127,7 @@ for (const page of pages) {
   const destPath = resolve(out, page.dest)
   mkdirSync(dirname(destPath), { recursive: true })
   writeFileSync(destPath, html)
-  console.log(`  ${page.src} → ${page.dest}`)
+  console.log(`  ${page.src} -> ${page.dest}`)
 }
 
 // Copy app/dist if it exists
@@ -133,7 +135,7 @@ const appDist = resolve(root, 'app/dist')
 if (existsSync(appDist)) {
   const appOut = resolve(out, 'app')
   cpSync(appDist, appOut, { recursive: true })
-  console.log('  app/dist → app/')
+  console.log('  app/dist -> app/')
 }
 
-console.log(`Site built → ${outDir}/`)
+console.log(`Site built -> ${outDir}/`)
