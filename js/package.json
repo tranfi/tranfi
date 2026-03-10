@@ -1,6 +1,6 @@
 {
   "name": "tranfi",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Streaming ETL language + runtime",
   "type": "commonjs",
   "main": "src/index.js",
@@ -24,13 +24,15 @@
     "app/",
     "napi_api.c",
     "binding.gyp",
+    "scripts/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
-    "prepack": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && rm -rf app && cp -r ../app/dist app && rm -rf app/wasm app/lib",
-    "install": "node-gyp rebuild 2>/dev/null || true",
-    "build:native": "rm -rf csrc && mkdir -p csrc && cp ../src/*.c ../src/*.h csrc/ && node-gyp rebuild",
+    "prepack": "node scripts/prepack.js",
+    "install": "node scripts/install-native.js",
+    "build:native": "node scripts/sync-csrc.js && node-gyp rebuild",
     "test": "node ../test/test_node.js"
   },
   "peerDependencies": {
@@ -60,5 +62,6 @@
   },
   "devDependencies": {
     "duckdb": "^1.4.4"
-  }
+  },
+  "author": "Anton Zemlyansky"
 }

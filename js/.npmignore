@@ -1,0 +1,17 @@
+AGENTS.md
+CLAUDE.md
+PLAN.md
+UPSTREAM.md
+.claude/
+test/
+upstream/
+reference/
+patches/
+build/
+.gitignore
+.gitmodules
+.npmignore
+package-lock.json
+*.log
+.DS_Store
+coverage/
