@@ -760,7 +760,13 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
         if (i > 0) { sb_append(&sel, ", "); sb_append(&grp, ", "); }
         cJSON *c = cJSON_GetArrayItem(cols, i);
         if (cJSON_IsString(c)) {
-          sql_quote_ident(&sel, c->valuestring);
+          /* Native engine renames to "value" for single column */
+          if (n == 1) {
+            sql_quote_ident(&sel, c->valuestring);
+            sb_append(&sel, " AS \"value\"");
+          } else {
+            sql_quote_ident(&sel, c->valuestring);
+          }
           sql_quote_ident(&grp, c->valuestring);
         }
       }
@@ -943,7 +949,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     }
     if (n > 0) {
       cJSON *last = cJSON_GetArrayItem(boundaries, n - 1);
-      sb_appendf(&expr, " WHEN %s >= %g THEN '>=%g'", qcol.data, last->valuedouble, last->valuedouble);
+      sb_appendf(&expr, " WHEN %s >= %g THEN '%g+'", qcol.data, last->valuedouble, last->valuedouble);
     }
     sb_append(&expr, " END");
     strbuf bin_col;
@@ -993,7 +999,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
         strbuf qc;
         sb_init(&qc);
         sql_quote_ident(&qc, c->valuestring);
-        sb_appendf(&rep, "LAST_VALUE(%s IGNORE NULLS) OVER (ORDER BY rowid() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS %s",
+        sb_appendf(&rep, "LAST_VALUE(%s IGNORE NULLS) OVER (ORDER BY _rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS %s",
                    qc.data, qc.data);
         sb_free(&qc);
       }
@@ -1022,7 +1028,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     sql_quote_ident(&qcol, column);
     if (result) sql_quote_ident(&qres, result);
     else sb_appendf(&qres, "\"%s_%s_%d\"", func, column, size);
-    sb_appendf(sb, "%s AS (SELECT *, %s(%s) OVER (ORDER BY rowid() ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS %s FROM %s)",
+    sb_appendf(sb, "%s AS (SELECT *, %s(%s) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS %s FROM %s)",
                cte_name, sql_func, qcol.data, size - 1, qres.data, prev);
     sb_free(&qcol); sb_free(&qres);
     return 0;
@@ -1044,7 +1050,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     sql_quote_ident(&qcol, column);
     if (result) sql_quote_ident(&qres, result);
     else sb_appendf(&qres, "\"%s_%s\"", func, column);
-    sb_appendf(sb, "%s AS (SELECT *, %s(%s) OVER (ORDER BY rowid() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS %s FROM %s)",
+    sb_appendf(sb, "%s AS (SELECT *, %s(%s) OVER (ORDER BY _rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS %s FROM %s)",
                cte_name, sql_func, qcol.data, qres.data, prev);
     sb_free(&qcol); sb_free(&qres);
     return 0;
@@ -1061,7 +1067,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     sql_quote_ident(&qcol, column);
     if (result) sql_quote_ident(&qres, result);
     else sb_appendf(&qres, "\"%s_lead_%d\"", column, offset);
-    sb_appendf(sb, "%s AS (SELECT *, LEAD(%s, %d) OVER (ORDER BY rowid()) AS %s FROM %s)",
+    sb_appendf(sb, "%s AS (SELECT *, LEAD(%s, %d) OVER (ORDER BY _rn) AS %s FROM %s)",
                cte_name, qcol.data, offset, qres.data, prev);
     sb_free(&qcol); sb_free(&qres);
     return 0;
@@ -1177,6 +1183,17 @@ char *tf_ir_to_sql(const tf_ir_plan *plan, char **error) {
     return sb_detach(&sb);
   }
 
+  /* Check if any operator needs row ordering (_rn column) */
+  int needs_rn = 0;
+  for (size_t i = first_transform; i < last_transform; i++) {
+    const char *op = plan->nodes[i].op;
+    if (strcmp(op, "window") == 0 || strcmp(op, "step") == 0 ||
+        strcmp(op, "lead") == 0 || strcmp(op, "fill-down") == 0) {
+      needs_rn = 1;
+      break;
+    }
+  }
+
   /* Build CTE chain — use two alternating name buffers so prev != current */
   int n_ctes = 0;
   char name_bufs[2][32];
@@ -1184,6 +1201,13 @@ char *tf_ir_to_sql(const tf_ir_plan *plan, char **error) {
   char *err = NULL;
 
   sb_append(&sb, "WITH\n");
+
+  /* If row ordering is needed, inject a _rn column from the source */
+  if (needs_rn) {
+    sb_appendf(&sb, "  _numbered AS (SELECT *, ROW_NUMBER() OVER () AS _rn FROM %s)", input_source);
+    prev = "_numbered";
+    n_ctes++;
+  }
 
   for (size_t i = first_transform; i < last_transform; i++) {
     const tf_ir_node *node = &plan->nodes[i];
@@ -1204,8 +1228,12 @@ char *tf_ir_to_sql(const tf_ir_plan *plan, char **error) {
     n_ctes++;
   }
 
-  /* Final SELECT from last CTE */
-  sb_appendf(&sb, "\nSELECT * FROM %s", prev);
+  /* Final SELECT from last CTE — exclude internal _rn column */
+  if (needs_rn) {
+    sb_appendf(&sb, "\nSELECT * EXCLUDE (_rn) FROM %s", prev);
+  } else {
+    sb_appendf(&sb, "\nSELECT * FROM %s", prev);
+  }
 
   return sb_detach(&sb);
 }

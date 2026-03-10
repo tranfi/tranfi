@@ -719,6 +719,10 @@ static cJSON *build_grep_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON_AddStringToObject(args, "pattern", tokens->items[idx]);
+    /* Optional column name after pattern */
+    if (idx + 1 < tokens->count) {
+        cJSON_AddStringToObject(args, "column", tokens->items[idx + 1]);
+    }
     return args;
 }
 
