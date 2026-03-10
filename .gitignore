@@ -1,5 +1,8 @@
 # Build
 build/
+build-debug/
+corpus/
+*.gcov
 _site/
 build-wasm/
 build-release/
@@ -18,6 +21,7 @@ compile_commands.json
 
 # Python
 __pycache__/
+.hypothesis/
 *.pyc
 *.egg-info/
 dist/
@@ -28,6 +32,7 @@ app/public/wasm/tranfi_core.js
 
 # Node
 node_modules/
+package-lock.json
 packages/js/build/
 packages/js/wasm/
 js/csrc/

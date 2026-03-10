@@ -50,6 +50,13 @@ static double get_numeric(const tf_batch *b, size_t r, int ci) {
     return 0;
 }
 
+static void set_numeric(tf_batch *b, size_t r, size_t ci, double val) {
+    if (b->col_types[ci] == TF_TYPE_INT64)
+        tf_batch_set_int64(b, r, ci, (int64_t)val);
+    else if (b->col_types[ci] == TF_TYPE_FLOAT64)
+        tf_batch_set_float64(b, r, ci, val);
+}
+
 static void add_pending(interpolate_state *st, tf_batch *row_batch, size_t target_col) {
     if (st->n_pending >= st->cap_pending) {
         size_t newcap = st->cap_pending ? st->cap_pending * 2 : 16;
@@ -86,7 +93,7 @@ static void flush_pending(interpolate_state *st, tf_batch *ob, size_t *out_row,
             }
         }
 
-        tf_batch_set_float64(ob, r, target_col, interp_val);
+        set_numeric(ob, r, target_col, interp_val);
         ob->n_rows = r + 1;
         (*out_row)++;
 
@@ -127,7 +134,7 @@ static int interpolate_process(tf_step *self, tf_batch *in, tf_batch **out,
             if (st->method == INTERP_FORWARD && st->has_last) {
                 /* Forward fill: use last known value */
                 tf_batch_copy_row(ob, out_row, in, r);
-                tf_batch_set_float64(ob, out_row, ci, st->last_val);
+                set_numeric(ob, out_row, ci, st->last_val);
                 ob->n_rows = out_row + 1;
                 out_row++;
             } else if (st->method == INTERP_FORWARD) {
@@ -193,7 +200,7 @@ static int interpolate_flush(tf_step *self, tf_batch **out, tf_side_channels *si
             tf_batch_copy_row(ob, i, pb, 0);
             /* For linear/backward at end of stream: use last known if available */
             if (st->has_last) {
-                tf_batch_set_float64(ob, i, st->pending[i].target_col, st->last_val);
+                set_numeric(ob, i, st->pending[i].target_col, st->last_val);
             }
             ob->n_rows = i + 1;
             tf_batch_free(pb);

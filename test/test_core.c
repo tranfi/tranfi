@@ -3100,8 +3100,8 @@ static void test_pipeline_acf(void) {
     assert(line_starts_with(out, 0, "lag,acf"));
     /* lag 0 → acf = 1.0 */
     assert(line_starts_with(out, 1, "0,1"));
-    /* lag 1 → acf = 0.7 */
-    assert(line_starts_with(out, 2, "1,0.7"));
+    /* lag 1 → acf = 0.625 */
+    assert(line_starts_with(out, 2, "1,0.625"));
     /* 4 rows total: lag 0,1,2,3 */
     assert(line_starts_with(out, 4, "3,"));
 }

@@ -1,0 +1,9 @@
+#!/bin/bash
+# Pre-commit hook: rebuild and run C tests with ASan/UBSan
+set -e
+
+echo "Running pre-commit: debug build + tests with sanitizers..."
+make build-debug
+make test-debug
+
+echo "Pre-commit checks passed."

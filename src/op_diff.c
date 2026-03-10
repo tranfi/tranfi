@@ -52,8 +52,11 @@ static int diff_process(tf_step *self, tf_batch *in, tf_batch **out,
         double val = get_numeric(in, r, ci);
 
         if (st->count < st->order) {
-            /* Not enough history yet */
-            st->prev[st->count] = val;
+            /* Not enough history yet -- shift and insert at front
+             * so prev[0] is always the most recent value */
+            for (int k = st->count; k > 0; k--)
+                st->prev[k] = st->prev[k - 1];
+            st->prev[0] = val;
             st->count++;
             tf_batch_set_null(ob, r, in->n_cols);
             ob->n_rows = r + 1;

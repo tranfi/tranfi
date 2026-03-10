@@ -718,6 +718,15 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
         return TF_OK;
     }
 
+    /* --- Empty lines: treat as all-null row --- */
+    if (n_fields == 0 && st->n_cols > 0) {
+        for (size_t i = 0; i < st->n_cols && i < MAX_COLS; i++) {
+            st->fields[i].ptr = "";
+            st->fields[i].len = 0;
+        }
+        n_fields = st->n_cols;
+    }
+
     /* --- Repair mode: normalize field count to match header --- */
     if (st->repair && n_fields != st->n_cols) {
         if (n_fields < st->n_cols) {
@@ -815,7 +824,7 @@ static int csv_decode(tf_decoder *self, const uint8_t *data, size_t len,
             if (buf[i] == '\r' && i + 1 < buf_len && buf[i + 1] == '\n') {
                 i++;
             }
-            if (line_len > 0) {
+            if (line_len > 0 || st->schema_ready) {
                 if (process_line(st, (const char *)buf + line_start, line_len,
                                  out, n_out, &out_cap) != TF_OK)
                     return TF_ERROR;
