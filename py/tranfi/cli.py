@@ -4,7 +4,7 @@ cli.py — Tranfi CLI entry point.
 Usage:
   tranfi 'csv | filter "age > 25" | csv'  < in.csv
   tranfi -f pipeline.tf < in.csv > out.csv
-  tranfi -i input.csv -o output.csv 'csv | sort age | csv'
+  tranfi -i input.csv -o output.csv 'csv | top-k 10 age | csv'
   tranfi profile < data.csv
   tranfi serve -d ./data/
 """
@@ -52,7 +52,7 @@ examples:
   tranfi 'csv | filter "age > 25" | csv'       # filter rows
   tranfi 'csv | select name,age | csv'         # select columns
   tranfi 'csv | head 10 | csv'                 # first N rows
-  tranfi 'csv | sort age | csv'                # sort by column
+  tranfi 'csv | top-k 10 age | csv'            # bounded top rows by column
   tranfi 'csv | stats | jsonl'                 # aggregate stats
   tranfi profile                               # built-in recipe
   tranfi serve -d ./data/                      # start server

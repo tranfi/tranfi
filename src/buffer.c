@@ -8,6 +8,8 @@
 #include <string.h>
 
 #define INITIAL_CAP 4096
+#define COMPACT_AFTER_READ_POS (64 * 1024)
+#define MAX_RETAINED_EMPTY_CAP (1024 * 1024)
 
 void tf_buffer_init(tf_buffer *b) {
     b->data = NULL;
@@ -47,10 +49,20 @@ size_t tf_buffer_read(tf_buffer *b, uint8_t *out, size_t len) {
         memcpy(out, b->data + b->read_pos, len);
         b->read_pos += len;
     }
-    /* Auto-compact when all data consumed */
+    /* Auto-compact when all data consumed. Keep a modest scratch buffer for
+     * future chunks, but release one-off large output buffers after drains. */
     if (b->read_pos == b->len) {
         b->read_pos = 0;
         b->len = 0;
+        if (b->cap > MAX_RETAINED_EMPTY_CAP) {
+            uint8_t *new_data = realloc(b->data, MAX_RETAINED_EMPTY_CAP);
+            if (new_data) {
+                b->data = new_data;
+                b->cap = MAX_RETAINED_EMPTY_CAP;
+            }
+        }
+    } else if (b->read_pos >= COMPACT_AFTER_READ_POS && b->read_pos > b->cap / 2) {
+        tf_buffer_compact(b);
     }
     return len;
 }

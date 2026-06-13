@@ -17,13 +17,71 @@ typedef struct {
     char   *replacement;
     int     use_regex;
     regex_t compiled;
+    size_t  row_index;
+    size_t  audit_limit;
+    size_t  audit_emitted;
+    int     audit;
 } replace_state;
+
+static cJSON *replace_cell_to_json(const tf_batch *b, size_t row, size_t col) {
+    if (!b || col >= b->n_cols || row >= b->n_rows || tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
+    switch (b->col_types[col]) {
+        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
+        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
+        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
+        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
+        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
+        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
+        default: return cJSON_CreateNull();
+    }
+}
+
+static cJSON *replace_row_to_json(const tf_batch *b, size_t row) {
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) return NULL;
+    for (size_t c = 0; c < b->n_cols; c++) {
+        cJSON *value = replace_cell_to_json(b, row, c);
+        if (!value) { cJSON_Delete(obj); return NULL; }
+        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
+    }
+    return obj;
+}
+
+static int emit_replace_audit(replace_state *st, const tf_batch *b, size_t row, size_t col,
+                              size_t row_no, const char *before, const char *after,
+                              tf_side_channels *side) {
+    if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) return TF_ERROR;
+    cJSON_AddStringToObject(obj, "type", "audit");
+    cJSON_AddStringToObject(obj, "op", "replace");
+    cJSON_AddStringToObject(obj, "event", "value_changed");
+    cJSON_AddStringToObject(obj, "reason", "replace_match");
+    cJSON_AddStringToObject(obj, "channel", "audit");
+    cJSON_AddStringToObject(obj, "column", b->col_names[col] ? b->col_names[col] : "");
+    cJSON_AddStringToObject(obj, "pattern", st->pattern ? st->pattern : "");
+    cJSON_AddStringToObject(obj, "replacement", st->replacement ? st->replacement : "");
+    cJSON_AddBoolToObject(obj, "regex", st->use_regex ? 1 : 0);
+    cJSON_AddNumberToObject(obj, "row", (double)row_no);
+    cJSON_AddStringToObject(obj, "before", before ? before : "");
+    cJSON_AddStringToObject(obj, "after", after ? after : "");
+    cJSON *row_obj = replace_row_to_json(b, row);
+    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
+    char *line = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!line) return TF_ERROR;
+    int rc = tf_buffer_write_str(side->stats, line);
+    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    free(line);
+    if (rc == TF_OK) st->audit_emitted++;
+    return rc;
+}
 
 static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
                            tf_side_channels *side) {
-    (void)side;
     replace_state *st = self->state;
     *out = NULL;
+    size_t row_base = st->row_index;
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) return TF_ERROR;
@@ -39,9 +97,8 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (st->use_regex) {
             /* Regex mode: use regexec to find matches */
             for (size_t r = 0; r < ob->n_rows; r++) {
-                if (tf_batch_is_null(ob, r, ci)) continue;
-                const char *val = tf_batch_get_string(ob, r, ci);
-                /* Build result by repeatedly matching and replacing */
+                if (tf_batch_is_null(ob, r, (size_t)ci)) continue;
+                const char *val = tf_batch_get_string(ob, r, (size_t)ci);
                 size_t val_len = strlen(val);
                 size_t buf_cap = val_len * 2 + 64;
                 char *buf = malloc(buf_cap);
@@ -103,7 +160,14 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
                     memcpy(buf + buf_len, p, rest);
                     buf_len += rest;
                     buf[buf_len] = '\0';
-                    tf_batch_set_string(ob, r, ci, buf);
+                    const char *before = val;
+                    tf_batch_set_string(ob, r, (size_t)ci, buf);
+                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
+                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before, after, side) != TF_OK) {
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
                 }
                 free(buf);
             }
@@ -113,22 +177,25 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
             size_t rep_len = strlen(st->replacement);
             if (pat_len > 0) {
                 for (size_t r = 0; r < ob->n_rows; r++) {
-                    if (tf_batch_is_null(ob, r, ci)) continue;
-                    const char *val = tf_batch_get_string(ob, r, ci);
+                    if (tf_batch_is_null(ob, r, (size_t)ci)) continue;
+                    const char *val = tf_batch_get_string(ob, r, (size_t)ci);
                     /* Count occurrences */
                     size_t count = 0;
                     const char *p = val;
                     while ((p = strstr(p, st->pattern)) != NULL) { count++; p += pat_len; }
                     if (count == 0) continue;
 
-                    size_t new_len = strlen(val) + count * (rep_len - pat_len);
+                    size_t val_len = strlen(val);
+                    size_t new_len = rep_len >= pat_len
+                        ? val_len + count * (rep_len - pat_len)
+                        : val_len - count * (pat_len - rep_len);
                     char *buf = malloc(new_len + 1);
                     if (!buf) continue;
                     char *dst = buf;
                     p = val;
                     const char *found;
                     while ((found = strstr(p, st->pattern)) != NULL) {
-                        size_t prefix = found - p;
+                        size_t prefix = (size_t)(found - p);
                         memcpy(dst, p, prefix);
                         dst += prefix;
                         memcpy(dst, st->replacement, rep_len);
@@ -136,13 +203,21 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
                         p = found + pat_len;
                     }
                     strcpy(dst, p);
-                    tf_batch_set_string(ob, r, ci, buf);
+                    const char *before = val;
+                    tf_batch_set_string(ob, r, (size_t)ci, buf);
+                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
+                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before, after, side) != TF_OK) {
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
                     free(buf);
                 }
             }
         }
     }
 
+    st->row_index += in->n_rows;
     *out = ob;
     return TF_OK;
 }
@@ -151,15 +226,17 @@ static int replace_flush(tf_step *self, tf_batch **out, tf_side_channels *side) 
     (void)self; (void)side; *out = NULL; return TF_OK;
 }
 
+static void replace_state_free(replace_state *st) {
+    if (!st) return;
+    if (st->use_regex) regfree(&st->compiled);
+    free(st->column);
+    free(st->pattern);
+    free(st->replacement);
+    free(st);
+}
+
 static void replace_destroy(tf_step *self) {
-    replace_state *st = self->state;
-    if (st) {
-        if (st->use_regex) regfree(&st->compiled);
-        free(st->column);
-        free(st->pattern);
-        free(st->replacement);
-        free(st);
-    }
+    if (self) replace_state_free(self->state);
     free(self);
 }
 
@@ -176,22 +253,36 @@ tf_step *tf_replace_create(const cJSON *args) {
     st->column = strdup(col_j->valuestring);
     st->pattern = strdup(pat_j->valuestring);
     st->replacement = strdup(rep_j->valuestring);
+    st->audit_limit = 1000;
+    if (!st->column || !st->pattern || !st->replacement) { replace_state_free(st); return NULL; }
 
     cJSON *regex_j = cJSON_GetObjectItemCaseSensitive(args, "regex");
     st->use_regex = (cJSON_IsBool(regex_j) && cJSON_IsTrue(regex_j)) ? 1 : 0;
 
+    cJSON *audit_j = cJSON_GetObjectItemCaseSensitive(args, "audit");
+    st->audit = cJSON_IsTrue(audit_j) ? 1 : 0;
+    cJSON *audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
+    if (!audit_limit_j) audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
+    if (audit_limit_j) {
+        if (!cJSON_IsNumber(audit_limit_j) || audit_limit_j->valuedouble <= 0) {
+            tf_set_last_error("replace: audit_limit must be a positive integer");
+            replace_state_free(st);
+            return NULL;
+        }
+        st->audit_limit = (size_t)audit_limit_j->valuedouble;
+    }
+
     if (st->use_regex) {
         int rc = regcomp(&st->compiled, st->pattern, REG_EXTENDED);
         if (rc != 0) {
-            free(st->column); free(st->pattern); free(st->replacement); free(st);
+            replace_state_free(st);
             return NULL;
         }
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) {
-        if (st->use_regex) regfree(&st->compiled);
-        free(st->column); free(st->pattern); free(st->replacement); free(st);
+        replace_state_free(st);
         return NULL;
     }
     step->process = replace_process;

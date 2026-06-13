@@ -78,7 +78,7 @@ tf_step *tf_clip_create(const cJSON *args) {
     cJSON *max_j = cJSON_GetObjectItemCaseSensitive(args, "max");
     if (cJSON_IsNumber(max_j)) { st->max_val = max_j->valuedouble; st->has_max = 1; }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st); return NULL; }
     step->process = clip_process;
     step->flush = clip_flush;

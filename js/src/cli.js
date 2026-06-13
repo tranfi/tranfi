@@ -25,7 +25,7 @@ Examples:
   tranfi 'csv | filter "age > 25" | csv'       # filter rows
   tranfi 'csv | select name,age | csv'         # select columns
   tranfi 'csv | head 10 | csv'                 # first N rows
-  tranfi 'csv | sort age | csv'                # sort by column
+  tranfi 'csv | top-k 10 age | csv'            # bounded top rows by column
   tranfi 'csv | stats | jsonl'                 # aggregate stats
   tranfi profile                               # built-in recipe
 

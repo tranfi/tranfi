@@ -44,6 +44,9 @@ typedef struct {
     size_t       schema_n_cols;
     char       **schema_names;
     tf_type     *schema_types;
+    size_t       audit_limit;
+    size_t       audit_emitted;
+    int          audit;
 } normalize_state;
 
 static norm_method parse_method(const char *s) {
@@ -51,10 +54,86 @@ static norm_method parse_method(const char *s) {
     return NORM_MINMAX;
 }
 
+static const char *method_name(norm_method method) {
+    return method == NORM_ZSCORE ? "zscore" : "minmax";
+}
+
+static double normalize_compute(norm_method method, const col_stats *cs, double val) {
+    if (method == NORM_MINMAX) {
+        double range = cs->max_val - cs->min_val;
+        return (range > 0) ? (val - cs->min_val) / range : 0;
+    }
+    double std = (cs->count > 1) ? sqrt(cs->m2 / (double)(cs->count - 1)) : 1;
+    return (std > 0) ? (val - cs->mean) / std : 0;
+}
+
+static double normalize_stddev(const col_stats *cs) {
+    return (cs->count > 1) ? sqrt(cs->m2 / (double)(cs->count - 1)) : 0;
+}
+
 static double get_numeric(const tf_batch *b, size_t r, int ci) {
     if (b->col_types[ci] == TF_TYPE_INT64) return (double)tf_batch_get_int64(b, r, ci);
     if (b->col_types[ci] == TF_TYPE_FLOAT64) return tf_batch_get_float64(b, r, ci);
     return 0;
+}
+
+
+static cJSON *normalize_cell_to_json(const tf_batch *b, size_t row, size_t col) {
+    if (!b || col >= b->n_cols || row >= b->n_rows || tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
+    switch (b->col_types[col]) {
+        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
+        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
+        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
+        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
+        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
+        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
+        default: return cJSON_CreateNull();
+    }
+}
+
+static cJSON *normalize_row_to_json(const tf_batch *b, size_t row) {
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) return NULL;
+    for (size_t c = 0; c < b->n_cols; c++) {
+        cJSON *value = normalize_cell_to_json(b, row, c);
+        if (!value) { cJSON_Delete(obj); return NULL; }
+        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
+    }
+    return obj;
+}
+
+static int emit_normalize_audit(normalize_state *st, const tf_batch *b, size_t row,
+                                size_t col, size_t row_no, double before,
+                                double after, const col_stats *cs,
+                                tf_side_channels *side) {
+    if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) return TF_ERROR;
+    cJSON_AddStringToObject(obj, "type", "audit");
+    cJSON_AddStringToObject(obj, "op", "normalize");
+    cJSON_AddStringToObject(obj, "event", "value_changed");
+    cJSON_AddStringToObject(obj, "reason", st->method == NORM_ZSCORE ? "normalize_zscore" : "normalize_minmax");
+    cJSON_AddStringToObject(obj, "channel", "audit");
+    cJSON_AddStringToObject(obj, "column", b->col_names[col] ? b->col_names[col] : "");
+    cJSON_AddStringToObject(obj, "method", method_name(st->method));
+    cJSON_AddNumberToObject(obj, "row", (double)row_no);
+    cJSON_AddNumberToObject(obj, "before", before);
+    cJSON_AddNumberToObject(obj, "after", after);
+    cJSON_AddNumberToObject(obj, "count", (double)cs->count);
+    cJSON_AddNumberToObject(obj, "min", cs->min_val);
+    cJSON_AddNumberToObject(obj, "max", cs->max_val);
+    cJSON_AddNumberToObject(obj, "mean", cs->mean);
+    cJSON_AddNumberToObject(obj, "stddev", normalize_stddev(cs));
+    cJSON *row_obj = normalize_row_to_json(b, row);
+    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
+    char *line = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!line) return TF_ERROR;
+    int rc = tf_buffer_write_str(side->stats, line);
+    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    free(line);
+    if (rc == TF_OK) st->audit_emitted++;
+    return rc;
 }
 
 static void add_row(normalize_state *st, tf_batch *b, size_t r) {
@@ -124,7 +203,6 @@ static int normalize_process(tf_step *self, tf_batch *in, tf_batch **out,
 }
 
 static int normalize_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
-    (void)side;
     normalize_state *st = self->state;
     *out = NULL;
 
@@ -146,50 +224,60 @@ static int normalize_flush(tf_step *self, tf_batch **out, tf_side_channels *side
     for (size_t r = 0; r < st->n_rows; r++) {
         tf_batch *rb = st->rows[r].batch;
         tf_batch_copy_row(ob, r, rb, 0);
+        ob->n_rows = r + 1;
 
-        /* Normalize target columns */
+        /* Normalize first so audit row data reflects final row state. */
         for (size_t i = 0; i < st->n_columns; i++) {
             int ci = st->stats[i].col_idx;
             if (ci < 0 || tf_batch_is_null(rb, 0, ci)) continue;
 
             double val = get_numeric(rb, 0, ci);
             col_stats *cs = &st->stats[i];
-            double norm;
-
-            if (st->method == NORM_MINMAX) {
-                double range = cs->max_val - cs->min_val;
-                norm = (range > 0) ? (val - cs->min_val) / range : 0;
-            } else {
-                double std = (cs->count > 1) ? sqrt(cs->m2 / (double)(cs->count - 1)) : 1;
-                norm = (std > 0) ? (val - cs->mean) / std : 0;
-            }
+            double norm = normalize_compute(st->method, cs, val);
             tf_batch_set_float64(ob, r, ci, norm);
         }
-        ob->n_rows = r + 1;
+
+        if (st->audit) {
+            for (size_t i = 0; i < st->n_columns; i++) {
+                int ci = st->stats[i].col_idx;
+                if (ci < 0 || tf_batch_is_null(rb, 0, ci)) continue;
+
+                double val = get_numeric(rb, 0, ci);
+                col_stats *cs = &st->stats[i];
+                double norm = normalize_compute(st->method, cs, val);
+                if (val == norm) continue;
+                if (emit_normalize_audit(st, ob, r, (size_t)ci, r + 1, val, norm, cs, side) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
+            }
+        }
     }
 
     *out = ob;
     return TF_OK;
 }
 
-static void normalize_destroy(tf_step *self) {
-    normalize_state *st = self->state;
-    if (st) {
-        for (size_t i = 0; i < st->n_columns; i++)
-            free(st->columns[i]);
-        free(st->columns);
-        free(st->stats);
-        for (size_t i = 0; i < st->n_rows; i++)
-            tf_batch_free(st->rows[i].batch);
-        free(st->rows);
-        if (st->schema_names) {
-            for (size_t c = 0; c < st->schema_n_cols; c++)
-                free(st->schema_names[c]);
-            free(st->schema_names);
-        }
-        free(st->schema_types);
-        free(st);
+static void normalize_state_free(normalize_state *st) {
+    if (!st) return;
+    for (size_t i = 0; i < st->n_columns; i++)
+        free(st->columns[i]);
+    free(st->columns);
+    free(st->stats);
+    for (size_t i = 0; i < st->n_rows; i++)
+        tf_batch_free(st->rows[i].batch);
+    free(st->rows);
+    if (st->schema_names) {
+        for (size_t c = 0; c < st->schema_n_cols; c++)
+            free(st->schema_names[c]);
+        free(st->schema_names);
     }
+    free(st->schema_types);
+    free(st);
+}
+
+static void normalize_destroy(tf_step *self) {
+    if (self) normalize_state_free(self->state);
     free(self);
 }
 
@@ -204,6 +292,7 @@ tf_step *tf_normalize_create(const cJSON *args) {
     normalize_state *st = calloc(1, sizeof(normalize_state));
     if (!st) return NULL;
 
+    st->audit_limit = 1000;
     st->n_columns = n;
     st->columns = malloc(n * sizeof(char *));
     st->stats = calloc(n, sizeof(col_stats));
@@ -216,8 +305,21 @@ tf_step *tf_normalize_create(const cJSON *args) {
     cJSON *method_j = cJSON_GetObjectItemCaseSensitive(args, "method");
     st->method = parse_method(cJSON_IsString(method_j) ? method_j->valuestring : NULL);
 
-    tf_step *step = malloc(sizeof(tf_step));
-    if (!step) { normalize_destroy(&(tf_step){.state = st}); return NULL; }
+    cJSON *audit_j = cJSON_GetObjectItemCaseSensitive(args, "audit");
+    st->audit = cJSON_IsTrue(audit_j) ? 1 : 0;
+    cJSON *audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
+    if (!audit_limit_j) audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
+    if (audit_limit_j) {
+        if (!cJSON_IsNumber(audit_limit_j) || audit_limit_j->valuedouble <= 0) {
+            tf_set_last_error("normalize: audit_limit must be a positive integer");
+            normalize_state_free(st);
+            return NULL;
+        }
+        st->audit_limit = (size_t)audit_limit_j->valuedouble;
+    }
+
+    tf_step *step = calloc(1, sizeof(tf_step));
+    if (!step) { normalize_state_free(st); return NULL; }
     step->process = normalize_process;
     step->flush = normalize_flush;
     step->destroy = normalize_destroy;

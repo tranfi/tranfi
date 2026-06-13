@@ -25,7 +25,9 @@ export function compileToSchema (dsl, options = {}) {
     },
     inputs: [
       { name: 'file', type: 'file', stream: true },
-      { name: 'dsl', type: 'string', default: dsl || 'csv | csv', display: false }
+      { name: 'dsl', type: 'string', default: dsl || 'csv | csv', display: false },
+      { name: 'preview_rows', type: 'int', default: options.previewRows || 200, display: false },
+      { name: 'collect_output', type: 'toggle', default: options.collectOutput === true, display: false }
     ],
     outputs: [
       { name: 'output', type: 'table' },

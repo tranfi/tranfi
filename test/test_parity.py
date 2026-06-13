@@ -134,30 +134,30 @@ CSV_WITH_FILL_DOWN = (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run_tf(steps, data=CSV_DATA):
+def run_tf(steps, data=CSV_DATA, allow_blocking=False):
     """Run tranfi pipeline, return output as DataFrame."""
     p = tf.pipeline(steps)
-    result = p.run(input=data)
+    result = p.run(input=data, allow_blocking=allow_blocking)
     text = result.output_text.strip()
     if not text:
         return pd.DataFrame()
     return pd.read_csv(io.StringIO(text))
 
 
-def run_tf_dsl(dsl, data=CSV_DATA):
+def run_tf_dsl(dsl, data=CSV_DATA, allow_blocking=False):
     """Run tranfi DSL pipeline, return output as DataFrame."""
     p = tf.pipeline(dsl)
-    result = p.run(input=data)
+    result = p.run(input=data, allow_blocking=allow_blocking)
     text = result.output_text.strip()
     if not text:
         return pd.DataFrame()
     return pd.read_csv(io.StringIO(text))
 
 
-def run_tf_raw(steps, data=CSV_DATA):
+def run_tf_raw(steps, data=CSV_DATA, allow_blocking=False):
     """Run tranfi pipeline, return raw text output."""
     p = tf.pipeline(steps)
-    result = p.run(input=data)
+    result = p.run(input=data, allow_blocking=allow_blocking)
     return result.output_text
 
 
@@ -273,6 +273,38 @@ class TestRowFiltering:
         expected = CSV_DF.nlargest(3, 'score').copy()
         assert_df_equal(result, expected, check_order=False)
 
+    def test_bottom_k(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.bottom_k(3, 'score'),
+            tf.codec.csv_encode(),
+        ])
+        expected = CSV_DF.nsmallest(3, 'score').copy()
+        assert_df_equal(result, expected, check_order=False)
+
+    def test_slice_min_max(self):
+        min_result = run_tf([
+            tf.codec.csv(),
+            tf.ops.slice_min('score', n=2),
+            tf.codec.csv_encode(),
+        ])
+        max_result = run_tf([
+            tf.codec.csv(),
+            tf.ops.slice_max('score', n=2),
+            tf.codec.csv_encode(),
+        ])
+        assert_df_equal(min_result, CSV_DF.nsmallest(2, 'score').copy(), check_order=False)
+        assert_df_equal(max_result, CSV_DF.nlargest(2, 'score').copy(), check_order=False)
+
+    def test_sort_head_rewrites_to_bounded_topk(self):
+        import json
+        recipe = json.loads(tf.compile_dsl('csv | sort -score | head 3 | csv'))
+        ops = [step['op'] for step in recipe['steps']]
+        assert 'sort' not in ops
+        assert 'head' not in ops
+        assert ops[1] == 'top'
+        assert recipe['steps'][1]['memory_class'] == 'bounded_state'
+
     def test_sample(self):
         result = run_tf([
             tf.codec.csv(),
@@ -298,6 +330,28 @@ class TestColumnOps:
         ])
         expected = CSV_DF[['name', 'age']].copy()
         assert_df_equal(result, expected)
+
+
+
+    def test_select_helpers(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.select(['where(numeric)']),
+            tf.codec.csv_encode(),
+        ])
+        expected = CSV_DF[['age', 'score']].copy()
+        assert_df_equal(result, expected)
+
+
+    def test_relocate(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.relocate(['score'], before='age'),
+            tf.codec.csv_encode(),
+        ])
+        expected = CSV_DF[['name', 'score', 'age', 'city', 'active']].copy()
+        assert_df_equal(result, expected)
+
 
     def test_rename(self):
         result = run_tf([
@@ -439,7 +493,7 @@ class TestSortDedup:
             tf.codec.csv(),
             tf.ops.sort(['age']),
             tf.codec.csv_encode(),
-        ])
+        ], allow_blocking=True)
         expected = CSV_DF.sort_values('age', kind='stable').copy()
         assert_df_equal(result, expected)
 
@@ -448,7 +502,7 @@ class TestSortDedup:
             tf.codec.csv(),
             tf.ops.sort(['-score']),
             tf.codec.csv_encode(),
-        ])
+        ], allow_blocking=True)
         expected = CSV_DF.sort_values('score', ascending=False, kind='stable').copy()
         assert_df_equal(result, expected)
 
@@ -457,7 +511,7 @@ class TestSortDedup:
             tf.codec.csv(),
             tf.ops.sort(['city', '-age']),
             tf.codec.csv_encode(),
-        ])
+        ], allow_blocking=True)
         expected = CSV_DF.sort_values(
             ['city', 'age'], ascending=[True, False], kind='stable'
         ).copy()
@@ -620,7 +674,7 @@ class TestReshape:
                 'agg': 'sum',
             }},
             {'op': 'codec.csv.encode', 'args': {}},
-        ], data=CSV_PIVOT_DATA)
+        ], data=CSV_PIVOT_DATA, allow_blocking=True)
         df = pd.read_csv(io.BytesIO(CSV_PIVOT_DATA))
         expected = df.pivot_table(
             index='id', columns='metric', values='value', aggfunc='sum'
@@ -688,6 +742,38 @@ class TestSequential:
         assert groups[2] == 'A'  # was empty, filled from row above
         assert groups[3] == 'B'
         assert groups[4] == 'B'  # was empty, filled from row above
+
+
+    def test_rowid_global(self):
+        result = run_tf([
+            tf.codec.csv(batch_size=2),
+            tf.ops.rowid(result='row_n'),
+            tf.codec.csv_encode(),
+        ], data=CSV_NUMERIC)
+        df = pd.read_csv(io.BytesIO(CSV_NUMERIC))
+        assert list(result['row_n']) == list(range(1, len(df) + 1))
+
+    def test_rowid_grouped_unsorted(self):
+        data = b'x,y\n20,a\n10,a\n10,a\n30,b\n30,b\n20,b\n'
+        result = run_tf([
+            tf.codec.csv(batch_size=2),
+            tf.ops.rowid('x', result='x_row', max_keys=3),
+            tf.codec.csv_encode(),
+        ], data=data)
+        df = pd.read_csv(io.BytesIO(data))
+        expected = df.groupby('x', sort=False).cumcount() + 1
+        assert list(result['x_row']) == list(expected)
+
+    def test_rleid(self):
+        data = b'city,status\nA,on\nA,on\nA,off\nB,off\nA,off\nA,off\n'
+        result = run_tf([
+            tf.codec.csv(batch_size=2),
+            tf.ops.rleid(['city', 'status'], 'run_id'),
+            tf.codec.csv_encode(),
+        ], data=data)
+        df = pd.read_csv(io.BytesIO(data))
+        expected = df[['city', 'status']].ne(df[['city', 'status']].shift()).any(axis=1).cumsum()
+        assert list(result['run_id']) == list(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +1015,7 @@ class TestStack:
             tf.codec.csv(),
             tf.ops.stack(self.file_b),
             tf.codec.csv_encode(),
-        ], data=CSV_STACK_A)
+        ], data=CSV_STACK_A, allow_blocking=True)
         df_a = pd.read_csv(io.BytesIO(CSV_STACK_A))
         df_b = pd.read_csv(io.BytesIO(CSV_STACK_B))
         assert len(result) == len(df_a) + len(df_b)
@@ -940,7 +1026,7 @@ class TestStack:
             tf.codec.csv(),
             tf.ops.stack(self.file_b),
             tf.codec.csv_encode(),
-        ], data=CSV_STACK_A)
+        ], data=CSV_STACK_A, allow_blocking=True)
         names = set(result['name'])
         assert names == {'Alice', 'Bob', 'Charlie', 'Diana'}
 
@@ -950,7 +1036,7 @@ class TestStack:
             tf.codec.csv(),
             tf.ops.stack(self.file_b),
             tf.codec.csv_encode(),
-        ], data=CSV_STACK_A)
+        ], data=CSV_STACK_A, allow_blocking=True)
         df_a = pd.read_csv(io.BytesIO(CSV_STACK_A))
         df_b = pd.read_csv(io.BytesIO(CSV_STACK_B))
         expected = pd.concat([df_a, df_b], ignore_index=True)
@@ -968,7 +1054,7 @@ class TestTableEncoder:
         raw = run_tf_raw([
             tf.codec.csv(),
             tf.codec.table_encode(),
-        ], data=data)
+        ], data=data, allow_blocking=True)
         lines = raw.strip().split('\n')
         assert len(lines) == 4  # header + separator + 2 data rows
         assert lines[0].startswith('|')
@@ -982,7 +1068,7 @@ class TestTableEncoder:
         raw = run_tf_raw([
             tf.codec.csv(),
             tf.codec.table_encode(),
-        ])
+        ], allow_blocking=True)
         for name in CSV_DF['name']:
             assert name in raw
 
@@ -992,7 +1078,7 @@ class TestTableEncoder:
         raw = run_tf_raw([
             tf.codec.csv(),
             tf.codec.table_encode(),
-        ], data=data)
+        ], data=data, allow_blocking=True)
         lines = raw.strip().split('\n')
         pipe_counts = [line.count('|') for line in lines]
         # All lines should have same number of pipes
@@ -1001,7 +1087,7 @@ class TestTableEncoder:
     def test_recipe_look(self):
         """The 'look' recipe should produce table output."""
         p = tf.pipeline('look')
-        raw = p.run(input=CSV_DATA).output_text
+        raw = p.run(input=CSV_DATA, allow_blocking=True).output_text
         assert '|' in raw
         assert '---' in raw
         for name in CSV_DF['name']:
@@ -1115,6 +1201,96 @@ class TestExprFunctions:
         assert list(result['mx'].astype(int)) == [3, 8]
         assert list(result['mn'].astype(int)) == [1, 4]
 
+    def test_between_inrange(self):
+        data = b'name,age\nAlice,30\nBob,20\nCharlie,35\nDiana,40\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.filter(tf.expr("between(col('age'), 25, 35)")),
+            tf.codec.csv_encode(),
+        ], data=data)
+        expected = pd.DataFrame({
+            'name': ['Alice', 'Charlie'],
+            'age': [30, 35],
+        })
+        assert_df_equal(result, expected)
+
+        result2 = run_tf([
+            tf.codec.csv(),
+            tf.ops.filter(tf.expr("inrange(col('age'), 30, 40)")),
+            tf.codec.csv_encode(),
+        ], data=data)
+        expected2 = pd.DataFrame({
+            'name': ['Alice', 'Charlie', 'Diana'],
+            'age': [30, 35, 40],
+        })
+        assert_df_equal(result2, expected2)
+
+    def test_date_expressions(self):
+        data = b'd,ts\n2024-03-15,2024-03-15T12:34:56Z\n2023-12-25,2023-12-25T08:09:10Z\n'
+        result = run_tf([
+            tf.codec.csv(batch_size=1),
+            tf.ops.derive({
+                'd_year': tf.expr("year(col('d'))"),
+                'd_month': tf.expr("month(col('d'))"),
+                'd_day': tf.expr("day(col('d'))"),
+                'd_weekday': tf.expr("weekday(col('d'))"),
+                'month_start': tf.expr("date_trunc(col('d'), 'month')"),
+                'hour_start': tf.expr("date_trunc(col('ts'), 'hour')"),
+            }),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert list(result['d_year'].astype(int)) == [2024, 2023]
+        assert list(result['d_month'].astype(int)) == [3, 12]
+        assert list(result['d_day'].astype(int)) == [15, 25]
+        assert list(result['d_weekday'].astype(int)) == [5, 1]
+        assert list(result['month_start']) == ['2024-03-01', '2023-12-01']
+        assert list(result['hour_start']) == ['2024-03-15T12:00:00Z', '2023-12-25T08:00:00Z']
+
+    def test_case_when_case_match(self):
+        data = b'name,age,city\nAlice,30,NY\nBob,20,LA\nCara,45,SF\n'
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.derive({
+                'age_band': tf.expr("case_when(col('age') < 25, 'young', col('age') < 40, 'adult', 'senior')"),
+                'city_code': tf.expr("case_match(col('city'), 'NY', 'new-york', 'LA', 'los-angeles', 'other')"),
+            }),
+            tf.codec.csv_encode(),
+        ], data=data)
+        expected = pd.DataFrame({
+            'name': ['Alice', 'Bob', 'Cara'],
+            'age': [30, 20, 45],
+            'city': ['NY', 'LA', 'SF'],
+            'age_band': ['adult', 'young', 'senior'],
+            'city_code': ['new-york', 'los-angeles', 'other'],
+        })
+        assert_df_equal(result, expected)
+
+    def test_if_any_if_all(self):
+        data = b'id,a,b\n1,0,0\n2,1,0\n3,1,2\n'
+        any_result = run_tf([
+            tf.codec.csv(),
+            tf.ops.filter(tf.expr("if_any(col('a') > 0, col('b') > 0)")),
+            tf.codec.csv_encode(),
+        ], data=data)
+        any_expected = pd.DataFrame({
+            'id': [2, 3],
+            'a': [1, 1],
+            'b': [0, 2],
+        })
+        assert_df_equal(any_result, any_expected)
+
+        all_result = run_tf([
+            tf.codec.csv(),
+            tf.ops.filter(tf.expr("if_all(col('a') > 0, col('b') > 0)")),
+            tf.codec.csv_encode(),
+        ], data=data)
+        all_expected = pd.DataFrame({
+            'id': [3],
+            'a': [1],
+            'b': [2],
+        })
+        assert_df_equal(all_result, all_expected)
+
     def test_aliases(self):
         data = b'word\nhello\n'
         result = run_tf([
@@ -1174,8 +1350,40 @@ class TestLead:
             assert abs(float(result.iloc[i]['next_val']) - expected.iloc[i]) < 1e-6
 
 
+
+
 # ---------------------------------------------------------------------------
-# 16. Date truncation
+# 16. Lag operator
+# ---------------------------------------------------------------------------
+
+class TestLag:
+    def test_lag_vs_pandas_shift(self):
+        result = run_tf([
+            tf.codec.csv(),
+            tf.ops.lag('val', offset=2, result='prev2'),
+            tf.codec.csv_encode(),
+        ], data=CSV_NUMERIC)
+        df = pd.read_csv(io.BytesIO(CSV_NUMERIC))
+        expected = df['val'].shift(2)
+        assert len(result) == len(df)
+        assert pd.isna(result.iloc[0]['prev2'])
+        assert pd.isna(result.iloc[1]['prev2'])
+        for i in range(2, len(df)):
+            assert abs(float(result.iloc[i]['prev2']) - expected.iloc[i]) < 1e-6
+
+    def test_lag_string_type(self):
+        data = b'id,name\n1,Alice\n2,Bob\n3,Cara\n'
+        result = run_tf([
+            tf.codec.csv(batch_size=2),
+            tf.ops.lag('name', offset=1, result='prev_name'),
+            tf.codec.csv_encode(),
+        ], data=data)
+        assert pd.isna(result.iloc[0]['prev_name'])
+        assert result.iloc[1]['prev_name'] == 'Alice'
+        assert result.iloc[2]['prev_name'] == 'Bob'
+
+# ---------------------------------------------------------------------------
+# 17. Date truncation
 # ---------------------------------------------------------------------------
 
 class TestDateTrunc:

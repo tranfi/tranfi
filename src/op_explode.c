@@ -96,9 +96,11 @@ tf_step *tf_explode_create(const cJSON *args) {
     st->column = strdup(col_j->valuestring);
 
     cJSON *delim_j = cJSON_GetObjectItemCaseSensitive(args, "delimiter");
-    st->delimiter = strdup(cJSON_IsString(delim_j) ? delim_j->valuestring : ",");
+    const char *delim = cJSON_IsString(delim_j) ? delim_j->valuestring : ",";
+    if (delim[0] == '\0') { free(st->column); free(st); return NULL; }
+    st->delimiter = strdup(delim);
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->delimiter); free(st); return NULL; }
     step->process = explode_process;
     step->flush = explode_flush;

@@ -1,5 +1,5 @@
 /*
- * recipes.c — Built-in named recipes (20 common ETL pipelines).
+ * recipes.c — Built-in named recipes for common ETL pipelines.
  */
 
 #include "recipes.h"
@@ -20,6 +20,8 @@ static const recipe_entry recipes[] = {
      "Quick preview of first 10 rows"},
     {"schema",      "csv | head 0 | csv",
      "Show column names only"},
+    {"sniff",       "csv | schema infer rows=1000 | csv",
+     "Bounded-memory schema/type/nullability sniff (sample 1000 rows)"},
     {"summary",     "csv | stats count,min,max,avg,stddev | csv",
      "Summary statistics"},
     {"count",       "csv | stats count | csv",

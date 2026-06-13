@@ -116,7 +116,7 @@ tf_step *tf_hash_create(const cJSON *args) {
         }
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { hash_destroy(&(tf_step){.state = st}); return NULL; }
     step->process = hash_process;
     step->flush = hash_flush;

@@ -96,6 +96,10 @@ tf_ir_plan *tf_ir_plan_clone(const tf_ir_plan *plan) {
         tf_schema_copy(&dst->input_schema, &src->input_schema);
         tf_schema_copy(&dst->output_schema, &src->output_schema);
         dst->caps = src->caps;
+        dst->memory_class = src->memory_class;
+        dst->emit_class = src->emit_class;
+        dst->schema_class = src->schema_class;
+        dst->state_estimate = src->state_estimate;
     }
 
     tf_schema_copy(&clone->final_schema, &plan->final_schema);

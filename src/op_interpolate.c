@@ -236,7 +236,7 @@ tf_step *tf_interpolate_create(const cJSON *args) {
     cJSON *method_j = cJSON_GetObjectItemCaseSensitive(args, "method");
     st->method = parse_method(cJSON_IsString(method_j) ? method_j->valuestring : NULL);
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st); return NULL; }
     step->process = interpolate_process;
     step->flush = interpolate_flush;

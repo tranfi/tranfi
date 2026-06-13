@@ -142,7 +142,7 @@ tf_step *tf_skip_create(const cJSON *args) {
     st->n = (size_t)n_json->valueint;
     st->seen = 0;
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st); return NULL; }
     step->process = skip_process;
     step->flush = skip_flush;

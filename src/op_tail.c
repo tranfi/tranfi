@@ -86,7 +86,7 @@ tf_step *tf_tail_create(const cJSON *args) {
     if (!st) return NULL;
     st->limit = (size_t)n_json->valueint;
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st); return NULL; }
     step->process = tail_process;
     step->flush = tail_flush;

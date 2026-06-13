@@ -224,6 +224,103 @@ static int expr_to_sql(const tf_expr *e, strbuf *sb) {
         return 0;
       }
 
+      /* Special: case_when(cond, value, ..., default) → searched CASE */
+      if (strcmp(name, "case_when") == 0 && n >= 2) {
+        int pair_count = n / 2;
+        int default_idx = (n % 2 == 1) ? n - 1 : -1;
+        sb_append(sb, "(CASE");
+        for (int i = 0; i < pair_count; i++) {
+          sb_append(sb, " WHEN ");
+          if (expr_to_sql(e->func.args[i * 2], sb) != 0) return -1;
+          sb_append(sb, " THEN ");
+          if (expr_to_sql(e->func.args[i * 2 + 1], sb) != 0) return -1;
+        }
+        sb_append(sb, " ELSE ");
+        if (default_idx >= 0) {
+          if (expr_to_sql(e->func.args[default_idx], sb) != 0) return -1;
+        } else {
+          sb_append(sb, "NULL");
+        }
+        sb_append(sb, " END)");
+        return 0;
+      }
+
+      /* Special: case_match(value, key, result, ..., default) → simple CASE */
+      if (strcmp(name, "case_match") == 0 && n >= 3) {
+        int remaining = n - 1;
+        int pair_count = remaining / 2;
+        int default_idx = (remaining % 2 == 1) ? n - 1 : -1;
+        sb_append(sb, "(CASE ");
+        if (expr_to_sql(e->func.args[0], sb) != 0) return -1;
+        for (int i = 0; i < pair_count; i++) {
+          sb_append(sb, " WHEN ");
+          if (expr_to_sql(e->func.args[1 + i * 2], sb) != 0) return -1;
+          sb_append(sb, " THEN ");
+          if (expr_to_sql(e->func.args[2 + i * 2], sb) != 0) return -1;
+        }
+        sb_append(sb, " ELSE ");
+        if (default_idx >= 0) {
+          if (expr_to_sql(e->func.args[default_idx], sb) != 0) return -1;
+        } else {
+          sb_append(sb, "NULL");
+        }
+        sb_append(sb, " END)");
+        return 0;
+      }
+
+      /* Special: if_any(pred, ...) / if_all(pred, ...) → OR/AND reduction */
+      if (strcmp(name, "if_any") == 0 || strcmp(name, "if_all") == 0) {
+        int is_any = strcmp(name, "if_any") == 0;
+        if (n == 0) {
+          sb_append(sb, is_any ? "(FALSE)" : "(TRUE)");
+          return 0;
+        }
+        sb_append(sb, "(");
+        for (int i = 0; i < n; i++) {
+          if (i > 0) sb_append(sb, is_any ? " OR " : " AND ");
+          if (expr_to_sql(e->func.args[i], sb) != 0) return -1;
+        }
+        sb_append(sb, ")");
+        return 0;
+      }
+
+      /* Special: between(x, left, right) / inrange(x, left, right) → inclusive SQL range */
+      if ((strcmp(name, "between") == 0 || strcmp(name, "inrange") == 0) && n == 3) {
+        sb_append(sb, "(");
+        if (expr_to_sql(e->func.args[0], sb) != 0) return -1;
+        sb_append(sb, " BETWEEN ");
+        if (expr_to_sql(e->func.args[1], sb) != 0) return -1;
+        sb_append(sb, " AND ");
+        if (expr_to_sql(e->func.args[2], sb) != 0) return -1;
+        sb_append(sb, ")");
+        return 0;
+      }
+
+      /* Special: date/time component extraction */
+      if ((strcmp(name, "year") == 0 || strcmp(name, "month") == 0 ||
+           strcmp(name, "day") == 0 || strcmp(name, "hour") == 0 ||
+           strcmp(name, "minute") == 0 || strcmp(name, "second") == 0 ||
+           strcmp(name, "weekday") == 0 || strcmp(name, "epoch") == 0) && n == 1) {
+        const char *part = name;
+        if (strcmp(name, "weekday") == 0) part = "dow";
+        sb_append(sb, "EXTRACT(");
+        sb_append(sb, part);
+        sb_append(sb, " FROM ");
+        if (expr_to_sql(e->func.args[0], sb) != 0) return -1;
+        sb_append(sb, ")");
+        return 0;
+      }
+
+      /* Special: date_trunc(value, 'unit') → SQL date_trunc('unit', value) */
+      if (strcmp(name, "date_trunc") == 0 && n == 2 && e->func.args[1]->kind == EXPR_LIT_STR) {
+        sb_append(sb, "date_trunc(");
+        sql_quote_str(sb, e->func.args[1]->lit_str);
+        sb_append(sb, ", ");
+        if (expr_to_sql(e->func.args[0], sb) != 0) return -1;
+        sb_append(sb, ")");
+        return 0;
+      }
+
       /* Special: mod(a, b) → (a % b) */
       if (strcmp(name, "mod") == 0 && n == 2) {
         sb_append(sb, "(");
@@ -316,10 +413,48 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     return 0;
   }
 
+  /* ---- relocate ---- */
+  if (strcmp(op, "relocate") == 0) {
+    cJSON *before = cJSON_GetObjectItemCaseSensitive(args, "before");
+    cJSON *after = cJSON_GetObjectItemCaseSensitive(args, "after");
+    if (before || after) {
+      *error = strdup("relocate: SQL lowering for before/after requires known schema; default-front relocate is supported");
+      return -1;
+    }
+    cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
+    if (!cols || !cJSON_IsArray(cols)) { *error = strdup("relocate: missing 'columns'"); return -1; }
+    if (tf_column_selectors_have_syntax_json(cols)) {
+      *error = strdup("relocate: selector helpers require known schema for SQL lowering");
+      return -1;
+    }
+    strbuf moved;
+    sb_init(&moved);
+    int n = cJSON_GetArraySize(cols);
+    for (int i = 0; i < n; i++) {
+      cJSON *c = cJSON_GetArrayItem(cols, i);
+      if (!cJSON_IsString(c)) continue;
+      if (moved.len > 0) sb_append(&moved, ", ");
+      sql_quote_ident(&moved, c->valuestring);
+    }
+    if (moved.len == 0) {
+      sb_free(&moved);
+      *error = strdup("relocate: missing 'columns'");
+      return -1;
+    }
+    sb_appendf(sb, "%s AS (SELECT %s, * EXCLUDE (%s) FROM %s)",
+               cte_name, moved.data, moved.data, prev);
+    sb_free(&moved);
+    return 0;
+  }
+
   /* ---- select / reorder ---- */
   if (strcmp(op, "select") == 0 || strcmp(op, "reorder") == 0) {
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
     if (!cols || !cJSON_IsArray(cols)) { *error = strdup("select: missing 'columns'"); return -1; }
+    if (tf_column_selectors_have_syntax_json(cols)) {
+      *error = strdup("select: selector helpers require known schema for SQL lowering");
+      return -1;
+    }
     strbuf sel;
     sb_init(&sel);
     int n = cJSON_GetArraySize(cols);
@@ -434,7 +569,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
   }
 
   /* ---- head ---- */
-  if (strcmp(op, "head") == 0) {
+  if (strcmp(op, "head") == 0 || strcmp(op, "slice-head") == 0) {
     int n = jint(args, "n", 10);
     sb_appendf(sb, "%s AS (SELECT * FROM %s LIMIT %d)", cte_name, prev, n);
     return 0;
@@ -448,7 +583,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
   }
 
   /* ---- tail ---- */
-  if (strcmp(op, "tail") == 0) {
+  if (strcmp(op, "tail") == 0 || strcmp(op, "slice-tail") == 0) {
     int n = jint(args, "n", 10);
     sb_appendf(sb, "%s AS (SELECT * FROM (SELECT *, ROW_NUMBER() OVER () AS _rn, "
                "COUNT(*) OVER () AS _total FROM %s) WHERE _rn > _total - %d)",
@@ -456,12 +591,14 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     return 0;
   }
 
-  /* ---- top ---- */
-  if (strcmp(op, "top") == 0) {
+  /* ---- bounded top-k / bottom-k ---- */
+  if (strcmp(op, "top") == 0 || strcmp(op, "top-k") == 0 ||
+      strcmp(op, "bottom-k") == 0 || strcmp(op, "slice-min") == 0 ||
+      strcmp(op, "slice-max") == 0) {
     int n = jint(args, "n", 10);
     const char *column = jstr(args, "column");
     int desc = jbool(args, "desc", 1);
-    if (!column) { *error = strdup("top: missing 'column'"); return -1; }
+    if (!column) { *error = strdup("top-k: missing 'column'"); return -1; }
     strbuf tmp;
     sb_init(&tmp);
     sql_quote_ident(&tmp, column);
@@ -724,7 +861,8 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
       else if (strcmp(func, "median") == 0) sql_func = "MEDIAN";
       sb_append(&sel, sql_func);
       sb_append(&sel, "(");
-      sql_quote_ident(&sel, col);
+      if (strcmp(func, "count") == 0 && strcmp(col, "*") == 0) sb_append(&sel, "*");
+      else sql_quote_ident(&sel, col);
       sb_append(&sel, ") AS ");
       if (result) sql_quote_ident(&sel, result);
       else {
@@ -749,6 +887,12 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
 
   /* ---- frequency ---- */
   if (strcmp(op, "frequency") == 0) {
+    cJSON *overflow = args ? cJSON_GetObjectItemCaseSensitive(args, "overflow") : NULL;
+    if (cJSON_IsString(overflow) && strcmp(overflow->valuestring, "other") == 0) {
+      *error = strdup("frequency: overflow=other is not supported by SQL lowering");
+      return -1;
+    }
+
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
     if (cols && cJSON_IsArray(cols) && cJSON_GetArraySize(cols) > 0) {
       strbuf sel;
@@ -783,12 +927,16 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
   }
 
   /* ---- join ---- */
-  if (strcmp(op, "join") == 0) {
+  if (strcmp(op, "join") == 0 || strcmp(op, "semi-join") == 0 || strcmp(op, "anti-join") == 0) {
     const char *file = jstr(args, "file");
     const char *on = jstr(args, "on");
     const char *how = jstr(args, "how");
     if (!file || !on) { *error = strdup("join: missing 'file' or 'on'"); return -1; }
-    if (!how) how = "inner";
+    if (!how) {
+      if (strcmp(op, "semi-join") == 0) how = "semi";
+      else if (strcmp(op, "anti-join") == 0) how = "anti";
+      else how = "inner";
+    }
     const char *join_type = "INNER";
     if (strcmp(how, "left") == 0) join_type = "LEFT";
     else if (strcmp(how, "right") == 0) join_type = "RIGHT";
@@ -820,11 +968,43 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
       sb_append(&cond, " = b.");
       sql_quote_ident(&cond, on);
     }
+    if (strcmp(how, "semi") == 0 || strcmp(how, "anti") == 0) {
+      sb_appendf(sb, "%s AS (SELECT a.* FROM %s a WHERE %sEXISTS (SELECT 1 FROM read_csv_auto(",
+                 cte_name, prev, strcmp(how, "anti") == 0 ? "NOT " : "");
+      sql_quote_str(sb, file);
+      sb_appendf(sb, ") b WHERE %s))", cond.data);
+      sb_free(&cond);
+      return 0;
+    }
+
     sb_appendf(sb, "%s AS (SELECT a.* FROM %s a %s JOIN read_csv_auto(",
                cte_name, prev, join_type);
     sql_quote_str(sb, file);
     sb_appendf(sb, ") b ON %s)", cond.data);
     sb_free(&cond);
+    return 0;
+  }
+
+  /* ---- set ops ---- */
+  if (strcmp(op, "intersect") == 0 || strcmp(op, "setdiff") == 0 ||
+      strcmp(op, "intersect-all") == 0 || strcmp(op, "setdiff-all") == 0 ||
+      strcmp(op, "union") == 0 || strcmp(op, "union-all") == 0) {
+    const char *file = jstr(args, "file");
+    if (!file) { *error = strdup("set op: missing 'file'"); return -1; }
+    cJSON *cols = args ? cJSON_GetObjectItemCaseSensitive(args, "columns") : NULL;
+    if (cols && cJSON_IsArray(cols) && cJSON_GetArraySize(cols) > 0) {
+      *error = strdup("set op SQL lowering only supports all-column set operations");
+      return -1;
+    }
+    const char *sql_op = "INTERSECT";
+    if (strcmp(op, "setdiff") == 0) sql_op = "EXCEPT";
+    else if (strcmp(op, "intersect-all") == 0) sql_op = "INTERSECT ALL";
+    else if (strcmp(op, "setdiff-all") == 0) sql_op = "EXCEPT ALL";
+    else if (strcmp(op, "union") == 0) sql_op = "UNION";
+    else if (strcmp(op, "union-all") == 0) sql_op = "UNION ALL";
+    sb_appendf(sb, "%s AS (SELECT * FROM %s %s SELECT * FROM read_csv_auto(", cte_name, prev, sql_op);
+    sql_quote_str(sb, file);
+    sb_append(sb, "))");
     return 0;
   }
 
@@ -1011,25 +1191,63 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     return 0;
   }
 
-  /* ---- window ---- */
-  if (strcmp(op, "window") == 0) {
+  /* ---- window / rolling ---- */
+  if (strcmp(op, "window") == 0 || strcmp(op, "rolling-sum") == 0 ||
+      strcmp(op, "rolling-mean") == 0 || strcmp(op, "rolling-min") == 0 ||
+      strcmp(op, "rolling-max") == 0 || strcmp(op, "rolling-any") == 0 ||
+      strcmp(op, "rolling-all") == 0) {
     const char *column = jstr(args, "column");
     int size = jint(args, "size", 3);
     const char *func = jstr(args, "func");
     const char *result = jstr(args, "result");
+    int bool_roll = 0;
+    if (strcmp(op, "rolling-sum") == 0) func = "sum";
+    else if (strcmp(op, "rolling-mean") == 0) func = "avg";
+    else if (strcmp(op, "rolling-min") == 0) func = "min";
+    else if (strcmp(op, "rolling-max") == 0) func = "max";
+    else if (strcmp(op, "rolling-any") == 0) { func = "any"; bool_roll = 1; }
+    else if (strcmp(op, "rolling-all") == 0) { func = "all"; bool_roll = 1; }
     if (!column || !func) { *error = strdup("window: missing args"); return -1; }
-    const char *sql_func = "AVG";
-    if (strcmp(func, "sum") == 0) sql_func = "SUM";
-    else if (strcmp(func, "min") == 0) sql_func = "MIN";
-    else if (strcmp(func, "max") == 0) sql_func = "MAX";
-    else if (strcmp(func, "avg") == 0) sql_func = "AVG";
+
     strbuf qcol, qres;
     sb_init(&qcol); sb_init(&qres);
     sql_quote_ident(&qcol, column);
     if (result) sql_quote_ident(&qres, result);
-    else sb_appendf(&qres, "\"%s_%s_%d\"", func, column, size);
+    else sb_appendf(&qres, "\"%s_%s%d\"", column, func, size);
+
+    int preceding = size > 0 ? size - 1 : 0;
+    if (bool_roll) {
+      const char *nulls = jstr(args, "nulls");
+      if (!nulls) nulls = "ignore";
+      if (strcmp(nulls, "ignore") != 0 && strcmp(nulls, "false") != 0 &&
+          strcmp(nulls, "true") != 0 && strcmp(nulls, "propagate") != 0) {
+        sb_free(&qcol); sb_free(&qres);
+        *error = strdup("rolling-any/all: nulls must be ignore, false, true, or propagate");
+        return -1;
+      }
+      const char *sql_func = strcmp(func, "any") == 0 ? "BOOL_OR" : "BOOL_AND";
+      if (strcmp(nulls, "propagate") == 0) {
+        sb_appendf(sb, "%s AS (SELECT *, CASE WHEN COUNT(*) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) > COUNT(%s) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) THEN NULL ELSE %s(%s) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) END AS %s FROM %s)",
+                   cte_name, preceding, qcol.data, preceding, sql_func, qcol.data, preceding, qres.data, prev);
+      } else if (strcmp(nulls, "false") == 0 || strcmp(nulls, "true") == 0) {
+        const char *fill = strcmp(nulls, "true") == 0 ? "TRUE" : "FALSE";
+        sb_appendf(sb, "%s AS (SELECT *, %s(COALESCE(%s, %s)) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS %s FROM %s)",
+                   cte_name, sql_func, qcol.data, fill, preceding, qres.data, prev);
+      } else {
+        sb_appendf(sb, "%s AS (SELECT *, %s(%s) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS %s FROM %s)",
+                   cte_name, sql_func, qcol.data, preceding, qres.data, prev);
+      }
+      sb_free(&qcol); sb_free(&qres);
+      return 0;
+    }
+
+    const char *sql_func = "AVG";
+    if (strcmp(func, "sum") == 0) sql_func = "SUM";
+    else if (strcmp(func, "min") == 0) sql_func = "MIN";
+    else if (strcmp(func, "max") == 0) sql_func = "MAX";
+    else if (strcmp(func, "avg") == 0 || strcmp(func, "mean") == 0) sql_func = "AVG";
     sb_appendf(sb, "%s AS (SELECT *, %s(%s) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS %s FROM %s)",
-               cte_name, sql_func, qcol.data, size - 1, qres.data, prev);
+               cte_name, sql_func, qcol.data, preceding, qres.data, prev);
     sb_free(&qcol); sb_free(&qres);
     return 0;
   }
@@ -1056,19 +1274,117 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     return 0;
   }
 
-  /* ---- lead ---- */
-  if (strcmp(op, "lead") == 0) {
+  /* ---- rowid ---- */
+  if (strcmp(op, "rowid") == 0) {
+    cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
+    const char *result = jstr(args, "result");
+    if (!result) result = "_rowid";
+
+    strbuf qres;
+    sb_init(&qres);
+    sql_quote_ident(&qres, result);
+
+    strbuf partition;
+    sb_init(&partition);
+    if (cJSON_IsArray(cols) && cJSON_GetArraySize(cols) > 0) {
+      int n_cols = cJSON_GetArraySize(cols);
+      for (int i = 0; i < n_cols; i++) {
+        cJSON *item = cJSON_GetArrayItem(cols, i);
+        if (!cJSON_IsString(item)) {
+          sb_free(&qres);
+          sb_free(&partition);
+          *error = strdup("rowid: columns must be strings");
+          return -1;
+        }
+        strbuf qcol;
+        sb_init(&qcol);
+        sql_quote_ident(&qcol, item->valuestring);
+        if (i > 0) sb_append(&partition, ", ");
+        sb_append(&partition, qcol.data);
+        sb_free(&qcol);
+      }
+    }
+
+    if (partition.len > 0) {
+      sb_appendf(sb, "%s AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY %s ORDER BY _rn) AS %s FROM %s)",
+                 cte_name, partition.data, qres.data, prev);
+    } else {
+      sb_appendf(sb, "%s AS (SELECT *, ROW_NUMBER() OVER (ORDER BY _rn) AS %s FROM %s)",
+                 cte_name, qres.data, prev);
+    }
+    sb_free(&qres);
+    sb_free(&partition);
+    return 0;
+  }
+
+  /* ---- rleid ---- */
+  if (strcmp(op, "rleid") == 0) {
+    cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
+    const char *result = jstr(args, "result");
+    if (!result) result = "_rleid";
+    if (!cJSON_IsArray(cols) || cJSON_GetArraySize(cols) <= 0) {
+      *error = strdup("rleid: missing 'columns'");
+      return -1;
+    }
+
+    strbuf qres;
+    sb_init(&qres);
+    sql_quote_ident(&qres, result);
+
+    strbuf change;
+    sb_init(&change);
+    int n_cols = cJSON_GetArraySize(cols);
+    for (int i = 0; i < n_cols; i++) {
+      cJSON *item = cJSON_GetArrayItem(cols, i);
+      if (!cJSON_IsString(item)) {
+        sb_free(&qres);
+        sb_free(&change);
+        *error = strdup("rleid: columns must be strings");
+        return -1;
+      }
+      strbuf qcol;
+      sb_init(&qcol);
+      sql_quote_ident(&qcol, item->valuestring);
+      if (i > 0) sb_append(&change, " OR ");
+      sb_appendf(&change, "%s IS DISTINCT FROM LAG(%s) OVER (ORDER BY _rn)",
+                 qcol.data, qcol.data);
+      sb_free(&qcol);
+    }
+
+    sb_appendf(sb, "%s AS (SELECT * EXCLUDE (__tf_rleid_changed, __tf_rleid_ord), "
+                   "SUM(__tf_rleid_changed) OVER (ORDER BY __tf_rleid_ord ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS %s "
+                   "FROM (SELECT *, _rn AS __tf_rleid_ord, "
+                   "CASE WHEN ROW_NUMBER() OVER (ORDER BY _rn) = 1 OR %s THEN 1 ELSE 0 END AS __tf_rleid_changed "
+                   "FROM %s) __tf_rleid_src)",
+               cte_name, qres.data, change.data, prev);
+    sb_free(&qres);
+    sb_free(&change);
+    return 0;
+  }
+
+  /* ---- lead / lag / shift ---- */
+  if (strcmp(op, "lead") == 0 || strcmp(op, "lag") == 0 || strcmp(op, "shift") == 0) {
     const char *column = jstr(args, "column");
     int offset = jint(args, "offset", 1);
     const char *result = jstr(args, "result");
-    if (!column) { *error = strdup("lead: missing 'column'"); return -1; }
+    const char *type = jstr(args, "type");
+    const char *fn = "LAG";
+    const char *suffix = "lag";
+    if (strcmp(op, "lead") == 0 || (strcmp(op, "shift") == 0 && type && strcmp(type, "lead") == 0)) {
+      fn = "LEAD";
+      suffix = "lead";
+    } else if (strcmp(op, "shift") == 0) {
+      suffix = "shift";
+    }
+    if (!column) { *error = strdup("shift: missing 'column'"); return -1; }
+    if (offset <= 0) offset = 1;
     strbuf qcol, qres;
     sb_init(&qcol); sb_init(&qres);
     sql_quote_ident(&qcol, column);
     if (result) sql_quote_ident(&qres, result);
-    else sb_appendf(&qres, "\"%s_lead_%d\"", column, offset);
-    sb_appendf(sb, "%s AS (SELECT *, LEAD(%s, %d) OVER (ORDER BY _rn) AS %s FROM %s)",
-               cte_name, qcol.data, offset, qres.data, prev);
+    else sb_appendf(&qres, "\"%s_%s\"", column, suffix);
+    sb_appendf(sb, "%s AS (SELECT *, %s(%s, %d) OVER (ORDER BY _rn) AS %s FROM %s)",
+               cte_name, fn, qcol.data, offset, qres.data, prev);
     sb_free(&qcol); sb_free(&qres);
     return 0;
   }
@@ -1187,8 +1503,13 @@ char *tf_ir_to_sql(const tf_ir_plan *plan, char **error) {
   int needs_rn = 0;
   for (size_t i = first_transform; i < last_transform; i++) {
     const char *op = plan->nodes[i].op;
-    if (strcmp(op, "window") == 0 || strcmp(op, "step") == 0 ||
-        strcmp(op, "lead") == 0 || strcmp(op, "fill-down") == 0) {
+    if (strcmp(op, "window") == 0 || strcmp(op, "rolling-sum") == 0 ||
+        strcmp(op, "rolling-mean") == 0 || strcmp(op, "rolling-min") == 0 ||
+        strcmp(op, "rolling-max") == 0 || strcmp(op, "rolling-any") == 0 ||
+        strcmp(op, "rolling-all") == 0 || strcmp(op, "step") == 0 ||
+        strcmp(op, "lead") == 0 || strcmp(op, "lag") == 0 ||
+        strcmp(op, "shift") == 0 || strcmp(op, "rowid") == 0 ||
+        strcmp(op, "rleid") == 0 || strcmp(op, "fill-down") == 0) {
       needs_rn = 1;
       break;
     }

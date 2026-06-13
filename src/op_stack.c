@@ -305,7 +305,7 @@ tf_step *tf_stack_create(const cJSON *args) {
         st->tag_value_in = strdup("input");
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->file_path); free(st->tag_col); free(st->tag_value); free(st->tag_value_in); free(st); return NULL; }
     step->process = stack_process;
     step->flush = stack_flush;

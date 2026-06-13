@@ -110,7 +110,7 @@ tf_step *tf_anomaly_create(const cJSON *args) {
         st->result = strdup(buf);
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st); return NULL; }
     step->process = anomaly_process;
     step->flush = anomaly_flush;

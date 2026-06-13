@@ -35,7 +35,8 @@ static tf_batch *make_text_batch(size_t capacity) {
 }
 
 static int text_decode(tf_decoder *self, const uint8_t *data, size_t len,
-                       tf_batch ***out, size_t *n_out) {
+                       tf_batch ***out, size_t *n_out, tf_side_channels *side) {
+    (void)side;
     text_decoder_state *st = self->state;
     *out = NULL;
     *n_out = 0;
@@ -93,7 +94,8 @@ static int text_decode(tf_decoder *self, const uint8_t *data, size_t len,
     return TF_OK;
 }
 
-static int text_flush(tf_decoder *self, tf_batch ***out, size_t *n_out) {
+static int text_flush(tf_decoder *self, tf_batch ***out, size_t *n_out, tf_side_channels *side) {
+    (void)side;
     text_decoder_state *st = self->state;
     *out = NULL;
     *n_out = 0;

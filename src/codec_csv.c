@@ -30,8 +30,10 @@
 #include <limits.h>
 #include <math.h>
 
-#define DEFAULT_BATCH_SIZE 1024
-#define MAX_COLS           256   /* max columns per row */
+#define DEFAULT_BATCH_SIZE      1024
+#define DEFAULT_MAX_ERROR_BYTES 4096
+#define DEFAULT_MAX_RECORD_BYTES (64 * 1024 * 1024)
+#define MAX_COLS                256   /* max columns per row */
 
 /* ================================================================
  * Field Slice — zero-copy reference into the line buffer
@@ -40,6 +42,7 @@
 typedef struct {
     const char *ptr;   /* points into line buffer (or field_arena for escapes) */
     size_t      len;
+    int         quoted;
 } field_slice;
 
 /* ================================================================
@@ -316,11 +319,11 @@ static tf_type widen_type(tf_type current, tf_type incoming) {
  * - Unquoted fields: zero-copy slice into line buffer
  * - Quoted fields without "": zero-copy slice (skipping quotes)
  * - Quoted fields with "": unescaped copy allocated from field_arena
- * - Leading/trailing whitespace is trimmed from unquoted fields
+ * - Leading/trailing whitespace is optionally trimmed from unquoted fields
  */
 static size_t parse_csv_fields(const char *line, size_t line_len, char delim,
                                 field_slice *fields, size_t max_fields,
-                                tf_arena *field_arena) {
+                                tf_arena *field_arena, int trim_ws) {
     size_t count = 0;
     size_t i = 0;
 
@@ -330,6 +333,7 @@ static size_t parse_csv_fields(const char *line, size_t line_len, char delim,
             if (count > 0 && i > 0 && line[i - 1] == delim) {
                 fields[count].ptr = "";
                 fields[count].len = 0;
+                fields[count].quoted = 0;
                 count++;
             }
             break;
@@ -362,6 +366,7 @@ static size_t parse_csv_fields(const char *line, size_t line_len, char delim,
                 /* Zero-copy: slice directly into line buffer, past the quotes */
                 fields[count].ptr = line + start;
                 fields[count].len = field_end - start;
+                fields[count].quoted = 1;
             } else {
                 /* Rare path: unescape "" → " into arena-allocated buffer */
                 size_t max_len = field_end - start; /* unescaped is always shorter */
@@ -378,6 +383,7 @@ static size_t parse_csv_fields(const char *line, size_t line_len, char delim,
                 buf[out_len] = '\0';
                 fields[count].ptr = buf;
                 fields[count].len = out_len;
+                fields[count].quoted = 1;
             }
             count++;
         } else {
@@ -388,15 +394,18 @@ static size_t parse_csv_fields(const char *line, size_t line_len, char delim,
             const char *fptr = line + start;
             size_t flen = i - start;
 
-            /* Trim trailing whitespace */
-            while (flen > 0 && (fptr[flen - 1] == ' ' || fptr[flen - 1] == '\t'))
-                flen--;
-            /* Trim leading whitespace */
-            while (flen > 0 && (*fptr == ' ' || *fptr == '\t'))
-                { fptr++; flen--; }
+            if (trim_ws) {
+                /* Trim trailing ASCII whitespace */
+                while (flen > 0 && (fptr[flen - 1] == ' ' || fptr[flen - 1] == '\t'))
+                    flen--;
+                /* Trim leading ASCII whitespace */
+                while (flen > 0 && (*fptr == ' ' || *fptr == '\t'))
+                    { fptr++; flen--; }
+            }
 
             fields[count].ptr = fptr;
             fields[count].len = flen;
+            fields[count].quoted = 0;
             count++;
 
             if (i < line_len) i++; /* skip delimiter */
@@ -410,11 +419,36 @@ static size_t parse_csv_fields(const char *line, size_t line_len, char delim,
  * CSV Decoder
  * ================================================================ */
 
+typedef enum {
+    CSV_MODE_PERMISSIVE = 0,
+    CSV_MODE_REPAIR,
+    CSV_MODE_STRICT,
+} csv_decode_mode;
+
 typedef struct {
     char      delimiter;
     int       has_header;
     size_t    batch_size;
-    int       repair;     /* if true, pad short rows and truncate long rows */
+    csv_decode_mode mode;
+    char    **null_literals;
+    size_t    n_null_literals;
+    int       quoted_nulls;
+    int       trim_ws;
+    int       skip_empty_rows;
+    size_t    skip_rows;
+    size_t    skipped_rows;
+    int       limit_rows;
+    size_t    n_max;
+    size_t    data_rows_read;
+    char     *comment;
+    size_t    comment_len;
+    size_t    max_error_bytes;
+    size_t    max_record_bytes;
+    size_t    audit_limit;
+    size_t    audit_emitted;
+    int       audit;
+    size_t    line_number;
+    size_t    byte_offset;
 
     /* Line accumulator: incoming bytes are appended, complete lines extracted */
     tf_buffer line_buf;
@@ -437,6 +471,292 @@ typedef struct {
     field_slice fields[MAX_COLS];
     tf_arena   *field_arena;
 } csv_decoder_state;
+
+static const char *csv_mode_name(csv_decode_mode mode) {
+    switch (mode) {
+        case CSV_MODE_REPAIR: return "repair";
+        case CSV_MODE_STRICT: return "strict";
+        case CSV_MODE_PERMISSIVE:
+        default: return "permissive";
+    }
+}
+
+static int parse_csv_mode(const char *s, csv_decode_mode *out) {
+    if (!s || strcmp(s, "permissive") == 0 || strcmp(s, "lenient") == 0) {
+        *out = CSV_MODE_PERMISSIVE;
+        return 1;
+    }
+    if (strcmp(s, "repair") == 0) {
+        *out = CSV_MODE_REPAIR;
+        return 1;
+    }
+    if (strcmp(s, "strict") == 0 || strcmp(s, "fail") == 0 || strcmp(s, "error") == 0) {
+        *out = CSV_MODE_STRICT;
+        return 1;
+    }
+    return 0;
+}
+
+static int csv_line_is_blank(const char *line, size_t line_len) {
+    for (size_t i = 0; i < line_len; i++) {
+        if (line[i] != ' ' && line[i] != '\t') return 0;
+    }
+    return 1;
+}
+
+static int csv_find_comment(const csv_decoder_state *st, const char *line, size_t line_len,
+                            size_t *comment_pos) {
+    if (!st->comment || st->comment_len == 0 || st->comment_len > line_len) return 0;
+    int in_quotes = 0;
+    int at_field_start = 1;
+    for (size_t i = 0; i < line_len; i++) {
+        if (in_quotes) {
+            if (line[i] == '"') {
+                if (i + 1 < line_len && line[i + 1] == '"') {
+                    i++;
+                } else {
+                    in_quotes = 0;
+                    at_field_start = 0;
+                }
+            }
+            continue;
+        }
+        if (line[i] == '"' && at_field_start) {
+            in_quotes = 1;
+            at_field_start = 0;
+            continue;
+        }
+        if (i + st->comment_len <= line_len &&
+            memcmp(line + i, st->comment, st->comment_len) == 0) {
+            *comment_pos = i;
+            return 1;
+        }
+        if (line[i] == st->delimiter) at_field_start = 1;
+        else at_field_start = 0;
+    }
+    return 0;
+}
+
+static char *csv_raw_preview(const csv_decoder_state *st, const char *line, size_t line_len,
+                             int *truncated_out) {
+    size_t keep = line_len;
+    int truncated = 0;
+    if (st->max_error_bytes > 0 && keep > st->max_error_bytes) {
+        keep = st->max_error_bytes;
+        truncated = 1;
+    }
+    char *raw = malloc(keep + 1);
+    if (!raw) return NULL;
+    memcpy(raw, line, keep);
+    raw[keep] = '\0';
+    if (truncated_out) *truncated_out = truncated;
+    return raw;
+}
+
+static int write_json_line(tf_buffer *buf, cJSON *obj) {
+    char *printed = cJSON_PrintUnformatted(obj);
+    if (!printed) return TF_ERROR;
+    int rc = tf_buffer_write_str(buf, printed);
+    if (rc == TF_OK) rc = tf_buffer_write_str(buf, "\n");
+    free(printed);
+    return rc;
+}
+
+static int emit_csv_repair_audit(csv_decoder_state *st, const char *line, size_t line_len,
+                                 size_t line_no, size_t byte_offset, size_t n_fields,
+                                 const char *message, tf_side_channels *side) {
+    if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
+    int truncated = 0;
+    char *raw = csv_raw_preview(st, line, line_len, &truncated);
+    if (!raw) return TF_ERROR;
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) { free(raw); return TF_ERROR; }
+    cJSON_AddStringToObject(obj, "type", "audit");
+    cJSON_AddStringToObject(obj, "op", "codec.csv.decode");
+    cJSON_AddStringToObject(obj, "event", "row_repaired");
+    cJSON_AddStringToObject(obj, "reason", "csv_field_count");
+    cJSON_AddStringToObject(obj, "channel", "audit");
+    cJSON_AddStringToObject(obj, "mode", csv_mode_name(st->mode));
+    cJSON_AddStringToObject(obj, "action", "repair");
+    cJSON_AddNumberToObject(obj, "line", (double)line_no);
+    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
+    cJSON_AddNumberToObject(obj, "expected_fields", (double)st->n_cols);
+    cJSON_AddNumberToObject(obj, "actual_fields", (double)n_fields);
+    cJSON_AddStringToObject(obj, "message", message ? message : "CSV row field count differs from header");
+    cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
+    cJSON_AddStringToObject(obj, "raw", raw);
+    if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
+    int rc = write_json_line(side->stats, obj);
+    cJSON_Delete(obj);
+    free(raw);
+    if (rc == TF_OK) st->audit_emitted++;
+    return rc;
+}
+
+static int emit_csv_field_count_diagnostic(csv_decoder_state *st, const char *line, size_t line_len,
+                                           size_t line_no, size_t byte_offset, size_t n_fields,
+                                           const char *action, const char *severity,
+                                           const char *message, tf_side_channels *side) {
+    if (!side || !side->errors) return TF_OK;
+
+    size_t keep = line_len;
+    int truncated = 0;
+    if (st->max_error_bytes > 0 && keep > st->max_error_bytes) {
+        keep = st->max_error_bytes;
+        truncated = 1;
+    }
+
+    char *raw = malloc(keep + 1);
+    if (!raw) return TF_ERROR;
+    memcpy(raw, line, keep);
+    raw[keep] = '\0';
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) { free(raw); return TF_ERROR; }
+    cJSON_AddStringToObject(obj, "type", "csv_field_count");
+    cJSON_AddStringToObject(obj, "op", "codec.csv.decode");
+    cJSON_AddStringToObject(obj, "mode", csv_mode_name(st->mode));
+    cJSON_AddStringToObject(obj, "action", action);
+    cJSON_AddStringToObject(obj, "severity", severity);
+    cJSON_AddNumberToObject(obj, "line", (double)line_no);
+    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
+    cJSON_AddNumberToObject(obj, "expected_fields", (double)st->n_cols);
+    cJSON_AddNumberToObject(obj, "actual_fields", (double)n_fields);
+    cJSON_AddStringToObject(obj, "message", message ? message : "CSV row field count differs from header");
+    cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
+    cJSON_AddStringToObject(obj, "raw", raw);
+    if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
+
+    char *printed = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    free(raw);
+    if (!printed) return TF_ERROR;
+    int rc = tf_buffer_write_str(side->errors, printed);
+    if (rc == TF_OK) rc = tf_buffer_write_str(side->errors, "\n");
+    free(printed);
+    return rc;
+}
+
+static int emit_csv_record_size_diagnostic(csv_decoder_state *st, const char *record, size_t record_len,
+                                           size_t line_no, size_t byte_offset, tf_side_channels *side) {
+    if (!side || !side->errors) return TF_OK;
+
+    size_t keep = record_len;
+    int truncated = 0;
+    if (st->max_error_bytes > 0 && keep > st->max_error_bytes) {
+        keep = st->max_error_bytes;
+        truncated = 1;
+    }
+
+    char *raw = malloc(keep + 1);
+    if (!raw) return TF_ERROR;
+    memcpy(raw, record, keep);
+    raw[keep] = '\0';
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) { free(raw); return TF_ERROR; }
+    cJSON_AddStringToObject(obj, "type", "csv_record_too_large");
+    cJSON_AddStringToObject(obj, "op", "codec.csv.decode");
+    cJSON_AddStringToObject(obj, "action", "fail");
+    cJSON_AddStringToObject(obj, "severity", "error");
+    cJSON_AddNumberToObject(obj, "line", (double)line_no);
+    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
+    cJSON_AddNumberToObject(obj, "max_record_bytes", (double)st->max_record_bytes);
+    cJSON_AddNumberToObject(obj, "observed_bytes", (double)record_len);
+    cJSON_AddStringToObject(obj, "message", "CSV record exceeds max_record_bytes");
+    cJSON_AddNumberToObject(obj, "raw_bytes", (double)record_len);
+    cJSON_AddStringToObject(obj, "raw", raw);
+    if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
+
+    char *printed = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    free(raw);
+    if (!printed) return TF_ERROR;
+    int rc = tf_buffer_write_str(side->errors, printed);
+    if (rc == TF_OK) rc = tf_buffer_write_str(side->errors, "\n");
+    free(printed);
+    return rc;
+}
+
+static int check_csv_record_limit(csv_decoder_state *st, const uint8_t *buf, size_t line_start,
+                                  size_t observed_len, size_t line_no, size_t byte_offset,
+                                  tf_side_channels *side) {
+    if (st->max_record_bytes == 0 || observed_len <= st->max_record_bytes) return TF_OK;
+    if (emit_csv_record_size_diagnostic(st, (const char *)buf + line_start, observed_len,
+                                        line_no, byte_offset, side) != TF_OK)
+        return TF_ERROR;
+    char err[256];
+    snprintf(err, sizeof(err), "csv record exceeds max_record_bytes at line %zu: max %zu bytes, observed %zu bytes",
+             line_no, st->max_record_bytes, observed_len);
+    tf_set_last_error(err);
+    return TF_ERROR;
+}
+
+static int csv_add_null_literal(csv_decoder_state *st, const char *ptr, size_t len) {
+    char **tmp = realloc(st->null_literals, (st->n_null_literals + 1) * sizeof(char *));
+    if (!tmp) return TF_ERROR;
+    st->null_literals = tmp;
+    char *copy = malloc(len + 1);
+    if (!copy) return TF_ERROR;
+    memcpy(copy, ptr, len);
+    copy[len] = '\0';
+    st->null_literals[st->n_null_literals++] = copy;
+    return TF_OK;
+}
+
+static int csv_add_null_literal_token(csv_decoder_state *st, const char *tok) {
+    if (!tok) return TF_OK;
+    return csv_add_null_literal(st, tok, strlen(tok));
+}
+
+static int csv_add_null_literal_list(csv_decoder_state *st, const char *list) {
+    if (!list) return TF_OK;
+    const char *start = list;
+    for (const char *p = list; ; p++) {
+        if (*p == ',' || *p == '\0') {
+            if (csv_add_null_literal(st, start, (size_t)(p - start)) != TF_OK) return TF_ERROR;
+            if (*p == '\0') break;
+            start = p + 1;
+        }
+    }
+    return TF_OK;
+}
+
+static int csv_configure_null_literals(csv_decoder_state *st, const cJSON *args) {
+    const cJSON *nulls = cJSON_GetObjectItemCaseSensitive(args, "nulls");
+    if (!nulls) nulls = cJSON_GetObjectItemCaseSensitive(args, "na");
+    if (!nulls) return TF_OK;
+
+    if (cJSON_IsString(nulls)) {
+        return csv_add_null_literal_list(st, nulls->valuestring ? nulls->valuestring : "");
+    }
+    if (cJSON_IsArray(nulls)) {
+        const cJSON *item = NULL;
+        cJSON_ArrayForEach(item, nulls) {
+            if (cJSON_IsString(item)) {
+                if (csv_add_null_literal_token(st, item->valuestring) != TF_OK) return TF_ERROR;
+            }
+        }
+    }
+    return TF_OK;
+}
+
+static int csv_field_is_null(const csv_decoder_state *st, const field_slice *field) {
+    if (field->quoted && !st->quoted_nulls) return 0;
+    if (field->len == 0) return 1;
+    for (size_t i = 0; i < st->n_null_literals; i++) {
+        const char *lit = st->null_literals[i];
+        size_t len = strlen(lit);
+        if (field->len == len && memcmp(field->ptr, lit, len) == 0) return 1;
+    }
+    return 0;
+}
+
+static tf_type detect_type_field(const csv_decoder_state *st, const field_slice *field) {
+    if (csv_field_is_null(st, field)) return TF_TYPE_NULL;
+    if (field->len == 0) return TF_TYPE_STRING;
+    return detect_type_slice(field->ptr, field->len);
+}
 
 /*
  * Create a batch with all STRING columns (for type detection phase).
@@ -471,13 +791,14 @@ static tf_batch *make_typed_batch(csv_decoder_state *st) {
  * Used during the type detection phase (first batch).
  * Copies slice content into the batch's arena.
  */
-static void add_row_strings(tf_batch *b, const field_slice *fields,
-                             size_t n_fields, size_t n_cols) {
+static void add_row_strings(tf_batch *b, const csv_decoder_state *st,
+                            const field_slice *fields, size_t n_fields,
+                            size_t n_cols) {
     size_t row = b->n_rows;
     size_t cols = n_cols < n_fields ? n_cols : n_fields;
 
     for (size_t i = 0; i < cols; i++) {
-        if (fields[i].len == 0) {
+        if (csv_field_is_null(st, &fields[i])) {
             b->nulls[i][row] = 1;
         } else {
             /* Copy slice into batch arena as null-terminated string */
@@ -502,14 +823,14 @@ static void add_row_strings(tf_batch *b, const field_slice *fields,
  * Writes directly to column arrays, bypassing tf_batch_set_*()
  * bounds/type checks for speed in this hot path.
  */
-static void add_row_typed(tf_batch *b, const field_slice *fields,
-                           size_t n_fields, size_t n_cols,
-                           const tf_type *types) {
+static void add_row_typed(tf_batch *b, const csv_decoder_state *st,
+                          const field_slice *fields, size_t n_fields,
+                          size_t n_cols, const tf_type *types) {
     size_t row = b->n_rows;
     size_t cols = n_cols < n_fields ? n_cols : n_fields;
 
     for (size_t i = 0; i < cols; i++) {
-        if (fields[i].len == 0) {
+        if (csv_field_is_null(st, &fields[i])) {
             b->nulls[i][row] = 1;
             continue;
         }
@@ -602,7 +923,7 @@ static tf_batch *convert_batch_types(csv_decoder_state *st) {
                 continue;
             }
             const char *val = ((char **)src->columns[c])[r];
-            if (!val || !*val) {
+            if (!val) {
                 dst->nulls[c][r] = 1;
                 continue;
             }
@@ -682,6 +1003,21 @@ static int emit_batch(tf_batch *batch, tf_batch ***out, size_t *n_out, size_t *o
     return TF_OK;
 }
 
+static tf_batch *make_schema_only_batch(csv_decoder_state *st) {
+    for (size_t i = 0; i < st->n_cols; i++) {
+        if (st->col_types[i] == TF_TYPE_NULL) st->col_types[i] = TF_TYPE_STRING;
+    }
+    tf_batch *b = tf_batch_create(st->n_cols, 0);
+    if (!b) return NULL;
+    for (size_t i = 0; i < st->n_cols; i++) {
+        if (tf_batch_set_schema(b, i, st->col_names[i], st->col_types[i]) != TF_OK) {
+            tf_batch_free(b);
+            return NULL;
+        }
+    }
+    return b;
+}
+
 /*
  * Process a single complete CSV line.
  *
@@ -690,13 +1026,32 @@ static int emit_batch(tf_batch *batch, tf_batch ***out, size_t *n_out, size_t *o
  * When batch is full → emit it and start a new one.
  */
 static int process_line(csv_decoder_state *st, const char *line, size_t line_len,
-                        tf_batch ***out, size_t *n_out, size_t *out_cap) {
+                        size_t line_no, size_t byte_offset, tf_batch ***out,
+                        size_t *n_out, size_t *out_cap, tf_side_channels *side) {
+    if (st->skipped_rows < st->skip_rows) {
+        st->skipped_rows++;
+        return TF_OK;
+    }
+
+    size_t comment_pos = 0;
+    int had_comment = csv_find_comment(st, line, line_len, &comment_pos);
+    if (had_comment) line_len = comment_pos;
+    if ((had_comment && csv_line_is_blank(line, line_len)) ||
+        (st->skip_empty_rows && csv_line_is_blank(line, line_len))) {
+        return TF_OK;
+    }
+
+    if (st->schema_ready && st->limit_rows && st->data_rows_read >= st->n_max) {
+        return TF_OK;
+    }
+
     /* Reset field arena — escaped field data from previous line is discarded */
     tf_arena_reset(st->field_arena);
 
     /* Parse the line into zero-copy field slices */
     size_t n_fields = parse_csv_fields(line, line_len, st->delimiter,
-                                        st->fields, MAX_COLS, st->field_arena);
+                                        st->fields, MAX_COLS, st->field_arena,
+                                        st->trim_ws);
 
     /* --- First line: extract column headers --- */
     if (!st->schema_ready) {
@@ -723,21 +1078,42 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
         for (size_t i = 0; i < st->n_cols && i < MAX_COLS; i++) {
             st->fields[i].ptr = "";
             st->fields[i].len = 0;
+            st->fields[i].quoted = 0;
         }
         n_fields = st->n_cols;
     }
 
-    /* --- Repair mode: normalize field count to match header --- */
-    if (st->repair && n_fields != st->n_cols) {
+    /* --- Field-count policy: legacy permissive, observable repair, or strict failure. --- */
+    if (n_fields != st->n_cols) {
+        const char *message = n_fields < st->n_cols
+            ? "CSV row has fewer fields than header"
+            : "CSV row has more fields than header";
+        if (st->mode == CSV_MODE_STRICT) {
+            if (emit_csv_field_count_diagnostic(st, line, line_len, line_no, byte_offset, n_fields,
+                                                "fail", "error", message, side) != TF_OK)
+                return TF_ERROR;
+            char err[256];
+            snprintf(err, sizeof(err), "csv strict field count mismatch at line %zu: expected %zu fields, got %zu",
+                     line_no, st->n_cols, n_fields);
+            tf_set_last_error(err);
+            return TF_ERROR;
+        }
+        if (st->mode == CSV_MODE_REPAIR) {
+            if (emit_csv_field_count_diagnostic(st, line, line_len, line_no, byte_offset, n_fields,
+                                                "repair", "warning", message, side) != TF_OK)
+                return TF_ERROR;
+            if (emit_csv_repair_audit(st, line, line_len, line_no, byte_offset, n_fields,
+                                      message, side) != TF_OK)
+                return TF_ERROR;
+        }
         if (n_fields < st->n_cols) {
-            /* Pad short row with empty fields */
             for (size_t i = n_fields; i < st->n_cols && i < MAX_COLS; i++) {
                 st->fields[i].ptr = "";
                 st->fields[i].len = 0;
+                st->fields[i].quoted = 0;
             }
             n_fields = st->n_cols;
         } else {
-            /* Truncate long row */
             n_fields = st->n_cols;
         }
     }
@@ -756,15 +1132,16 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
     if (!st->types_frozen) {
         /* Type detection phase: detect types and store as STRING */
         for (size_t i = 0; i < n_fields && i < st->n_cols; i++) {
-            tf_type t = detect_type_slice(st->fields[i].ptr, st->fields[i].len);
+            tf_type t = detect_type_field(st, &st->fields[i]);
             st->col_types[i] = widen_type(st->col_types[i], t);
         }
-        add_row_strings(st->batch, st->fields, n_fields, st->n_cols);
+        add_row_strings(st->batch, st, st->fields, n_fields, st->n_cols);
     } else {
         /* Direct parse phase: parse directly to typed columns */
-        add_row_typed(st->batch, st->fields, n_fields, st->n_cols, st->col_types);
+        add_row_typed(st->batch, st, st->fields, n_fields, st->n_cols, st->col_types);
     }
     st->rows_buffered++;
+    st->data_rows_read++;
 
     /* --- Emit batch if full --- */
     if (st->rows_buffered >= st->batch_size) {
@@ -800,7 +1177,7 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
  * line remains in line_buf for the next call.
  */
 static int csv_decode(tf_decoder *self, const uint8_t *data, size_t len,
-                      tf_batch ***out, size_t *n_out) {
+                      tf_batch ***out, size_t *n_out, tf_side_channels *side) {
     csv_decoder_state *st = self->state;
     *out = NULL;
     *n_out = 0;
@@ -813,28 +1190,56 @@ static int csv_decode(tf_decoder *self, const uint8_t *data, size_t len,
     uint8_t *buf = st->line_buf.data + st->line_buf.read_pos;
     size_t buf_len = st->line_buf.len - st->line_buf.read_pos;
 
+    size_t base_offset = st->byte_offset;
     size_t line_start = 0;
     int in_quotes = 0;
+    int at_field_start = 1;
     for (size_t i = 0; i < buf_len; i++) {
-        if (buf[i] == '"') {
-            in_quotes = !in_quotes;
-        } else if (!in_quotes && (buf[i] == '\n' || buf[i] == '\r')) {
+        size_t current_record_len = i - line_start;
+        if (check_csv_record_limit(st, buf, line_start, current_record_len,
+                                   st->line_number + 1, base_offset + line_start, side) != TF_OK)
+            return TF_ERROR;
+
+        if (in_quotes) {
+            if (buf[i] == '"') {
+                if (i + 1 < buf_len && buf[i + 1] == '"') {
+                    i++; /* RFC 4180 escaped quote: doubled quote inside quoted field. */
+                } else {
+                    in_quotes = 0;
+                    at_field_start = 0;
+                }
+            }
+            continue;
+        }
+
+        if (buf[i] == '"' && at_field_start) {
+            in_quotes = 1;
+            at_field_start = 0;
+        } else if (buf[i] == st->delimiter) {
+            at_field_start = 1;
+        } else if (buf[i] == '\n' || buf[i] == '\r') {
             size_t line_len = i - line_start;
             /* Handle \r\n */
             if (buf[i] == '\r' && i + 1 < buf_len && buf[i + 1] == '\n') {
                 i++;
             }
+            size_t line_no = ++st->line_number;
+            size_t record_offset = base_offset + line_start;
             if (line_len > 0 || st->schema_ready) {
                 if (process_line(st, (const char *)buf + line_start, line_len,
-                                 out, n_out, &out_cap) != TF_OK)
+                                 line_no, record_offset, out, n_out, &out_cap, side) != TF_OK)
                     return TF_ERROR;
             }
             line_start = i + 1;
+            at_field_start = 1;
+        } else {
+            at_field_start = 0;
         }
     }
 
     /* Move unconsumed data to start of buffer */
     st->line_buf.read_pos += line_start;
+    st->byte_offset += line_start;
     tf_buffer_compact(&st->line_buf);
 
     return TF_OK;
@@ -843,7 +1248,7 @@ static int csv_decode(tf_decoder *self, const uint8_t *data, size_t len,
 /*
  * Flush: process any remaining partial line and emit the final batch.
  */
-static int csv_flush(tf_decoder *self, tf_batch ***out, size_t *n_out) {
+static int csv_flush(tf_decoder *self, tf_batch ***out, size_t *n_out, tf_side_channels *side) {
     csv_decoder_state *st = self->state;
     *out = NULL;
     *n_out = 0;
@@ -853,10 +1258,22 @@ static int csv_flush(tf_decoder *self, tf_batch ***out, size_t *n_out) {
     size_t remaining = tf_buffer_readable(&st->line_buf);
     if (remaining > 0) {
         uint8_t *buf = st->line_buf.data + st->line_buf.read_pos;
+        size_t line_no = ++st->line_number;
+        size_t record_offset = st->byte_offset;
+        if (check_csv_record_limit(st, buf, 0, remaining, line_no, record_offset, side) != TF_OK)
+            return TF_ERROR;
         if (process_line(st, (const char *)buf, remaining,
-                         out, n_out, &out_cap) != TF_OK)
+                         line_no, record_offset, out, n_out, &out_cap, side) != TF_OK)
             return TF_ERROR;
         st->line_buf.read_pos = st->line_buf.len;
+        st->byte_offset += remaining;
+    }
+
+    if (st->schema_ready && st->limit_rows && st->n_max == 0 && !st->batch) {
+        tf_batch *schema_only = make_schema_only_batch(st);
+        if (!schema_only) return TF_ERROR;
+        st->types_frozen = 1;
+        if (emit_batch(schema_only, out, n_out, &out_cap) != TF_OK) return TF_ERROR;
     }
 
     /* Emit any remaining partial batch */
@@ -892,6 +1309,9 @@ static void csv_decoder_destroy(tf_decoder *self) {
         for (size_t i = 0; i < st->n_cols; i++) free(st->col_names[i]);
         free(st->col_names);
         free(st->col_types);
+        for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+        free(st->null_literals);
+        free(st->comment);
         free(st);
     }
     free(self);
@@ -904,7 +1324,18 @@ tf_decoder *tf_csv_decoder_create(const cJSON *args) {
     st->delimiter = ',';
     st->has_header = 1;
     st->batch_size = DEFAULT_BATCH_SIZE;
-    st->repair = 0;
+    st->mode = CSV_MODE_PERMISSIVE;
+    st->quoted_nulls = 1;
+    st->trim_ws = 1;
+    st->skip_empty_rows = 0;
+    st->skip_rows = 0;
+    st->skipped_rows = 0;
+    st->limit_rows = 0;
+    st->n_max = 0;
+    st->data_rows_read = 0;
+    st->max_error_bytes = DEFAULT_MAX_ERROR_BYTES;
+    st->max_record_bytes = DEFAULT_MAX_RECORD_BYTES;
+    st->audit_limit = 1000;
 
     if (args) {
         cJSON *d = cJSON_GetObjectItemCaseSensitive(args, "delimiter");
@@ -920,18 +1351,154 @@ tf_decoder *tf_csv_decoder_create(const cJSON *args) {
             st->batch_size = (size_t)bs->valueint;
 
         cJSON *rep = cJSON_GetObjectItemCaseSensitive(args, "repair");
-        if (cJSON_IsBool(rep))
-            st->repair = cJSON_IsTrue(rep);
+        if (cJSON_IsBool(rep) && cJSON_IsTrue(rep))
+            st->mode = CSV_MODE_REPAIR;
+
+        cJSON *mode = cJSON_GetObjectItemCaseSensitive(args, "mode");
+        if (cJSON_IsString(mode)) {
+            if (!parse_csv_mode(mode->valuestring, &st->mode)) {
+                tf_set_last_error("csv: mode must be permissive, repair, or strict");
+                free(st);
+                return NULL;
+            }
+        }
+
+        cJSON *strict = cJSON_GetObjectItemCaseSensitive(args, "strict");
+        if (cJSON_IsBool(strict) && cJSON_IsTrue(strict))
+            st->mode = CSV_MODE_STRICT;
+
+        cJSON *max_err = cJSON_GetObjectItemCaseSensitive(args, "max_error_bytes");
+        if (cJSON_IsNumber(max_err) && max_err->valueint >= 0)
+            st->max_error_bytes = (size_t)max_err->valueint;
+
+        cJSON *max_rec = cJSON_GetObjectItemCaseSensitive(args, "max_record_bytes");
+        if (cJSON_IsNumber(max_rec) && max_rec->valueint >= 0)
+            st->max_record_bytes = (size_t)max_rec->valueint;
+
+        cJSON *audit = cJSON_GetObjectItemCaseSensitive(args, "audit");
+        st->audit = cJSON_IsTrue(audit) ? 1 : 0;
+        cJSON *audit_limit = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
+        if (!audit_limit) audit_limit = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
+        if (audit_limit) {
+            if (!cJSON_IsNumber(audit_limit) || audit_limit->valuedouble <= 0) {
+                tf_set_last_error("csv: audit_limit must be a positive integer");
+                for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+                free(st->null_literals);
+                free(st->comment);
+                free(st);
+                return NULL;
+            }
+            st->audit_limit = (size_t)audit_limit->valuedouble;
+            st->audit = 1;
+        }
+
+        cJSON *quoted_nulls = cJSON_GetObjectItemCaseSensitive(args, "quoted_nulls");
+        if (cJSON_IsBool(quoted_nulls))
+            st->quoted_nulls = cJSON_IsTrue(quoted_nulls);
+
+        cJSON *trim_ws = cJSON_GetObjectItemCaseSensitive(args, "trim_ws");
+        if (!trim_ws) trim_ws = cJSON_GetObjectItemCaseSensitive(args, "trimWs");
+        if (cJSON_IsBool(trim_ws))
+            st->trim_ws = cJSON_IsTrue(trim_ws);
+
+        cJSON *skip_empty = cJSON_GetObjectItemCaseSensitive(args, "skip_empty_rows");
+        if (!skip_empty) skip_empty = cJSON_GetObjectItemCaseSensitive(args, "skipEmptyRows");
+        if (cJSON_IsBool(skip_empty))
+            st->skip_empty_rows = cJSON_IsTrue(skip_empty);
+
+        cJSON *skip_rows = cJSON_GetObjectItemCaseSensitive(args, "skip");
+        if (!skip_rows) skip_rows = cJSON_GetObjectItemCaseSensitive(args, "skip_rows");
+        if (!skip_rows) skip_rows = cJSON_GetObjectItemCaseSensitive(args, "skipRows");
+        if (skip_rows) {
+            if (!cJSON_IsNumber(skip_rows) || skip_rows->valuedouble < 0) {
+                tf_set_last_error("csv: skip must be a non-negative integer");
+                for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+                free(st->null_literals);
+                free(st->comment);
+                free(st);
+                return NULL;
+            }
+            size_t parsed_skip = (size_t)skip_rows->valuedouble;
+            if ((double)parsed_skip != skip_rows->valuedouble) {
+                tf_set_last_error("csv: skip must be a non-negative integer");
+                for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+                free(st->null_literals);
+                free(st->comment);
+                free(st);
+                return NULL;
+            }
+            st->skip_rows = parsed_skip;
+        }
+
+        cJSON *n_max = cJSON_GetObjectItemCaseSensitive(args, "n_max");
+        if (!n_max) n_max = cJSON_GetObjectItemCaseSensitive(args, "nMax");
+        if (!n_max) n_max = cJSON_GetObjectItemCaseSensitive(args, "max_rows");
+        if (!n_max) n_max = cJSON_GetObjectItemCaseSensitive(args, "maxRows");
+        if (n_max) {
+            if (!cJSON_IsNumber(n_max) || n_max->valuedouble < 0) {
+                tf_set_last_error("csv: n_max must be a non-negative integer");
+                for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+                free(st->null_literals);
+                free(st->comment);
+                free(st);
+                return NULL;
+            }
+            size_t parsed_n_max = (size_t)n_max->valuedouble;
+            if ((double)parsed_n_max != n_max->valuedouble) {
+                tf_set_last_error("csv: n_max must be a non-negative integer");
+                for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+                free(st->null_literals);
+                free(st->comment);
+                free(st);
+                return NULL;
+            }
+            st->limit_rows = 1;
+            st->n_max = parsed_n_max;
+        }
+
+        cJSON *comment = cJSON_GetObjectItemCaseSensitive(args, "comment");
+        if (cJSON_IsString(comment) && comment->valuestring && comment->valuestring[0]) {
+            st->comment = strdup(comment->valuestring);
+            if (!st->comment) {
+                for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+                free(st->null_literals);
+                free(st->comment);
+                free(st);
+                return NULL;
+            }
+            st->comment_len = strlen(st->comment);
+        }
+
+        if (csv_configure_null_literals(st, args) != TF_OK) {
+            for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+            free(st->null_literals);
+            free(st->comment);
+            free(st);
+            return NULL;
+        }
     }
 
     tf_buffer_init(&st->line_buf);
 
     /* Arena for escaped quoted field data (reset per line, rarely used) */
     st->field_arena = tf_arena_create(4096);
-    if (!st->field_arena) { free(st); return NULL; }
+    if (!st->field_arena) {
+        for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+        free(st->null_literals);
+        free(st->comment);
+        free(st);
+        return NULL;
+    }
 
     tf_decoder *dec = malloc(sizeof(tf_decoder));
-    if (!dec) { tf_arena_free(st->field_arena); free(st); return NULL; }
+    if (!dec) {
+        tf_arena_free(st->field_arena);
+        for (size_t i = 0; i < st->n_null_literals; i++) free(st->null_literals[i]);
+        free(st->null_literals);
+        free(st->comment);
+        free(st);
+        return NULL;
+    }
     dec->decode = csv_decode;
     dec->flush = csv_flush;
     dec->destroy = csv_decoder_destroy;

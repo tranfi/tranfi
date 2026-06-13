@@ -93,7 +93,7 @@ tf_step *tf_ewma_create(const cJSON *args) {
         st->result = strdup(buf);
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st); return NULL; }
     step->process = ewma_process;
     step->flush = ewma_flush;

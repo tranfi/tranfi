@@ -15,6 +15,10 @@
     "./wasm": {
       "require": "./wasm/index.js",
       "default": "./wasm/index.js"
+    },
+    "./wasm/worker": {
+      "require": "./wasm/worker.js",
+      "default": "./wasm/worker.js"
     }
   },
   "files": [

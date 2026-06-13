@@ -4,12 +4,17 @@ import os
 import tempfile
 from .._ffi import compile_to_sql
 from ..pipeline import PipelineResult
+from ..memory_policy import memory_for_engine
+
+
+def _sql_string(value):
+    return str(value).replace("'", "''")
 
 
 class DuckDBEngine:
     """Execute tranfi pipelines using DuckDB."""
 
-    def run(self, dsl, *, input=None, input_file=None):
+    def run(self, dsl, *, input=None, input_file=None, memory=None, spill_dir=None):
         try:
             import duckdb
         except ImportError:
@@ -20,6 +25,12 @@ class DuckDBEngine:
 
         sql = compile_to_sql(dsl)
         conn = duckdb.connect(':memory:')
+
+        memory_limit = memory_for_engine(memory)
+        if memory_limit:
+            conn.execute(f"SET memory_limit = '{_sql_string(memory_limit)}'")
+        if spill_dir:
+            conn.execute(f"SET temp_directory = '{_sql_string(spill_dir)}'")
 
         tmp_path = None
         try:

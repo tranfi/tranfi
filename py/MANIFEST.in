@@ -1,3 +1,4 @@
+include LICENSE NOTICE
 recursive-include csrc *.c *.h
 include tranfi/_native.c
 recursive-include tranfi/app *

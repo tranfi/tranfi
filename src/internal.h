@@ -95,6 +95,29 @@ int tf_batch_copy_row(tf_batch *dst, size_t dst_row,
 
 void tf_batch_free(tf_batch *b);
 
+/* ---- Column selector helpers ---- */
+
+typedef struct cJSON cJSON;
+
+const cJSON *tf_json_path_resolve(const cJSON *root, const char *path);
+
+int tf_column_selector_has_syntax(const char *raw);
+int tf_column_selectors_have_syntax_json(const cJSON *selectors);
+int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
+                                char **names, const tf_type *types, size_t n_cols,
+                                int **out_indices, size_t *out_n,
+                                char **error);
+int tf_column_selectors_resolve_json(const cJSON *selectors,
+                                     char **names, const tf_type *types, size_t n_cols,
+                                     int **out_indices, size_t *out_n,
+                                     char **error);
+
+int tf_estimate_step_state_bytes(const tf_ir_node *node, size_t *out,
+                                 char *reason, size_t reason_size);
+int tf_estimate_key_state_plan_bytes(const tf_ir_plan *ir, size_t *out,
+                                     const tf_ir_node **failed_node,
+                                     char *reason, size_t reason_size);
+
 /* ---- Step interface (transforms) ---- */
 
 /*
@@ -105,6 +128,7 @@ typedef struct tf_side_channels {
     tf_buffer *errors;
     tf_buffer *stats;
     tf_buffer *samples;
+    const char *source_name;
 } tf_side_channels;
 
 typedef struct tf_step {
@@ -114,10 +138,37 @@ typedef struct tf_step {
                     tf_side_channels *side);
     /* Flush any buffered state. */
     int  (*flush)(struct tf_step *self, tf_batch **out, tf_side_channels *side);
+    /* Optional continuation for flush-latent steps that emit multiple batches. */
+    int  (*flush_next)(struct tf_step *self, tf_batch **out, tf_side_channels *side);
+    /* Optional JSON stats hook. Appends comma-prefixed fields to step_stats. */
+    int  (*append_stats)(struct tf_step *self, tf_buffer *out);
     /* Free all resources. */
     void (*destroy)(struct tf_step *self);
     void  *state;
 } tf_step;
+
+#define TF_STEP_WARN_BLOCKING              (1u << 0)
+#define TF_STEP_WARN_FLUSH_LATENT          (1u << 1)
+#define TF_STEP_WARN_UNBOUNDED_STATE       (1u << 2)
+#define TF_STEP_WARN_DATA_DEPENDENT_SCHEMA (1u << 3)
+
+typedef struct tf_step_run_stats {
+    char           *op;
+    char           *state_estimate;
+    char           *state_bytes_reason;
+    char           *execution_target;
+    size_t          node_index;
+    size_t          state_bytes_estimate;
+    int             has_state_bytes_estimate;
+    uint32_t        warnings;
+    tf_memory_class memory_class;
+    tf_emit_class   emit_class;
+    tf_schema_class schema_class;
+    size_t          batches_in;
+    size_t          batches_out;
+    size_t          rows_in;
+    size_t          rows_out;
+} tf_step_run_stats;
 
 /* ---- Decoder interface (bytes → batches) ---- */
 
@@ -128,9 +179,10 @@ typedef struct tf_decoder {
      * Caller frees the array and each batch.
      */
     int  (*decode)(struct tf_decoder *self, const uint8_t *data, size_t len,
-                   tf_batch ***out, size_t *n_out);
+                   tf_batch ***out, size_t *n_out, tf_side_channels *side);
     /* Flush remaining data (e.g. last partial line). */
-    int  (*flush)(struct tf_decoder *self, tf_batch ***out, size_t *n_out);
+    int  (*flush)(struct tf_decoder *self, tf_batch ***out, size_t *n_out,
+                  tf_side_channels *side);
     void (*destroy)(struct tf_decoder *self);
     void  *state;
 } tf_decoder;
@@ -154,20 +206,40 @@ struct tf_pipeline {
     tf_decoder  *decoder;
     tf_step    **steps;
     size_t       n_steps;
+    tf_step_run_stats *step_stats;
+    size_t       n_step_stats;
     tf_encoder  *encoder;
     tf_buffer    output[TF_NUM_CHANNELS];
+    tf_pipeline_sink_fn sinks[TF_NUM_CHANNELS];
+    void        *sink_users[TF_NUM_CHANNELS];
+    tf_pipeline_batch_sink_fn batch_sink;
+    void        *batch_sink_user;
+    int          encode_output;
+    tf_pipeline_progress_fn progress_cb;
+    void        *progress_user;
+    size_t       progress_interval_rows;
+    size_t       progress_last_rows_in;
+    size_t       progress_last_rows_out;
     tf_side_channels side;
     size_t       rows_in;
     size_t       rows_out;
+    size_t       batches_in;
+    size_t       batches_out;
     size_t       bytes_in;
     size_t       bytes_out;
+    char        *source_name;
     char        *error;
     int          finished;
+    int          finish_started;
+    int          finish_phase;
+    tf_batch   **finish_batches;
+    size_t       finish_n_batches;
+    size_t       finish_batch_index;
+    size_t       finish_step_index;
+    int          finish_step_in_next;
 };
 
 /* ---- Codec constructors (used by plan parser) ---- */
-
-typedef struct cJSON cJSON;
 
 tf_decoder *tf_csv_decoder_create(const cJSON *args);
 tf_encoder *tf_csv_encoder_create(const cJSON *args);
@@ -180,14 +252,23 @@ tf_encoder *tf_text_encoder_create(const cJSON *args);
 
 tf_step *tf_filter_create(const cJSON *args);
 tf_step *tf_select_create(const cJSON *args);
+tf_step *tf_relocate_create(const cJSON *args);
 tf_step *tf_rename_create(const cJSON *args);
 tf_step *tf_head_create(const cJSON *args);
 tf_step *tf_skip_create(const cJSON *args);
 tf_step *tf_derive_create(const cJSON *args);
+tf_step *tf_source_name_create(const cJSON *args);
+tf_step *tf_across_create(const cJSON *args);
 tf_step *tf_stats_create(const cJSON *args);
+tf_step *tf_scan_create(const cJSON *args);
 tf_step *tf_unique_create(const cJSON *args);
 tf_step *tf_sort_create(const cJSON *args);
 tf_step *tf_validate_create(const cJSON *args);
+tf_step *tf_assert_create(const cJSON *args);
+tf_step *tf_quarantine_create(const cJSON *args);
+tf_step *tf_schema_create(const cJSON *args);
+tf_step *tf_schema_infer_create(const cJSON *args);
+tf_step *tf_tee_create(const cJSON *args);
 tf_step *tf_trim_create(const cJSON *args);
 tf_step *tf_fill_null_create(const cJSON *args);
 tf_step *tf_cast_create(const cJSON *args);
@@ -198,20 +279,46 @@ tf_step *tf_bin_create(const cJSON *args);
 tf_step *tf_fill_down_create(const cJSON *args);
 tf_step *tf_step_create(const cJSON *args);
 tf_step *tf_window_create(const cJSON *args);
+tf_step *tf_rolling_sum_create(const cJSON *args);
+tf_step *tf_rolling_mean_create(const cJSON *args);
+tf_step *tf_rolling_min_create(const cJSON *args);
+tf_step *tf_rolling_max_create(const cJSON *args);
+tf_step *tf_rolling_any_create(const cJSON *args);
+tf_step *tf_rolling_all_create(const cJSON *args);
 tf_step *tf_explode_create(const cJSON *args);
 tf_step *tf_split_create(const cJSON *args);
 tf_step *tf_unpivot_create(const cJSON *args);
 tf_step *tf_tail_create(const cJSON *args);
 tf_step *tf_top_create(const cJSON *args);
+tf_step *tf_top_k_create(const cJSON *args);
+tf_step *tf_bottom_k_create(const cJSON *args);
+tf_step *tf_slice_min_create(const cJSON *args);
+tf_step *tf_slice_max_create(const cJSON *args);
 tf_step *tf_sample_create(const cJSON *args);
 tf_step *tf_group_agg_create(const cJSON *args);
 tf_step *tf_frequency_create(const cJSON *args);
 tf_step *tf_datetime_create(const cJSON *args);
 tf_step *tf_grep_create(const cJSON *args);
+tf_step *tf_json_extract_create(const cJSON *args);
+tf_step *tf_json_filter_create(const cJSON *args);
+tf_step *tf_json_schema_create(const cJSON *args);
+tf_step *tf_json_flatten_create(const cJSON *args);
 tf_step *tf_pivot_create(const cJSON *args);
 tf_step *tf_join_create(const cJSON *args);
+tf_step *tf_semi_join_create(const cJSON *args);
+tf_step *tf_anti_join_create(const cJSON *args);
+tf_step *tf_intersect_create(const cJSON *args);
+tf_step *tf_setdiff_create(const cJSON *args);
+tf_step *tf_intersect_all_create(const cJSON *args);
+tf_step *tf_setdiff_all_create(const cJSON *args);
+tf_step *tf_union_create(const cJSON *args);
+tf_step *tf_union_all_create(const cJSON *args);
 tf_step *tf_stack_create(const cJSON *args);
 tf_step *tf_lead_create(const cJSON *args);
+tf_step *tf_lag_create(const cJSON *args);
+tf_step *tf_shift_create(const cJSON *args);
+tf_step *tf_rowid_create(const cJSON *args);
+tf_step *tf_rleid_create(const cJSON *args);
 tf_step *tf_date_trunc_create(const cJSON *args);
 tf_step *tf_onehot_create(const cJSON *args);
 tf_step *tf_label_encode_create(const cJSON *args);

@@ -28,5 +28,12 @@ if [ -f tranfi_core.wasm ]; then
   cp tranfi_core.wasm "$ROOT/js/wasm/"
 fi
 
+echo "Copying to app/public/wasm/..."
+mkdir -p "$ROOT/app/public/wasm"
+cp tranfi_core.js "$ROOT/app/public/wasm/"
+if [ -f tranfi_core.wasm ]; then
+  cp tranfi_core.wasm "$ROOT/app/public/wasm/"
+fi
+
 echo "Done."
-ls -lh "$ROOT/js/wasm/tranfi_core."*
+ls -lh "$ROOT/js/wasm/tranfi_core."* "$ROOT/app/public/wasm/tranfi_core."*

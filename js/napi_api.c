@@ -71,6 +71,66 @@ static napi_value napi_push(napi_env env, napi_callback_info info) {
     return NULL;
 }
 
+/* flushInput(pipeline: External) → void */
+static napi_value napi_flush_input(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    tf_pipeline *p;
+    NAPI_CALL(env, napi_get_value_external(env, argv[0], (void **)&p));
+
+    int rc = tf_pipeline_flush_input(p);
+    if (rc != 0) {
+        const char *err = tf_pipeline_error(p);
+        napi_throw_error(env, NULL, err ? err : "input flush failed");
+    }
+    return NULL;
+}
+
+/* setSourceName(pipeline: External, name?: string | null) → void */
+static napi_value napi_set_source_name(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 1) {
+        napi_throw_error(env, NULL, "setSourceName requires pipeline");
+        return NULL;
+    }
+
+    tf_pipeline *p;
+    NAPI_CALL(env, napi_get_value_external(env, argv[0], (void **)&p));
+
+    char *name = NULL;
+    if (argc >= 2) {
+        napi_valuetype type;
+        NAPI_CALL(env, napi_typeof(env, argv[1], &type));
+        if (type != napi_null && type != napi_undefined) {
+            if (type != napi_string) {
+                napi_throw_error(env, NULL, "source name must be a string, null, or undefined");
+                return NULL;
+            }
+            size_t str_len = 0;
+            NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], NULL, 0, &str_len));
+            name = malloc(str_len + 1);
+            if (!name) {
+                napi_throw_error(env, NULL, "out of memory");
+                return NULL;
+            }
+            NAPI_CALL(env, napi_get_value_string_utf8(env, argv[1], name, str_len + 1, &str_len));
+        }
+    }
+
+    int rc = tf_pipeline_set_source_name(p, name);
+    free(name);
+    if (rc != 0) {
+        const char *err = tf_pipeline_error(p);
+        napi_throw_error(env, NULL, err ? err : "set source name failed");
+    }
+    return NULL;
+}
+
 /* finish(pipeline: External) → void */
 static napi_value napi_finish(napi_env env, napi_callback_info info) {
     size_t argc = 1;
@@ -86,6 +146,26 @@ static napi_value napi_finish(napi_env env, napi_callback_info info) {
         napi_throw_error(env, NULL, err ? err : "finish failed");
     }
     return NULL;
+}
+
+/* finishStep(pipeline: External) → boolean done */
+static napi_value napi_finish_step(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    tf_pipeline *p;
+    NAPI_CALL(env, napi_get_value_external(env, argv[0], (void **)&p));
+
+    int rc = tf_pipeline_finish_step(p);
+    if (rc == TF_ERROR) {
+        const char *err = tf_pipeline_error(p);
+        napi_throw_error(env, NULL, err ? err : "finish failed");
+        return NULL;
+    }
+    napi_value result;
+    NAPI_CALL(env, napi_get_boolean(env, rc == TF_DONE, &result));
+    return result;
 }
 
 /* pull(pipeline: External, channel: number) → Buffer */
@@ -121,6 +201,46 @@ static napi_value napi_pull(napi_env env, napi_callback_info info) {
     void *buf_data;
     NAPI_CALL(env, napi_create_buffer_copy(env, total, result, &buf_data, &buffer));
     free(result);
+    return buffer;
+}
+
+/* pullChunk(pipeline: External, channel: number, maxBytes?: number) → Buffer */
+static napi_value napi_pull_chunk(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3];
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    if (argc < 2) {
+        napi_throw_error(env, NULL, "pullChunk requires pipeline and channel");
+        return NULL;
+    }
+
+    tf_pipeline *p;
+    NAPI_CALL(env, napi_get_value_external(env, argv[0], (void **)&p));
+
+    int32_t channel;
+    NAPI_CALL(env, napi_get_value_int32(env, argv[1], &channel));
+
+    uint32_t max_bytes = 65536;
+    if (argc >= 3) {
+        NAPI_CALL(env, napi_get_value_uint32(env, argv[2], &max_bytes));
+        if (max_bytes == 0) {
+            napi_throw_error(env, NULL, "pullChunk maxBytes must be positive");
+            return NULL;
+        }
+    }
+
+    uint8_t *tmp = malloc((size_t)max_bytes);
+    if (!tmp) {
+        napi_throw_error(env, NULL, "out of memory");
+        return NULL;
+    }
+
+    size_t n = tf_pipeline_pull(p, channel, tmp, (size_t)max_bytes);
+    napi_value buffer;
+    void *buf_data;
+    NAPI_CALL(env, napi_create_buffer_copy(env, n, tmp, &buf_data, &buffer));
+    free(tmp);
     return buffer;
 }
 
@@ -184,17 +304,14 @@ static napi_value napi_compile_dsl(napi_env env, napi_callback_info info) {
     NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], dsl, str_len + 1, &str_len));
 
     char *error = NULL;
-    tf_ir_plan *plan = tf_dsl_parse(dsl, str_len, &error);
+    char *json = tf_compile_dsl(dsl, str_len, &error);
     free(dsl);
 
-    if (!plan) {
-        napi_throw_error(env, NULL, error ? error : "DSL parse failed");
+    if (!json) {
+        napi_throw_error(env, NULL, error ? error : "DSL compile failed");
         free(error);
         return NULL;
     }
-
-    char *json = tf_ir_plan_to_json(plan);
-    tf_ir_plan_destroy(plan);
 
     napi_value result;
     NAPI_CALL(env, napi_create_string_utf8(env, json, strlen(json), &result));
@@ -306,8 +423,12 @@ static napi_value init(napi_env env, napi_value exports) {
     napi_property_descriptor props[] = {
         {"createPipeline",    NULL, napi_create_pipeline,    NULL, NULL, NULL, napi_default, NULL},
         {"push",              NULL, napi_push,               NULL, NULL, NULL, napi_default, NULL},
+        {"flushInput",        NULL, napi_flush_input,        NULL, NULL, NULL, napi_default, NULL},
+        {"setSourceName",     NULL, napi_set_source_name,    NULL, NULL, NULL, napi_default, NULL},
         {"finish",            NULL, napi_finish,             NULL, NULL, NULL, napi_default, NULL},
+        {"finishStep",        NULL, napi_finish_step,        NULL, NULL, NULL, napi_default, NULL},
         {"pull",              NULL, napi_pull,               NULL, NULL, NULL, napi_default, NULL},
+        {"pullChunk",         NULL, napi_pull_chunk,         NULL, NULL, NULL, napi_default, NULL},
         {"free",              NULL, napi_free_pipeline,      NULL, NULL, NULL, napi_default, NULL},
         {"version",           NULL, napi_tranfi_version,     NULL, NULL, NULL, napi_default, NULL},
         {"error",             NULL, napi_tranfi_error,       NULL, NULL, NULL, napi_default, NULL},
@@ -319,7 +440,7 @@ static napi_value init(napi_env env, napi_value exports) {
         {"recipeDescription", NULL, napi_recipe_description, NULL, NULL, NULL, napi_default, NULL},
         {"recipeFindDsl",     NULL, napi_recipe_find_dsl,    NULL, NULL, NULL, napi_default, NULL},
     };
-    NAPI_CALL(env, napi_define_properties(env, exports, 14, props));
+    NAPI_CALL(env, napi_define_properties(env, exports, 18, props));
     return exports;
 }
 

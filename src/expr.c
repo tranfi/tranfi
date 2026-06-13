@@ -449,13 +449,22 @@ static tf_expr *parse_expr(parser_state *p) {
 }
 
 tf_expr *tf_expr_parse(const char *text) {
-    if (!text) return NULL;
+    if (!text || !*text) {
+        tf_set_last_error("expression: empty expression");
+        return NULL;
+    }
     parser_state p = { .src = text, .pos = 0, .len = strlen(text) };
     tf_expr *e = parse_expr(&p);
-    if (!e) return NULL;
+    if (!e) {
+        tf_set_last_error("expression: invalid syntax");
+        return NULL;
+    }
     /* Ensure we consumed all input */
     skip_ws(&p);
     if (p.pos < p.len) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expression: unexpected input near byte %zu", p.pos);
+        tf_set_last_error(buf);
         tf_expr_free(e);
         return NULL;
     }
@@ -530,6 +539,146 @@ static eval_val val_bool(int v) { return (eval_val){ .tag = VAL_BOOL, .b = v }; 
 static eval_val val_date(int32_t v) { return (eval_val){ .tag = VAL_DATE, .date = v }; }
 static eval_val val_timestamp(int64_t v) { return (eval_val){ .tag = VAL_TIMESTAMP, .ts = v }; }
 
+typedef enum {
+    TF_EXPR_TRUNC_YEAR,
+    TF_EXPR_TRUNC_MONTH,
+    TF_EXPR_TRUNC_DAY,
+    TF_EXPR_TRUNC_HOUR,
+    TF_EXPR_TRUNC_MINUTE,
+    TF_EXPR_TRUNC_SECOND,
+} tf_expr_trunc_level;
+
+static int expr_parse_trunc_level(const char *s, tf_expr_trunc_level *level) {
+    if (!s || !level) return 0;
+    if (strcmp(s, "year") == 0 || strcmp(s, "years") == 0) {
+        *level = TF_EXPR_TRUNC_YEAR; return 1;
+    }
+    if (strcmp(s, "month") == 0 || strcmp(s, "months") == 0) {
+        *level = TF_EXPR_TRUNC_MONTH; return 1;
+    }
+    if (strcmp(s, "day") == 0 || strcmp(s, "days") == 0) {
+        *level = TF_EXPR_TRUNC_DAY; return 1;
+    }
+    if (strcmp(s, "hour") == 0 || strcmp(s, "hours") == 0) {
+        *level = TF_EXPR_TRUNC_HOUR; return 1;
+    }
+    if (strcmp(s, "minute") == 0 || strcmp(s, "minutes") == 0) {
+        *level = TF_EXPR_TRUNC_MINUTE; return 1;
+    }
+    if (strcmp(s, "second") == 0 || strcmp(s, "seconds") == 0) {
+        *level = TF_EXPR_TRUNC_SECOND; return 1;
+    }
+    return 0;
+}
+
+static int parse_temporal_string(const char *s, int *y, int *mo, int *d,
+                                 int *h, int *mi, int *se, int *frac_us,
+                                 int *has_time) {
+    if (!s) return 0;
+    *y = *mo = *d = *h = *mi = *se = *frac_us = 0;
+    *has_time = 0;
+
+    int n = sscanf(s, "%d-%d-%dT%d:%d:%d", y, mo, d, h, mi, se);
+    if (n >= 6) {
+        *has_time = 1;
+        const char *dot = strchr(s, '.');
+        if (dot) {
+            int frac = 0, digits = 0;
+            dot++;
+            while (digits < 6 && dot[digits] >= '0' && dot[digits] <= '9') {
+                frac = frac * 10 + (dot[digits] - '0');
+                digits++;
+            }
+            while (digits > 0 && digits < 6) { frac *= 10; digits++; }
+            *frac_us = frac;
+        }
+        return 1;
+    }
+    n = sscanf(s, "%d-%d-%d %d:%d:%d", y, mo, d, h, mi, se);
+    if (n >= 6) {
+        *has_time = 1;
+        const char *dot = strchr(s, '.');
+        if (dot) {
+            int frac = 0, digits = 0;
+            dot++;
+            while (digits < 6 && dot[digits] >= '0' && dot[digits] <= '9') {
+                frac = frac * 10 + (dot[digits] - '0');
+                digits++;
+            }
+            while (digits > 0 && digits < 6) { frac *= 10; digits++; }
+            *frac_us = frac;
+        }
+        return 1;
+    }
+    n = sscanf(s, "%d-%d-%d", y, mo, d);
+    return n >= 3;
+}
+
+static int eval_temporal_parts(eval_val v, int *y, int *mo, int *d,
+                               int *h, int *mi, int *se, int *frac_us,
+                               int32_t *date_days, int64_t *timestamp_us,
+                               int *is_timestamp, int *is_string) {
+    *y = *mo = *d = *h = *mi = *se = *frac_us = 0;
+    *date_days = 0;
+    *timestamp_us = 0;
+    *is_timestamp = 0;
+    *is_string = 0;
+
+    if (v.tag == VAL_DATE) {
+        tf_date_to_ymd(v.date, y, mo, d);
+        *date_days = v.date;
+        return 1;
+    }
+    if (v.tag == VAL_TIMESTAMP) {
+        tf_timestamp_to_parts(v.ts, y, mo, d, h, mi, se, frac_us);
+        *date_days = tf_date_from_ymd(*y, *mo, *d);
+        *timestamp_us = v.ts;
+        *is_timestamp = 1;
+        return 1;
+    }
+    if (v.tag == VAL_STR) {
+        int has_time = 0;
+        if (!parse_temporal_string(v.s, y, mo, d, h, mi, se, frac_us, &has_time)) return 0;
+        *date_days = tf_date_from_ymd(*y, *mo, *d);
+        if (has_time) {
+            *timestamp_us = tf_timestamp_from_parts(*y, *mo, *d, *h, *mi, *se, *frac_us);
+            *is_timestamp = 1;
+        }
+        *is_string = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int32_t expr_trunc_date(int32_t days, tf_expr_trunc_level level) {
+    int y, mo, d;
+    tf_date_to_ymd(days, &y, &mo, &d);
+    switch (level) {
+        case TF_EXPR_TRUNC_YEAR:  return tf_date_from_ymd(y, 1, 1);
+        case TF_EXPR_TRUNC_MONTH: return tf_date_from_ymd(y, mo, 1);
+        default:                  return days;
+    }
+}
+
+static int64_t expr_trunc_timestamp(int64_t us, tf_expr_trunc_level level) {
+    int y, mo, d, h, mi, se, frac;
+    tf_timestamp_to_parts(us, &y, &mo, &d, &h, &mi, &se, &frac);
+    switch (level) {
+        case TF_EXPR_TRUNC_YEAR:   return tf_timestamp_from_parts(y, 1, 1, 0, 0, 0, 0);
+        case TF_EXPR_TRUNC_MONTH:  return tf_timestamp_from_parts(y, mo, 1, 0, 0, 0, 0);
+        case TF_EXPR_TRUNC_DAY:    return tf_timestamp_from_parts(y, mo, d, 0, 0, 0, 0);
+        case TF_EXPR_TRUNC_HOUR:   return tf_timestamp_from_parts(y, mo, d, h, 0, 0, 0);
+        case TF_EXPR_TRUNC_MINUTE: return tf_timestamp_from_parts(y, mo, d, h, mi, 0, 0);
+        case TF_EXPR_TRUNC_SECOND: return tf_timestamp_from_parts(y, mo, d, h, mi, se, 0);
+    }
+    return us;
+}
+
+static int64_t timestamp_epoch_seconds(int64_t us) {
+    if (us >= 0) return us / 1000000LL;
+    return -(((-us) + 999999LL) / 1000000LL);
+}
+
 /* Convert to double for numeric comparison */
 static double to_double(eval_val v) {
     if (v.tag == VAL_INT) return (double)v.i;
@@ -539,6 +688,13 @@ static double to_double(eval_val v) {
 
 static int is_numeric(eval_val v) {
     return v.tag == VAL_INT || v.tag == VAL_FLOAT;
+}
+
+static int eval_truthy(eval_val v) {
+    if (v.tag == VAL_BOOL) return v.b;
+    if (v.tag == VAL_INT) return v.i != 0;
+    if (v.tag == VAL_FLOAT) return v.f != 0.0;
+    return v.tag != VAL_NULL;
 }
 
 static eval_val eval_cmp(eval_val lv, eval_val rv, cmp_op op) {
@@ -870,13 +1026,43 @@ static eval_val eval_func(const char *name, eval_val *args, int n_args) {
 
     /* if(cond, then, else) */
     if (strcmp(name, "if") == 0 && n_args == 3) {
-        if (args[0].tag == VAL_BOOL)
-            return args[0].b ? args[1] : args[2];
-        /* Truthy: non-null, non-zero */
-        int truthy = (args[0].tag != VAL_NULL);
-        if (args[0].tag == VAL_INT) truthy = (args[0].i != 0);
-        if (args[0].tag == VAL_FLOAT) truthy = (args[0].f != 0.0);
-        return truthy ? args[1] : args[2];
+        return eval_truthy(args[0]) ? args[1] : args[2];
+    }
+
+    /* case_when(cond, value, ..., default) — first matching condition */
+    if (strcmp(name, "case_when") == 0 && n_args >= 2) {
+        int pair_count = n_args / 2;
+        int default_idx = (n_args % 2 == 1) ? n_args - 1 : -1;
+        for (int i = 0; i < pair_count; i++) {
+            if (eval_truthy(args[i * 2])) return args[i * 2 + 1];
+        }
+        return default_idx >= 0 ? args[default_idx] : val_null();
+    }
+
+    /* case_match(value, key, result, ..., default) — first equal key */
+    if (strcmp(name, "case_match") == 0 && n_args >= 3) {
+        int remaining = n_args - 1;
+        int pair_count = remaining / 2;
+        int default_idx = (remaining % 2 == 1) ? n_args - 1 : -1;
+        for (int i = 0; i < pair_count; i++) {
+            eval_val eq = eval_cmp(args[0], args[1 + i * 2], CMP_EQ);
+            if (eq.tag == VAL_BOOL && eq.b) return args[2 + i * 2];
+        }
+        return default_idx >= 0 ? args[default_idx] : val_null();
+    }
+
+    /* if_any(pred, ...) / if_all(pred, ...) — row-local boolean reduction */
+    if (strcmp(name, "if_any") == 0) {
+        for (int i = 0; i < n_args; i++) {
+            if (eval_truthy(args[i])) return val_bool(1);
+        }
+        return val_bool(0);
+    }
+    if (strcmp(name, "if_all") == 0) {
+        for (int i = 0; i < n_args; i++) {
+            if (!eval_truthy(args[i])) return val_bool(0);
+        }
+        return val_bool(1);
     }
 
     /* coalesce(a, b, ...) — first non-null */
@@ -885,6 +1071,65 @@ static eval_val eval_func(const char *name, eval_val *args, int n_args) {
             if (args[i].tag != VAL_NULL) return args[i];
         }
         return val_null();
+    }
+
+    /* between(x, lower, upper) / inrange(x, lower, upper) — inclusive range predicate */
+    if ((strcmp(name, "between") == 0 || strcmp(name, "inrange") == 0) && n_args == 3) {
+        if (args[0].tag == VAL_NULL || args[1].tag == VAL_NULL || args[2].tag == VAL_NULL)
+            return val_null();
+        eval_val ge = eval_cmp(args[0], args[1], CMP_GE);
+        eval_val le = eval_cmp(args[0], args[2], CMP_LE);
+        if (ge.tag != VAL_BOOL || le.tag != VAL_BOOL) return val_null();
+        return val_bool(ge.b && le.b);
+    }
+
+    /* ---- Date/time functions ---- */
+
+    if ((strcmp(name, "year") == 0 || strcmp(name, "month") == 0 ||
+         strcmp(name, "day") == 0 || strcmp(name, "hour") == 0 ||
+         strcmp(name, "minute") == 0 || strcmp(name, "second") == 0 ||
+         strcmp(name, "weekday") == 0 || strcmp(name, "epoch") == 0) && n_args == 1) {
+        if (args[0].tag == VAL_NULL) return val_null();
+        int y, mo, d, h, mi, se, frac, is_ts, is_str;
+        int32_t days;
+        int64_t us;
+        if (!eval_temporal_parts(args[0], &y, &mo, &d, &h, &mi, &se, &frac,
+                                 &days, &us, &is_ts, &is_str)) return val_null();
+        (void)frac; (void)is_str;
+        if (strcmp(name, "year") == 0) return val_int(y);
+        if (strcmp(name, "month") == 0) return val_int(mo);
+        if (strcmp(name, "day") == 0) return val_int(d);
+        if (strcmp(name, "hour") == 0) return val_int(h);
+        if (strcmp(name, "minute") == 0) return val_int(mi);
+        if (strcmp(name, "second") == 0) return val_int(se);
+        if (strcmp(name, "weekday") == 0) return val_int(tf_date_weekday(days));
+        if (strcmp(name, "epoch") == 0) {
+            if (is_ts) return val_int(timestamp_epoch_seconds(us));
+            return val_int((int64_t)days * 86400LL);
+        }
+    }
+
+    if (strcmp(name, "date_trunc") == 0 && n_args == 2) {
+        if (args[0].tag == VAL_NULL || args[1].tag != VAL_STR) return val_null();
+        tf_expr_trunc_level level;
+        if (!expr_parse_trunc_level(args[1].s, &level)) return val_null();
+        int y, mo, d, h, mi, se, frac, is_ts, is_str;
+        int32_t days;
+        int64_t us;
+        if (!eval_temporal_parts(args[0], &y, &mo, &d, &h, &mi, &se, &frac,
+                                 &days, &us, &is_ts, &is_str)) return val_null();
+        (void)y; (void)mo; (void)d; (void)h; (void)mi; (void)se; (void)frac;
+        if (args[0].tag == VAL_DATE) return val_date(expr_trunc_date(days, level));
+        if (args[0].tag == VAL_TIMESTAMP) return val_timestamp(expr_trunc_timestamp(us, level));
+        if (is_str) {
+            char *out = scratch_alloc();
+            if (is_ts) {
+                tf_timestamp_format(expr_trunc_timestamp(us, level), out, SCRATCH_SLOT_SIZE);
+            } else {
+                tf_date_format(expr_trunc_date(days, level), out, SCRATCH_SLOT_SIZE);
+            }
+            return val_str(out);
+        }
     }
 
     /* ---- Math functions ---- */

@@ -99,7 +99,7 @@ tf_step *tf_bin_create(const cJSON *args) {
         }
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->boundaries); free(st); return NULL; }
     step->process = bin_process;
     step->flush = bin_flush;

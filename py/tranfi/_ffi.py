@@ -11,6 +11,9 @@ import sys
 import platform
 
 _lib = None
+_SINK_CALLBACK = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p
+)
 
 
 def _find_lib():
@@ -87,13 +90,29 @@ def _load_lib():
     _lib.tf_pipeline_push.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
     _lib.tf_pipeline_push.restype = ctypes.c_int
 
+    # tf_pipeline_flush_input
+    _lib.tf_pipeline_flush_input.argtypes = [ctypes.c_void_p]
+    _lib.tf_pipeline_flush_input.restype = ctypes.c_int
+
+    # tf_pipeline_set_source_name
+    _lib.tf_pipeline_set_source_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    _lib.tf_pipeline_set_source_name.restype = ctypes.c_int
+
     # tf_pipeline_finish
     _lib.tf_pipeline_finish.argtypes = [ctypes.c_void_p]
     _lib.tf_pipeline_finish.restype = ctypes.c_int
 
+    # tf_pipeline_finish_step
+    _lib.tf_pipeline_finish_step.argtypes = [ctypes.c_void_p]
+    _lib.tf_pipeline_finish_step.restype = ctypes.c_int
+
     # tf_pipeline_pull
     _lib.tf_pipeline_pull.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
     _lib.tf_pipeline_pull.restype = ctypes.c_size_t
+
+    # tf_pipeline_set_sink
+    _lib.tf_pipeline_set_sink.argtypes = [ctypes.c_void_p, ctypes.c_int, _SINK_CALLBACK, ctypes.c_void_p]
+    _lib.tf_pipeline_set_sink.restype = ctypes.c_int
 
     # tf_pipeline_error
     _lib.tf_pipeline_error.argtypes = [ctypes.c_void_p]
@@ -188,6 +207,26 @@ def pipeline_push(handle: int, data: bytes) -> None:
         msg = err.decode('utf-8') if err else 'unknown error'
         raise RuntimeError(f"Push failed: {msg}")
 
+def pipeline_flush_input(handle: int) -> None:
+    """Flush the decoder input boundary without finishing transforms."""
+    lib = _load_lib()
+    rc = lib.tf_pipeline_flush_input(handle)
+    if rc != 0:
+        err = lib.tf_pipeline_error(handle)
+        msg = err.decode('utf-8') if err else 'unknown error'
+        raise RuntimeError(f"Input flush failed: {msg}")
+
+
+def pipeline_set_source_name(handle: int, name) -> None:
+    """Set or clear the host source name used by source-name."""
+    lib = _load_lib()
+    raw = None if name is None else os.fspath(name).encode('utf-8')
+    rc = lib.tf_pipeline_set_source_name(handle, raw)
+    if rc != 0:
+        err = lib.tf_pipeline_error(handle)
+        msg = err.decode('utf-8') if err else 'unknown error'
+        raise RuntimeError(f"Set source name failed: {msg}")
+
 
 def pipeline_finish(handle: int) -> None:
     """Signal end of input and flush the pipeline."""
@@ -199,17 +238,57 @@ def pipeline_finish(handle: int) -> None:
         raise RuntimeError(f"Finish failed: {msg}")
 
 
+def pipeline_finish_step(handle: int) -> bool:
+    """Advance finish by one flush boundary. Return True when complete."""
+    lib = _load_lib()
+    rc = lib.tf_pipeline_finish_step(handle)
+    if rc < 0:
+        err = lib.tf_pipeline_error(handle)
+        msg = err.decode('utf-8') if err else 'unknown error'
+        raise RuntimeError(f"Finish failed: {msg}")
+    return rc == 1
+
+
+def pipeline_pull_chunk(handle: int, channel: int, buf_size: int = 65536) -> bytes:
+    """Pull at most buf_size bytes from a channel."""
+    if buf_size <= 0:
+        raise ValueError("buf_size must be positive")
+    lib = _load_lib()
+    buf = ctypes.create_string_buffer(buf_size)
+    n = lib.tf_pipeline_pull(handle, channel, buf, buf_size)
+    return buf.raw[:n]
+
+
 def pipeline_pull(handle: int, channel: int, buf_size: int = 65536) -> bytes:
     """Pull all available output from a channel."""
-    lib = _load_lib()
     chunks = []
-    buf = ctypes.create_string_buffer(buf_size)
     while True:
-        n = lib.tf_pipeline_pull(handle, channel, buf, buf_size)
-        if n == 0:
+        chunk = pipeline_pull_chunk(handle, channel, buf_size)
+        if not chunk:
             break
-        chunks.append(buf.raw[:n])
+        chunks.append(chunk)
     return b''.join(chunks)
+
+
+def pipeline_set_sink(handle: int, channel: int, callback):
+    """Register a C-level sink callback. Return the ctypes callback to keep alive."""
+    lib = _load_lib()
+
+    @_SINK_CALLBACK
+    def c_callback(ch, data, length, user):
+        del user
+        try:
+            callback(ch, ctypes.string_at(data, length))
+        except BaseException:
+            return -1
+        return 0
+
+    rc = lib.tf_pipeline_set_sink(handle, channel, c_callback, None)
+    if rc != 0:
+        err = lib.tf_pipeline_error(handle)
+        msg = err.decode('utf-8') if err else 'unknown error'
+        raise RuntimeError(f"Set sink failed: {msg}")
+    return c_callback
 
 
 def pipeline_free(handle: int) -> None:

@@ -77,7 +77,7 @@ tf_step *tf_split_data_create(const cJSON *args) {
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     st->result = strdup(cJSON_IsString(res_j) ? res_j->valuestring : "_split");
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->result); free(st); return NULL; }
     step->process = split_data_process;
     step->flush = split_data_flush;

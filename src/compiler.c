@@ -66,8 +66,12 @@ int tf_compile_native(const tf_ir_plan *plan,
 
         void *obj = entry->create_native(node->args);
         if (!obj) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "failed to create '%s'", node->op);
+            const char *detail = tf_last_error();
+            char buf[512];
+            if (detail && detail[0])
+                snprintf(buf, sizeof(buf), "failed to create '%s': %s", node->op, detail);
+            else
+                snprintf(buf, sizeof(buf), "failed to create '%s'", node->op);
             set_error(error, buf);
             goto fail;
         }

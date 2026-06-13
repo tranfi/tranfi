@@ -202,7 +202,7 @@ tf_step *tf_datetime_create(const cJSON *args) {
         st->w_weekday = st->w_epoch = 1;
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st); return NULL; }
     step->process = datetime_process;
     step->flush = datetime_flush;

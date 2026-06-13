@@ -229,7 +229,7 @@ tf_step *tf_derive_create(const cJSON *args) {
         if (!st->cols[i].name || !st->cols[i].expr) goto fail;
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) goto fail;
     step->process = derive_process;
     step->flush = derive_flush;

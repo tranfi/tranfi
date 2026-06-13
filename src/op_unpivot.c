@@ -149,7 +149,7 @@ tf_step *tf_unpivot_create(const cJSON *args) {
         if (cJSON_IsString(item)) st->cols[i] = strdup(item->valuestring);
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { unpivot_destroy(&(tf_step){.state = st}); return NULL; }
     step->process = unpivot_process;
     step->flush = unpivot_flush;

@@ -12,6 +12,9 @@ set(CORE_SOURCES
     src/pipeline.c
     src/plan.c
     src/expr.c
+    src/selector.c
+    src/memory_estimate.c
+    src/json_path.c
     src/codec_csv.c
     src/codec_jsonl.c
     src/codec_text.c
@@ -21,10 +24,17 @@ set(CORE_SOURCES
     src/op_head.c
     src/op_skip.c
     src/op_derive.c
+    src/op_source_name.c
+    src/op_across.c
     src/op_stats.c
     src/op_unique.c
     src/op_sort.c
     src/op_validate.c
+    src/op_assert.c
+    src/op_quarantine.c
+    src/op_schema.c
+    src/op_schema_infer.c
+    src/op_tee.c
     src/op_trim.c
     src/op_fill_null.c
     src/op_cast.c
@@ -45,10 +55,18 @@ set(CORE_SOURCES
     src/op_frequency.c
     src/op_datetime.c
     src/op_grep.c
+    src/op_json_extract.c
+    src/op_json_filter.c
+    src/op_json_schema.c
+    src/op_json_flatten.c
     src/op_pivot.c
     src/op_join.c
+    src/op_set.c
     src/op_stack.c
     src/op_lead.c
+    src/op_lag.c
+    src/op_rowid.c
+    src/op_rleid.c
     src/op_date_trunc.c
     src/op_onehot.c
     src/op_label_encode.c
@@ -145,6 +163,18 @@ if(BUILD_TESTING)
         target_link_options(test_core PRIVATE -fsanitize=address,undefined)
     endif()
     add_test(NAME core_tests COMMAND test_core)
+
+    add_executable(test_memory test/test_memory.c)
+    target_link_libraries(test_memory tranfi_core)
+    target_include_directories(test_memory PRIVATE src)
+    target_compile_definitions(test_memory PRIVATE _POSIX_C_SOURCE=200809L $<$<CONFIG:Release>:NDEBUG=0>)
+    target_compile_options(test_memory PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_options(test_memory PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0)
+        target_link_options(test_memory PRIVATE -fsanitize=address,undefined)
+    endif()
+    add_test(NAME memory_tests COMMAND test_memory)
+    add_test(NAME cli_memory_policy COMMAND bash ${CMAKE_SOURCE_DIR}/test/test_cli_memory_policy.sh $<TARGET_FILE:tranfi_cli>)
 endif()
 
 # Benchmark

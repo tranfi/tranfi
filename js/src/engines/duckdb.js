@@ -10,6 +10,7 @@ const { tmpdir } = require('os')
 const { join } = require('path')
 const { randomBytes } = require('crypto')
 const { PipelineResult } = require('../pipeline.js')
+const { memoryForEngine } = require('../memory_policy.js')
 
 let _compileToSql = null
 
@@ -21,7 +22,7 @@ async function getCompileToSql() {
 }
 
 class DuckDBEngine {
-  async run(dsl, { input, inputFile } = {}) {
+  async run(dsl, { input, inputFile, memory, spillDir } = {}) {
     let duckdb
     try {
       duckdb = require('duckdb')
@@ -40,6 +41,10 @@ class DuckDBEngine {
 
     let tmpPath = null
     try {
+      const memoryLimit = memoryForEngine(memory)
+      if (memoryLimit) await runSql(conn, `SET memory_limit = '${sqlString(memoryLimit)}'`)
+      if (spillDir) await runSql(conn, `SET temp_directory = '${sqlString(spillDir)}'`)
+
       if (inputFile) {
         sql = sql.replaceAll('input_data', `read_csv('${inputFile}')`)
       } else if (input) {
@@ -68,6 +73,19 @@ class DuckDBEngine {
       }
     }
   }
+}
+
+function sqlString(value) {
+  return String(value).replace(/'/g, "''")
+}
+
+function runSql(conn, sql) {
+  return new Promise((resolve, reject) => {
+    conn.run(sql, err => {
+      if (err) reject(err)
+      else resolve()
+    })
+  })
 }
 
 function queryAll(conn, sql) {

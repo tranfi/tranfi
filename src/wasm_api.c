@@ -10,6 +10,7 @@
 #endif
 
 #include "tranfi.h"
+#include "internal.h"
 #include "dsl.h"
 #include "recipes.h"
 #include <stdlib.h>
@@ -60,10 +61,31 @@ int wasm_pipeline_push(int handle, const uint8_t *data, int len) {
 }
 
 EXPORT
+int wasm_pipeline_flush_input(int handle) {
+    tf_pipeline *p = get_handle(handle);
+    if (!p) return -1;
+    return tf_pipeline_flush_input(p);
+}
+
+EXPORT
+int wasm_pipeline_set_source_name(int handle, const char *name) {
+    tf_pipeline *p = get_handle(handle);
+    if (!p) return -1;
+    return tf_pipeline_set_source_name(p, name);
+}
+
+EXPORT
 int wasm_pipeline_finish(int handle) {
     tf_pipeline *p = get_handle(handle);
     if (!p) return -1;
     return tf_pipeline_finish(p);
+}
+
+EXPORT
+int wasm_pipeline_finish_step(int handle) {
+    tf_pipeline *p = get_handle(handle);
+    if (!p) return -1;
+    return tf_pipeline_finish_step(p);
 }
 
 EXPORT
@@ -99,15 +121,12 @@ void wasm_pipeline_free(int handle) {
 EXPORT
 char *wasm_compile_dsl(const char *dsl, int len) {
     char *error = NULL;
-    tf_ir_plan *plan = tf_dsl_parse(dsl, (size_t)len, &error);
-    if (!plan) {
-        /* Store error so JS can retrieve it via wasm_pipeline_error(-1) */
-        (void)error; /* error accessible via tf_last_error() */
+    char *json = tf_compile_dsl(dsl, (size_t)len, &error);
+    if (!json) {
+        tf_set_last_error(error ? error : "DSL compile failed");
         free(error);
         return NULL;
     }
-    char *json = tf_ir_plan_to_json(plan);
-    tf_ir_plan_destroy(plan);
     return json;
 }
 

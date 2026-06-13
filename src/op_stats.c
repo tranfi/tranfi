@@ -1,10 +1,14 @@
 /*
  * op_stats.c — Streaming aggregates with online algorithms.
  *
- * Config: {"stats": ["count","sum","avg","min","max","var","stddev",
- *                     "median","p25","p75","skewness","kurtosis",
- *                     "distinct","hist","sample"]}
+ * Config: {"stats": ["count","missing","complete_rate","sum","avg",
+ *                     "min","max","var","stddev","median","p25",
+ *                     "p75","skewness","kurtosis","distinct",
+ *                     "hist","sample"]}
  *   or {} for default stats (count, sum, avg, min, max, var, stddev, median).
+ * The scan op uses this engine with profile defaults: count, missing,
+ * complete_rate, distinct, min, max, avg, stddev, p25, median, p75,
+ * hist, and sample.
  *
  * Algorithms ported from OnlineStats.jl (MIT):
  *   - Welford's online variance (var, stddev)
@@ -182,8 +186,9 @@ static void hll_update(hll_state *h, const char *val) {
     uint32_t x = hll_hash(val);
     uint32_t idx = x & (HLL_M - 1);
     uint32_t w = x >> HLL_P;
-    int rho = hll_clz32(w) + 1;
-    if (rho > 32 - HLL_P) rho = 32 - HLL_P;
+    int rho = w == 0 ? (32 - HLL_P + 1) : (hll_clz32(w) - HLL_P + 1);
+    if (rho < 1) rho = 1;
+    if (rho > 32 - HLL_P + 1) rho = 32 - HLL_P + 1;
     if ((uint8_t)rho > h->M[idx]) h->M[idx] = (uint8_t)rho;
 }
 
@@ -345,6 +350,7 @@ static void reservoir_update(reservoir_state *r, double y) {
 
 typedef struct {
     /* Basic stats */
+    size_t total;
     size_t count;
     double sum;
     double min;
@@ -381,7 +387,8 @@ typedef struct {
     size_t      n_cols;
     int         initialized;
     /* Which stats to output */
-    int want_count, want_sum, want_avg, want_min, want_max;
+    int want_count, want_missing, want_complete_rate;
+    int want_sum, want_avg, want_min, want_max;
     int want_var, want_stddev;
     int want_median, want_p25, want_p75;
     int want_skewness, want_kurtosis;
@@ -477,6 +484,8 @@ static int stats_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     for (size_t r = 0; r < in->n_rows; r++) {
         for (size_t c = 0; c < st->n_cols && c < in->n_cols; c++) {
+            col_accum *a = &st->accums[c];
+            a->total++;
             if (tf_batch_is_null(in, r, c)) continue;
 
             double val = 0;
@@ -524,7 +533,7 @@ static int stats_process(tf_step *self, tf_batch *in, tf_batch **out,
                 default:
                     break;
             }
-            accum_update(&st->accums[c], val, str_val, is_num);
+            accum_update(a, val, str_val, is_num);
         }
     }
 
@@ -540,8 +549,10 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 
     /* Count output columns */
     size_t n_stat_cols = 1; /* "column" */
-    if (st->want_count)    n_stat_cols++;
-    if (st->want_sum)      n_stat_cols++;
+    if (st->want_count)         n_stat_cols++;
+    if (st->want_missing)       n_stat_cols++;
+    if (st->want_complete_rate) n_stat_cols++;
+    if (st->want_sum)           n_stat_cols++;
     if (st->want_avg)      n_stat_cols++;
     if (st->want_min)      n_stat_cols++;
     if (st->want_max)      n_stat_cols++;
@@ -562,8 +573,10 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     /* Set schema */
     size_t ci = 0;
     tf_batch_set_schema(ob, ci++, "column", TF_TYPE_STRING);
-    if (st->want_count)    tf_batch_set_schema(ob, ci++, "count", TF_TYPE_INT64);
-    if (st->want_sum)      tf_batch_set_schema(ob, ci++, "sum", TF_TYPE_FLOAT64);
+    if (st->want_count)         tf_batch_set_schema(ob, ci++, "count", TF_TYPE_INT64);
+    if (st->want_missing)       tf_batch_set_schema(ob, ci++, "missing", TF_TYPE_INT64);
+    if (st->want_complete_rate) tf_batch_set_schema(ob, ci++, "complete_rate", TF_TYPE_FLOAT64);
+    if (st->want_sum)           tf_batch_set_schema(ob, ci++, "sum", TF_TYPE_FLOAT64);
     if (st->want_avg)      tf_batch_set_schema(ob, ci++, "avg", TF_TYPE_FLOAT64);
     if (st->want_min)      tf_batch_set_schema(ob, ci++, "min", TF_TYPE_FLOAT64);
     if (st->want_max)      tf_batch_set_schema(ob, ci++, "max", TF_TYPE_FLOAT64);
@@ -588,6 +601,16 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 
         if (st->want_count) {
             tf_batch_set_int64(ob, c, ci++, (int64_t)a->count);
+        }
+        if (st->want_missing) {
+            size_t missing = a->total >= a->count ? a->total - a->count : 0;
+            tf_batch_set_int64(ob, c, ci++, (int64_t)missing);
+        }
+        if (st->want_complete_rate) {
+            if (a->total > 0)
+                tf_batch_set_float64(ob, c, ci, (double)a->count / (double)a->total);
+            else tf_batch_set_null(ob, c, ci);
+            ci++;
         }
         if (st->want_sum) {
             if (a->has_numeric) tf_batch_set_float64(ob, c, ci, a->sum);
@@ -730,7 +753,54 @@ static void stats_destroy(tf_step *self) {
     free(self);
 }
 
-tf_step *tf_stats_create(const cJSON *args) {
+static void stats_enable_name(stats_state *st, const char *s) {
+    if (strcmp(s, "count") == 0)              st->want_count = 1;
+    else if (strcmp(s, "missing") == 0)       st->want_missing = 1;
+    else if (strcmp(s, "complete_rate") == 0) st->want_complete_rate = 1;
+    else if (strcmp(s, "sum") == 0)           st->want_sum = 1;
+    else if (strcmp(s, "avg") == 0)           st->want_avg = 1;
+    else if (strcmp(s, "min") == 0)           st->want_min = 1;
+    else if (strcmp(s, "max") == 0)           st->want_max = 1;
+    else if (strcmp(s, "var") == 0)           st->want_var = 1;
+    else if (strcmp(s, "stddev") == 0)        st->want_stddev = 1;
+    else if (strcmp(s, "median") == 0)        st->want_median = 1;
+    else if (strcmp(s, "p25") == 0)           st->want_p25 = 1;
+    else if (strcmp(s, "p75") == 0)           st->want_p75 = 1;
+    else if (strcmp(s, "skewness") == 0)      st->want_skewness = 1;
+    else if (strcmp(s, "kurtosis") == 0)      st->want_kurtosis = 1;
+    else if (strcmp(s, "distinct") == 0)      st->want_distinct = 1;
+    else if (strcmp(s, "hist") == 0)          st->want_hist = 1;
+    else if (strcmp(s, "sample") == 0)        st->want_sample = 1;
+}
+
+static void stats_enable_default(stats_state *st) {
+    st->want_count = 1;
+    st->want_sum = 1;
+    st->want_avg = 1;
+    st->want_min = 1;
+    st->want_max = 1;
+    st->want_var = 1;
+    st->want_stddev = 1;
+    st->want_median = 1;
+}
+
+static void scan_enable_default(stats_state *st) {
+    st->want_count = 1;
+    st->want_missing = 1;
+    st->want_complete_rate = 1;
+    st->want_distinct = 1;
+    st->want_min = 1;
+    st->want_max = 1;
+    st->want_avg = 1;
+    st->want_stddev = 1;
+    st->want_p25 = 1;
+    st->want_median = 1;
+    st->want_p75 = 1;
+    st->want_hist = 1;
+    st->want_sample = 1;
+}
+
+static tf_step *stats_create_common(const cJSON *args, int scan_defaults) {
     stats_state *st = calloc(1, sizeof(stats_state));
     if (!st) return NULL;
 
@@ -739,41 +809,27 @@ tf_step *tf_stats_create(const cJSON *args) {
         int n = cJSON_GetArraySize(stats_arr);
         for (int i = 0; i < n; i++) {
             cJSON *item = cJSON_GetArrayItem(stats_arr, i);
-            if (!cJSON_IsString(item)) continue;
-            const char *s = item->valuestring;
-            if (strcmp(s, "count") == 0)         st->want_count = 1;
-            else if (strcmp(s, "sum") == 0)      st->want_sum = 1;
-            else if (strcmp(s, "avg") == 0)      st->want_avg = 1;
-            else if (strcmp(s, "min") == 0)      st->want_min = 1;
-            else if (strcmp(s, "max") == 0)      st->want_max = 1;
-            else if (strcmp(s, "var") == 0)      st->want_var = 1;
-            else if (strcmp(s, "stddev") == 0)   st->want_stddev = 1;
-            else if (strcmp(s, "median") == 0)   st->want_median = 1;
-            else if (strcmp(s, "p25") == 0)      st->want_p25 = 1;
-            else if (strcmp(s, "p75") == 0)      st->want_p75 = 1;
-            else if (strcmp(s, "skewness") == 0) st->want_skewness = 1;
-            else if (strcmp(s, "kurtosis") == 0) st->want_kurtosis = 1;
-            else if (strcmp(s, "distinct") == 0) st->want_distinct = 1;
-            else if (strcmp(s, "hist") == 0)     st->want_hist = 1;
-            else if (strcmp(s, "sample") == 0)   st->want_sample = 1;
+            if (cJSON_IsString(item)) stats_enable_name(st, item->valuestring);
         }
+    } else if (scan_defaults) {
+        scan_enable_default(st);
     } else {
-        /* Default: basic + variance + median */
-        st->want_count = 1;
-        st->want_sum = 1;
-        st->want_avg = 1;
-        st->want_min = 1;
-        st->want_max = 1;
-        st->want_var = 1;
-        st->want_stddev = 1;
-        st->want_median = 1;
+        stats_enable_default(st);
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st); return NULL; }
     step->process = stats_process;
     step->flush = stats_flush;
     step->destroy = stats_destroy;
     step->state = st;
     return step;
+}
+
+tf_step *tf_stats_create(const cJSON *args) {
+    return stats_create_common(args, 0);
+}
+
+tf_step *tf_scan_create(const cJSON *args) {
+    return stats_create_common(args, 1);
 }

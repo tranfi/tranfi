@@ -95,6 +95,10 @@ char *tf_ir_to_json(const tf_ir_plan *plan) {
         } else {
             cJSON_AddItemToObject(step, "args", cJSON_CreateObject());
         }
+        cJSON_AddStringToObject(step, "memory_class", tf_memory_class_name(node->memory_class));
+        cJSON_AddStringToObject(step, "emit_class", tf_emit_class_name(node->emit_class));
+        cJSON_AddStringToObject(step, "schema_class", tf_schema_class_name(node->schema_class));
+        cJSON_AddStringToObject(step, "state_estimate", node->state_estimate ? node->state_estimate : "unknown");
         cJSON_AddItemToArray(steps, step);
     }
 

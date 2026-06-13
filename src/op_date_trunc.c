@@ -171,7 +171,7 @@ tf_step *tf_date_trunc_create(const cJSON *args) {
         st->result = strdup(st->column);
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st); return NULL; }
     step->process = date_trunc_process;
     step->flush = date_trunc_flush;

@@ -4,8 +4,8 @@
  * Loaded in JSEE's web worker via importScripts.
  * Expects createTranfi global from imports (tranfi_core.js).
  *
- * Receives: { file: ChunkedReader|Uint8Array, dsl: string }
- * Returns:  { output: htmlString, stats: htmlString }
+ * Receives: { file: ChunkedReader|Uint8Array, dsl: string, preview_rows?: number, collect_output?: boolean }
+ * Returns:  bounded output preview table plus stats side-channel table
  */
 
 let wasm = null
@@ -56,12 +56,23 @@ function pipelinePush (handle, data) {
   }
 }
 
-function pipelineFinish (handle) {
-  const rc = wasm.ccall('wasm_pipeline_finish', 'number', ['number'], [handle])
-  if (rc !== 0) {
+function pipelineFinishStep (handle) {
+  const rc = wasm.ccall('wasm_pipeline_finish_step', 'number', ['number'], [handle])
+  if (rc < 0) {
     const err = wasm.ccall('wasm_pipeline_error', 'string', ['number'], [handle])
     throw new Error(err || 'Finish failed')
   }
+  return rc === 1
+}
+
+function pipelinePullChunk (handle, channel, bufSize) {
+  bufSize = bufSize || 65536
+  const ptr = wasm._malloc(bufSize)
+  const n = wasm.ccall('wasm_pipeline_pull', 'number',
+    ['number', 'number', 'number', 'number'], [handle, channel, ptr, bufSize])
+  const result = new Uint8Array(wasm.HEAPU8.buffer, ptr, n).slice()
+  wasm._free(ptr)
+  return result
 }
 
 function pipelinePullAll (handle, channel) {
@@ -125,12 +136,80 @@ function csvToTable (csv, label) {
   return { columns: columns, rows: rows, label: label }
 }
 
+function createCsvPreview (maxRows) {
+  maxRows = Number(maxRows)
+  if (!isFinite(maxRows) || maxRows < 0) maxRows = 200
+  maxRows = Math.floor(maxRows)
+  var decoder = new TextDecoder()
+  var pending = ''
+  var columns = null
+  var rows = []
+  var rowsSeen = 0
+  var bytesSeen = 0
+  var maxPendingChars = 1024 * 1024
+  var truncatedRecord = false
+
+  function consumeLine (line) {
+    if (line.endsWith('\r')) line = line.slice(0, -1)
+    if (!columns) {
+      if (!line.trim()) return
+      columns = csvParseLine(line)
+      return
+    }
+    if (!line.trim()) return
+    rowsSeen++
+    if (rows.length < maxRows) rows.push(csvParseLine(line))
+  }
+
+  function feed (chunk) {
+    if (!chunk || chunk.length === 0) return
+    bytesSeen += chunk.length
+    pending += decoder.decode(chunk, { stream: true })
+    if (pending.length > maxPendingChars) {
+      pending = pending.slice(0, maxPendingChars)
+      truncatedRecord = true
+    }
+    var start = 0
+    for (;;) {
+      var idx = pending.indexOf('\n', start)
+      if (idx < 0) break
+      consumeLine(pending.slice(start, idx))
+      start = idx + 1
+    }
+    pending = pending.slice(start)
+  }
+
+  function finish () {
+    var tail = decoder.decode()
+    if (tail) pending += tail
+    if (pending) consumeLine(pending)
+    if (!columns) return null
+    var label = 'Output preview'
+    if (rowsSeen > rows.length) label += ' (first ' + rows.length + ' of ' + rowsSeen + ' rows)'
+    return {
+      columns: columns,
+      rows: rows,
+      label: label,
+      preview: true,
+      rows_seen: rowsSeen,
+      rows_shown: rows.length,
+      truncated: rowsSeen > rows.length || truncatedRecord,
+      bytes_seen: bytesSeen
+    }
+  }
+
+  return { feed: feed, finish: finish }
+}
+
+
 // JSEE model function — set on worker global
 self.tranfiRunner = async function tranfiRunner (inputs, ctx) {
   await initWasm()
 
   const dsl = inputs.dsl
   const file = inputs.file
+  const previewRows = inputs.preview_rows == null ? 200 : inputs.preview_rows
+  const collectOutput = inputs.collect_output === true || inputs.collect_output === 'true'
 
   if (!dsl) throw new Error('No DSL pipeline provided')
   if (!file) throw new Error('No file provided')
@@ -138,35 +217,66 @@ self.tranfiRunner = async function tranfiRunner (inputs, ctx) {
   ctx.log('Compiling DSL:', dsl)
   const planJson = compileDsl(dsl)
   const handle = pipelineCreate(planJson)
+  const preview = createCsvPreview(previewRows)
+  const outputChunks = collectOutput ? [] : null
+  const CHUNK = 64 * 1024
+
+  function drainMain () {
+    for (;;) {
+      const chunk = pipelinePullChunk(handle, 0, CHUNK)
+      if (chunk.length === 0) break
+      preview.feed(chunk)
+      if (outputChunks) outputChunks.push(chunk)
+    }
+  }
 
   try {
     let bytesProcessed = 0
     const totalBytes = file.size || 0
 
     if (file[Symbol.asyncIterator]) {
-      // JSEE ChunkedReader — async iterable of Uint8Array chunks
+      // JSEE ChunkedReader — async iterable of Uint8Array chunks.
       for await (const chunk of file) {
         pipelinePush(handle, chunk)
+        drainMain()
         bytesProcessed += chunk.length
         if (totalBytes > 0) {
           ctx.progress(Math.round(bytesProcessed / totalBytes * 100))
         }
       }
     } else if (file instanceof Uint8Array || file instanceof ArrayBuffer) {
-      // Raw bytes fallback
+      // Raw bytes fallback.
       const data = file instanceof Uint8Array ? file : new Uint8Array(file)
-      const CHUNK = 64 * 1024
       for (let i = 0; i < data.length; i += CHUNK) {
         pipelinePush(handle, data.subarray(i, Math.min(i + CHUNK, data.length)))
+        drainMain()
         ctx.progress(Math.round(Math.min(i + CHUNK, data.length) / data.length * 100))
+      }
+    } else if (file.stream && typeof file.stream === 'function') {
+      const reader = file.stream().getReader()
+      try {
+        for (;;) {
+          const next = await reader.read()
+          if (next.done) break
+          const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value)
+          pipelinePush(handle, chunk)
+          drainMain()
+          bytesProcessed += chunk.length
+          if (totalBytes > 0) ctx.progress(Math.round(bytesProcessed / totalBytes * 100))
+        }
+      } finally {
+        reader.releaseLock()
       }
     } else {
       throw new Error('Unsupported file input type')
     }
 
-    pipelineFinish(handle)
+    for (;;) {
+      const done = pipelineFinishStep(handle)
+      drainMain()
+      if (done) break
+    }
 
-    const output = pipelinePullAll(handle, 0)
     const errors = pipelinePullAll(handle, 1)
     const stats = pipelinePullAll(handle, 2)
 
@@ -175,7 +285,15 @@ self.tranfiRunner = async function tranfiRunner (inputs, ctx) {
     }
 
     const result = {}
-    if (output) result.output = csvToTable(output, 'Output')
+    const previewTable = preview.finish()
+    if (previewTable) result.output = previewTable
+    if (collectOutput && outputChunks.length > 0) {
+      const total = outputChunks.reduce((sum, c) => sum + c.length, 0)
+      const all = new Uint8Array(total)
+      let offset = 0
+      for (const c of outputChunks) { all.set(c, offset); offset += c.length }
+      result.output_full = new TextDecoder().decode(all)
+    }
     if (stats) result.stats = csvToTable(stats, 'Stats')
 
     ctx.log('Pipeline complete')

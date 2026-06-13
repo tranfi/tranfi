@@ -153,7 +153,7 @@ tf_step *tf_fill_down_create(const cJSON *args) {
         }
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st); return NULL; }
     step->process = fill_down_process;
     step->flush = fill_down_flush;

@@ -144,38 +144,57 @@ void tf_batch_set_timestamp(tf_batch *b, size_t row, size_t col, int64_t val) {
 
 /* ---- Getters ---- */
 
+size_t tf_batch_num_rows(const tf_batch *b) {
+    return b ? b->n_rows : 0;
+}
+
+size_t tf_batch_num_cols(const tf_batch *b) {
+    return b ? b->n_cols : 0;
+}
+
+const char *tf_batch_col_name(const tf_batch *b, size_t col) {
+    if (!b || col >= b->n_cols) return NULL;
+    return b->col_names[col];
+}
+
+tf_type tf_batch_col_type(const tf_batch *b, size_t col) {
+    if (!b || col >= b->n_cols) return TF_TYPE_NULL;
+    return b->col_types[col];
+}
+
 bool tf_batch_is_null(const tf_batch *b, size_t row, size_t col) {
-    if (row >= b->n_rows || col >= b->n_cols) return true;
+    if (!b || row >= b->n_rows || col >= b->n_cols) return true;
+    if (!b->nulls[col]) return true;
     return b->nulls[col][row] != 0;
 }
 
 bool tf_batch_get_bool(const tf_batch *b, size_t row, size_t col) {
-    if (row >= b->n_rows || col >= b->n_cols) return false;
+    if (!b || row >= b->n_rows || col >= b->n_cols) return false;
     return ((uint8_t *)b->columns[col])[row] != 0;
 }
 
 int64_t tf_batch_get_int64(const tf_batch *b, size_t row, size_t col) {
-    if (row >= b->n_rows || col >= b->n_cols) return 0;
+    if (!b || row >= b->n_rows || col >= b->n_cols) return 0;
     return ((int64_t *)b->columns[col])[row];
 }
 
 double tf_batch_get_float64(const tf_batch *b, size_t row, size_t col) {
-    if (row >= b->n_rows || col >= b->n_cols) return 0.0;
+    if (!b || row >= b->n_rows || col >= b->n_cols) return 0.0;
     return ((double *)b->columns[col])[row];
 }
 
 const char *tf_batch_get_string(const tf_batch *b, size_t row, size_t col) {
-    if (row >= b->n_rows || col >= b->n_cols) return NULL;
+    if (!b || row >= b->n_rows || col >= b->n_cols) return NULL;
     return ((char **)b->columns[col])[row];
 }
 
 int32_t tf_batch_get_date(const tf_batch *b, size_t row, size_t col) {
-    if (row >= b->n_rows || col >= b->n_cols) return 0;
+    if (!b || row >= b->n_rows || col >= b->n_cols) return 0;
     return ((int32_t *)b->columns[col])[row];
 }
 
 int64_t tf_batch_get_timestamp(const tf_batch *b, size_t row, size_t col) {
-    if (row >= b->n_rows || col >= b->n_cols) return 0;
+    if (!b || row >= b->n_rows || col >= b->n_cols) return 0;
     return ((int64_t *)b->columns[col])[row];
 }
 

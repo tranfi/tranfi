@@ -123,7 +123,7 @@ tf_step *tf_acf_create(const cJSON *args) {
     st->lags = cJSON_IsNumber(lags_j) ? lags_j->valueint : 20;
     if (st->lags < 1) st->lags = 1;
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st); return NULL; }
     step->process = acf_process;
     step->flush = acf_flush;

@@ -2,6 +2,7 @@
 build/
 build-debug/
 corpus/
+references/
 *.gcov
 _site/
 build-wasm/
@@ -29,6 +30,7 @@ dist/
 
 # App build artifacts
 app/public/wasm/tranfi_core.js
+js/wasm/tranfi_core.js
 
 # Node
 node_modules/
@@ -51,4 +53,9 @@ Thumbs.db
 .claude/
 CLAUDE.md
 AGENTS.md
-plan.md
+PLAN.md
+MEMORY.md
+# Markdown: keep publish/user READMEs, ignore local plans/notes by default
+*.md
+!README.md
+!**/README.md

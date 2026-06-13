@@ -125,7 +125,7 @@ tf_step *tf_rename_create(const cJSON *args) {
         i++;
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) {
         rename_destroy(&(tf_step){.state = st});
         return NULL;

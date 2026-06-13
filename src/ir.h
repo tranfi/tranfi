@@ -41,6 +41,29 @@ typedef enum {
     TF_OP_TRANSFORM,
 } tf_op_kind;
 
+/* ---- Streaming contract metadata ---- */
+
+typedef enum {
+    TF_MEM_ROW_LOCAL,       /* O(batch_rows * columns) */
+    TF_MEM_BOUNDED_STATE,   /* O(parameter), e.g. window K or tail N */
+    TF_MEM_KEY_STATE,       /* O(distinct keys/categories) */
+    TF_MEM_BLOCKING,        /* needs full input in native mode */
+    TF_MEM_EXTERNAL,        /* uses spill/SQL/external bounded storage */
+} tf_memory_class;
+
+typedef enum {
+    TF_EMIT_PER_BATCH,      /* can emit during push() */
+    TF_EMIT_ON_FLUSH,       /* emits only at finish(), e.g. tail/top/stats */
+    TF_EMIT_SIDE_ONLY,      /* writes side channels, not main output */
+    TF_EMIT_MIXED,          /* emits both during push() and flush/side output */
+} tf_emit_class;
+
+typedef enum {
+    TF_SCHEMA_STABLE,       /* output columns known from input schema/args */
+    TF_SCHEMA_PARAMETRIC,   /* output schema depends on explicit parameters */
+    TF_SCHEMA_DATA_DEPENDENT, /* output schema depends on observed data */
+} tf_schema_class;
+
 /* ---- Argument descriptor ---- */
 
 typedef struct {
@@ -52,6 +75,8 @@ typedef struct {
 
 /* ---- Value types (shared with batch system) ---- */
 
+#ifndef TF_TYPE_DEFINED
+#define TF_TYPE_DEFINED
 typedef enum tf_type {
     TF_TYPE_NULL = 0,
     TF_TYPE_BOOL,
@@ -61,6 +86,7 @@ typedef enum tf_type {
     TF_TYPE_DATE,       /* int32_t: days since 1970-01-01 */
     TF_TYPE_TIMESTAMP,  /* int64_t: microseconds since 1970-01-01T00:00:00Z */
 } tf_type;
+#endif
 
 /* ---- Schema ---- */
 
@@ -81,6 +107,10 @@ typedef struct {
     tf_op_kind     kind;
     tf_op_tier     tier;
     uint32_t       caps;        /* TF_CAP_* bitfield */
+    tf_memory_class memory_class;
+    tf_emit_class   emit_class;
+    tf_schema_class schema_class;
+    const char    *state_estimate; /* Big-O state retained by the op */
     tf_arg_desc   *args;
     size_t         n_args;
     /* Schema transform: given input schema, compute output schema.
@@ -97,6 +127,9 @@ typedef struct {
 const tf_op_entry *tf_op_registry_find(const char *name);
 size_t             tf_op_registry_count(void);
 const tf_op_entry *tf_op_registry_get(size_t index);
+const char        *tf_memory_class_name(tf_memory_class cls);
+const char        *tf_emit_class_name(tf_emit_class cls);
+const char        *tf_schema_class_name(tf_schema_class cls);
 
 /* ---- IR node ---- */
 
@@ -106,6 +139,10 @@ struct tf_ir_node {
     tf_schema       input_schema;
     tf_schema       output_schema;
     uint32_t        caps;         /* resolved capability flags from registry */
+    tf_memory_class memory_class;
+    tf_emit_class   emit_class;
+    tf_schema_class schema_class;
+    const char     *state_estimate; /* Big-O state estimate, static string */
     size_t          index;        /* position in plan */
 };
 

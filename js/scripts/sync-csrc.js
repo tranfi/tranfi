@@ -8,6 +8,11 @@ const repoDir = path.resolve(pkgDir, '..')
 const srcDir = path.join(repoDir, 'src')
 const outDir = path.join(pkgDir, 'csrc')
 
+if (!fs.existsSync(srcDir)) {
+  console.log('sync-csrc: src/ not found (published package), skipping')
+  process.exit(0)
+}
+
 fs.rmSync(outDir, { recursive: true, force: true })
 fs.mkdirSync(outDir, { recursive: true })
 

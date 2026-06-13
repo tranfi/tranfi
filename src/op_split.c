@@ -95,7 +95,9 @@ tf_step *tf_split_create(const cJSON *args) {
     st->column = strdup(col_j->valuestring);
 
     cJSON *delim_j = cJSON_GetObjectItemCaseSensitive(args, "delimiter");
-    st->delimiter = strdup(cJSON_IsString(delim_j) ? delim_j->valuestring : " ");
+    const char *delim = cJSON_IsString(delim_j) ? delim_j->valuestring : " ";
+    if (delim[0] == '\0') { free(st->column); free(st); return NULL; }
+    st->delimiter = strdup(delim);
 
     st->names = calloc(n, sizeof(char *));
     st->n_names = n;
@@ -104,7 +106,7 @@ tf_step *tf_split_create(const cJSON *args) {
         if (cJSON_IsString(item)) st->names[i] = strdup(item->valuestring);
     }
 
-    tf_step *step = malloc(sizeof(tf_step));
+    tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { split_destroy(&(tf_step){.state = st}); return NULL; }
     step->process = split_process;
     step->flush = split_flush;

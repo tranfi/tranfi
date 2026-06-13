@@ -24,7 +24,7 @@ console.log(result.outputText)
 Or use the pipe DSL for one-liners:
 
 ```js
-const result = await pipeline('csv | filter "col(age) > 25" | sort -age | csv')
+const result = await pipeline('csv | filter "col(age) > 25" | top-k 100 age | csv')
   .run({ inputFile: 'data.csv' })
 ```
 
@@ -46,7 +46,7 @@ echo 'name,age\nAlice,30\nBob,25' | npx tranfi 'csv | filter "age > 25" | csv'
 
 # Or install globally
 npm i -g tranfi
-tranfi 'csv | filter "age > 25" | sort -age | csv' < data.csv
+tranfi 'csv | filter "age > 25" | top-k 100 age | csv' < data.csv
 tranfi profile < data.csv
 tranfi -R  # list recipes
 ```
@@ -64,8 +64,7 @@ const p = pipeline([
   codec.csv(),
   ops.filter(expr("col('score') >= 80")),
   ops.derive({ grade: expr("if(col('score')>=90, 'A', 'B')") }),
-  ops.sort(['-score']),
-  ops.head(10),
+  ops.top(10, 'score'),
   codec.csvEncode(),
 ])
 const result = await p.run({ inputFile: 'students.csv' })
@@ -74,11 +73,13 @@ const result = await p.run({ inputFile: 'students.csv' })
 **DSL strings** -- compact, suitable for CLI-like use:
 
 ```js
-const p = pipeline('csv | filter "col(score) >= 80" | sort -score | head 10 | csv')
+const p = pipeline('csv | filter "col(score) >= 80" | top-k 10 score | csv')
 const result = await p.run({ inputFile: 'students.csv' })
 ```
 
 Both produce identical pipelines under the hood.
+
+Dataframe-style DSL aliases are accepted and normalize to canonical ops: `mutate` -> `derive`, `summarise`/`summarize` -> `group-agg`, `distinct` -> `unique`, and `arrange` -> `sort`.
 
 ### Running pipelines
 
@@ -98,19 +99,83 @@ result.statsText      // string
 result.samples        // Buffer (sample channel)
 ```
 
+For large outputs, drain chunks instead of collecting `result.output`:
+
+```js
+const { createReadStream, createWriteStream } = require("fs")
+
+// Write to a Node Writable and wait for `drain` when the sink applies backpressure.
+const out = createWriteStream("out.csv")
+const result = await p.writeTo(out, { inputFile: "data.csv" })
+
+// Or consume Tranfi output as a Node Readable.
+for await (const chunk of p.toReadable({ inputFile: "data.csv" })) {
+  // process each output chunk
+}
+
+// Existing input streams can feed the native pipeline without readFile() materialization.
+const result2 = await p.run({ inputStream: createReadStream("data.csv") })
+
+// .gz input files are decompressed as streaming sources by default.
+const gz = await p.run({ inputFile: "events.jsonl.gz" })
+const raw = await p.run({ inputFile: "events.jsonl.gz", compression: "none" })
+const streamGz = await p.run({ inputStream: createReadStream("events.jsonl.gz"), compression: "gzip" })
+
+// Multiple files stream sequentially through one pipeline.
+const inputFiles = ["part-a.csv", "part-b.csv"]
+const combined = await p.run({ inputFiles, sourceColumn: "src" })
+
+// Low-level async iteration is still available.
+for await (const chunk of p.iterChunks({ inputFiles, sourceColumn: "src" })) {
+  // process each output chunk
+}
+```
+
+`sourceColumn` appends the path for each input row without preloading file contents. Tranfi flushes decoder input at each file boundary so an unterminated final record belongs to the correct source file. It does not remove repeated CSV headers from later files; use shards without repeated headers, `header: false`, or a pre-cleaning step when every file has its own header.
+
+Standalone WASM exposes the same non-collecting shape for in-memory data: `tf.run(dsl, data, { onOutput, collectOutput: false })` and `tf.iterChunks(dsl, data)`.
+
+For browser UI work, keep Worker placement outside the core pipeline and use the optional WASM Worker adapter:
+
+```js
+// main thread
+import { createWorkerClient } from 'tranfi/wasm/worker'
+
+const client = createWorkerClient(new Worker(new URL('./tranfi-worker.js', import.meta.url), { type: 'module' }))
+const result = await client.runFile('csv | filter "col(age) >= 18" | csv', file, {
+  chunkSize: 64 * 1024,
+  collectOutput: false,
+  onOutput: chunk => downloadSink.write(chunk),
+  onProgress: p => updateProgress(p),
+  signal: abortController.signal
+})
+
+// tranfi-worker.js, bundled by the app
+import { runWorkerServer } from 'tranfi/wasm/worker'
+runWorkerServer()
+```
+
+The Worker protocol streams chunks with transferable buffers and sends progress, stats, errors, and cancellation messages around the same WASM `create/push/pull/finish/free` API; it is not a separate IR target.
+
+The bundled Tranfi app runner is also preview-bounded by default: file chunks are streamed into WASM, main output is drained incrementally into a table preview capped by hidden `preview_rows` (default 200), and full output text is only materialized when `collect_output` is explicitly true in the schema.
+
 ## Codecs
 
 Codecs convert between raw bytes and columnar batches. Every pipeline starts with a decoder and ends with an encoder.
 
 | Method | Description |
 |--------|-------------|
-| `codec.csv({ delimiter, header, batchSize, repair })` | CSV decoder. `repair: true` pads short / truncates long rows |
+| `codec.csv({ delimiter, header, batchSize, repair, mode, strict, maxErrorBytes, maxRecordBytes, nulls, quotedNulls, skip, nMax, maxRows, comment, trimWs, skipEmptyRows })` | CSV decoder. `mode: 'strict'` fails on field-count mismatches; `repair: true` / `mode: 'repair'` emits repair diagnostics; `maxRecordBytes` bounds buffered records; `nulls: ['NA']` adds null sentinels; `skip: 2`, `nMax: 100`, `comment: '#'`, `trimWs: false`, and `skipEmptyRows: true` control row-local parsing |
 | `codec.csvEncode({ delimiter })` | CSV encoder |
-| `codec.jsonl({ batchSize })` | JSON Lines decoder |
+| `codec.jsonl({ batchSize, onError, maxErrorBytes })` | JSON Lines decoder. `onError` is `skip`, `fail`, `warn`, or `quarantine` |
 | `codec.jsonlEncode()` | JSON Lines encoder |
 | `codec.text({ batchSize })` | Line-oriented text decoder (single `_line` column) |
 | `codec.textEncode()` | Text encoder |
 | `codec.tableEncode({ maxWidth, maxRows })` | Pretty-print Markdown table |
+
+CSV treats unquoted empty fields as null by default. Pass `nulls: ['NA', 'NULL']` to add sentinel strings; pass `quotedNulls: false` when quoted sentinels like `"NA"` or `""` should remain strings. Default field-count handling is permissive for compatibility. Use `mode: 'strict'` or `strict: true` to fail on row/header width mismatches. Use `repair: true` or `mode: 'repair'` to pad/truncate and collect JSONL diagnostics in `result.errors`; `maxErrorBytes` bounds raw previews. `maxRecordBytes` defaults to `67108864` bytes, caps the current record buffer before a newline is seen, and rejects with a `csv_record_too_large` diagnostic when exceeded; pass `0` to disable the guard. `skip: 2` discards preamble records before header/schema discovery; comments are applied after skipped rows. `nMax: 100` / `maxRows: 100` keeps at most that many decoded data rows after skip/comment/header handling and uses only one counter; `nMax: 0` preserves a header-only schema batch. `comment: '#'` removes text after an unquoted marker and skips comment-only rows; quoted markers are preserved. Unquoted spaces/tabs are trimmed by default; pass `trimWs: false` to preserve them. Blank physical rows after the header are preserved as all-null rows by default; pass `skipEmptyRows: true` to drop them.
+
+Malformed JSONL records are skipped by default. Set `onError: 'warn'` or `onError: 'quarantine'` to keep valid rows and collect JSONL diagnostics in `result.errors`; set `onError: 'fail'` to reject on the first malformed line. `maxErrorBytes` bounds the raw preview stored in diagnostics.
 
 Cross-codec pipelines work naturally:
 
@@ -135,23 +200,35 @@ pipeline([codec.jsonl(), ops.sort(['name']), codec.csvEncode()])
 | `ops.top(n, column, desc?)` | Top N by column value |
 | `ops.sample(n)` | Reservoir sampling (uniform random) |
 | `ops.grep(pattern, { invert, column, regex })` | Substring/regex filter |
-| `ops.validate(expr)` | Add `_valid` boolean column, keep all rows |
+| `ops.validate(expr, { rules, rulesFile, audit, auditLimit, maxFailures, warnFailureRate, maxFailureRate, name, message }?)` | Add `_valid` boolean column, keep all rows; supports inline rules or local JSON rule-suite files; step stats include checked/passed/failed/failure-rate counters; optional bounded failure audit records and count/rate thresholds |
+| `ops.assert(expr, { action, name, message, result, aggregate, op, value, column }?)` | Row-local data-quality rule or finish-time O(1) aggregate assertion; aggregate mode supports `count`, `sum:col`, `avg:col`, `min:col`, `max:col`, `missing:col`, and `non_null:col` with `fail`/`warn` |
+| `ops.quarantine(expr, { name, message }?)` | Route rows matching expression to `errors` and drop them from main output |
+| `ops.schema({ columns, required, nonNull, nullable, values, min, max, regex, mode, result })` | Row-local table schema contract; fail, warn, filter, quarantine, or annotate |
+| `ops.schemaInfer({ rows })` | Bounded decoded-type/nullability schema report; defaults to 10000 sampled rows |
+| `ops.tee({ expr, channel, columns, limit, every, name })` | Preserve main rows and write bounded JSONL row snapshots to a side channel |
 
 ### Column operations
 
 | Method | Description |
 |--------|-------------|
 | `ops.select(columns)` | Keep and reorder columns |
+| `ops.relocate(columns, { before, after })` | Move columns while preserving all columns |
 | `ops.rename(mapping)` | Rename columns: `rename({ name: 'full_name' })` |
 | `ops.derive(columns)` | Computed columns: `derive({ total: expr("col('a')*col('b')") })` |
-| `ops.cast(mapping)` | Type conversion: `cast({ age: 'int', score: 'float' })` |
+| `ops.sourceName({ result, defaultValue })` | Append the current host source path/name as a row-local string column |
+| `ops.across(columns, { fn, functions, names, replace })` | Apply row-local functions over selected columns |
+| `ops.cast(mapping, { audit, auditLimit })` | Type conversion; optional bounded value/coercion audit records |
 | `ops.trim(columns?)` | Strip whitespace |
-| `ops.fillNull(mapping)` | Replace nulls: `fillNull({ age: '0' })` |
+| `ops.fillNull(mapping, { audit, auditLimit })` | Replace nulls: `fillNull({ age: '0' })` |
 | `ops.fillDown(columns?)` | Forward-fill nulls |
 | `ops.clip(column, { min, max })` | Clamp numeric values |
-| `ops.replace(column, pattern, replacement, { regex })` | String find/replace |
+| `ops.replace(column, pattern, replacement, { regex, audit, auditLimit })` | String find/replace |
 | `ops.hash(columns?)` | Add `_hash` column (DJB2) |
 | `ops.bin(column, boundaries)` | Discretize into bins |
+
+`columns` may contain exact names or selector strings: `id:score`, `starts_with(score_)`, `ends_with(_id)`, `contains(temp)`, `matches(^score_)`, `where(numeric)`, strict `all_of(score,name)`, lenient `any_of(optional,score)`, exclusions with `!name` or `-name`, and boolean selector algebra such as `starts_with(score_)&where(numeric)`, `starts_with(score_)&!ends_with(raw)`, or `!(id:score)`. Ranges use input schema order and can be reversed. Helper matching is case-insensitive; exact names are case-sensitive. These selectors are resolved by the native schema-aware `select`, `relocate`, and `across` ops in `O(columns)` without retaining rows; SQL lowering rejects selector helpers without a known schema.
+
+Example: `ops.across(['starts_with(score_)'], { fn: 'round' })` replaces selected numeric columns per row; `ops.across(['name'], { functions: ['lower'], replace: false, names: '{col}_{fn}' })` appends templated columns. This is native/WASM row-local execution, not arbitrary lambdas or grouped dplyr evaluation.
 
 ### Sorting and deduplication
 
@@ -165,14 +242,15 @@ pipeline([codec.jsonl(), ops.sort(['name']), codec.csvEncode()])
 | Method | Description |
 |--------|-------------|
 | `ops.stats(statsList?)` | Column statistics. Stats: `count`, `min`, `max`, `sum`, `avg`, `stddev`, `variance`, `median`, `p25`, `p75`, `p90`, `p99`, `distinct`, `hist`, `sample` |
-| `ops.frequency(columns?)` | Value counts (descending) |
-| `ops.groupAgg(groupBy, aggs)` | Group by + aggregate |
+| `ops.frequency(columns?, { maxValues, maxStateBytes, overflow, other, audit, auditLimit }?)` | Value counts; `overflow: "other"` can emit bounded category-overflow audit records |
+| `ops.groupAgg(groupBy, aggs)` | Group by + aggregate. `count` on a column counts non-null values; `column: '*'` counts rows. |
 
 ```js
 // Group aggregation
 ops.groupAgg(['city'], [
-  { column: 'price', func: 'sum', result: 'total' },
-  { column: 'price', func: 'avg', result: 'avg_price' },
+  { column: 'price', func: 'sum', name: 'total' },
+  { column: 'price', func: 'avg', name: 'avg_price' },
+  { column: '*', func: 'count', name: 'rows' },
 ])
 ```
 
@@ -182,7 +260,13 @@ ops.groupAgg(['city'], [
 |--------|-------------|
 | `ops.step(column, func, result?)` | Running aggregation: `running-sum`, `running-avg`, `running-min`, `running-max`, `lag` |
 | `ops.window(column, size, func, result?)` | Sliding window: `avg`, `sum`, `min`, `max` |
+| `ops.rollingSum/rollingMean/rollingMin/rollingMax(column, size, { result })` | Named trailing fixed-row numeric windows |
+| `ops.rollingAny/rollingAll(column, size, { result, nulls })` | Boolean trailing windows; `nulls`: `ignore`, `false`, `true`, `propagate` |
 | `ops.lead(column, { offset, result })` | Lookahead N rows |
+| `ops.lag(column, { offset, result })` | Previous-row shift |
+| `ops.shift(column, { offset, result, type })` | Shift alias; `type='lag'` default or `type='lead'` |
+| `ops.rowid(columns, { result, sorted, maxKeys })` | Global or per-key 1-based row ids |
+| `ops.rleid(columns, { result })` | Consecutive run id by selected column(s) |
 
 ### Reshape
 
@@ -205,12 +289,16 @@ ops.groupAgg(['city'], [
 | Method | Description |
 |--------|-------------|
 | `ops.flatten()` | Flatten nested columns |
+| `ops.jsonExtract(path, result, { column, type })` | Extract JSON Pointer/simple JSONPath value into a new column |
+| `ops.jsonFilter(path, { op, value, column, type })` | Filter rows by JSON Pointer/simple JSONPath predicate |
+| `ops.jsonSchema(schema, { column, mode, result })` | Validate JSON text with a supported JSON Schema subset |
+| `ops.jsonFlatten(fields, { column })` | Append declared JSON Pointer/simple JSONPath fields as bounded output columns |
 | `ops.reorder(columns)` | Alias for `select` |
 | `ops.dedup(columns?)` | Alias for `unique` |
 
 ## Expressions
 
-Used in `filter`, `derive`, and `validate`. Reference columns with `col('name')`.
+Used in `filter`, `derive`, `validate`, and `assert`. Reference columns with `col('name')`.
 
 ```js
 ops.filter(expr("col('age') > 25 and contains(col('name'), 'A')"))
@@ -228,11 +316,19 @@ ops.derive({
 | Comparison | `>` `>=` `<` `<=` `==` `!=` |
 | Logic | `and` `or` `not` |
 | String | `upper(s)` `lower(s)` `initcap(s)` `len(s)` `trim(s)` `left(s,n)` `right(s,n)` `concat(a,b,...)` `replace(s,old,new)` `slice(s,start,len)` `pad_left(s,w)` `pad_right(s,w)` |
-| Predicates | `starts_with(s,prefix)` `ends_with(s,suffix)` `contains(s,sub)` |
-| Conditional | `if(cond,then,else)` `coalesce(a,b,...)` `nullif(a,b)` |
+| Predicates | `starts_with(s,prefix)` `ends_with(s,suffix)` `contains(s,sub)` `between(x,left,right)` `inrange(x,left,right)` |
+| Date/time | `year(x)` `month(x)` `day(x)` `hour(x)` `minute(x)` `second(x)` `weekday(x)` `epoch(x)` `date_trunc(x,unit)` |
+| Conditional | `if(cond,then,else)` `case_when(cond,value,...,default)` `case_match(value,key,result,...,default)` `if_any(pred,...)` `if_all(pred,...)` `coalesce(a,b,...)` `nullif(a,b)` |
 | Math | `abs(x)` `round(x)` `floor(x)` `ceil(x)` `sign(x)` `pow(x,y)` `sqrt(x)` `log(x)` `exp(x)` `mod(a,b)` `greatest(a,b,...)` `least(a,b,...)` |
 
-Aliases: `substr`=`slice`, `length`=`len`, `lpad`=`pad_left`, `rpad`=`pad_right`, `min`=`least`, `max`=`greatest`.
+Aliases: `substr`=`slice`, `length`=`len`, `lpad`=`pad_left`, `rpad`=`pad_right`, `min`=`least`, `max`=`greatest`. Date/time functions are row-local and accept date/timestamp values plus parseable date/timestamp strings; `weekday()` returns `0=Sunday` through `6=Saturday`.
+
+```js
+ops.derive({
+  year: expr("year(col('date'))"),
+  monthStart: expr("date_trunc(col('date'), 'month')"),
+})
+```
 
 ## Recipes
 
@@ -248,6 +344,7 @@ const result = await pipeline('freq').run({ inputFile: 'data.csv' })
 | `profile` | `csv \| stats \| csv` | Full data profiling |
 | `preview` | `csv \| head 10 \| csv` | First 10 rows |
 | `schema` | `csv \| head 0 \| csv` | Column names only |
+| `sniff` | `csv \| schema infer rows=1000 \| csv` | Bounded-memory schema/type/nullability sniff |
 | `summary` | `csv \| stats count,min,max,avg,stddev \| csv` | Summary statistics |
 | `count` | `csv \| stats count \| csv` | Row count |
 | `cardinality` | `csv \| stats count,distinct \| csv` | Unique value counts |
@@ -276,6 +373,23 @@ for (const r of await recipes()) {
   console.log(`${r.name.padEnd(15)} ${r.description}`)
 }
 ```
+
+
+## Memory policy
+
+Native Node/WASM execution rejects full-input blocking steps such as `sort`, `pivot`, `stack`, `normalize`, `acf`, and table encoding unless you opt in for known-small data:
+
+```js
+await pipeline('csv | sort age | csv').run({ inputFile: 'small.csv', allowBlocking: true })
+```
+
+For capped key-state operators, pass `memory` to validate the conservative native state estimate before execution:
+
+```js
+await pipeline('csv | unique city max_keys=10000 | csv').run({ inputFile: 'data.csv', memory: '64MB' })
+```
+
+Native Node execution supports spill-backed `sort`, capped unsorted `pivot`, unsorted `unique`/`dedup`, unsorted `group-agg`, capped unsorted `join` inner/left, unsorted `semi-join`/`anti-join`, unsorted set operations, and duplicate-eliminating `union` when `spillDir` is provided. `run()`, `iterChunks()`, `toReadable()`, and `writeTo()` drain finish-time merge output through N-API `finishStep()` instead of waiting for one whole `finish()`. Standalone WASM supports `allowBlocking` and `memory`, but rejects `spillDir` because browser/WASM spill storage would occupy WASM memory. Use the Node native addon, CLI/direct C, or `{ engine: 'duckdb' }` for external spill; with DuckDB, `memory` maps to `memory_limit` and `spillDir` maps to `temp_directory`.
 
 ## DuckDB engine
 
@@ -356,12 +470,12 @@ Every pipeline produces four output channels:
 
 - **output** -- main pipeline result
 - **errors** -- rows that failed processing
-- **stats** -- pipeline execution statistics (rows in/out, timing)
+- **stats** -- newline-delimited execution statistics: run summary plus per-step counters, state estimates, and warnings
 - **samples** -- reserved for sampling operators
 
 ```js
 const result = await p.run({ inputFile: 'data.csv' })
-console.log(result.statsText)   // {"rows_in": 1000, "rows_out": 42, ...}
+console.log(result.statsText)   // newline-delimited JSON: summary plus step_stats/state_bytes_estimate/warnings
 ```
 
 ### Pipeline from JSON
@@ -381,7 +495,7 @@ const p = await loadRecipe({
 The package automatically selects the best backend:
 
 1. **N-API** (Node.js) -- native C addon, fastest, used when available
-2. **WASM** (browsers/fallback) -- same C core compiled to WebAssembly, ~313 KB single-file
+2. **WASM** (browsers/fallback) -- same C core compiled to WebAssembly, ~500 KB single-file
 3. **DuckDB** (opt-in) -- SQL execution via `{ engine: 'duckdb' }`, requires `npm install duckdb`
 
 ```js
@@ -392,4 +506,4 @@ const tf = await createTranfi()
 
 ## Architecture
 
-The Node.js package wraps the same C11 core used by the CLI, Python, and WASM targets. Data flows through columnar batches with typed columns (`bool`, `int64`, `float64`, `string`, `date`, `timestamp`) and per-cell null bitmaps. All operators are streaming with bounded memory, except those that require full input (sort, unique, stats, tail, top, group-agg, frequency, pivot).
+The Node.js package wraps the same C11 core used by the CLI, Python, and WASM targets. Data flows through columnar batches with typed columns (`bool`, `int64`, `float64`, `string`, `date`, `timestamp`) and per-cell null bitmaps. `run({ inputFile })` streams files with `createReadStream()` and drains native/WASM main output after each push and each incremental finish boundary; by default it still collects the final output for convenience. `.gz` input files are decompressed through a `zlib.createGunzip()` source transform; use `compression: "none"` to force raw bytes or `compression: "gzip"` to force gzip for `inputFile`/`inputStream`. Use `inputStream`, `toReadable()`, `writeTo()`, `onOutput` with `collectOutput: false`, or `iterChunks()` for large inputs/outputs and backpressure-aware sinks. Native execution is strict by default: row-local and bounded-state operators stream, blocking operators require `allowBlocking: true` or supported `spillDir`, and capped key-state plans can be checked with `memory: "64MB"`.
