@@ -56,6 +56,10 @@ class TestCompileToSql:
         with pytest.raises(RuntimeError, match='sample.*cannot be lowered to SQL'):
             tf.compile_to_sql('csv | sample 2 seed=42 | csv')
 
+    def test_stats_rejected(self):
+        with pytest.raises(RuntimeError, match='stats.*cannot be lowered to SQL'):
+            tf.compile_to_sql('csv | stats count,missing,complete_rate | csv')
+
     def test_derive(self):
         sql = tf.compile_to_sql("csv | derive total=col('a')+col('b') | csv")
         assert '"total"' in sql
@@ -84,6 +88,10 @@ class TestDuckDBEngine:
     def test_sample_rejected(self):
         with pytest.raises(RuntimeError, match='sample.*cannot be lowered to SQL'):
             tf.pipeline('csv | sample 2 seed=42 | csv', engine='duckdb').run(input=CSV_DATA)
+
+    def test_stats_rejected(self):
+        with pytest.raises(RuntimeError, match='stats.*cannot be lowered to SQL'):
+            tf.pipeline('csv | stats count,missing,complete_rate | csv', engine='duckdb').run(input=CSV_DATA)
 
     def test_select(self):
         r = tf.pipeline('csv | select name,age | csv', engine='duckdb').run(input=CSV_DATA)

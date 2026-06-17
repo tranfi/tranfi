@@ -1541,9 +1541,8 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
 
   /* ---- stats ---- */
   if (strcmp(op, "stats") == 0) {
-    /* Stats uses DuckDB's SUMMARIZE — works without knowing column names */
-    sb_appendf(sb, "%s AS (SELECT * FROM (SUMMARIZE SELECT * FROM %s))", cte_name, prev);
-    return 0;
+    *error = strdup("stats: native report shape cannot be lowered to SQL");
+    return -1;
   }
 
   /* ---- flatten ---- */

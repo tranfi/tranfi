@@ -4173,6 +4173,13 @@ await test('compileToSql rejects sample', async () => {
   )
 })
 
+await test('compileToSql rejects stats', async () => {
+  await assertRejects(
+    () => compileToSql('csv | stats count,missing,complete_rate | csv'),
+    /stats.*cannot be lowered to SQL/
+  )
+})
+
 await test('compileToSql between', async () => {
   const sql = await compileToSql('csv | filter "between(col(\'age\'), 25, 35)" | csv')
   assert(sql.includes('"age" BETWEEN 25 AND 35'), 'between should lower to SQL BETWEEN')
@@ -4412,6 +4419,13 @@ if (hasDuckDB) {
     await assertRejects(
       () => pipeline('csv | sample 2 seed=42 | csv', { engine: 'duckdb' }).run({ input: csvData }),
       /sample.*cannot be lowered to SQL/
+    )
+  })
+
+  await test('duckdb rejects stats', async () => {
+    await assertRejects(
+      () => pipeline('csv | stats count,missing,complete_rate | csv', { engine: 'duckdb' }).run({ input: csvData }),
+      /stats.*cannot be lowered to SQL/
     )
   })
 
