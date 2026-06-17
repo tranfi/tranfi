@@ -101,6 +101,7 @@ struct tf_schema {
 
 void tf_schema_free(tf_schema *s);
 void tf_schema_copy(tf_schema *dst, const tf_schema *src);
+int  tf_schema_copy_checked(tf_schema *dst, const tf_schema *src);
 
 /* ---- Op registry entry ---- */
 

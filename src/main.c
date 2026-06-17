@@ -941,8 +941,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Schema inference (best-effort) */
-    tf_ir_infer_schema(ir);
+    /* Schema inference allows unknown runtime schemas but reports allocation failures. */
+    if (tf_ir_infer_schema(ir) != TF_OK) {
+        fprintf(stderr, "error: schema inference failed\n");
+        tf_ir_plan_free(ir);
+        return 1;
+    }
 
     if (apply_native_spill_policy(ir, &policy) != 0) {
         fprintf(stderr, "error: failed to apply native spill policy\n");

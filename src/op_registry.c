@@ -15,14 +15,84 @@
 
 /* ---- Schema inference callbacks ---- */
 
-/* Decoders: output schema unknown until runtime */
-static int infer_schema_unknown(const tf_ir_node *node,
-                                const tf_schema *in, tf_schema *out) {
-    (void)node; (void)in;
+static void registry_schema_unknown(tf_schema *out) {
+    if (!out) return;
+    tf_schema_free(out);
     out->col_names = NULL;
     out->col_types = NULL;
     out->n_cols = 0;
     out->known = false;
+}
+
+static int registry_schema_alloc_known(tf_schema *out, size_t n_cols) {
+    if (!out) return TF_ERROR;
+    tf_schema_free(out);
+    size_t alloc_n = n_cols ? n_cols : 1;
+    out->col_names = calloc(alloc_n, sizeof(char *));
+    out->col_types = calloc(alloc_n, sizeof(tf_type));
+    if (!out->col_names || !out->col_types) {
+        tf_schema_free(out);
+        return TF_ERROR;
+    }
+    out->n_cols = n_cols;
+    out->known = true;
+    return TF_OK;
+}
+
+static int registry_schema_set_col(tf_schema *out, size_t idx,
+                                   const char *name, tf_type type) {
+    if (!out || !out->known || idx >= out->n_cols || !name) return TF_ERROR;
+    char *copy = strdup(name);
+    if (!copy) return TF_ERROR;
+    free(out->col_names[idx]);
+    out->col_names[idx] = copy;
+    out->col_types[idx] = type;
+    return TF_OK;
+}
+
+static int registry_schema_take_col(tf_schema *out, size_t idx,
+                                    char *name, tf_type type) {
+    if (!out || !out->known || idx >= out->n_cols || !name) {
+        free(name);
+        return TF_ERROR;
+    }
+    free(out->col_names[idx]);
+    out->col_names[idx] = name;
+    out->col_types[idx] = type;
+    return TF_OK;
+}
+
+static int registry_schema_copy_input_columns(tf_schema *out, const tf_schema *in) {
+    if (!out || !in || !out->known || !in->known || out->n_cols < in->n_cols) return TF_ERROR;
+    for (size_t i = 0; i < in->n_cols; i++) {
+        if (registry_schema_set_col(out, i, in->col_names[i] ? in->col_names[i] : "",
+                                    in->col_types[i]) != TF_OK) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
+    }
+    return TF_OK;
+}
+
+static int registry_schema_copy_input_plus(tf_schema *out, const tf_schema *in,
+                                           size_t n_extra) {
+    if (!in || !in->known) {
+        registry_schema_unknown(out);
+        return TF_OK;
+    }
+    size_t total = 0;
+    if (tf_size_add(in->n_cols, n_extra, &total) != TF_OK ||
+        registry_schema_alloc_known(out, total) != TF_OK) {
+        return TF_ERROR;
+    }
+    return registry_schema_copy_input_columns(out, in);
+}
+
+/* Decoders: output schema unknown until runtime */
+static int infer_schema_unknown(const tf_ir_node *node,
+                                const tf_schema *in, tf_schema *out) {
+    (void)node; (void)in;
+    registry_schema_unknown(out);
     return TF_OK;
 }
 
@@ -30,10 +100,7 @@ static int infer_schema_unknown(const tf_ir_node *node,
 static int infer_schema_sink(const tf_ir_node *node,
                              const tf_schema *in, tf_schema *out) {
     (void)node; (void)in;
-    out->col_names = NULL;
-    out->col_types = NULL;
-    out->n_cols = 0;
-    out->known = false;
+    registry_schema_unknown(out);
     return TF_OK;
 }
 
@@ -42,24 +109,17 @@ static int infer_schema_passthrough(const tf_ir_node *node,
                                     const tf_schema *in, tf_schema *out) {
     (void)node;
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
-    tf_schema_copy(out, in);
-    return TF_OK;
+    return tf_schema_copy_checked(out, in);
 }
 
 /* select: output schema = subset of input columns */
 static int infer_schema_select(const tf_ir_node *node,
                                const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
@@ -74,29 +134,24 @@ static int infer_schema_select(const tf_ir_node *node,
                                                   &indices, &n_indices, &error);
         free(error);
         if (rc != TF_OK) return TF_ERROR;
-        out->col_names = calloc(n_indices, sizeof(char *));
-        out->col_types = calloc(n_indices, sizeof(tf_type));
-        if (!out->col_names || !out->col_types) {
+        if (registry_schema_alloc_known(out, n_indices) != TF_OK) {
             free(indices);
-            tf_schema_free(out);
             return TF_ERROR;
         }
-        out->n_cols = n_indices;
-        out->known = true;
         for (size_t i = 0; i < n_indices; i++) {
             int ci = indices[i];
-            out->col_names[i] = strdup(in->col_names[ci]);
-            out->col_types[i] = in->col_types[ci];
+            if (registry_schema_set_col(out, i, in->col_names[ci], in->col_types[ci]) != TF_OK) {
+                free(indices);
+                tf_schema_free(out);
+                return TF_ERROR;
+            }
         }
         free(indices);
         return TF_OK;
     }
 
     int n = cJSON_GetArraySize(cols);
-    out->col_names = calloc(n, sizeof(char *));
-    out->col_types = calloc(n, sizeof(tf_type));
-    out->n_cols = n;
-    out->known = true;
+    if (n < 0 || registry_schema_alloc_known(out, (size_t)n) != TF_OK) return TF_ERROR;
 
     for (int i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(cols, i);
@@ -109,16 +164,20 @@ static int infer_schema_select(const tf_ir_node *node,
         bool found = false;
         for (size_t j = 0; j < in->n_cols; j++) {
             if (strcmp(in->col_names[j], name) == 0) {
-                out->col_names[i] = strdup(name);
-                out->col_types[i] = in->col_types[j];
+                if (registry_schema_set_col(out, (size_t)i, name, in->col_types[j]) != TF_OK) {
+                    tf_schema_free(out);
+                    return TF_ERROR;
+                }
                 found = true;
                 break;
             }
         }
         if (!found) {
             /* Column not in input — still record it, validation can catch it */
-            out->col_names[i] = strdup(name);
-            out->col_types[i] = TF_TYPE_NULL;
+            if (registry_schema_set_col(out, (size_t)i, name, TF_TYPE_NULL) != TF_OK) {
+                tf_schema_free(out);
+                return TF_ERROR;
+            }
         }
     }
     return TF_OK;
@@ -127,10 +186,7 @@ static int infer_schema_select(const tf_ir_node *node,
 static int infer_schema_relocate(const tf_ir_node *node,
                                  const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
@@ -205,19 +261,19 @@ static int infer_schema_relocate(const tf_ir_node *node,
         return TF_ERROR;
     }
 
-    out->col_names = calloc(n_in, sizeof(char *));
-    out->col_types = calloc(n_in, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
+    if (registry_schema_alloc_known(out, n_in) != TF_OK) {
         free(move_idx); free(is_moving); free(order);
-        tf_schema_free(out);
         return TF_ERROR;
     }
-    out->n_cols = n_in;
-    out->known = true;
     for (size_t i = 0; i < n_in; i++) {
         int ci = order[i];
-        out->col_names[i] = strdup(in->col_names[ci]);
-        out->col_types[i] = in->col_types[ci];
+        if (registry_schema_set_col(out, i, in->col_names[ci], in->col_types[ci]) != TF_OK) {
+            free(move_idx);
+            free(is_moving);
+            free(order);
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
     }
 
     free(move_idx);
@@ -230,14 +286,11 @@ static int infer_schema_relocate(const tf_ir_node *node,
 static int infer_schema_rename(const tf_ir_node *node,
                                const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
-    tf_schema_copy(out, in);
+    if (tf_schema_copy_checked(out, in) != TF_OK) return TF_ERROR;
 
     cJSON *mapping = cJSON_GetObjectItemCaseSensitive(node->args, "mapping");
     if (!mapping || !cJSON_IsObject(mapping)) return TF_OK; /* no renames */
@@ -249,8 +302,10 @@ static int infer_schema_rename(const tf_ir_node *node,
         const char *new_name = entry->valuestring;
         for (size_t i = 0; i < out->n_cols; i++) {
             if (strcmp(out->col_names[i], old_name) == 0) {
-                free(out->col_names[i]);
-                out->col_names[i] = strdup(new_name);
+                if (registry_schema_set_col(out, i, new_name, out->col_types[i]) != TF_OK) {
+                    tf_schema_free(out);
+                    return TF_ERROR;
+                }
                 break;
             }
         }
@@ -262,34 +317,26 @@ static int infer_schema_rename(const tf_ir_node *node,
 static int infer_schema_derive(const tf_ir_node *node,
                                const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
     cJSON *columns = cJSON_GetObjectItemCaseSensitive(node->args, "columns");
     int n_derived = columns ? cJSON_GetArraySize(columns) : 0;
-    size_t total = in->n_cols + n_derived;
-
-    out->col_names = calloc(total, sizeof(char *));
-    out->col_types = calloc(total, sizeof(tf_type));
-    out->n_cols = total;
-    out->known = true;
-
-    /* Copy input columns */
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
+    if (n_derived < 0 ||
+        registry_schema_copy_input_plus(out, in, (size_t)n_derived) != TF_OK) {
+        return TF_ERROR;
     }
 
     /* Add derived columns (type unknown at compile time) */
     for (int i = 0; i < n_derived; i++) {
         cJSON *item = cJSON_GetArrayItem(columns, i);
         cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
-        out->col_names[in->n_cols + i] = strdup(name_j ? name_j->valuestring : "?");
-        out->col_types[in->n_cols + i] = TF_TYPE_NULL;
+        const char *name = cJSON_IsString(name_j) ? name_j->valuestring : "?";
+        if (registry_schema_set_col(out, in->n_cols + (size_t)i, name, TF_TYPE_NULL) != TF_OK) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
     }
     return TF_OK;
 }
@@ -373,10 +420,7 @@ static int registry_across_functions(const tf_ir_node *node, cJSON **out_fns, in
 static int infer_schema_across(const tf_ir_node *node,
                                const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
@@ -399,15 +443,17 @@ static int infer_schema_across(const tf_ir_node *node,
     if (replace && n_fns != 1) { free(indices); return TF_ERROR; }
     const char *tmpl = cJSON_IsString(names) ? names->valuestring : (replace ? "{col}" : "{col}_{fn}");
 
-    size_t total = in->n_cols + (replace ? 0 : n_indices * (size_t)n_fns);
-    out->col_names = calloc(total ? total : 1, sizeof(char *));
-    out->col_types = calloc(total ? total : 1, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) { free(indices); tf_schema_free(out); return TF_ERROR; }
-    out->n_cols = total;
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
+    size_t extra = 0;
+    size_t total = 0;
+    if (!replace && tf_size_mul(n_indices, (size_t)n_fns, &extra) != TF_OK) {
+        free(indices);
+        return TF_ERROR;
+    }
+    if (tf_size_add(in->n_cols, extra, &total) != TF_OK ||
+        registry_schema_alloc_known(out, total) != TF_OK ||
+        registry_schema_copy_input_columns(out, in) != TF_OK) {
+        free(indices);
+        return TF_ERROR;
     }
 
     if (replace) {
@@ -427,9 +473,12 @@ static int infer_schema_across(const tf_ir_node *node,
                 if (!cJSON_IsString(fn_j)) { free(indices); tf_schema_free(out); return TF_ERROR; }
                 tf_type t = registry_across_output_type(fn_j->valuestring, in->col_types[ci]);
                 if (t == TF_TYPE_NULL) { free(indices); tf_schema_free(out); return TF_ERROR; }
-                out->col_names[in->n_cols + a] = registry_across_format_name(tmpl, in->col_names[ci], fn_j->valuestring);
-                out->col_types[in->n_cols + a] = t;
-                if (!out->col_names[in->n_cols + a]) { free(indices); tf_schema_free(out); return TF_ERROR; }
+                char *name = registry_across_format_name(tmpl, in->col_names[ci], fn_j->valuestring);
+                if (registry_schema_take_col(out, in->n_cols + a, name, t) != TF_OK) {
+                    free(indices);
+                    tf_schema_free(out);
+                    return TF_ERROR;
+                }
                 a++;
             }
         }
@@ -442,17 +491,12 @@ static int infer_schema_across(const tf_ir_node *node,
 static int infer_schema_validate(const tf_ir_node *node,
                                  const tf_schema *in, tf_schema *out) {
     (void)node;
-    if (!in->known) { out->known = false; out->col_names = NULL; out->col_types = NULL; out->n_cols = 0; return TF_OK; }
-    out->n_cols = in->n_cols + 1;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
+    if (!in->known) { registry_schema_unknown(out); return TF_OK; }
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, "_valid", TF_TYPE_BOOL) != TF_OK) {
+        tf_schema_free(out);
+        return TF_ERROR;
     }
-    out->col_names[in->n_cols] = strdup("_valid");
-    out->col_types[in->n_cols] = TF_TYPE_BOOL;
     return TF_OK;
 }
 
@@ -461,21 +505,15 @@ static int infer_schema_assert(const tf_ir_node *node,
     cJSON *action_j = cJSON_GetObjectItemCaseSensitive(node->args, "action");
     const char *action = cJSON_IsString(action_j) ? action_j->valuestring : "fail";
     if (strcmp(action, "annotate") != 0) return infer_schema_passthrough(node, in, out);
-    if (!in->known) { out->known = false; out->col_names = NULL; out->col_types = NULL; out->n_cols = 0; return TF_OK; }
+    if (!in->known) { registry_schema_unknown(out); return TF_OK; }
     cJSON *result_j = cJSON_GetObjectItemCaseSensitive(node->args, "result");
     const char *result = cJSON_IsString(result_j) && result_j->valuestring[0]
         ? result_j->valuestring : "_assert";
-    out->n_cols = in->n_cols + 1;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) { tf_schema_free(out); return TF_ERROR; }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, result, TF_TYPE_BOOL) != TF_OK) {
+        tf_schema_free(out);
+        return TF_ERROR;
     }
-    out->col_names[in->n_cols] = strdup(result);
-    out->col_types[in->n_cols] = TF_TYPE_BOOL;
     return TF_OK;
 }
 
@@ -486,21 +524,15 @@ static int infer_schema_schema(const tf_ir_node *node,
     const char *action = cJSON_IsString(action_j) ? action_j->valuestring :
         (cJSON_IsString(mode_j) ? mode_j->valuestring : "fail");
     if (strcmp(action, "annotate") != 0) return infer_schema_passthrough(node, in, out);
-    if (!in->known) { out->known = false; out->col_names = NULL; out->col_types = NULL; out->n_cols = 0; return TF_OK; }
+    if (!in->known) { registry_schema_unknown(out); return TF_OK; }
     cJSON *result_j = cJSON_GetObjectItemCaseSensitive(node->args, "result");
     const char *result = cJSON_IsString(result_j) && result_j->valuestring[0]
         ? result_j->valuestring : "_schema";
-    out->n_cols = in->n_cols + 1;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) { tf_schema_free(out); return TF_ERROR; }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, result, TF_TYPE_BOOL) != TF_OK) {
+        tf_schema_free(out);
+        return TF_ERROR;
     }
-    out->col_names[in->n_cols] = strdup(result);
-    out->col_types[in->n_cols] = TF_TYPE_BOOL;
     return TF_OK;
 }
 
@@ -516,34 +548,23 @@ static int infer_schema_schema_infer(const tf_ir_node *node,
         TF_TYPE_INT64, TF_TYPE_INT64, TF_TYPE_INT64, TF_TYPE_STRING, TF_TYPE_STRING
     };
     size_t n = sizeof(names) / sizeof(names[0]);
-    out->col_names = calloc(n, sizeof(char *));
-    out->col_types = calloc(n, sizeof(tf_type));
-    out->n_cols = n;
-    out->known = true;
-    if (!out->col_names || !out->col_types) { tf_schema_free(out); return TF_ERROR; }
+    if (registry_schema_alloc_known(out, n) != TF_OK) return TF_ERROR;
     for (size_t i = 0; i < n; i++) {
-        out->col_names[i] = strdup(names[i]);
-        out->col_types[i] = types[i];
-        if (!out->col_names[i]) { tf_schema_free(out); return TF_ERROR; }
+        if (registry_schema_set_col(out, i, names[i], types[i]) != TF_OK) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
     }
     return TF_OK;
 }
 
 static int infer_schema_add_int64_column(const tf_schema *in, tf_schema *out, const char *name) {
-    if (!in->known) { out->known = false; out->col_names = NULL; out->col_types = NULL; out->n_cols = 0; return TF_OK; }
-    if (tf_size_add(in->n_cols, 1, &out->n_cols) != TF_OK) return TF_ERROR;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) { tf_schema_free(out); return TF_ERROR; }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
-        if (!out->col_names[i]) { tf_schema_free(out); return TF_ERROR; }
+    if (!in->known) { registry_schema_unknown(out); return TF_OK; }
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, name, TF_TYPE_INT64) != TF_OK) {
+        tf_schema_free(out);
+        return TF_ERROR;
     }
-    out->col_names[in->n_cols] = strdup(name);
-    out->col_types[in->n_cols] = TF_TYPE_INT64;
-    if (!out->col_names[in->n_cols]) { tf_schema_free(out); return TF_ERROR; }
     return TF_OK;
 }
 
@@ -573,10 +594,7 @@ static int infer_schema_rowid(const tf_ir_node *node,
 static int infer_schema_source_name(const tf_ir_node *node,
                                     const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
     const char *name = "_source";
@@ -585,25 +603,8 @@ static int infer_schema_source_name(const tf_ir_node *node,
     if (!cJSON_IsString(res)) res = cJSON_GetObjectItemCaseSensitive(node->args, "as");
     if (cJSON_IsString(res) && res->valuestring[0] != '\0') name = res->valuestring;
 
-    if (tf_size_add(in->n_cols, 1, &out->n_cols) != TF_OK) return TF_ERROR;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
-        tf_schema_free(out);
-        return TF_ERROR;
-    }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
-        if (!out->col_names[i]) {
-            tf_schema_free(out);
-            return TF_ERROR;
-        }
-    }
-    out->col_names[in->n_cols] = strdup(name);
-    out->col_types[in->n_cols] = TF_TYPE_STRING;
-    if (!out->col_names[in->n_cols]) {
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, name, TF_TYPE_STRING) != TF_OK) {
         tf_schema_free(out);
         return TF_ERROR;
     }
@@ -614,22 +615,12 @@ static int infer_schema_source_name(const tf_ir_node *node,
 static int infer_schema_frequency(const tf_ir_node *node,
                                   const tf_schema *in, tf_schema *out) {
     (void)node; (void)in;
-    out->n_cols = 2;
-    out->col_names = calloc(2, sizeof(char *));
-    out->col_types = calloc(2, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
+    if (registry_schema_alloc_known(out, 2) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, 0, "value", TF_TYPE_STRING) != TF_OK ||
+        registry_schema_set_col(out, 1, "count", TF_TYPE_INT64) != TF_OK) {
         tf_schema_free(out);
         return TF_ERROR;
     }
-    out->col_names[0] = strdup("value");
-    out->col_types[0] = TF_TYPE_STRING;
-    out->col_names[1] = strdup("count");
-    out->col_types[1] = TF_TYPE_INT64;
-    if (!out->col_names[0] || !out->col_names[1]) {
-        tf_schema_free(out);
-        return TF_ERROR;
-    }
-    out->known = true;
     return TF_OK;
 }
 
@@ -649,19 +640,13 @@ static int infer_schema_append_source_column(const tf_ir_node *node,
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(node->args, "column");
     const char *column = cJSON_IsString(col_j) ? col_j->valuestring : NULL;
     if (!in->known || !column) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
     int ci = schema_col_index(in, column);
     if (ci < 0) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
@@ -675,25 +660,8 @@ static int infer_schema_append_source_column(const tf_ir_node *node,
         name = fallback;
     }
 
-    if (tf_size_add(in->n_cols, 1, &out->n_cols) != TF_OK) return TF_ERROR;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
-        tf_schema_free(out);
-        return TF_ERROR;
-    }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
-        if (!out->col_names[i]) {
-            tf_schema_free(out);
-            return TF_ERROR;
-        }
-    }
-    out->col_names[in->n_cols] = strdup(name);
-    out->col_types[in->n_cols] = in->col_types[ci];
-    if (!out->col_names[in->n_cols]) {
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, name, in->col_types[ci]) != TF_OK) {
         tf_schema_free(out);
         return TF_ERROR;
     }
@@ -730,30 +698,19 @@ static tf_type json_extract_type_from_arg(const cJSON *args) {
 static int infer_schema_json_extract(const tf_ir_node *node,
                                      const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
     cJSON *res = cJSON_GetObjectItemCaseSensitive(node->args, "result");
     if (!cJSON_IsString(res) || res->valuestring[0] == '\0') return TF_ERROR;
 
-    out->n_cols = in->n_cols + 1;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, res->valuestring,
+                                json_extract_type_from_arg(node->args)) != TF_OK) {
         tf_schema_free(out);
         return TF_ERROR;
     }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
-    }
-    out->col_names[in->n_cols] = strdup(res->valuestring);
-    out->col_types[in->n_cols] = json_extract_type_from_arg(node->args);
     return TF_OK;
 }
 
@@ -766,10 +723,7 @@ static int infer_schema_json_schema(const tf_ir_node *node,
     }
 
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
 
@@ -777,20 +731,11 @@ static int infer_schema_json_schema(const tf_ir_node *node,
     cJSON *res = cJSON_GetObjectItemCaseSensitive(node->args, "result");
     if (cJSON_IsString(res) && res->valuestring[0] != '\0') result = res->valuestring;
 
-    out->n_cols = in->n_cols + 1;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
+    if (registry_schema_copy_input_plus(out, in, 1) != TF_OK) return TF_ERROR;
+    if (registry_schema_set_col(out, in->n_cols, result, TF_TYPE_BOOL) != TF_OK) {
         tf_schema_free(out);
         return TF_ERROR;
     }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
-    }
-    out->col_names[in->n_cols] = strdup(result);
-    out->col_types[in->n_cols] = TF_TYPE_BOOL;
     return TF_OK;
 }
 
@@ -840,27 +785,13 @@ static int json_flatten_field_schema(const cJSON *item, char **name, tf_type *ty
 static int infer_schema_json_flatten(const tf_ir_node *node,
                                      const tf_schema *in, tf_schema *out) {
     if (!in->known) {
-        out->known = false;
-        out->col_names = NULL;
-        out->col_types = NULL;
-        out->n_cols = 0;
+        registry_schema_unknown(out);
         return TF_OK;
     }
     cJSON *fields = cJSON_GetObjectItemCaseSensitive(node->args, "fields");
     if (!cJSON_IsArray(fields) || cJSON_GetArraySize(fields) <= 0) return TF_ERROR;
     int n_fields = cJSON_GetArraySize(fields);
-    out->n_cols = in->n_cols + (size_t)n_fields;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
-        tf_schema_free(out);
-        return TF_ERROR;
-    }
-    out->known = true;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        out->col_names[i] = strdup(in->col_names[i]);
-        out->col_types[i] = in->col_types[i];
-    }
+    if (registry_schema_copy_input_plus(out, in, (size_t)n_fields) != TF_OK) return TF_ERROR;
     for (int i = 0; i < n_fields; i++) {
         char *name = NULL;
         tf_type type = TF_TYPE_STRING;
@@ -869,8 +800,10 @@ static int infer_schema_json_flatten(const tf_ir_node *node,
             tf_schema_free(out);
             return TF_ERROR;
         }
-        out->col_names[in->n_cols + (size_t)i] = name;
-        out->col_types[in->n_cols + (size_t)i] = type;
+        if (registry_schema_take_col(out, in->n_cols + (size_t)i, name, type) != TF_OK) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
     }
     return TF_OK;
 }
@@ -884,35 +817,28 @@ static int infer_schema_group_agg(const tf_ir_node *node,
     int ng = group_by ? cJSON_GetArraySize(group_by) : 0;
     int na = aggs ? cJSON_GetArraySize(aggs) : 0;
     if (ng < 0 || na < 0) return TF_ERROR;
-    out->n_cols = (size_t)ng + (size_t)na;
-    out->col_names = calloc(out->n_cols ? out->n_cols : 1, sizeof(char *));
-    out->col_types = calloc(out->n_cols ? out->n_cols : 1, sizeof(tf_type));
-    if (!out->col_names || !out->col_types) {
-        tf_schema_free(out);
-        return TF_ERROR;
-    }
+    size_t total = 0;
+    if (tf_size_add((size_t)ng, (size_t)na, &total) != TF_OK ||
+        registry_schema_alloc_known(out, total) != TF_OK) return TF_ERROR;
     for (int i = 0; i < ng; i++) {
         cJSON *item = cJSON_GetArrayItem(group_by, i);
         const char *name = cJSON_IsString(item) ? item->valuestring : "?";
-        out->col_names[i] = strdup(name);
-        if (!out->col_names[i]) {
+        int input_idx = schema_col_index(in, name);
+        tf_type type = input_idx >= 0 ? in->col_types[input_idx] : TF_TYPE_STRING;
+        if (registry_schema_set_col(out, (size_t)i, name, type) != TF_OK) {
             tf_schema_free(out);
             return TF_ERROR;
         }
-        int input_idx = schema_col_index(in, name);
-        out->col_types[i] = input_idx >= 0 ? in->col_types[input_idx] : TF_TYPE_STRING;
     }
     for (int i = 0; i < na; i++) {
         cJSON *item = cJSON_GetArrayItem(aggs, i);
         cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
-        out->col_names[(size_t)ng + (size_t)i] = strdup(name_j && cJSON_IsString(name_j) ? name_j->valuestring : "?");
-        if (!out->col_names[(size_t)ng + (size_t)i]) {
+        const char *name = name_j && cJSON_IsString(name_j) ? name_j->valuestring : "?";
+        if (registry_schema_set_col(out, (size_t)ng + (size_t)i, name, TF_TYPE_FLOAT64) != TF_OK) {
             tf_schema_free(out);
             return TF_ERROR;
         }
-        out->col_types[(size_t)ng + (size_t)i] = TF_TYPE_FLOAT64;
     }
-    out->known = true;
     return TF_OK;
 }
 
@@ -983,20 +909,11 @@ static int infer_schema_stats(const tf_ir_node *node,
     if (w_hist) n_cols++;
     if (w_sample) n_cols++;
 
-    out->col_names = calloc(n_cols, sizeof(char *));
-    out->col_types = calloc(n_cols, sizeof(tf_type));
-    out->n_cols = n_cols;
-    if (!out->col_names || !out->col_types) {
-        tf_schema_free(out);
-        return TF_ERROR;
-    }
-    out->known = true;
+    if (registry_schema_alloc_known(out, n_cols) != TF_OK) return TF_ERROR;
 
     size_t ci = 0;
 #define ADD_STAT_COLUMN(name, type) do { \
-        out->col_names[ci] = strdup((name)); \
-        out->col_types[ci] = (type); \
-        if (!out->col_names[ci]) { \
+        if (registry_schema_set_col(out, ci, (name), (type)) != TF_OK) { \
             tf_schema_free(out); \
             return TF_ERROR; \
         } \

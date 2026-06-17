@@ -359,7 +359,11 @@ static tf_pipeline *pipeline_create_from_owned_ir(tf_ir_plan *ir, const tf_host_
         return NULL;
     }
 
-    tf_ir_infer_schema(ir);
+    if (tf_ir_infer_schema(ir) != TF_OK) {
+        tf_set_last_error("schema inference failed");
+        tf_ir_plan_free(ir);
+        return NULL;
+    }
 
     tf_step_run_stats *step_stats = NULL;
     size_t n_step_stats = 0;
@@ -1019,7 +1023,11 @@ char *tf_compile_to_sql(const char *dsl, size_t len, char **error) {
         tf_ir_plan_destroy(plan);
         return NULL;
     }
-    tf_ir_infer_schema(plan);
+    if (tf_ir_infer_schema(plan) != TF_OK) {
+        if (error) *error = strdup("schema inference failed");
+        tf_ir_plan_destroy(plan);
+        return NULL;
+    }
     char *sql = tf_ir_to_sql(plan, error);
     tf_ir_plan_destroy(plan);
     return sql;
@@ -1040,7 +1048,11 @@ char *tf_compile_dsl_with_host_policy(const char *dsl, size_t len,
         tf_ir_plan_destroy(plan);
         return NULL;
     }
-    tf_ir_infer_schema(plan);
+    if (tf_ir_infer_schema(plan) != TF_OK) {
+        if (error) *error = strdup("schema inference failed");
+        tf_ir_plan_destroy(plan);
+        return NULL;
+    }
 
     char *json = tf_ir_plan_to_json(plan);
     tf_ir_plan_destroy(plan);

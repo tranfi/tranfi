@@ -25,16 +25,27 @@ int tf_ir_infer_schema(tf_ir_plan *plan) {
 
         /* Copy current schema as this node's input */
         tf_schema_free(&node->input_schema);
-        tf_schema_copy(&node->input_schema, &current);
+        if (tf_schema_copy_checked(&node->input_schema, &current) != TF_OK) {
+            tf_schema_free(&current);
+            plan->schema_inferred = false;
+            return TF_ERROR;
+        }
 
         if (entry && entry->infer_schema) {
             /* Clear old output schema */
             tf_schema_free(&node->output_schema);
-            entry->infer_schema(node, &current, &node->output_schema);
+            if (entry->infer_schema(node, &current, &node->output_schema) != TF_OK) {
+                tf_schema_free(&current);
+                plan->schema_inferred = false;
+                return TF_ERROR;
+            }
 
             /* Advance current to this node's output */
             tf_schema_free(&current);
-            tf_schema_copy(&current, &node->output_schema);
+            if (tf_schema_copy_checked(&current, &node->output_schema) != TF_OK) {
+                plan->schema_inferred = false;
+                return TF_ERROR;
+            }
         } else {
             /* No schema inference available — propagate unknown */
             tf_schema_free(&node->output_schema);
@@ -48,8 +59,12 @@ int tf_ir_infer_schema(tf_ir_plan *plan) {
     tf_schema_free(&plan->final_schema);
     if (plan->n_nodes >= 2) {
         /* The schema before the encoder is the second-to-last node's output */
-        tf_schema_copy(&plan->final_schema,
-                       &plan->nodes[plan->n_nodes - 2].output_schema);
+        if (tf_schema_copy_checked(&plan->final_schema,
+                                   &plan->nodes[plan->n_nodes - 2].output_schema) != TF_OK) {
+            tf_schema_free(&current);
+            plan->schema_inferred = false;
+            return TF_ERROR;
+        }
     } else {
         plan->final_schema.known = false;
     }

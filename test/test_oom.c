@@ -343,6 +343,12 @@ int main(void) {
             520
         },
         {
+            "data_quality_annotate_schema",
+            "csv batch_size=1 | validate \"col(age) > 0\" | assert \"col(score) >= 20\" action=annotate result=score_ok | schema name:string age:int city:string mode=annotate result=schema_ok | csv",
+            people,
+            560
+        },
+        {
             "schema_selector_rules",
             "csv batch_size=1 | schema columns=starts_with(score_):number,code:string non_null=starts_with(score_) min=where(number):0 max=starts_with(score_):100 regex=ends_with(code):^[A-Z]+$ mode=warn | csv",
             selector_people,
@@ -386,9 +392,9 @@ int main(void) {
         },
         {
             "metadata_time_ops",
-            "csv batch_size=1 | source-name src default=oom | datetime d year,month | date-trunc ts month result=ts_month | relocate src after=name | csv",
+            "csv batch_size=1 | source-name src default=oom | rleid name result=name_run | datetime d year,month | date-trunc ts month result=ts_month | relocate src after=name | csv",
             dates,
-            360
+            420
         },
         {
             "typed_string_materialization",
@@ -401,6 +407,12 @@ int main(void) {
             "text | json-schema required=user types=user:object mode=filter audit audit_limit=1 | json-flatten fields=/user/id:user_id:int,$.user.name:name:string | csv",
             "{\"user\":{\"id\":42,\"name\":\"Ada\"}}\n{\"other\":true}\n{\"user\":{\"id\":7,\"name\":\"Ben\"}}\n",
             420
+        },
+        {
+            "json_schema_annotate",
+            "text | json-schema required=user types=user:object mode=annotate result=json_ok | csv",
+            "{\"user\":{\"id\":42,\"name\":\"Ada\"}}\n{\"other\":true}\n",
+            360
         },
         {
             "stack_file",

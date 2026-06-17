@@ -24,33 +24,38 @@ void tf_schema_free(tf_schema *s) {
     s->known = false;
 }
 
-void tf_schema_copy(tf_schema *dst, const tf_schema *src) {
-    if (!dst) return;
+int tf_schema_copy_checked(tf_schema *dst, const tf_schema *src) {
+    if (!dst) return TF_ERROR;
     dst->known = false;
     dst->n_cols = 0;
     dst->col_names = NULL;
     dst->col_types = NULL;
-    if (!src) return;
+    if (!src) return TF_OK;
 
     dst->known = src->known;
     dst->n_cols = src->n_cols;
-    if (src->n_cols == 0 || !src->known) return;
+    if (src->n_cols == 0 || !src->known) return TF_OK;
 
     dst->col_names = calloc(src->n_cols, sizeof(char *));
     dst->col_types = calloc(src->n_cols, sizeof(tf_type));
     if (!dst->col_names || !dst->col_types) {
         tf_schema_free(dst);
-        return;
+        return TF_ERROR;
     }
     for (size_t i = 0; i < src->n_cols; i++) {
         dst->col_names[i] = strdup(src->col_names[i] ? src->col_names[i] : "");
         if (!dst->col_names[i]) {
             tf_schema_free(dst);
-            return;
+            return TF_ERROR;
         }
         dst->col_types[i] = src->col_types[i];
     }
     dst->known = true;
+    return TF_OK;
+}
+
+void tf_schema_copy(tf_schema *dst, const tf_schema *src) {
+    (void)tf_schema_copy_checked(dst, src);
 }
 
 /* ---- IR node helpers ---- */
@@ -119,8 +124,11 @@ tf_ir_plan *tf_ir_plan_clone(const tf_ir_plan *plan) {
         }
         /* Copy schemas if they were inferred */
         tf_ir_node *dst = &clone->nodes[i];
-        tf_schema_copy(&dst->input_schema, &src->input_schema);
-        tf_schema_copy(&dst->output_schema, &src->output_schema);
+        if (tf_schema_copy_checked(&dst->input_schema, &src->input_schema) != TF_OK ||
+            tf_schema_copy_checked(&dst->output_schema, &src->output_schema) != TF_OK) {
+            tf_ir_plan_free(clone);
+            return NULL;
+        }
         dst->caps = src->caps;
         dst->memory_class = src->memory_class;
         dst->emit_class = src->emit_class;
@@ -128,11 +136,20 @@ tf_ir_plan *tf_ir_plan_clone(const tf_ir_plan *plan) {
         dst->state_estimate = src->state_estimate;
     }
 
-    tf_schema_copy(&clone->final_schema, &plan->final_schema);
+    if (tf_schema_copy_checked(&clone->final_schema, &plan->final_schema) != TF_OK) {
+        tf_ir_plan_free(clone);
+        return NULL;
+    }
     clone->plan_caps = plan->plan_caps;
     clone->validated = plan->validated;
     clone->schema_inferred = plan->schema_inferred;
-    if (plan->error) clone->error = strdup(plan->error);
+    if (plan->error) {
+        clone->error = strdup(plan->error);
+        if (!clone->error) {
+            tf_ir_plan_free(clone);
+            return NULL;
+        }
+    }
 
     return clone;
 }
