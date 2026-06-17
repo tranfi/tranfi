@@ -206,6 +206,24 @@ TF_WARN_UNUSED int tf_batch_copy_selected_row(tf_batch *dst, size_t dst_row,
                                               const size_t *cols, size_t n_cols);
 TF_WARN_UNUSED int tf_batch_copy_row(tf_batch *dst, size_t dst_row,
                                      const tf_batch *src, size_t src_row);
+TF_WARN_UNUSED int tf_batch_clone_with_selected_extra_cols(tf_batch *dst,
+                                                           const tf_batch *src,
+                                                           const tf_batch *extra,
+                                                           const int *extra_cols,
+                                                           size_t n_extra);
+TF_WARN_UNUSED int tf_batch_append_row(tf_batch *dst, const tf_batch *src,
+                                       size_t src_row);
+TF_WARN_UNUSED int tf_batch_append_row_with_selected_extra(tf_batch *dst,
+                                                           const tf_batch *left,
+                                                           size_t left_row,
+                                                           const tf_batch *extra,
+                                                           size_t extra_row,
+                                                           const int *extra_cols,
+                                                           size_t n_extra);
+TF_WARN_UNUSED int tf_batch_append_row_with_null_extra(tf_batch *dst,
+                                                       const tf_batch *left,
+                                                       size_t left_row,
+                                                       size_t n_extra);
 
 void tf_batch_free(tf_batch *b);
 

@@ -479,6 +479,29 @@ int tf_batch_clone_with_extra_cols(tf_batch *dst, const tf_batch *src,
     return TF_OK;
 }
 
+int tf_batch_clone_with_selected_extra_cols(tf_batch *dst,
+                                            const tf_batch *src,
+                                            const tf_batch *extra,
+                                            const int *extra_cols,
+                                            size_t n_extra) {
+    if (!dst || !src) return TF_ERROR;
+    size_t needed_cols = 0;
+    if (tf_size_add(src->n_cols, n_extra, &needed_cols) != TF_OK || dst->n_cols < needed_cols)
+        return TF_ERROR;
+    if (n_extra > 0 && (!extra || !extra_cols)) return TF_ERROR;
+    if (tf_batch_clone_schema(dst, src) != TF_OK) return TF_ERROR;
+    for (size_t i = 0; i < n_extra; i++) {
+        if (extra_cols[i] < 0 || (size_t)extra_cols[i] >= extra->n_cols)
+            return TF_ERROR;
+        size_t src_col = (size_t)extra_cols[i];
+        if (tf_batch_set_schema(dst, src->n_cols + i,
+                                extra->col_names[src_col],
+                                extra->col_types[src_col]) != TF_OK)
+            return TF_ERROR;
+    }
+    return TF_OK;
+}
+
 int tf_batch_copy_selected_row(tf_batch *dst, size_t dst_row,
                                const tf_batch *src, size_t src_row,
                                const size_t *cols, size_t n_cols) {
@@ -509,6 +532,69 @@ int tf_batch_copy_row(tf_batch *dst, size_t dst_row,
             return TF_ERROR;
     }
     return TF_OK;
+}
+
+int tf_batch_append_row(tf_batch *dst, const tf_batch *src, size_t src_row) {
+    if (!dst || !src || dst->n_cols != src->n_cols) return TF_ERROR;
+    size_t dst_row = dst->n_rows;
+    if (tf_batch_copy_row(dst, dst_row, src, src_row) != TF_OK) return TF_ERROR;
+    return tf_batch_expose_row(dst, dst_row);
+}
+
+int tf_batch_append_row_with_selected_extra(tf_batch *dst,
+                                            const tf_batch *left,
+                                            size_t left_row,
+                                            const tf_batch *extra,
+                                            size_t extra_row,
+                                            const int *extra_cols,
+                                            size_t n_extra) {
+    if (!dst || !left || left_row >= left->n_rows) return TF_ERROR;
+    size_t needed_cols = 0;
+    if (tf_size_add(left->n_cols, n_extra, &needed_cols) != TF_OK || dst->n_cols < needed_cols)
+        return TF_ERROR;
+    if (n_extra > 0 && (!extra || !extra_cols || extra_row >= extra->n_rows))
+        return TF_ERROR;
+
+    size_t dst_row = dst->n_rows;
+    size_t need_rows = 0;
+    if (tf_size_add(dst_row, 1, &need_rows) != TF_OK) return TF_ERROR;
+    if (tf_batch_ensure_capacity(dst, need_rows) != TF_OK) return TF_ERROR;
+
+    for (size_t c = 0; c < left->n_cols; c++) {
+        if (tf_batch_copy_cell(dst, dst_row, c, left, left_row, c) != TF_OK)
+            return TF_ERROR;
+    }
+    for (size_t i = 0; i < n_extra; i++) {
+        if (tf_batch_copy_cell_index(dst, dst_row, left->n_cols + i,
+                                     extra, extra_row, extra_cols[i]) != TF_OK)
+            return TF_ERROR;
+    }
+    return tf_batch_expose_row(dst, dst_row);
+}
+
+int tf_batch_append_row_with_null_extra(tf_batch *dst,
+                                        const tf_batch *left,
+                                        size_t left_row,
+                                        size_t n_extra) {
+    if (!dst || !left || left_row >= left->n_rows) return TF_ERROR;
+    size_t needed_cols = 0;
+    if (tf_size_add(left->n_cols, n_extra, &needed_cols) != TF_OK || dst->n_cols < needed_cols)
+        return TF_ERROR;
+
+    size_t dst_row = dst->n_rows;
+    size_t need_rows = 0;
+    if (tf_size_add(dst_row, 1, &need_rows) != TF_OK) return TF_ERROR;
+    if (tf_batch_ensure_capacity(dst, need_rows) != TF_OK) return TF_ERROR;
+
+    for (size_t c = 0; c < left->n_cols; c++) {
+        if (tf_batch_copy_cell(dst, dst_row, c, left, left_row, c) != TF_OK)
+            return TF_ERROR;
+    }
+    for (size_t i = 0; i < n_extra; i++) {
+        if (tf_batch_set_null(dst, dst_row, left->n_cols + i) != TF_OK)
+            return TF_ERROR;
+    }
+    return tf_batch_expose_row(dst, dst_row);
 }
 
 int tf_batch_col_index(const tf_batch *b, const char *name) {

@@ -2367,7 +2367,6 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
     }
 
-    size_t out_row = 0;
     for (size_t r = 0; r < in->n_rows; r++) {
         if (sorted_join_check_left_order(st, in, r, left_ci, side) != TF_OK) {
             tf_batch_free(ob);
@@ -2393,41 +2392,28 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
             int keep = (st->how == 2) ? has_match : !has_match;
             if (keep) {
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
-                if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                for (size_t c = 0; c < in->n_cols; c++) {
-                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                }
-                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                out_row++;
+                if (tf_batch_append_row(ob, in, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             }
         } else if (has_match) {
             for (size_t m = 0; m < st->right_run->n_rows; m++) {
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
-                if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                for (size_t c = 0; c < in->n_cols; c++) {
-                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                if (tf_batch_append_row_with_selected_extra(ob, in, r, st->right_run, m,
+                                                            st->lookup_out_cols,
+                                                            st->n_lookup_out) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
                 }
-                for (size_t k = 0; k < st->n_lookup_out; k++) {
-                    if (tf_batch_copy_cell_index(ob, out_row, in->n_cols + k, st->right_run, m, st->lookup_out_cols[k]) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                }
-                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                out_row++;
             }
         } else if (st->how == 1) {
             if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
-            if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            for (size_t c = 0; c < in->n_cols; c++) {
-                if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            if (tf_batch_append_row_with_null_extra(ob, in, r, st->n_lookup_out) != TF_OK) {
+                tf_batch_free(ob);
+                return TF_ERROR;
             }
-            for (size_t k = 0; k < st->n_lookup_out; k++) {
-                if (tf_batch_set_null(ob, out_row, in->n_cols + k) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            }
-            if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            out_row++;
         }
     }
 
-    if (out_row > 0)
+    if (ob->n_rows > 0)
         *out = ob;
     else
         tf_batch_free(ob);
@@ -2463,25 +2449,16 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (!ob) return TF_ERROR;
 
     /* Set schema: main columns, plus lookup columns for mutating joins. */
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
-    if (st->how < 2) {
-        for (size_t k = 0; k < st->n_lookup_out; k++) {
-            int lc = st->lookup_out_cols[k];
-            if (tf_batch_set_schema(ob, in->n_cols + k,
-                                    st->lookup->col_names[lc],
-                                    st->lookup->col_types[lc]) != TF_OK) {
-                tf_batch_free(ob);
-                return TF_ERROR;
-            }
-        }
+    int schema_rc = (st->how >= 2)
+        ? tf_batch_clone_schema(ob, in)
+        : tf_batch_clone_with_selected_extra_cols(ob, in, st->lookup,
+                                                  st->lookup_out_cols,
+                                                  st->n_lookup_out);
+    if (schema_rc != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
 
-    size_t out_row = 0;
     for (size_t r = 0; r < in->n_rows; r++) {
         char *key = format_join_key(in, r, left_ci);
         if (!key) continue;
@@ -2493,12 +2470,7 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
             int keep = (st->how == 2) ? (bucket != NULL) : (bucket == NULL);
             if (keep) {
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
-                if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                for (size_t c = 0; c < in->n_cols; c++) {
-                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                }
-                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                out_row++;
+                if (tf_batch_append_row(ob, in, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             }
         } else if (bucket) {
             if (st->max_matches_per_row > 0 && bucket->n_rows > st->max_matches_per_row) {
@@ -2512,35 +2484,25 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
             for (size_t m = 0; m < bucket->n_rows; m++) {
                 size_t lr = bucket->rows[m];
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
-                if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                /* Copy main columns */
-                for (size_t c = 0; c < in->n_cols; c++) {
-                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                if (tf_batch_append_row_with_selected_extra(ob, in, r, st->lookup, lr,
+                                                            st->lookup_out_cols,
+                                                            st->n_lookup_out) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
                 }
-                /* Copy lookup columns */
-                for (size_t k = 0; k < st->n_lookup_out; k++) {
-                    if (tf_batch_copy_cell_index(ob, out_row, in->n_cols + k, st->lookup, lr, st->lookup_out_cols[k]) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                }
-                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                out_row++;
             }
         } else if (st->how == 1) {
             /* Left join: emit main + nulls */
             if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
-            if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            for (size_t c = 0; c < in->n_cols; c++) {
-                if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            if (tf_batch_append_row_with_null_extra(ob, in, r, st->n_lookup_out) != TF_OK) {
+                tf_batch_free(ob);
+                return TF_ERROR;
             }
-            for (size_t k = 0; k < st->n_lookup_out; k++) {
-                if (tf_batch_set_null(ob, out_row, in->n_cols + k) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            }
-            if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            out_row++;
         }
         /* Inner join + no match: skip */
     }
 
-    if (out_row > 0)
+    if (ob->n_rows > 0)
         *out = ob;
     else
         tf_batch_free(ob);

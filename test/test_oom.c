@@ -147,6 +147,11 @@ int main(void) {
         "Bob,25,LA,20,c,2,5,blue\n"
         " Alice ,30,NY,10,a|b,1,4,red\n"
         "Cara,35,NY,30,d|e,3,6,red\n";
+    const char *sorted_people_unmatched =
+        "name,age,city,score,tags,x,y,color\n"
+        "Bob,25,LA,20,c,2,5,blue\n"
+        " Alice ,30,NY,10,a|b,1,4,red\n"
+        "Cara,35,SF,30,d|e,3,6,red\n";
     const char *missing_people =
         "name,age,city,score\n"
         "Alice,30,NY,10\n"
@@ -488,10 +493,28 @@ int main(void) {
             520
         },
         {
+            "hash_filtering_join",
+            "csv batch_size=1 | semi-join /tmp/tranfi_oom_join_lookup.csv on city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 | csv",
+            people,
+            460
+        },
+        {
+            "hash_left_join_nulls",
+            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city --left max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_matches_per_row=2 max_output_rows=16 | csv",
+            people,
+            560
+        },
+        {
             "sorted_mutating_join",
             "csv batch_size=1 | join /tmp/tranfi_oom_join_sorted_lookup.csv on city sorted=true max_matches_per_row=2 max_output_rows=16 | csv",
             sorted_people,
             560
+        },
+        {
+            "sorted_left_join_nulls",
+            "csv batch_size=1 | join /tmp/tranfi_oom_join_sorted_lookup.csv on city --left sorted=true max_matches_per_row=2 max_output_rows=16 | csv",
+            sorted_people_unmatched,
+            600
         },
         {
             "hash_set_schema_capture",
