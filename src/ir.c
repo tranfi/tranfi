@@ -2,7 +2,7 @@
  * ir.c — IR plan construction, cloning, and memory management.
  */
 
-#include "ir.h"
+#include "internal.h"
 #include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
@@ -76,8 +76,10 @@ tf_ir_plan *tf_ir_plan_create(void) {
 int tf_ir_plan_add_node(tf_ir_plan *plan, const char *op, cJSON *args) {
     if (!plan || !op) return -1;
     if (plan->n_nodes >= plan->capacity) {
-        size_t new_cap = plan->capacity * 2;
-        tf_ir_node *new_nodes = realloc(plan->nodes, new_cap * sizeof(tf_ir_node));
+        size_t new_cap = 0;
+        if (tf_size_mul(plan->capacity, 2, &new_cap) != TF_OK) return -1;
+        tf_ir_node *new_nodes = tf_reallocarray_checked(plan->nodes, new_cap,
+                                                        sizeof(tf_ir_node));
         if (!new_nodes) return -1;
         memset(new_nodes + plan->capacity, 0,
                (new_cap - plan->capacity) * sizeof(tf_ir_node));

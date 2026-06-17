@@ -212,7 +212,7 @@ static int append_bytes(char **buf, size_t *len, size_t *cap, const void *src, s
     if (need > *cap) {
         size_t new_cap = 0;
         if (tf_size_grow_pow2(*cap, need, 128, &new_cap) != TF_OK) return TF_ERROR;
-        char *tmp = realloc(*buf, new_cap);
+        char *tmp = tf_reallocarray_checked(*buf, new_cap, sizeof(char));
         if (!tmp) return TF_ERROR;
         *buf = tmp;
         *cap = new_cap;

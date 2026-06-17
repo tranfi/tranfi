@@ -35,20 +35,22 @@ typedef struct {
 static int rleid_buf_init(rleid_buf *b) {
     b->cap = 128;
     b->len = 0;
-    b->data = malloc(b->cap);
+    b->data = tf_mallocarray_checked(b->cap, sizeof(char));
     if (!b->data) return -1;
     b->data[0] = '\0';
     return 0;
 }
 
 static int rleid_buf_ensure(rleid_buf *b, size_t extra) {
-    if (b->len + extra + 1 <= b->cap) return 0;
-    size_t new_cap = b->cap ? b->cap : 128;
-    while (new_cap < b->len + extra + 1) {
-        if (new_cap > SIZE_MAX / 2) return -1;
-        new_cap *= 2;
+    size_t need = 0;
+    if (tf_size_add(b->len, extra, &need) != TF_OK ||
+        tf_size_add(need, 1, &need) != TF_OK) {
+        return -1;
     }
-    char *tmp = realloc(b->data, new_cap);
+    if (need <= b->cap) return 0;
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(b->cap, need, 128, &new_cap) != TF_OK) return -1;
+    char *tmp = tf_reallocarray_checked(b->data, new_cap, sizeof(char));
     if (!tmp) return -1;
     b->data = tmp;
     b->cap = new_cap;

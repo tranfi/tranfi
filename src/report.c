@@ -6,6 +6,7 @@
  */
 
 #include "report.h"
+#include "internal.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -27,41 +28,68 @@ typedef struct {
   char  *data;
   size_t len;
   size_t cap;
+  int    failed;
 } strbuf;
 
 static void sb_init(strbuf *sb) {
   sb->cap = 4096;
-  sb->data = malloc(sb->cap);
   sb->len = 0;
-  if (sb->data) sb->data[0] = '\0';
-}
-
-static void sb_ensure(strbuf *sb, size_t extra) {
-  if (sb->len + extra + 1 > sb->cap) {
-    while (sb->len + extra + 1 > sb->cap) sb->cap *= 2;
-    sb->data = realloc(sb->data, sb->cap);
+  sb->failed = 0;
+  sb->data = tf_mallocarray_checked(sb->cap, sizeof(char));
+  if (sb->data) {
+    sb->data[0] = '\0';
+  } else {
+    sb->cap = 0;
+    sb->failed = 1;
   }
 }
 
+static int sb_ensure(strbuf *sb, size_t extra) {
+  if (!sb || sb->failed) return -1;
+  size_t need;
+  if (tf_size_add(sb->len, extra, &need) != TF_OK ||
+      tf_size_add(need, 1, &need) != TF_OK) {
+    sb->failed = 1;
+    return -1;
+  }
+  if (need <= sb->cap) return 0;
+  size_t new_cap;
+  if (tf_size_grow_pow2(sb->cap, need, 4096, &new_cap) != TF_OK) {
+    sb->failed = 1;
+    return -1;
+  }
+  char *tmp = tf_reallocarray_checked(sb->data, new_cap, sizeof(char));
+  if (!tmp) {
+    sb->failed = 1;
+    return -1;
+  }
+  sb->data = tmp;
+  sb->cap = new_cap;
+  return 0;
+}
+
 static void sb_append(strbuf *sb, const char *s) {
+  if (!sb || sb->failed || !s) return;
   size_t n = strlen(s);
-  sb_ensure(sb, n);
+  if (sb_ensure(sb, n) != 0) return;
   memcpy(sb->data + sb->len, s, n);
   sb->len += n;
   sb->data[sb->len] = '\0';
 }
 
 static void sb_printf(strbuf *sb, const char *fmt, ...) {
+  if (!sb || sb->failed || !fmt) return;
   va_list ap;
   va_start(ap, fmt);
   int needed = vsnprintf(NULL, 0, fmt, ap);
   va_end(ap);
-  if (needed < 0) return;
-  sb_ensure(sb, (size_t)needed);
+  if (needed < 0) { sb->failed = 1; return; }
+  if (sb_ensure(sb, (size_t)needed) != 0) return;
   va_start(ap, fmt);
-  vsnprintf(sb->data + sb->len, (size_t)needed + 1, fmt, ap);
+  int written = vsnprintf(sb->data + sb->len, (size_t)needed + 1, fmt, ap);
   va_end(ap);
-  sb->len += (size_t)needed;
+  if (written < 0 || written > needed) { sb->failed = 1; return; }
+  sb->len += (size_t)written;
 }
 
 /* ---- Sparkline ---- */
@@ -293,7 +321,7 @@ char *tf_report_format(const char *stats_csv, size_t stats_len, int use_color) {
 
   strbuf sb;
   sb_init(&sb);
-  if (!sb.data) { csv_free(t); return NULL; }
+  if (sb.failed) { csv_free(t); return NULL; }
 
   /* Header */
   long long total_count = 0;
@@ -459,5 +487,9 @@ char *tf_report_format(const char *stats_csv, size_t stats_len, int use_color) {
 
   csv_free(t);
 
+  if (sb.failed) {
+    free(sb.data);
+    return NULL;
+  }
   return sb.data;
 }

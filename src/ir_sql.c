@@ -21,34 +21,60 @@ typedef struct {
   char  *data;
   size_t len;
   size_t cap;
+  int    failed;
 } strbuf;
 
+static void sb_free(strbuf *sb);
+
 static void sb_init(strbuf *sb) {
-  sb->data = malloc(256);
+  sb->data = tf_mallocarray_checked(256, sizeof(char));
   sb->len = 0;
   sb->cap = 256;
+  sb->failed = 0;
   if (sb->data) sb->data[0] = '\0';
+  else { sb->cap = 0; sb->failed = 1; }
 }
 
-static void sb_ensure(strbuf *sb, size_t extra) {
-  if (sb->len + extra + 1 > sb->cap) {
-    size_t newcap = sb->cap * 2;
-    if (newcap < sb->len + extra + 1) newcap = sb->len + extra + 1;
-    char *nd = realloc(sb->data, newcap);
-    if (nd) { sb->data = nd; sb->cap = newcap; }
+static int sb_ensure(strbuf *sb, size_t extra) {
+  if (!sb || sb->failed) return TF_ERROR;
+  size_t need = 0;
+  if (tf_size_add(sb->len, extra, &need) != TF_OK ||
+      tf_size_add(need, 1, &need) != TF_OK) {
+    sb->failed = 1;
+    return TF_ERROR;
   }
+  if (need <= sb->cap) return TF_OK;
+  size_t newcap = 0;
+  if (tf_size_grow_pow2(sb->cap, need, 256, &newcap) != TF_OK) {
+    sb->failed = 1;
+    return TF_ERROR;
+  }
+  char *nd = tf_reallocarray_checked(sb->data, newcap, sizeof(char));
+  if (!nd) {
+    sb->failed = 1;
+    return TF_ERROR;
+  }
+  sb->data = nd;
+  sb->cap = newcap;
+  return TF_OK;
 }
 
 static void sb_append(strbuf *sb, const char *s) {
+  if (!sb || sb->failed || !s) return;
   size_t n = strlen(s);
-  sb_ensure(sb, n);
+  if (sb_ensure(sb, n) != TF_OK) return;
   memcpy(sb->data + sb->len, s, n);
   sb->len += n;
   sb->data[sb->len] = '\0';
 }
 
 static void sb_appendn(strbuf *sb, const char *s, size_t n) {
-  sb_ensure(sb, n);
+  if (!sb || sb->failed || (!s && n > 0)) {
+    if (sb) sb->failed = 1;
+    return;
+  }
+  if (sb_ensure(sb, n) != TF_OK) return;
+  if (n == 0) return;
   memcpy(sb->data + sb->len, s, n);
   sb->len += n;
   sb->data[sb->len] = '\0';
@@ -58,25 +84,61 @@ static void sb_appendf(strbuf *sb, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 static void sb_appendf(strbuf *sb, const char *fmt, ...) {
+  if (!sb || sb->failed || !fmt) return;
   char buf[512];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  if (n > 0) sb_appendn(sb, buf, (size_t)n);
+  if (n == 0) return;
+  if (n < 0) {
+    sb->failed = 1;
+    return;
+  }
+  if ((size_t)n < sizeof(buf)) {
+    sb_appendn(sb, buf, (size_t)n);
+    return;
+  }
+  size_t dyn_size = 0;
+  if (tf_size_add((size_t)n, 1, &dyn_size) != TF_OK) {
+    sb->failed = 1;
+    return;
+  }
+  char *dyn = tf_mallocarray_checked(dyn_size, sizeof(char));
+  if (!dyn) {
+    sb->failed = 1;
+    return;
+  }
+  va_start(ap, fmt);
+  int n2 = vsnprintf(dyn, dyn_size, fmt, ap);
+  va_end(ap);
+  if (n2 < 0 || (size_t)n2 >= dyn_size) {
+    free(dyn);
+    sb->failed = 1;
+    return;
+  }
+  sb_appendn(sb, dyn, (size_t)n2);
+  free(dyn);
 }
 
 static char *sb_detach(strbuf *sb) {
+  if (!sb || sb->failed) {
+    if (sb) sb_free(sb);
+    return NULL;
+  }
   char *s = sb->data;
   sb->data = NULL;
   sb->len = sb->cap = 0;
+  sb->failed = 0;
   return s;
 }
 
 static void sb_free(strbuf *sb) {
+  if (!sb) return;
   free(sb->data);
   sb->data = NULL;
   sb->len = sb->cap = 0;
+  sb->failed = 0;
 }
 
 /* ---- Expression AST to SQL ---- */
@@ -372,7 +434,7 @@ static char *translate_expr(const char *expr_str) {
   sb_init(&sb);
   int rc = expr_to_sql(e, &sb);
   tf_expr_free(e);
-  if (rc != 0) { sb_free(&sb); return NULL; }
+  if (rc != 0 || sb.failed) { sb_free(&sb); return NULL; }
   return sb_detach(&sb);
 }
 
@@ -1496,7 +1558,9 @@ char *tf_ir_to_sql(const tf_ir_plan *plan, char **error) {
   /* No transforms — just SELECT * */
   if (first_transform >= last_transform) {
     sb_appendf(&sb, "SELECT * FROM %s", input_source);
-    return sb_detach(&sb);
+    char *sql = sb_detach(&sb);
+    if (!sql && error && !*error) *error = strdup("sql: out of memory");
+    return sql;
   }
 
   /* Check if any operator needs row ordering (_rn column) */
@@ -1544,6 +1608,11 @@ char *tf_ir_to_sql(const tf_ir_plan *plan, char **error) {
       else free(err);
       return NULL;
     }
+    if (sb.failed) {
+      sb_free(&sb);
+      if (error) *error = strdup("sql: out of memory");
+      return NULL;
+    }
 
     prev = cte_name;
     n_ctes++;
@@ -1556,5 +1625,7 @@ char *tf_ir_to_sql(const tf_ir_plan *plan, char **error) {
     sb_appendf(&sb, "\nSELECT * FROM %s", prev);
   }
 
-  return sb_detach(&sb);
+  char *sql = sb_detach(&sb);
+  if (!sql && error && !*error) *error = strdup("sql: out of memory");
+  return sql;
 }

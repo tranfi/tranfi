@@ -244,14 +244,15 @@ typedef struct {
 
 static int sb_reserve(cli_string_builder *sb, size_t extra) {
     if (!sb) return -1;
-    size_t need = sb->len + extra + 1;
-    if (need <= sb->cap) return 0;
-    size_t new_cap = sb->cap ? sb->cap : 256;
-    while (new_cap < need) {
-        if (new_cap > SIZE_MAX / 2) return -1;
-        new_cap *= 2;
+    size_t need;
+    if (tf_size_add(sb->len, extra, &need) != TF_OK ||
+        tf_size_add(need, 1, &need) != TF_OK) {
+        return -1;
     }
-    char *tmp = realloc(sb->data, new_cap);
+    if (need <= sb->cap) return 0;
+    size_t new_cap;
+    if (tf_size_grow_pow2(sb->cap, need, 256, &new_cap) != TF_OK) return -1;
+    char *tmp = tf_reallocarray_checked(sb->data, new_cap, sizeof(char));
     if (!tmp) return -1;
     sb->data = tmp;
     sb->cap = new_cap;
@@ -276,6 +277,33 @@ static int sb_append_char(cli_string_builder *sb, char ch) {
     sb->data[sb->len++] = ch;
     sb->data[sb->len] = '\0';
     return 0;
+}
+
+static int cli_report_buffer_append(char **buf, size_t *len, size_t *cap,
+                                    const uint8_t *data, size_t n) {
+    if (!buf || !len || !cap || !*buf || (!data && n > 0)) return -1;
+    size_t need;
+    if (tf_size_add(*len, n, &need) != TF_OK) return -1;
+    if (need > *cap) {
+        size_t new_cap;
+        if (tf_size_grow_pow2(*cap, need, PULL_BUF_SIZE, &new_cap) != TF_OK) return -1;
+        char *tmp = tf_reallocarray_checked(*buf, new_cap, sizeof(char));
+        if (!tmp) return -1;
+        *buf = tmp;
+        *cap = new_cap;
+    }
+    if (n > 0) memcpy(*buf + *len, data, n);
+    *len = need;
+    return 0;
+}
+
+static void cli_disable_report_buffer(FILE *fout, char **buf, size_t *len, size_t *cap) {
+    if (!buf || !len || !cap) return;
+    if (fout && *buf && *len > 0) fwrite(*buf, 1, *len, fout);
+    free(*buf);
+    *buf = NULL;
+    *len = 0;
+    *cap = 0;
 }
 
 static int cli_is_bare_dsl_token(const char *s) {
@@ -1055,7 +1083,11 @@ int main(int argc, char **argv) {
     /* Output buffer (used when try_report is true) */
     size_t out_cap = PULL_BUF_SIZE;
     size_t out_len = 0;
-    char *out_buf = try_report ? malloc(out_cap) : NULL;
+    char *out_buf = try_report ? tf_mallocarray_checked(out_cap, sizeof(char)) : NULL;
+    if (try_report && !out_buf) {
+        out_cap = 0;
+        try_report = 0;
+    }
 
     while ((nread = fread(read_buf, 1, sizeof(read_buf), fin)) > 0) {
         if (tf_pipeline_push(p, read_buf, nread) != TF_OK) {
@@ -1076,15 +1108,10 @@ int main(int argc, char **argv) {
         size_t n;
         while ((n = tf_pipeline_pull(p, TF_CHAN_MAIN, pull_buf, sizeof(pull_buf))) > 0) {
             if (try_report && out_buf) {
-                while (out_len + n > out_cap) {
-                    out_cap *= 2;
-                    char *tmp = realloc(out_buf, out_cap);
-                    if (!tmp) { free(out_buf); out_buf = NULL; break; }
-                    out_buf = tmp;
-                }
-                if (out_buf) {
-                    memcpy(out_buf + out_len, pull_buf, n);
-                    out_len += n;
+                if (cli_report_buffer_append(&out_buf, &out_len, &out_cap, pull_buf, n) != 0) {
+                    cli_disable_report_buffer(fout, &out_buf, &out_len, &out_cap);
+                    fwrite(pull_buf, 1, n, fout);
+                    try_report = 0;
                 }
             } else {
                 fwrite(pull_buf, 1, n, fout);
@@ -1116,15 +1143,10 @@ int main(int argc, char **argv) {
     size_t n;
     while ((n = tf_pipeline_pull(p, TF_CHAN_MAIN, pull_buf, sizeof(pull_buf))) > 0) {
         if (try_report && out_buf) {
-            while (out_len + n > out_cap) {
-                out_cap *= 2;
-                char *tmp = realloc(out_buf, out_cap);
-                if (!tmp) { free(out_buf); out_buf = NULL; break; }
-                out_buf = tmp;
-            }
-            if (out_buf) {
-                memcpy(out_buf + out_len, pull_buf, n);
-                out_len += n;
+            if (cli_report_buffer_append(&out_buf, &out_len, &out_cap, pull_buf, n) != 0) {
+                cli_disable_report_buffer(fout, &out_buf, &out_len, &out_cap);
+                fwrite(pull_buf, 1, n, fout);
+                try_report = 0;
             }
         } else {
             fwrite(pull_buf, 1, n, fout);

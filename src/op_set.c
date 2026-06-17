@@ -213,7 +213,7 @@ static int keybuf_reserve(keybuf *b, size_t extra) {
     if (need <= b->cap) return TF_OK;
     size_t cap = 0;
     if (tf_size_grow_pow2(b->cap, need, 128, &cap) != TF_OK) return TF_ERROR;
-    char *tmp = realloc(b->data, cap);
+    char *tmp = tf_reallocarray_checked(b->data, cap, sizeof(char));
     if (!tmp) return TF_ERROR;
     b->data = tmp;
     b->cap = cap;

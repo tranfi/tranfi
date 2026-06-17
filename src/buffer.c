@@ -24,7 +24,7 @@ static int buffer_ensure(tf_buffer *b, size_t extra) {
     if (needed <= b->cap) return TF_OK;
     size_t new_cap = 0;
     if (tf_size_grow_pow2(b->cap, needed, INITIAL_CAP, &new_cap) != TF_OK) return TF_ERROR;
-    uint8_t *new_data = realloc(b->data, new_cap);
+    uint8_t *new_data = tf_reallocarray_checked(b->data, new_cap, sizeof(uint8_t));
     if (!new_data) return TF_ERROR;
     b->data = new_data;
     b->cap = new_cap;
@@ -70,7 +70,8 @@ size_t tf_buffer_read(tf_buffer *b, uint8_t *out, size_t len) {
         b->read_pos = 0;
         b->len = 0;
         if (b->cap > MAX_RETAINED_EMPTY_CAP) {
-            uint8_t *new_data = realloc(b->data, MAX_RETAINED_EMPTY_CAP);
+            uint8_t *new_data = tf_reallocarray_checked(b->data, MAX_RETAINED_EMPTY_CAP,
+                                                        sizeof(uint8_t));
             if (new_data) {
                 b->data = new_data;
                 b->cap = MAX_RETAINED_EMPTY_CAP;

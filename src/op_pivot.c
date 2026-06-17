@@ -318,10 +318,10 @@ static char *build_pivot_key(const tf_batch *b, size_t row,
                 free(buf);
                 return NULL;
             }
-            buf_cap = new_cap;
-            char *tmp = realloc(buf, buf_cap);
+            char *tmp = tf_reallocarray_checked(buf, new_cap, sizeof(char));
             if (!tmp) { free(buf); return NULL; }
             buf = tmp;
+            buf_cap = new_cap;
         }
         memcpy(buf + buf_len, val, val_len);
         buf_len += val_len;

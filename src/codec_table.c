@@ -66,17 +66,20 @@ static char *cell_to_string(tf_batch *b, size_t row, size_t col) {
 }
 
 static int table_capture_schema(table_encoder_state *st, const tf_batch *in) {
-    st->n_cols = in->n_cols < TABLE_MAX_COLS ? in->n_cols : TABLE_MAX_COLS;
-    if (st->n_cols == 0) return TF_OK;
-    size_t bytes = 0;
-    if (tf_size_mul(st->n_cols, sizeof(char *), &bytes) != TF_OK) return TF_ERROR;
-    st->col_names = malloc(bytes);
-    if (!st->col_names) return TF_ERROR;
-    memset(st->col_names, 0, bytes);
-    for (size_t i = 0; i < st->n_cols; i++) {
-        st->col_names[i] = strdup(in->col_names[i] ? in->col_names[i] : "");
-        if (!st->col_names[i]) return TF_ERROR;
+    size_t n_cols = in->n_cols < TABLE_MAX_COLS ? in->n_cols : TABLE_MAX_COLS;
+    if (n_cols == 0) return TF_OK;
+    char **names = tf_callocarray_checked(n_cols, sizeof(char *));
+    if (!names) return TF_ERROR;
+    for (size_t i = 0; i < n_cols; i++) {
+        names[i] = strdup(in->col_names[i] ? in->col_names[i] : "");
+        if (!names[i]) {
+            for (size_t j = 0; j < i; j++) free(names[j]);
+            free(names);
+            return TF_ERROR;
+        }
     }
+    st->col_names = names;
+    st->n_cols = n_cols;
     return TF_OK;
 }
 
@@ -84,13 +87,11 @@ static int table_ensure_value_capacity(table_encoder_state *st, size_t min_rows)
     if (st->n_cols == 0 || min_rows <= st->capacity) return TF_OK;
     size_t new_cap = 0;
     size_t cells = 0;
-    size_t bytes = 0;
     if (tf_size_grow_pow2(st->capacity, min_rows, 64, &new_cap) != TF_OK ||
-        tf_size_mul(new_cap, st->n_cols, &cells) != TF_OK ||
-        tf_size_mul(cells, sizeof(char *), &bytes) != TF_OK) {
+        tf_size_mul(new_cap, st->n_cols, &cells) != TF_OK) {
         return TF_ERROR;
     }
-    char **new_values = realloc(st->values, bytes);
+    char **new_values = tf_reallocarray_checked(st->values, cells, sizeof(char *));
     if (!new_values) return TF_ERROR;
     st->values = new_values;
     st->capacity = new_cap;
@@ -120,9 +121,14 @@ static int table_encode(tf_encoder *self, tf_batch *in, tf_buffer *out) {
     /* Buffer all cell values as strings */
     for (size_t r = 0; r < in->n_rows; r++) {
         if (st->max_rows > 0 && st->n_rows >= st->max_rows) break;
-        if (table_ensure_value_capacity(st, st->n_rows + 1) != TF_OK) return TF_ERROR;
+        size_t next_rows = 0;
+        if (tf_size_add(st->n_rows, 1, &next_rows) != TF_OK ||
+            table_ensure_value_capacity(st, next_rows) != TF_OK) {
+            return TF_ERROR;
+        }
 
-        size_t base = st->n_rows * st->n_cols;
+        size_t base = 0;
+        if (tf_size_mul(st->n_rows, st->n_cols, &base) != TF_OK) return TF_ERROR;
         size_t c = 0;
         for (; c < st->n_cols; c++) {
             st->values[base + c] = cell_to_string(in, r, c);
@@ -134,7 +140,7 @@ static int table_encode(tf_encoder *self, tf_batch *in, tf_buffer *out) {
                 return TF_ERROR;
             }
         }
-        st->n_rows++;
+        st->n_rows = next_rows;
     }
 
     return TF_OK;
@@ -145,7 +151,7 @@ static int table_flush(tf_encoder *self, tf_buffer *out) {
     if (!st->col_names || st->n_cols == 0) return TF_OK;
 
     /* Compute column widths */
-    size_t *widths = calloc(st->n_cols, sizeof(size_t));
+    size_t *widths = tf_callocarray_checked(st->n_cols, sizeof(size_t));
     if (!widths) return TF_ERROR;
     for (size_t c = 0; c < st->n_cols; c++) {
         widths[c] = strlen(st->col_names[c]);
@@ -221,7 +227,10 @@ static void table_encoder_destroy(tf_encoder *self) {
             free(st->col_names);
         }
         if (st->values) {
-            for (size_t i = 0; i < st->n_rows * st->n_cols; i++) free(st->values[i]);
+            size_t n_cells = 0;
+            if (tf_size_mul(st->n_rows, st->n_cols, &n_cells) == TF_OK) {
+                for (size_t i = 0; i < n_cells; i++) free(st->values[i]);
+            }
             free(st->values);
         }
         free(st);
