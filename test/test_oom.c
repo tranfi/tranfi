@@ -260,6 +260,12 @@ int main(void) {
             280
         },
         {
+            "row_selection_aliases",
+            "csv batch_size=1 | reorder city,name,score | dedup city max_keys=8 | slice-head n=3 | slice-tail 2 | csv",
+            people,
+            340
+        },
+        {
             "row_local_hash",
             "csv batch_size=1 | hash name,city | csv",
             people,
@@ -285,9 +291,15 @@ int main(void) {
         },
         {
             "bounded_state_time_series",
-            "csv batch_size=1 | lag age 1 | lead age 1 | rolling-sum age 2 sum2 | rolling-mean score 2 mean2 | rolling-any score 2 any_score | ewma score 0.5 | anomaly score 2 | step score running-sum score_run | diff score | csv",
+            "csv batch_size=1 | lag age 1 | lead age 1 | shift age 2 age_next type=lead | rolling-sum age 2 sum2 | rolling-mean score 2 mean2 | rolling-min score 2 min2 | rolling-max score 2 max2 | rolling-any score 2 any_score | ewma score 0.5 | anomaly score 2 | step score running-sum score_run | diff score | csv",
             people,
-            360
+            520
+        },
+        {
+            "boolean_rolling_aliases",
+            "csv batch_size=1 | rolling-all active 2 all_active nulls=false | rolling-any active 2 any_active nulls=propagate | csv",
+            selector_people,
+            300
         },
         {
             "reshape_expand",
@@ -411,9 +423,9 @@ int main(void) {
         },
         {
             "bounded_rank_aliases",
-            "csv batch_size=1 | bottom-k 3 score | slice-min name n=2 with_ties=false | csv",
+            "csv batch_size=1 | top-k n=3 score | bottom-k 3 score | slice-min name n=2 with_ties=false | slice-max score 2 with_ties=false | csv",
             people,
-            360
+            480
         },
         {
             "blocking_sort",
@@ -494,14 +506,32 @@ int main(void) {
             420
         },
         {
+            "hash_setdiff_mode",
+            "csv batch_size=1 | setdiff /tmp/tranfi_oom_union_lookup.csv columns=city max_lookup_keys=8 max_output_keys=8 | csv",
+            people,
+            340
+        },
+        {
             "sorted_bag_set_modes",
             "csv batch_size=1 | intersect-all /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | setdiff-all /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | csv",
             sorted_people,
             420
         },
         {
+            "sorted_setdiff_mode",
+            "csv batch_size=1 | setdiff /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | csv",
+            sorted_people,
+            340
+        },
+        {
             "spill_set_schema_capture",
             "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            people,
+            380
+        },
+        {
+            "spill_setdiff_schema_capture",
+            "csv batch_size=1 | setdiff /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
             people,
             380
         },
