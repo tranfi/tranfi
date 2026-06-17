@@ -3711,6 +3711,65 @@ static void test_pipeline_source_name_boundary_flush(void) {
     tf_pipeline_free(p);
 }
 
+static void test_pipeline_csv_skip_repeated_header_boundary(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"skip_repeated_header\":true}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+
+    const char *first = "name,age\nAlice,30";
+    assert(tf_pipeline_push(p, (const uint8_t *)first, strlen(first)) == TF_OK);
+    assert(tf_pipeline_flush_input(p) == TF_OK);
+
+    const char *second = "name,age\nBob,25\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)second, strlen(second)) == TF_OK);
+    assert(tf_pipeline_flush_input(p) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+
+    uint8_t out[1024];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    char *first_header = strstr((char *)out, "name,age");
+    assert(first_header != NULL);
+    assert(strstr(first_header + strlen("name,age"), "name,age") == NULL);
+    assert(strstr((char *)out, "Alice,30") != NULL);
+    assert(strstr((char *)out, "Bob,25") != NULL);
+    tf_pipeline_free(p);
+
+    p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+    const char *single_input = "name,age\nAlice,30\nname,age\nBob,25\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)single_input, strlen(single_input)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    first_header = strstr((char *)out, "name,age");
+    assert(first_header != NULL);
+    assert(strstr(first_header + strlen("name,age"), "name,age") != NULL);
+    tf_pipeline_free(p);
+
+    p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+    assert(tf_pipeline_flush_input(p) == TF_OK);
+    const char *after_empty_source = "name,age\nname,age\nBob,25\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)after_empty_source, strlen(after_empty_source)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    first_header = strstr((char *)out, "name,age");
+    assert(first_header != NULL);
+    assert(strstr(first_header + strlen("name,age"), "name,age") != NULL);
+    assert(strstr((char *)out, "Bob,25") != NULL);
+    tf_pipeline_free(p);
+}
+
 static void test_pipeline_source_name_default(void) {
     const char *plan =
         "{\"steps\":["
@@ -12251,6 +12310,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_csv_quoted_null_literals_disabled);
     TEST(test_pipeline_csv_comment_skip_empty_trim);
     TEST(test_pipeline_source_name_boundary_flush);
+    TEST(test_pipeline_csv_skip_repeated_header_boundary);
     TEST(test_pipeline_source_name_default);
     TEST(test_pipeline_fill_null_audit_side_channel);
 

@@ -749,6 +749,36 @@ def test_multi_file_source_column(tmp_path):
         p.run(input=b'name\nAlice\n', source_column='src')
 
 
+def test_multi_file_skip_repeated_csv_header(tmp_path):
+    first = tmp_path / 'part-a.csv'
+    second = tmp_path / 'part-b.csv'
+    first.write_bytes(b'name,age\nAlice,30')
+    second.write_bytes(b'name,age\nBob,25\n')
+
+    p = tf.pipeline([
+        tf.codec.csv(skip_repeated_header=True),
+        tf.codec.csv_encode(),
+    ])
+    result = p.run(input_files=[first, second], chunk_size=2)
+    text = result.output_text
+    assert text.count('name,age') == 1
+    assert 'Alice,30' in text
+    assert 'Bob,25' in text
+
+    chunks = list(p.iter_chunks(input_files=[first, second], chunk_size=3))
+    chunked = b''.join(chunks).decode('utf-8')
+    assert len(chunks) > 1
+    assert chunked.count('name,age') == 1
+    assert 'Alice,30' in chunked
+    assert 'Bob,25' in chunked
+
+    dsl_result = tf.pipeline('csv skip_repeated_header=true | csv').run(
+        input_files=[first, second],
+        chunk_size=2,
+    )
+    assert dsl_result.output_text.count('name,age') == 1
+
+
 def test_gzip_file_input(tmp_path):
     csv = b'name,age\nAlice,30\nBob,25\nCharlie,35\nEve,42\n'
     gz_path = tmp_path / 'sample.csv.gz'

@@ -36,7 +36,7 @@ function expr(text) {
 }
 
 const codec = {
-  csv({ delimiter = ',', header = true, batchSize = 1024, repair = false, mode, strict = false, maxErrorBytes = 4096, maxRecordBytes = 64 * 1024 * 1024, maxColumns = 8192, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes, nulls, na, quotedNulls = true, comment, trimWs = true, skipEmptyRows = false, skip = 0, nMax, maxRows } = {}) {
+  csv({ delimiter = ',', header = true, batchSize = 1024, repair = false, mode, strict = false, maxErrorBytes = 4096, maxRecordBytes = 64 * 1024 * 1024, maxColumns = 8192, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes, nulls, na, quotedNulls = true, comment, trimWs = true, skipEmptyRows = false, skipRepeatedHeader = false, skip = 0, nMax, maxRows } = {}) {
     const args = {}
     if (delimiter !== ',') args.delimiter = delimiter
     if (!header) args.header = false
@@ -61,6 +61,7 @@ const codec = {
     if (comment) args.comment = String(comment)
     if (trimWs !== true) args.trim_ws = Boolean(trimWs)
     if (skipEmptyRows) args.skip_empty_rows = true
+    if (skipRepeatedHeader) args.skip_repeated_header = true
     if (skip) args.skip = Number(skip)
     if (nMax !== undefined) args.n_max = Number(nMax)
     else if (maxRows !== undefined) args.max_rows = Number(maxRows)

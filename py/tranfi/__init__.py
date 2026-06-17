@@ -47,7 +47,7 @@ class codec:
     def csv(delimiter=',', header=True, batch_size=1024, encode=False, repair=False,
             nulls=None, quoted_nulls=True, mode=None, strict=False, max_error_bytes=4096,
             max_record_bytes=64 * 1024 * 1024, max_columns=8192, comment=None, trim_ws=True,
-            skip_empty_rows=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None,
+            skip_empty_rows=False, skip_repeated_header=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None,
             audit_include_row=None, audit_columns=None, audit_redact=None,
             audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """CSV codec. Use encode=True for encoding (output), False for decoding (input)."""
@@ -97,6 +97,8 @@ class codec:
                 args['trim_ws'] = bool(trim_ws)
             if skip_empty_rows:
                 args['skip_empty_rows'] = True
+            if skip_repeated_header:
+                args['skip_repeated_header'] = True
             if skip:
                 args['skip'] = int(skip)
             if n_max is not None:
@@ -110,7 +112,7 @@ class codec:
     def csv_decode(delimiter=',', header=True, batch_size=1024, nulls=None, quoted_nulls=True,
                    mode=None, strict=False, max_error_bytes=4096,
                    max_record_bytes=64 * 1024 * 1024, max_columns=8192, comment=None, trim_ws=True,
-                   skip_empty_rows=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None,
+                   skip_empty_rows=False, skip_repeated_header=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None,
                    audit_include_row=None, audit_columns=None, audit_redact=None,
                    audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """CSV decoder."""
@@ -118,7 +120,8 @@ class codec:
                          encode=False, nulls=nulls, quoted_nulls=quoted_nulls,
                          mode=mode, strict=strict, max_error_bytes=max_error_bytes,
                          max_record_bytes=max_record_bytes, max_columns=max_columns, comment=comment,
-                         trim_ws=trim_ws, skip_empty_rows=skip_empty_rows, skip=skip,
+                         trim_ws=trim_ws, skip_empty_rows=skip_empty_rows,
+                         skip_repeated_header=skip_repeated_header, skip=skip,
                          n_max=n_max, max_rows=max_rows, audit=audit, audit_limit=audit_limit,
                          audit_include_row=audit_include_row, audit_columns=audit_columns,
                          audit_redact=audit_redact, audit_hash_columns=audit_hash_columns,

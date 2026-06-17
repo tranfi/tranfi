@@ -782,6 +782,40 @@ await test('multi-file source column', async () => {
 })
 
 
+await test('multi-file skip repeated CSV header', async () => {
+  const dir = await mkdtemp(join(tmpdir(), `tranfi-header-${process.pid}-`))
+  const first = join(dir, 'part-a.csv')
+  const second = join(dir, 'part-b.csv')
+  try {
+    await writeFile(first, 'name,age\nAlice,30')
+    await writeFile(second, 'name,age\nBob,25\n')
+
+    const p = pipeline([
+      codec.csv({ skipRepeatedHeader: true }),
+      codec.csvEncode(),
+    ])
+    const result = await p.run({ inputFiles: [first, second], chunkSize: 2 })
+    assert(result.outputText.split('name,age').length - 1 === 1, 'second header should be stripped')
+    assert(result.outputText.includes('Alice,30'), 'first data row should be present')
+    assert(result.outputText.includes('Bob,25'), 'second data row should be present')
+
+    const chunks = []
+    for await (const chunk of p.iterChunks({ inputFiles: [first, second], chunkSize: 3 })) {
+      chunks.push(Buffer.from(chunk))
+    }
+    const text = Buffer.concat(chunks).toString('utf-8')
+    assert(chunks.length > 1, 'iterChunks should stream bounded chunks')
+    assert(text.split('name,age').length - 1 === 1, 'iterChunks should strip second header')
+    assert(text.includes('Bob,25'), 'iterChunks should include second data row')
+
+    const dslResult = await pipeline('csv skipRepeatedHeader=true | csv').run({ inputFiles: [first, second], chunkSize: 2 })
+    assert(dslResult.outputText.split('name,age').length - 1 === 1, 'DSL camelCase option should work')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
 await test('gzip file input', async () => {
   const gzPath = join(tmpdir(), `tranfi-sample-${process.pid}.csv.gz`)
   const csv = 'name,age\nAlice,30\nBob,25\nCharlie,35\nEve,42\n'

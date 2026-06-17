@@ -448,6 +448,8 @@ typedef enum {
 typedef struct {
     char      delimiter;
     int       has_header;
+    int       skip_repeated_header;
+    int       after_input_boundary;
     size_t    batch_size;
     csv_decode_mode mode;
     char    **null_literals;
@@ -1126,6 +1128,17 @@ static tf_batch *make_schema_only_batch(csv_decoder_state *st) {
     return b;
 }
 
+static int csv_fields_match_header(const csv_decoder_state *st, const field_slice *fields, size_t n_fields) {
+    if (!st || !st->schema_ready || n_fields != st->n_cols) return 0;
+    for (size_t i = 0; i < st->n_cols; i++) {
+        const char *name = st->col_names[i] ? st->col_names[i] : "";
+        size_t name_len = strlen(name);
+        if (fields[i].len != name_len) return 0;
+        if (name_len > 0 && memcmp(fields[i].ptr, name, name_len) != 0) return 0;
+    }
+    return 1;
+}
+
 /*
  * Process a single complete CSV line.
  *
@@ -1175,6 +1188,13 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
         return TF_ERROR;
     }
 
+    if (st->schema_ready && st->has_header && st->skip_repeated_header && st->after_input_boundary) {
+        st->after_input_boundary = 0;
+        if (csv_fields_match_header(st, st->fields, n_fields)) {
+            return TF_OK;
+        }
+    }
+
     /* --- First line: extract column headers --- */
     if (!st->schema_ready) {
         char **col_names = tf_callocarray_checked(n_fields ? n_fields : 1, sizeof(char *));
@@ -1213,6 +1233,7 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
         st->col_names = col_names;
         st->col_types = col_types;
         st->schema_ready = 1;
+        st->after_input_boundary = 0;
         return TF_OK;
     }
 
@@ -1442,6 +1463,7 @@ static int csv_flush(tf_decoder *self, tf_batch ***out, size_t *n_out, tf_side_c
         st->rows_buffered = 0;
     }
 
+    st->after_input_boundary = 1;
     return TF_OK;
 }
 
@@ -1472,6 +1494,8 @@ tf_decoder *tf_csv_decoder_create(const cJSON *args) {
 
     st->delimiter = ',';
     st->has_header = 1;
+    st->skip_repeated_header = 0;
+    st->after_input_boundary = 0;
     st->batch_size = DEFAULT_BATCH_SIZE;
     st->mode = CSV_MODE_PERMISSIVE;
     st->quoted_nulls = 1;
@@ -1496,6 +1520,11 @@ tf_decoder *tf_csv_decoder_create(const cJSON *args) {
         cJSON *h = cJSON_GetObjectItemCaseSensitive(args, "header");
         if (cJSON_IsBool(h))
             st->has_header = cJSON_IsTrue(h);
+
+        cJSON *skip_repeated_header = cJSON_GetObjectItemCaseSensitive(args, "skip_repeated_header");
+        if (!skip_repeated_header) skip_repeated_header = cJSON_GetObjectItemCaseSensitive(args, "skipRepeatedHeader");
+        if (cJSON_IsBool(skip_repeated_header))
+            st->skip_repeated_header = cJSON_IsTrue(skip_repeated_header);
 
         size_t parsed_size = 0;
         int has_batch_size = tf_json_get_size_arg(args, "batch_size", 1, TF_MAX_BATCH_ROWS, &parsed_size, "csv");
