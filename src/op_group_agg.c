@@ -1151,8 +1151,7 @@ static int copy_spill_group_key_values(tf_batch *keys, const group_agg_state *st
         if (set_spill_row_cell(keys, 0, k, row, c, keys->col_types[k]) != TF_OK)
             return TF_ERROR;
     }
-    keys->n_rows = 1;
-    return TF_OK;
+    return tf_batch_expose_row(keys, 0);
 }
 
 static void group_accum_add_spill_row(group_accum *a, const group_agg_state *st, const group_spill_row *row) {
@@ -1405,7 +1404,7 @@ static int group_agg_start_sorted_group(group_agg_state *st, char *key,
     st->sorted_key = key;
     st->sorted_have_current = 1;
     st->sorted_groups_started++;
-    st->sorted_key_batch->n_rows = 1;
+    if (tf_batch_expose_row(st->sorted_key_batch, 0) != TF_OK) return -1;
     if (group_agg_check_state_bytes(st, side) != 0) return -1;
     return 0;
 }

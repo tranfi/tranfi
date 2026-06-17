@@ -1162,8 +1162,7 @@ static int pivot_copy_spill_pt_values(tf_batch *dst, const pivot_state *st, cons
                 return TF_ERROR;
         }
     }
-    dst->n_rows = 1;
-    return TF_OK;
+    return tf_batch_expose_row(dst, 0);
 }
 
 static int pivot_spill_row_to_batch(const pivot_state *st, tf_batch *out, size_t dst_row,
@@ -1433,7 +1432,7 @@ static int pivot_start_sorted_group(pivot_state *st, char *key,
     for (size_t k = 0; k < st->n_pt; k++) {
         if (tf_batch_copy_cell_index(st->current_pt, 0, k, in, row, st->pt_cols[k]) != TF_OK) return TF_ERROR;
     }
-    st->current_pt->n_rows = 1;
+    if (tf_batch_expose_row(st->current_pt, 0) != TF_OK) return TF_ERROR;
     st->have_current = 1;
     return TF_OK;
 }

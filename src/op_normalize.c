@@ -225,7 +225,10 @@ static int add_row(normalize_state *st, tf_batch *b, size_t r) {
         tf_batch_free(rb);
         return TF_ERROR;
     }
-    rb->n_rows = 1;
+    if (tf_batch_expose_row(rb, 0) != TF_OK) {
+        tf_batch_free(rb);
+        return TF_ERROR;
+    }
     st->rows[st->n_rows].batch = rb;
     st->n_rows++;
     return TF_OK;

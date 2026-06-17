@@ -185,6 +185,29 @@ int main(void) {
           "SF,870,West\n",
           join_lookup);
     assert(fclose(join_lookup) == 0);
+    const char *join_sorted_lookup_path = "/tmp/tranfi_oom_join_sorted_lookup.csv";
+    FILE *join_sorted_lookup = fopen(join_sorted_lookup_path, "wb");
+    assert(join_sorted_lookup);
+    fputs("city,pop,region\n"
+          "LA,3900,West\n"
+          "NY,8000,East\n"
+          "NY,8100,East2\n",
+          join_sorted_lookup);
+    assert(fclose(join_sorted_lookup) == 0);
+    const char *bag_lookup_path = "/tmp/tranfi_oom_bag_lookup.csv";
+    FILE *bag_lookup = fopen(bag_lookup_path, "wb");
+    assert(bag_lookup);
+    fputs("city\nNY\n", bag_lookup);
+    assert(fclose(bag_lookup) == 0);
+    const char *sorted_union_lookup_path = "/tmp/tranfi_oom_sorted_union_lookup.csv";
+    FILE *sorted_union_lookup = fopen(sorted_union_lookup_path, "wb");
+    assert(sorted_union_lookup);
+    fputs("name,age,city,score,tags,x,y,color\n"
+          "Liam,21,LA,19,m,8,8,blue\n"
+          "Nora,39,NY,33,n,9,9,red\n"
+          "Sam,44,SF,41,s,10,10,green\n",
+          sorted_union_lookup);
+    assert(fclose(sorted_union_lookup) == 0);
     const char *stack_path = "/tmp/tranfi_oom_stack.csv";
     FILE *stack_file = fopen(stack_path, "wb");
     assert(stack_file);
@@ -356,6 +379,18 @@ int main(void) {
             620
         },
         {
+            "hash_mutating_join",
+            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_matches_per_row=2 max_output_rows=16 | csv",
+            people,
+            520
+        },
+        {
+            "sorted_mutating_join",
+            "csv batch_size=1 | join /tmp/tranfi_oom_join_sorted_lookup.csv on city sorted=true max_matches_per_row=2 max_output_rows=16 | csv",
+            sorted_people,
+            560
+        },
+        {
             "hash_set_schema_capture",
             "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city max_lookup_keys=8 max_output_keys=8 | csv",
             people,
@@ -368,10 +403,28 @@ int main(void) {
             340
         },
         {
+            "hash_bag_set_modes",
+            "csv batch_size=1 | intersect-all /tmp/tranfi_oom_bag_lookup.csv columns=city max_lookup_keys=8 max_lookup_bytes=4096 | setdiff-all /tmp/tranfi_oom_bag_lookup.csv columns=city max_lookup_keys=8 max_lookup_bytes=4096 | csv",
+            people,
+            420
+        },
+        {
+            "sorted_bag_set_modes",
+            "csv batch_size=1 | intersect-all /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | setdiff-all /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | csv",
+            sorted_people,
+            420
+        },
+        {
             "spill_set_schema_capture",
             "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
             people,
             380
+        },
+        {
+            "spill_bag_set_schema_capture",
+            "csv batch_size=1 | intersect-all /tmp/tranfi_oom_bag_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            people,
+            420
         },
         {
             "union_schema_capture",
@@ -380,10 +433,22 @@ int main(void) {
             320
         },
         {
+            "sorted_union_schema_capture",
+            "csv batch_size=1 | union /tmp/tranfi_oom_sorted_union_lookup.csv columns=city sorted=true | csv",
+            sorted_people,
+            420
+        },
+        {
             "spill_union_schema_capture",
             "csv batch_size=1 | union /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
             people,
             380
+        },
+        {
+            "sorted_key_state_modes",
+            "csv batch_size=1 | unique city sorted=true | group-agg city sum:score:total sorted=true | csv",
+            sorted_people,
+            360
         },
         {
             "json_record_ops",
@@ -440,6 +505,9 @@ int main(void) {
     remove(union_lookup_path);
     remove(sorted_lookup_path);
     remove(join_lookup_path);
+    remove(join_sorted_lookup_path);
+    remove(bag_lookup_path);
+    remove(sorted_union_lookup_path);
     remove(stack_path);
     remove(spill_root);
     return 0;

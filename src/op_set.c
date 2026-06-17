@@ -2656,7 +2656,8 @@ static int union_sorted_load_next_right_key(set_state *st, tf_side_channels *sid
                           st->sorted_row, st->union_right_cols[c], side, "union") != TF_OK)
             return TF_ERROR;
     }
-    st->union_sorted_right_row->n_rows = 1;
+    if (tf_batch_expose_row(st->union_sorted_right_row, 0) != TF_OK)
+        return TF_ERROR;
 
     while (st->sorted_have_row) {
         set_key_tuple row_key = {0};
