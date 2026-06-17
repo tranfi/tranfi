@@ -2013,6 +2013,33 @@ await test('assert actions', async () => {
   assert(aggregateWarn.statsText.includes('"aggregate_value":50'), 'aggregate assert stats should include value')
   assert(aggregateWarn.statsText.includes('"aggregate_passed":false'), 'aggregate assert stats should include pass/fail')
 
+  const rateData = 'name,score\nA,10\nB,\nC,30\n'
+  const missingRateWarn = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.assert(null, { aggregate: 'missing_rate:score', op: '<=', value: 0.25, action: 'warn', name: 'score_missing_rate' }),
+    codec.csvEncode(),
+  ]).run({ input: rateData })
+  assert(missingRateWarn.outputText.includes('A,10'), 'missing-rate assert should pass through rows')
+  const rateErrors = missingRateWarn.errors.toString('utf-8')
+  assert(rateErrors.includes('aggregate_assert_failed'), 'missing-rate warning should emit failure')
+  assert(rateErrors.includes('"aggregate":"missing_rate"'), 'missing-rate failure should name aggregate')
+  assert(rateErrors.includes('"column":"score"'), 'missing-rate failure should name column')
+  assert(missingRateWarn.statsText.includes('"aggregate":"missing_rate"'), 'missing-rate stats should name aggregate')
+  assert(missingRateWarn.statsText.includes('"aggregate_column":"score"'), 'missing-rate stats should name column')
+  assert(missingRateWarn.statsText.includes('"aggregate_rows":3'), 'missing-rate stats should count rows')
+  assert(missingRateWarn.statsText.includes('"aggregate_non_null":2'), 'missing-rate stats should count non-null')
+  assert(missingRateWarn.statsText.includes('"aggregate_missing":1'), 'missing-rate stats should count missing')
+  assert(missingRateWarn.statsText.includes('"aggregate_passed":false'), 'missing-rate stats should fail')
+
+  const completeRatePass = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.assert(null, { aggregate: 'complete_rate:score', op: '>=', value: 0.66, action: 'fail', name: 'score_complete_rate' }),
+    codec.csvEncode(),
+  ]).run({ input: rateData })
+  assert(completeRatePass.errors.length === 0, 'complete-rate assert should pass')
+  assert(completeRatePass.statsText.includes('"aggregate":"complete_rate"'), 'complete-rate stats should name aggregate')
+  assert(completeRatePass.statsText.includes('"aggregate_passed":true'), 'complete-rate stats should pass')
+
   await assertRejects(
     () => pipeline([
       codec.csv(),
@@ -4967,6 +4994,15 @@ if (createTranfi) {
     assert(errors.includes('"actual":50'), 'wasm aggregate assert should include actual value')
     assert(result.statsText.includes('"memory_class":"bounded_state"'), 'wasm aggregate assert metadata should be bounded')
     assert(result.statsText.includes('"aggregate_value":50'), 'wasm aggregate assert stats should include value')
+
+    const rateResult = tf.run(
+      'csv batch_size=1 | assert aggregate=missing_rate:score op=<= value=0.25 action=warn name=score_missing_rate | csv',
+      'name,score\nA,10\nB,\nC,30\n'
+    )
+    const rateErrors = new TextDecoder().decode(rateResult.errors)
+    assert(rateErrors.includes('"aggregate":"missing_rate"'), 'wasm missing-rate warning should name aggregate')
+    assert(rateResult.statsText.includes('"aggregate_rows":3'), 'wasm missing-rate stats should count rows')
+    assert(rateResult.statsText.includes('"aggregate_missing":1'), 'wasm missing-rate stats should count missing')
   })
 
 

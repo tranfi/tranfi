@@ -7174,6 +7174,59 @@ static void test_pipeline_assert_actions(void) {
     assert(strstr((char *)stats, "\"aggregate_passed\":false") != NULL);
     tf_pipeline_free(p);
 
+    const char *rate_csv = "name,score\nA,10\nB,\nC,30\n";
+    const char *missing_rate_warn_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"assert\",\"args\":{\"aggregate\":\"missing_rate:score\",\"op\":\"<=\",\"value\":0.25,\"action\":\"warn\",\"name\":\"score_missing_rate\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create(missing_rate_warn_plan, strlen(missing_rate_warn_plan));
+    assert(p != NULL);
+    assert(tf_pipeline_push(p, (const uint8_t *)rate_csv, strlen(rate_csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strstr((char *)out, "A,10") != NULL);
+    assert(strstr((char *)out, "B,") != NULL);
+    en = tf_pipeline_pull(p, TF_CHAN_ERRORS, err, sizeof(err) - 1);
+    assert(en > 0);
+    err[en] = '\0';
+    assert(strstr((char *)err, "aggregate_assert_failed") != NULL);
+    assert(strstr((char *)err, "\"aggregate\":\"missing_rate\"") != NULL);
+    assert(strstr((char *)err, "\"column\":\"score\"") != NULL);
+    assert(strstr((char *)err, "\"rows\":3") != NULL);
+    assert(strstr((char *)err, "\"missing\":1") != NULL);
+    sn = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(sn > 0);
+    stats[sn] = '\0';
+    assert(strstr((char *)stats, "\"aggregate\":\"missing_rate\"") != NULL);
+    assert(strstr((char *)stats, "\"aggregate_column\":\"score\"") != NULL);
+    assert(strstr((char *)stats, "\"aggregate_rows\":3") != NULL);
+    assert(strstr((char *)stats, "\"aggregate_non_null\":2") != NULL);
+    assert(strstr((char *)stats, "\"aggregate_missing\":1") != NULL);
+    assert(strstr((char *)stats, "\"aggregate_passed\":false") != NULL);
+    tf_pipeline_free(p);
+
+    const char *complete_rate_pass_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"assert\",\"args\":{\"aggregate\":\"complete_rate:score\",\"op\":\">=\",\"value\":0.66,\"action\":\"fail\",\"name\":\"score_complete_rate\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create(complete_rate_pass_plan, strlen(complete_rate_pass_plan));
+    assert(p != NULL);
+    assert(tf_pipeline_push(p, (const uint8_t *)rate_csv, strlen(rate_csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    assert(tf_pipeline_pull(p, TF_CHAN_ERRORS, err, sizeof(err)) == 0);
+    sn = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(sn > 0);
+    stats[sn] = '\0';
+    assert(strstr((char *)stats, "\"aggregate\":\"complete_rate\"") != NULL);
+    assert(strstr((char *)stats, "\"aggregate_passed\":true") != NULL);
+    tf_pipeline_free(p);
+
     const char *agg_fail_plan =
         "{\"steps\":["
         "{\"op\":\"codec.csv.decode\",\"args\":{}},"
@@ -7264,6 +7317,15 @@ static void test_pipeline_assert_actions(void) {
     assert(cJSON_IsNumber(tol_arg) && tol_arg->valuedouble == 0.001);
     assert(cJSON_IsBool(rel_arg) && !cJSON_IsTrue(rel_arg));
     tf_ir_plan_free(agg_dsl);
+
+    const char *rate_dsl_text = "csv | assert aggregate=missing_rate:score op=<= value=0.1 action=warn name=score_missing_rate | csv";
+    tf_ir_plan *rate_dsl = tf_dsl_parse(rate_dsl_text, strlen(rate_dsl_text), NULL);
+    assert(rate_dsl != NULL);
+    assert(tf_ir_validate(rate_dsl) == TF_OK);
+    assert(rate_dsl->nodes[1].memory_class == TF_MEM_BOUNDED_STATE);
+    cJSON *rate_arg = cJSON_GetObjectItemCaseSensitive(rate_dsl->nodes[1].args, "aggregate");
+    assert(cJSON_IsString(rate_arg) && strcmp(rate_arg->valuestring, "missing_rate:score") == 0);
+    tf_ir_plan_free(rate_dsl);
 }
 
 

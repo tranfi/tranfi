@@ -5,6 +5,8 @@ NPM ?= npm
 NODE ?= node
 TWINE ?= twine
 PYTEST ?= $(PYTHON) -m pytest
+PACKAGE_TMPDIR ?= $(CURDIR)/build/tmp
+PY_BUILD_ENV := TMPDIR="$(PACKAGE_TMPDIR)" TEMP="$(PACKAGE_TMPDIR)" TMP="$(PACKAGE_TMPDIR)"
 SANITIZER_RUN := $(shell if command -v setarch >/dev/null 2>&1 && setarch "$$(uname -m)" -R true >/dev/null 2>&1; then printf 'setarch %s -R' "$$(uname -m)"; fi)
 ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
 BENCH_ROWS ?= 1000000
@@ -67,7 +69,8 @@ build-node: build-c sync-js-csrc check-js-csrc-sync
 build-js: build-node build-wasm
 
 build-py: sync-py-csrc check-py-csrc-sync
-	@cd py && rm -rf dist build *.egg-info && $(PYTHON) -m build --sdist
+	@mkdir -p "$(PACKAGE_TMPDIR)"
+	@cd py && rm -rf dist build *.egg-info && $(PY_BUILD_ENV) $(PYTHON) -m build --sdist
 	@$(PYTHON) scripts/audit-package-artifacts.py --python-sdist "py/dist/tranfi-*.tar.gz"
 
 build-wasm:
@@ -125,7 +128,7 @@ test-python: build-c
 	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_python.py test/test_parity.py test/test_duckdb.py -v --tb=short
 
-test-node: build-node
+test-node: build-node build-wasm
 	@$(NODE) test/test_node.js
 
 test-parity: build-c
@@ -140,10 +143,11 @@ test-properties: build-c
 	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_properties.py -v --tb=short
 
-test-packaging: check-csrc-sync sbom test-packaging-python test-packaging-node test-packaging-install
+test-packaging: sync-py-csrc sync-js-csrc check-csrc-sync sbom test-packaging-python test-packaging-node test-packaging-install
 
 test-packaging-python: sbom sync-py-csrc check-py-csrc-sync
-	@cd py && rm -rf dist build *.egg-info && $(PYTHON) -m build --sdist
+	@mkdir -p "$(PACKAGE_TMPDIR)"
+	@cd py && rm -rf dist build *.egg-info && $(PY_BUILD_ENV) $(PYTHON) -m build --sdist
 	@$(PYTHON) scripts/audit-package-artifacts.py --python-sdist "py/dist/tranfi-*.tar.gz"
 
 test-packaging-node: sbom sync-js-csrc check-js-csrc-sync
@@ -242,11 +246,12 @@ site: app
 # --- Publish targets ---
 
 publish-python:
+	@mkdir -p "$(PACKAGE_TMPDIR)"
 	@cd py && rm -rf dist && \
 		$(PYTHON) scripts/sync-csrc.py && \
 		$(PYTHON) ../scripts/check-csrc-sync.py --mirror py && \
 		rm -rf tranfi/app && cp -r ../app/dist tranfi/app && rm -rf tranfi/app/wasm tranfi/app/lib && \
-		$(PYTHON) -m build --sdist && \
+		$(PY_BUILD_ENV) $(PYTHON) -m build --sdist && \
 		$(PYTHON) ../scripts/audit-package-artifacts.py --python-sdist "dist/tranfi-*.tar.gz" && \
 		$(PYTHON) ../scripts/smoke-install-packages.py --python-sdist "dist/tranfi-*.tar.gz" --python "$(PYTHON)" && \
 		$(TWINE) upload dist/*.tar.gz

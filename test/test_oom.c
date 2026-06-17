@@ -480,7 +480,7 @@ int main(void) {
         },
         {
             "aggregate_assert_tolerance",
-            "csv batch_size=1 | assert aggregate=count op=>= value=2 tolerance=0.001 rel=false action=warn name=row_count | csv",
+            "csv batch_size=1 | assert aggregate=count op=>= value=2 tolerance=0.001 rel=false action=warn name=row_count | assert aggregate=missing_rate:score op=<= value=0.25 action=warn name=score_missing_rate | csv",
             people,
             420
         },

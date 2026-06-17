@@ -4,7 +4,7 @@
  * Row mode:
  *   {"expr":"col('age') >= 0", "action":"fail|warn|filter|quarantine|annotate"}
  * Aggregate mode:
- *   {"aggregate":"count|sum:col|avg:col|min:col|max:col|missing:col|non_null:col",
+ *   {"aggregate":"count|sum:col|avg:col|min:col|max:col|missing:col|non_null:col|missing_rate:col|complete_rate:col",
  *    "op":">=", "value":1, "action":"fail|warn"}
  */
 
@@ -37,6 +37,8 @@ typedef enum {
     ASSERT_AGG_AVG,
     ASSERT_AGG_MIN,
     ASSERT_AGG_MAX,
+    ASSERT_AGG_MISSING_RATE,
+    ASSERT_AGG_COMPLETE_RATE,
 } assert_agg_kind;
 
 typedef enum {
@@ -103,6 +105,8 @@ static const char *assert_agg_kind_name(assert_agg_kind kind) {
         case ASSERT_AGG_AVG: return "avg";
         case ASSERT_AGG_MIN: return "min";
         case ASSERT_AGG_MAX: return "max";
+        case ASSERT_AGG_MISSING_RATE: return "missing_rate";
+        case ASSERT_AGG_COMPLETE_RATE: return "complete_rate";
         default: return "count";
     }
 }
@@ -147,6 +151,12 @@ static int parse_agg_kind_name(const char *s, assert_agg_kind *out) {
     if (strcmp(s, "count") == 0 || strcmp(s, "n") == 0 || strcmp(s, "rows") == 0) { *out = ASSERT_AGG_COUNT; return 1; }
     if (strcmp(s, "non_null") == 0 || strcmp(s, "non-null") == 0 || strcmp(s, "complete") == 0 || strcmp(s, "present") == 0) { *out = ASSERT_AGG_NON_NULL; return 1; }
     if (strcmp(s, "missing") == 0 || strcmp(s, "null") == 0 || strcmp(s, "nulls") == 0) { *out = ASSERT_AGG_MISSING; return 1; }
+    if (strcmp(s, "missing_rate") == 0 || strcmp(s, "missing-rate") == 0 ||
+        strcmp(s, "null_rate") == 0 || strcmp(s, "null-rate") == 0 ||
+        strcmp(s, "null_fraction") == 0 || strcmp(s, "null-fraction") == 0) { *out = ASSERT_AGG_MISSING_RATE; return 1; }
+    if (strcmp(s, "complete_rate") == 0 || strcmp(s, "complete-rate") == 0 ||
+        strcmp(s, "non_null_rate") == 0 || strcmp(s, "non-null-rate") == 0 ||
+        strcmp(s, "present_rate") == 0 || strcmp(s, "present-rate") == 0) { *out = ASSERT_AGG_COMPLETE_RATE; return 1; }
     if (strcmp(s, "sum") == 0) { *out = ASSERT_AGG_SUM; return 1; }
     if (strcmp(s, "avg") == 0 || strcmp(s, "mean") == 0) { *out = ASSERT_AGG_AVG; return 1; }
     if (strcmp(s, "min") == 0) { *out = ASSERT_AGG_MIN; return 1; }
@@ -236,6 +246,14 @@ static int aggregate_value(const assert_state *st, double *out) {
         case ASSERT_AGG_COUNT: *out = (double)st->agg_rows; return 1;
         case ASSERT_AGG_NON_NULL: *out = (double)st->agg_non_null; return 1;
         case ASSERT_AGG_MISSING: *out = (double)st->agg_missing; return 1;
+        case ASSERT_AGG_MISSING_RATE:
+            if (st->agg_rows == 0) return 0;
+            *out = (double)st->agg_missing / (double)st->agg_rows;
+            return 1;
+        case ASSERT_AGG_COMPLETE_RATE:
+            if (st->agg_rows == 0) return 0;
+            *out = (double)st->agg_non_null / (double)st->agg_rows;
+            return 1;
         case ASSERT_AGG_SUM:
             if (!st->agg_has_numeric) return 0;
             *out = st->agg_sum;

@@ -2082,6 +2082,35 @@ def test_ops_assert_actions():
     assert '"aggregate_value":50' in aggregate_warn.stats_text
     assert '"aggregate_passed":false' in aggregate_warn.stats_text
 
+    rate_data = b'name,score\nA,10\nB,\nC,30\n'
+    missing_rate_warn = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.assert_(aggregate='missing_rate:score', op='<=', value=0.25,
+                       action='warn', name='score_missing_rate'),
+        tf.codec.csv_encode(),
+    ]).run(input=rate_data)
+    assert 'A,10' in missing_rate_warn.output_text
+    rate_errors = missing_rate_warn.errors.decode('utf-8')
+    assert 'aggregate_assert_failed' in rate_errors
+    assert '"aggregate":"missing_rate"' in rate_errors
+    assert '"column":"score"' in rate_errors
+    assert '"aggregate":"missing_rate"' in missing_rate_warn.stats_text
+    assert '"aggregate_column":"score"' in missing_rate_warn.stats_text
+    assert '"aggregate_rows":3' in missing_rate_warn.stats_text
+    assert '"aggregate_non_null":2' in missing_rate_warn.stats_text
+    assert '"aggregate_missing":1' in missing_rate_warn.stats_text
+    assert '"aggregate_passed":false' in missing_rate_warn.stats_text
+
+    complete_rate_pass = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.assert_(aggregate='complete_rate:score', op='>=', value=0.66,
+                       action='fail', name='score_complete_rate'),
+        tf.codec.csv_encode(),
+    ]).run(input=rate_data)
+    assert complete_rate_pass.errors == b''
+    assert '"aggregate":"complete_rate"' in complete_rate_pass.stats_text
+    assert '"aggregate_passed":true' in complete_rate_pass.stats_text
+
     with pytest.raises(RuntimeError, match='assert aggregate failed'):
         tf.pipeline([
             tf.codec.csv(),
