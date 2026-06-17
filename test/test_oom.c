@@ -344,6 +344,12 @@ int main(void) {
             360
         },
         {
+            "jsonl_malformed_diagnostics",
+            "jsonl batch_size=1 on_error=warn max_error_bytes=8 | csv",
+            "{\"name\":\"Alice\",\"age\":30}\nnot-json-record-long\n[1,2]\n{\"name\":\"Bob\",\"age\":25}\n",
+            520
+        },
+        {
             "audit_privacy_producers",
             "csv batch_size=1 nulls=NA | fill-null note=SECRET audit audit_columns=note audit_redact=note | cast secret=int audit audit_columns=secret audit_redact=secret | frequency city max_values=1 overflow=other audit audit_limit=1 audit_columns=city audit_redact=city | csv",
             audit_rows,
@@ -376,6 +382,12 @@ int main(void) {
         {
             "flush_report_stats",
             "csv batch_size=1 | scan | csv",
+            people,
+            360
+        },
+        {
+            "stats_hist_sample",
+            "csv batch_size=1 | stats hist,sample | csv",
             people,
             360
         },
@@ -498,6 +510,12 @@ int main(void) {
             "csv batch_size=1 | union /tmp/tranfi_oom_union_lookup.csv columns=city max_output_keys=8 | csv",
             people,
             320
+        },
+        {
+            "union_all_append",
+            "csv batch_size=1 | union-all /tmp/tranfi_oom_union_lookup.csv | csv",
+            people,
+            360
         },
         {
             "sorted_union_schema_capture",
