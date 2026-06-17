@@ -58,6 +58,27 @@ static int pipeline_fail(tf_pipeline *p, const char *fallback) {
     return TF_ERROR;
 }
 
+static void set_last_schema_inference_error(void) {
+    const char *detail = tf_last_error();
+    if (detail && detail[0]) {
+        char buf[TF_LAST_ERROR_CAP];
+        snprintf(buf, sizeof(buf), "schema inference failed: %s", detail);
+        tf_set_last_error(buf);
+    } else {
+        tf_set_last_error("schema inference failed");
+    }
+}
+
+static char *schema_inference_error_string(void) {
+    const char *detail = tf_last_error();
+    if (detail && detail[0]) {
+        char buf[TF_LAST_ERROR_CAP];
+        snprintf(buf, sizeof(buf), "schema inference failed: %s", detail);
+        return strdup(buf);
+    }
+    return strdup("schema inference failed");
+}
+
 static int pipeline_fail_msg(tf_pipeline *p, const char *msg) {
     if (p) {
         free(p->error);
@@ -359,8 +380,9 @@ static tf_pipeline *pipeline_create_from_owned_ir(tf_ir_plan *ir, const tf_host_
         return NULL;
     }
 
+    tf_set_last_error(NULL);
     if (tf_ir_infer_schema(ir) != TF_OK) {
-        tf_set_last_error("schema inference failed");
+        set_last_schema_inference_error();
         tf_ir_plan_free(ir);
         return NULL;
     }
@@ -1023,8 +1045,9 @@ char *tf_compile_to_sql(const char *dsl, size_t len, char **error) {
         tf_ir_plan_destroy(plan);
         return NULL;
     }
+    tf_set_last_error(NULL);
     if (tf_ir_infer_schema(plan) != TF_OK) {
-        if (error) *error = strdup("schema inference failed");
+        if (error) *error = schema_inference_error_string();
         tf_ir_plan_destroy(plan);
         return NULL;
     }
@@ -1048,8 +1071,9 @@ char *tf_compile_dsl_with_host_policy(const char *dsl, size_t len,
         tf_ir_plan_destroy(plan);
         return NULL;
     }
+    tf_set_last_error(NULL);
     if (tf_ir_infer_schema(plan) != TF_OK) {
-        if (error) *error = strdup("schema inference failed");
+        if (error) *error = schema_inference_error_string();
         tf_ir_plan_destroy(plan);
         return NULL;
     }

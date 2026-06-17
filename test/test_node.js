@@ -4134,7 +4134,20 @@ await test('compileToSql select', async () => {
   assert(sql.includes('"age"'), 'should have age')
 })
 
+await test('compileToSql trim explicit columns', async () => {
+  const sql = await compileToSql('csv | trim name,city | csv')
+  assert(sql.includes('trim("name")'), 'explicit trim should lower name column')
+  assert(sql.includes('trim("city")'), 'explicit trim should lower city column')
+})
 
+await test('compileToSql rejects trim without explicit columns', async () => {
+  try {
+    await compileToSql('csv | trim | csv')
+    assert(false, 'trim without columns should not lower silently')
+  } catch (err) {
+    assert(String(err.message || err).includes('requires explicit columns'), 'should explain explicit-column requirement')
+  }
+})
 
 await test('compileToSql rejects frequency overflow other', async () => {
   try {
@@ -4142,6 +4155,22 @@ await test('compileToSql rejects frequency overflow other', async () => {
     assert(false, 'frequency overflow SQL lowering should throw')
   } catch (err) {
     assert(String(err.message || err).includes('overflow=other is not supported by SQL lowering'), 'should explain unsupported overflow lowering')
+  }
+})
+
+await test('compileToSql frequency emits native-shaped value key', async () => {
+  const sql = await compileToSql('csv | frequency a,b | csv')
+  assert(sql.includes('AS "value"'), 'frequency SQL should project a native-shaped value column')
+  assert(sql.includes('chr(1)'), 'multi-column frequency SQL should use the native key separator')
+  assert(sql.includes('GROUP BY "value"'), 'frequency SQL should group on the serialized value key')
+})
+
+await test('compileToSql rejects frequency without explicit columns', async () => {
+  try {
+    await compileToSql('csv | frequency | csv')
+    assert(false, 'frequency without columns should not lower silently')
+  } catch (err) {
+    assert(String(err.message || err).includes('requires explicit columns'), 'should explain explicit-column requirement')
   }
 })
 

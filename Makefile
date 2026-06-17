@@ -12,7 +12,7 @@ ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
 .PHONY: build-c build-debug build-tsan build-node build-wasm build-js build-py sync-js-csrc sync-py-csrc
 .PHONY: check-js-csrc-sync check-py-csrc-sync check-csrc-sync sbom test-packaging test-packaging-install
 .PHONY: test-packaging-node test-packaging-node-install test-packaging-python test-packaging-python-install test-properties
-.PHONY: test-c test-memory test-debug test-tsan test-oom test-python test-node test-parity
+.PHONY: test-c test-memory test-debug test-tsan test-oom test-python test-node test-parity test-duckdb
 .PHONY: test-spill-sec test-depth-limits test-float-rt test-wide-csv
 .PHONY: publish-python publish-node publish-github
 
@@ -75,7 +75,7 @@ wasm: build-wasm
 
 # --- Test targets ---
 
-test: test-c test-python test-node test-packaging
+test: test-c test-python test-properties test-node test-packaging fuzz-smoke
 
 test-c: build-c
 	@cmake --build build --target test_memory test_core > /dev/null
@@ -121,7 +121,7 @@ test-wide-csv: build-debug
 
 test-python: build-c
 	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
-		$(PYTEST) test/test_python.py test/test_parity.py -v --tb=short
+		$(PYTEST) test/test_python.py test/test_parity.py test/test_duckdb.py -v --tb=short
 
 test-node: build-node
 	@$(NODE) test/test_node.js
@@ -129,6 +129,10 @@ test-node: build-node
 test-parity: build-c
 	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_parity.py -v --tb=short
+
+test-duckdb: build-c
+	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
+		$(PYTEST) test/test_duckdb.py -v --tb=short
 
 test-properties: build-c
 	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
@@ -142,7 +146,7 @@ test-packaging-python: sbom sync-py-csrc check-py-csrc-sync
 
 test-packaging-node: sbom sync-js-csrc check-js-csrc-sync
 	@mkdir -p build
-	@cd js && npm_config_cache=/tmp/npm-pack-audit $(NPM) pack --dry-run --json > ../build/npm-pack-dry-run.json
+	@cd js && npm_config_cache=../build/npm-pack-audit $(NPM) pack --dry-run --json > ../build/npm-pack-dry-run.json
 	@$(PYTHON) scripts/audit-package-artifacts.py --npm-json build/npm-pack-dry-run.json
 
 test-packaging-python-install: test-packaging-python
@@ -150,7 +154,7 @@ test-packaging-python-install: test-packaging-python
 
 test-packaging-node-install: test-packaging-node
 	@rm -rf build/npm-install-smoke && mkdir -p build/npm-install-smoke
-	@cd js && npm_config_cache=/tmp/npm-pack-audit $(NPM) pack --json --pack-destination ../build/npm-install-smoke > ../build/npm-pack-install.json
+	@cd js && npm_config_cache=../build/npm-pack-audit $(NPM) pack --json --pack-destination ../build/npm-install-smoke > ../build/npm-pack-install.json
 	@$(PYTHON) scripts/audit-package-artifacts.py --npm-json build/npm-pack-install.json
 	@$(PYTHON) scripts/smoke-install-packages.py --npm-tarball "build/npm-install-smoke/tranfi-*.tgz" --node "$(NODE)" --npm "$(NPM)"
 
@@ -210,7 +214,7 @@ build/fuzz_%: test/fuzz_%.c
 
 # --- Verify (full suite with sanitizers) ---
 
-verify: build-debug test-debug test-spill-sec test-depth-limits test-float-rt test-wide-csv test-oom test-python test-node test-packaging
+verify: build-debug test-debug test-spill-sec test-depth-limits test-float-rt test-wide-csv test-oom test-tsan test-python test-properties test-node test-packaging fuzz-smoke
 
 # --- App targets ---
 

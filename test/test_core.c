@@ -5909,6 +5909,52 @@ static void test_pipeline_csv_sort_desc(void) {
     tf_pipeline_free(p);
 }
 
+static void test_pipeline_csv_sort_stable_equal_keys(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"sort\",\"args\":{\"columns\":[{\"name\":\"age\",\"desc\":false}]}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+
+    const char *csv =
+        "name,city,age\n"
+        "Alice,NY,30\n"
+        "Bob,LA,25\n"
+        "Eve,SF,30\n"
+        "Diana,CHI,25\n"
+        "Grace,LA,30\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+
+    uint8_t out[2048];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    char *s = (char *)out;
+
+    const char *rows[] = {
+        "Bob,LA,25",
+        "Diana,CHI,25",
+        "Alice,NY,30",
+        "Eve,SF,30",
+        "Grace,LA,30"
+    };
+    char *prev = strstr(s, "name,city,age");
+    assert(prev != NULL);
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        char *pos = strstr(s, rows[i]);
+        assert(pos != NULL);
+        assert(prev < pos);
+        prev = pos;
+    }
+
+    tf_pipeline_free(p);
+}
+
 static void test_pipeline_skip_head_combo(void) {
     /* skip 2 | head 2 should give rows 3-4 */
     const char *plan =
@@ -9242,6 +9288,70 @@ static void test_spill_sort_typed_multi_key_null_ordering(void) {
     assert(rmdir(spill_dir) == 0);
 }
 
+static void test_spill_sort_stable_equal_keys(void) {
+    char spill_dir[256];
+    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_sort_stable_%ld", (long)getpid());
+    rmdir(spill_dir);
+    assert(mkdir(spill_dir, 0700) == 0);
+
+    char plan[2048];
+    snprintf(plan, sizeof(plan),
+             "{\"steps\":["
+             "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+             "{\"op\":\"sort\",\"args\":{\"columns\":[{\"name\":\"age\",\"desc\":false}],"
+             "\"spill_dir\":\"%s\",\"spill_run_rows\":2,\"spill_output_rows\":2}},"
+             "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+             "]}", spill_dir);
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+
+    const char *csv =
+        "name,age\n"
+        "Alice,20\n"
+        "Bob,20\n"
+        "Cara,20\n"
+        "Drew,30\n"
+        "Eve,30\n"
+        "Finn,30\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+
+    uint8_t out[2048];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    char *s = (char *)out;
+
+    const char *rows[] = {
+        "Alice,20",
+        "Bob,20",
+        "Cara,20",
+        "Drew,30",
+        "Eve,30",
+        "Finn,30"
+    };
+    char *prev = strstr(s, "name,age");
+    assert(prev != NULL);
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        char *pos = strstr(s, rows[i]);
+        assert(pos != NULL);
+        assert(prev < pos);
+        prev = pos;
+    }
+
+    uint8_t stats_buf[2048];
+    size_t stats_n = tf_pipeline_pull(p, TF_CHAN_STATS, stats_buf, sizeof(stats_buf) - 1);
+    assert(stats_n > 0);
+    stats_buf[stats_n] = '\0';
+    assert(strstr((char *)stats_buf, "\"execution_target\":\"native_spill\"") != NULL);
+    assert(strstr((char *)stats_buf, "\"spill_runs\":3") != NULL);
+    assert(strstr((char *)stats_buf, "\"spill_output_rows\":6") != NULL);
+
+    tf_pipeline_free(p);
+    assert(rmdir(spill_dir) == 0);
+}
+
 
 static void test_spill_unique_preserves_first_row_order(void) {
     char spill_dir[256];
@@ -11218,6 +11328,17 @@ static void test_compile_dsl(void) {
     assert(strstr(json, "\"state_bytes_estimate\":null") != NULL);
     assert(strstr(json, "\"state_bytes_reason\":\"step 'unique' needs max_keys") != NULL);
     tf_string_free(json);
+
+    json = tf_compile_dsl("csv | summarise city count:*:rows | select starts_with(score) | csv",
+                          strlen("csv | summarise city count:*:rows | select starts_with(score) | csv"),
+                          &error);
+    assert(json == NULL);
+    assert(error != NULL);
+    assert(strstr(error, "schema inference failed") != NULL);
+    assert(strstr(error, "select schema") != NULL);
+    assert(strstr(error, "selectors resolved no columns") != NULL);
+    free(error);
+    error = NULL;
 }
 
 static void test_recipe_roundtrip(void) {
@@ -12265,6 +12386,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_unique_sorted);
     TEST(test_pipeline_csv_sort);
     TEST(test_pipeline_csv_sort_desc);
+    TEST(test_pipeline_csv_sort_stable_equal_keys);
     TEST(test_pipeline_skip_head_combo);
 
     printf("\nNew DSL:\n");
@@ -12339,6 +12461,7 @@ int main(int argc, char **argv) {
     TEST(test_filter_date_comparison);
     TEST(test_sort_by_date);
     TEST(test_spill_sort_typed_multi_key_null_ordering);
+    TEST(test_spill_sort_stable_equal_keys);
     TEST(test_spill_unique_preserves_first_row_order);
     TEST(test_spill_group_agg_preserves_first_group_order);
     TEST(test_datetime_native_date);

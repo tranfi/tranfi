@@ -337,6 +337,12 @@ int main(void) {
             320
         },
         {
+            "category_declared_unknowns",
+            "csv batch_size=1 | onehot color categories=red,blue unknown=other | label-encode city city_id categories=LA,NY unknown=null | csv",
+            people,
+            420
+        },
+        {
             "data_quality_audit",
             "csv batch_size=1 | validate \"col(age) > 25\" audit audit_limit=2 | assert \"col(score) >= 20\" action=filter audit audit_limit=2 | schema name:string age:int city:string non_null=name,age min=age:0 max=age:120 values=city:NY,LA mode=filter audit audit_limit=2 | quarantine \"col(city) == 'LA'\" name=city_block message=la | csv",
             people,
@@ -529,6 +535,18 @@ int main(void) {
             600
         },
         {
+            "sorted_filtering_joins",
+            "csv batch_size=1 | semi-join /tmp/tranfi_oom_join_sorted_lookup.csv on city sorted=true | csv",
+            sorted_people,
+            420
+        },
+        {
+            "sorted_anti_join",
+            "csv batch_size=1 | anti-join /tmp/tranfi_oom_join_sorted_lookup.csv on city sorted=true | csv",
+            sorted_people_unmatched,
+            420
+        },
+        {
             "hash_set_schema_capture",
             "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city max_lookup_keys=8 max_output_keys=8 | csv",
             people,
@@ -583,6 +601,12 @@ int main(void) {
             420
         },
         {
+            "spill_bag_setdiff_schema_capture",
+            "csv batch_size=1 | setdiff-all /tmp/tranfi_oom_bag_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            people,
+            420
+        },
+        {
             "union_schema_capture",
             "csv batch_size=1 | union /tmp/tranfi_oom_union_lookup.csv columns=city max_output_keys=8 | csv",
             people,
@@ -625,6 +649,12 @@ int main(void) {
             300
         },
         {
+            "json_filter_predicates",
+            "text | json-filter /user/name starts-with A type=string | json-filter /tags contains vip type=string | csv",
+            "{\"user\":{\"name\":\"Alice\"},\"tags\":\"vip,gold\"}\n{\"user\":{\"name\":\"Ada\"},\"tags\":\"basic\"}\n{\"user\":{\"name\":\"Bob\"},\"tags\":\"vip\"}\n",
+            360
+        },
+        {
             "jsonl_decode_encode",
             "jsonl batch_size=4 | jsonl",
             "{\"name\":\"Alice\",\"age\":30,\"payload\":{\"city\":\"NY\"}}\n{\"name\":\"Bob\",\"age\":25.5,\"payload\":{\"city\":\"LA\"}}\n{\"name\":\"Cara\",\"age\":\"35\",\"payload\":[\"x\",\"y\"]}\n",
@@ -640,6 +670,12 @@ int main(void) {
             "text_passthrough",
             "text batch_size=2 | text",
             "alpha\nbeta\ngamma\n",
+            220
+        },
+        {
+            "text_no_newline_with_record_cap",
+            "text batch_size=1 max_record_bytes=64 | grep alpha | text",
+            "alpha beta gamma",
             220
         },
         {

@@ -39,6 +39,15 @@ class TestCompileToSql:
         assert '"name"' in sql
         assert '"age"' in sql
 
+    def test_trim_explicit_columns(self):
+        sql = tf.compile_to_sql('csv | trim name,city | csv')
+        assert 'trim("name")' in sql
+        assert 'trim("city")' in sql
+
+    def test_trim_all_requires_schema(self):
+        with pytest.raises(RuntimeError, match='requires explicit columns'):
+            tf.compile_to_sql('csv | trim | csv')
+
     def test_sort(self):
         sql = tf.compile_to_sql('csv | sort age | csv')
         assert 'ORDER BY' in sql
@@ -159,6 +168,11 @@ def parse_rows_ordered(output_text):
     return lines[0], lines[1:]
 
 
+def run_native_for_parity(dsl, data):
+    """Run native semantics on small fixtures, including blocking ops."""
+    return tf.pipeline(dsl).run(input=data, allow_blocking=True)
+
+
 def assert_parity(dsl, data=CSV_DATA, ordered=False, float_cols=None):
     """Run DSL on both native and DuckDB engines, compare results.
 
@@ -168,7 +182,7 @@ def assert_parity(dsl, data=CSV_DATA, ordered=False, float_cols=None):
         ordered: if True, compare row order; otherwise compare as sets
         float_cols: if set, parse these columns as floats with tolerance
     """
-    native = tf.pipeline(dsl).run(input=data)
+    native = run_native_for_parity(dsl, data)
     duck = tf.pipeline(dsl, engine='duckdb').run(input=data)
     n_text = native.output_text.strip()
     d_text = duck.output_text.strip()
@@ -340,7 +354,7 @@ class TestParityColumnOps:
         assert len(n_lines) == len(d_lines)
 
     def test_trim(self):
-        """Trim: native trims all columns, DuckDB trims only specified columns."""
+        """Explicit-column trim should match native for the selected columns."""
         dsl = 'csv | trim name | csv'
         native = tf.pipeline(dsl).run(input=CSV_PADDED)
         duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_PADDED)
@@ -352,6 +366,10 @@ class TestParityColumnOps:
             n_name = nl.split(',')[0].strip()
             d_name = dl.split(',')[0].strip()
             assert n_name == d_name
+
+    def test_trim_all_columns_is_native_only_without_schema(self):
+        with pytest.raises(RuntimeError, match='requires explicit columns'):
+            tf.pipeline('csv | trim | csv', engine='duckdb').run(input=CSV_PADDED)
 
     def test_bin(self):
         """Bin labels should match between engines."""
@@ -410,16 +428,13 @@ class TestParityAggregation:
         assert_parity('csv | frequency city | csv', data=CSV_CITIES)
 
     def test_frequency_multi(self):
-        """Multi-column frequency: native concatenates into value, DuckDB keeps separate.
-        This is a known semantic difference; verify structure only."""
+        """Multi-column frequency should preserve native value-key shape."""
         data = b'a,b\nx,1\ny,1\nx,2\ny,1\nx,1\n'
-        dsl = 'csv | frequency a,b | csv'
-        native = tf.pipeline(dsl).run(input=data)
-        duck = tf.pipeline(dsl, engine='duckdb').run(input=data)
-        n_lines = native.output_text.strip().split('\n')
-        d_lines = duck.output_text.strip().split('\n')
-        # Same number of distinct groups
-        assert len(n_lines) == len(d_lines)
+        assert_parity('csv | frequency a,b | csv', data=data, ordered=True)
+
+    def test_frequency_multi_null_keys(self):
+        data = b'a,b\nx,\n,1\n,\n'
+        assert_parity('csv | frequency a,b | csv', data=data, ordered=True)
 
 
 class TestParityReshape:
@@ -457,7 +472,7 @@ class TestParityReshape:
 
     def test_pivot(self):
         dsl = 'csv | pivot metric value sum | csv'
-        native = tf.pipeline(dsl).run(input=CSV_PIVOT)
+        native = run_native_for_parity(dsl, CSV_PIVOT)
         duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_PIVOT)
         n_lines = native.output_text.strip().split('\n')
         d_lines = duck.output_text.strip().split('\n')
@@ -609,7 +624,7 @@ class TestParityEdgeCases:
         """Rows with same sort key should appear in both engines."""
         data = b'name,score\nAlice,90\nBob,90\nCharlie,85\n'
         dsl = 'csv | sort -score | csv'
-        native = tf.pipeline(dsl).run(input=data)
+        native = run_native_for_parity(dsl, data)
         duck = tf.pipeline(dsl, engine='duckdb').run(input=data)
         # Both should have Charlie last (score 85)
         n_lines = native.output_text.strip().split('\n')

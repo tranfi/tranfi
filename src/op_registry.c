@@ -62,6 +62,13 @@ static int registry_schema_take_col(tf_schema *out, size_t idx,
     return TF_OK;
 }
 
+static void registry_set_schema_error(const char *op, const char *detail) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s schema: %s",
+             op ? op : "op", (detail && detail[0]) ? detail : "schema inference failed");
+    tf_set_last_error(buf);
+}
+
 static int registry_schema_copy_input_columns(tf_schema *out, const tf_schema *in) {
     if (!out || !in || !out->known || !in->known || out->n_cols < in->n_cols) return TF_ERROR;
     for (size_t i = 0; i < in->n_cols; i++) {
@@ -132,8 +139,12 @@ static int infer_schema_select(const tf_ir_node *node,
         char *error = NULL;
         int rc = tf_column_selectors_resolve_json(cols, in->col_names, in->col_types, in->n_cols,
                                                   &indices, &n_indices, &error);
+        if (rc != TF_OK) {
+            registry_set_schema_error("select", error);
+            free(error);
+            return TF_ERROR;
+        }
         free(error);
-        if (rc != TF_OK) return TF_ERROR;
         if (registry_schema_alloc_known(out, n_indices) != TF_OK) {
             free(indices);
             return TF_ERROR;
@@ -204,8 +215,12 @@ static int infer_schema_relocate(const tf_ir_node *node,
     char *selector_error = NULL;
     int rc = tf_column_selectors_resolve_json(cols, in->col_names, in->col_types, in->n_cols,
                                               &move_idx, &n_move, &selector_error);
+    if (rc != TF_OK) {
+        registry_set_schema_error("relocate", selector_error);
+        free(selector_error);
+        return TF_ERROR;
+    }
     free(selector_error);
-    if (rc != TF_OK) return TF_ERROR;
 
     int *is_moving = calloc(n_in ? n_in : 1, sizeof(int));
     int *order = malloc(n_in ? n_in * sizeof(int) : sizeof(int));
@@ -431,8 +446,12 @@ static int infer_schema_across(const tf_ir_node *node,
     char *error = NULL;
     int rc = tf_column_selectors_resolve_json(cols, in->col_names, in->col_types, in->n_cols,
                                               &indices, &n_indices, &error);
+    if (rc != TF_OK) {
+        registry_set_schema_error("across", error);
+        free(error);
+        return TF_ERROR;
+    }
     free(error);
-    if (rc != TF_OK) return TF_ERROR;
 
     cJSON *fns = NULL;
     int n_fns = 0;

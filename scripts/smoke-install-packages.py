@@ -12,6 +12,15 @@ import tempfile
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def temp_root() -> Path:
+    root = Path(os.environ.get('TRANFI_TEST_TMPDIR', REPO_ROOT / 'build' / 'package-smoke-tmp'))
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
 def expand_one(pattern: str) -> Path:
     matches = [Path(p) for p in glob.glob(pattern)]
     if len(matches) != 1:
@@ -21,6 +30,10 @@ def expand_one(pattern: str) -> Path:
 
 def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     merged_env = os.environ.copy()
+    tmp = str(temp_root())
+    merged_env.setdefault('TMPDIR', tmp)
+    merged_env.setdefault('TEMP', tmp)
+    merged_env.setdefault('TMP', tmp)
     if env:
         merged_env.update(env)
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=merged_env, check=True)
@@ -33,7 +46,7 @@ def venv_python(venv: Path) -> Path:
 
 
 def smoke_python(python: str, sdist: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix='tranfi-py-install-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='tranfi-py-install-', dir=temp_root()) as tmp:
         tmp_path = Path(tmp)
         venv = tmp_path / 'venv'
         run([python, '-m', 'venv', str(venv)])
@@ -55,10 +68,10 @@ print('python clean install smoke OK')
 
 
 def smoke_npm(node: str, npm: str, tarball: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix='tranfi-npm-install-') as tmp:
+    with tempfile.TemporaryDirectory(prefix='tranfi-npm-install-', dir=temp_root()) as tmp:
         tmp_path = Path(tmp)
         env = {
-            'npm_config_cache': '/tmp/npm-pack-audit',
+            'npm_config_cache': str(temp_root() / 'npm-cache'),
             'npm_config_audit': 'false',
             'npm_config_fund': 'false',
         }

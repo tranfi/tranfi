@@ -287,7 +287,7 @@ def jsonl_flat_rows(draw):
     return rows
 
 
-dsl_valid_fragments = [
+dsl_base_valid_fragments = [
     ['head 0'],
     ['head 5'],
     ['skip 0'],
@@ -299,8 +299,6 @@ dsl_valid_fragments = [
     ['mutate doubled=col(score)*2'],
     ["derive band=case_when(col(score)<10,'low','high')"],
     ['select id,city,score'],
-    ['select starts_with(score)'],
-    ['relocate score before=city'],
     ['rename city=town'],
     ['distinct city max_keys=16'],
     ['frequency city max_values=16'],
@@ -313,6 +311,37 @@ dsl_valid_fragments = [
 ]
 
 
+def _dsl_schema_after_fragment(schema, fragment):
+    """Approximate compile-time schema effects for valid-DSL generation."""
+    first = fragment[0]
+    if first.startswith('select id,city,score'):
+        return ['id', 'city', 'score'] if schema is not None else None
+    if first.startswith('select starts_with(score)'):
+        return [name for name in schema if name.startswith('score')] if schema is not None else None
+    if first.startswith('rename city=town'):
+        return ['town' if name == 'city' else name for name in schema] if schema is not None else None
+    if first.startswith('frequency '):
+        return ['value', 'count']
+    if first.startswith('summarise '):
+        return ['city', 'rows']
+    if first.startswith('mutate doubled='):
+        return schema + ['doubled'] if schema is not None else None
+    if first.startswith('derive band='):
+        return schema + ['band'] if schema is not None else None
+    if first.startswith('rowid ') and schema is not None and 'city_row' not in schema:
+        return schema + ['city_row']
+    return schema
+
+
+def _dsl_valid_fragment_options(schema):
+    options = list(dsl_base_valid_fragments)
+    if schema is None or any(name.startswith('score') for name in schema):
+        options.append(['select starts_with(score)'])
+    if schema is None or ('score' in schema and 'city' in schema):
+        options.append(['relocate score before=city'])
+    return options
+
+
 @st.composite
 def dsl_valid_pipeline(draw):
     first = draw(st.sampled_from([
@@ -321,14 +350,13 @@ def dsl_valid_pipeline(draw):
         'csv batch_size=3 trim_ws=false',
         'csv nulls=NA,NULL quoted_nulls=false',
     ]))
-    fragments = draw(st.lists(
-        st.sampled_from(dsl_valid_fragments),
-        min_size=1,
-        max_size=6,
-    ))
+    n_fragments = draw(st.integers(min_value=1, max_value=6))
     stages = [first]
-    for fragment in fragments:
+    schema = None
+    for _ in range(n_fragments):
+        fragment = draw(st.sampled_from(_dsl_valid_fragment_options(schema)))
         stages.extend(fragment)
+        schema = _dsl_schema_after_fragment(schema, fragment)
     stages.append('csv')
     return ' | '.join(stages)
 

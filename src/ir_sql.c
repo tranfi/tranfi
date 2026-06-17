@@ -459,6 +459,25 @@ static int jbool(const cJSON *obj, const char *key, int def) {
   return def;
 }
 
+static int append_frequency_key_expr(strbuf *sb, cJSON *cols) {
+  if (!sb || !cJSON_IsArray(cols) || cJSON_GetArraySize(cols) <= 0) return TF_ERROR;
+  int n = cJSON_GetArraySize(cols);
+  for (int i = 0; i < n; i++) {
+    cJSON *c = cJSON_GetArrayItem(cols, i);
+    if (!cJSON_IsString(c) || !c->valuestring || c->valuestring[0] == '\0') {
+      return TF_ERROR;
+    }
+    if (i > 0) sb_append(sb, " || chr(1) || ");
+    sb_append(sb, "COALESCE(CAST(");
+    sql_quote_ident(sb, c->valuestring);
+    sb_append(sb, " AS VARCHAR), ");
+    sql_quote_str(sb, "\\N");
+    sb_append(sb, ")");
+    if (sb->failed) return TF_ERROR;
+  }
+  return TF_OK;
+}
+
 /* Emit a CTE for a transform op. prev is the name of the previous CTE/source.
  * Appends SQL like: step_N AS (SELECT ... FROM prev ...) */
 static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
@@ -851,27 +870,33 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
   /* ---- trim ---- */
   if (strcmp(op, "trim") == 0) {
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
-    if (cols && cJSON_IsArray(cols) && cJSON_GetArraySize(cols) > 0) {
-      strbuf rep;
-      sb_init(&rep);
-      int n = cJSON_GetArraySize(cols);
-      for (int i = 0; i < n; i++) {
-        if (i > 0) sb_append(&rep, ", ");
-        cJSON *c = cJSON_GetArrayItem(cols, i);
-        if (!cJSON_IsString(c)) continue;
-        sb_append(&rep, "trim(");
-        sql_quote_ident(&rep, c->valuestring);
-        sb_append(&rep, ") AS ");
-        sql_quote_ident(&rep, c->valuestring);
-      }
-      sb_appendf(sb, "%s AS (SELECT * REPLACE (%s) FROM %s)", cte_name, rep.data, prev);
-      sb_free(&rep);
-    } else {
-      /* Trim all string columns — without schema we just pass through.
-       * DuckDB doesn't have a "trim all" so we'd need column names.
-       * Fallback: SELECT * (no trim) with a comment. */
-      sb_appendf(sb, "%s AS (SELECT * FROM %s)", cte_name, prev);
+    if (!cols || !cJSON_IsArray(cols) || cJSON_GetArraySize(cols) <= 0) {
+      *error = strdup("trim: SQL lowering requires explicit columns");
+      return -1;
     }
+    strbuf rep;
+    sb_init(&rep);
+    int n = cJSON_GetArraySize(cols);
+    for (int i = 0; i < n; i++) {
+      cJSON *c = cJSON_GetArrayItem(cols, i);
+      if (!cJSON_IsString(c) || !c->valuestring || c->valuestring[0] == '\0') {
+        sb_free(&rep);
+        *error = strdup("trim: invalid columns");
+        return -1;
+      }
+      if (i > 0) sb_append(&rep, ", ");
+      sb_append(&rep, "trim(");
+      sql_quote_ident(&rep, c->valuestring);
+      sb_append(&rep, ") AS ");
+      sql_quote_ident(&rep, c->valuestring);
+    }
+    if (rep.failed) {
+      sb_free(&rep);
+      *error = strdup("sql: out of memory");
+      return -1;
+    }
+    sb_appendf(sb, "%s AS (SELECT * REPLACE (%s) FROM %s)", cte_name, rep.data, prev);
+    sb_free(&rep);
     return 0;
   }
 
@@ -968,35 +993,22 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     }
 
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
-    if (cols && cJSON_IsArray(cols) && cJSON_GetArraySize(cols) > 0) {
-      strbuf sel;
-      sb_init(&sel);
-      strbuf grp;
-      sb_init(&grp);
-      int n = cJSON_GetArraySize(cols);
-      for (int i = 0; i < n; i++) {
-        if (i > 0) { sb_append(&sel, ", "); sb_append(&grp, ", "); }
-        cJSON *c = cJSON_GetArrayItem(cols, i);
-        if (cJSON_IsString(c)) {
-          /* Native engine renames to "value" for single column */
-          if (n == 1) {
-            sql_quote_ident(&sel, c->valuestring);
-            sb_append(&sel, " AS \"value\"");
-          } else {
-            sql_quote_ident(&sel, c->valuestring);
-          }
-          sql_quote_ident(&grp, c->valuestring);
-        }
-      }
-      sb_appendf(sb, "%s AS (SELECT %s, COUNT(*) AS \"count\" FROM %s GROUP BY %s ORDER BY \"count\" DESC)",
-                 cte_name, sel.data, prev, grp.data);
-      sb_free(&sel);
-      sb_free(&grp);
-    } else {
-      /* No columns specified — frequency of all columns not meaningful,
-       * fall back to counting rows */
-      sb_appendf(sb, "%s AS (SELECT COUNT(*) AS \"count\" FROM %s)", cte_name, prev);
+    if (!cols || !cJSON_IsArray(cols) || cJSON_GetArraySize(cols) <= 0) {
+      *error = strdup("frequency: SQL lowering requires explicit columns");
+      return -1;
     }
+    strbuf key;
+    sb_init(&key);
+    if (append_frequency_key_expr(&key, cols) != TF_OK) {
+      sb_free(&key);
+      *error = strdup("frequency: invalid columns");
+      return -1;
+    }
+    sb_appendf(sb, "%s AS (SELECT \"value\", COUNT(*) AS \"count\" FROM "
+                 "(SELECT %s AS \"value\" FROM %s) __tf_frequency "
+                 "GROUP BY \"value\" ORDER BY \"count\" DESC, \"value\" ASC)",
+               cte_name, key.data, prev);
+    sb_free(&key);
     return 0;
   }
 

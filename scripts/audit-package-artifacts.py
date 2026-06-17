@@ -132,7 +132,24 @@ def require_paths(kind: str, paths: set[str], required: set[str], prefixes: tupl
 
 
 def npm_paths(path: Path) -> set[str]:
-    data = json.loads(path.read_text(encoding='utf-8'))
+    text = path.read_text(encoding='utf-8')
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        data = None
+        for idx, ch in enumerate(text):
+            if ch != '[':
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(text[idx:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, list):
+                data = candidate
+                break
+        if data is None:
+            raise original_error
     if not isinstance(data, list) or not data:
         raise ValueError(f'{path}: expected npm pack --json list')
     files = data[0].get('files')

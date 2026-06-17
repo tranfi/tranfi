@@ -23,6 +23,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <regex.h>
+#include <limits.h>
 
 #define TF_SELECTOR_MAX_DEPTH 256
 
@@ -256,7 +257,8 @@ static int selector_find_column(char **names, size_t n_cols, const char *name) {
     return -1;
 }
 
-static int append_index(int *order, size_t *n_order, int *included, int idx);
+static TF_WARN_UNUSED int append_index(int *order, size_t *n_order, size_t cap,
+                                       int *included, int idx);
 static void remove_index(int *order, size_t n_order, int *included, int idx);
 
 static int selector_apply_range(const char *expr, int neg, char **names, size_t n_cols,
@@ -292,7 +294,11 @@ static int selector_apply_range(const char *expr, int neg, char **names, size_t 
     int step = li <= ri ? 1 : -1;
     for (int idx = li;; idx += step) {
         if (neg) remove_index(order, *n_order, included, idx);
-        else append_index(order, n_order, included, idx);
+        else if (append_index(order, n_order, n_cols, included, idx) != TF_OK) {
+            selector_set_error(error, "selector index overflow", expr);
+            free(left); free(right);
+            return TF_ERROR;
+        }
         if (idx == ri) break;
     }
 
@@ -403,9 +409,12 @@ static int selector_parse_name_list(const char *arg, char ***out_items, size_t *
     return TF_OK;
 }
 
-static int append_index(int *order, size_t *n_order, int *included, int idx) {
+static int append_index(int *order, size_t *n_order, size_t cap,
+                        int *included, int idx) {
     if (idx < 0) return TF_ERROR;
+    if ((size_t)idx >= cap) return TF_ERROR;
     if (included[idx]) return TF_OK;
+    if (*n_order >= cap) return TF_ERROR;
     included[idx] = 1;
     order[(*n_order)++] = idx;
     return TF_OK;
@@ -428,6 +437,7 @@ typedef struct {
 } selector_result;
 
 static int selector_result_init(selector_result *r, size_t n_cols) {
+    if (n_cols > (size_t)INT_MAX) return TF_ERROR;
     r->n_cols = n_cols;
     r->n_order = 0;
     size_t alloc_cols = n_cols ? n_cols : 1;
@@ -460,11 +470,19 @@ static int selector_result_union(const selector_result *left,
     if (selector_result_init(out, left->n_cols) != TF_OK) return TF_ERROR;
     for (size_t i = 0; i < left->n_order; i++) {
         int idx = left->order[i];
-        if (idx >= 0 && left->included[idx]) append_index(out->order, &out->n_order, out->included, idx);
+        if (idx >= 0 && left->included[idx] &&
+            append_index(out->order, &out->n_order, out->n_cols, out->included, idx) != TF_OK) {
+            selector_result_free(out);
+            return TF_ERROR;
+        }
     }
     for (size_t i = 0; i < right->n_order; i++) {
         int idx = right->order[i];
-        if (idx >= 0 && right->included[idx]) append_index(out->order, &out->n_order, out->included, idx);
+        if (idx >= 0 && right->included[idx] &&
+            append_index(out->order, &out->n_order, out->n_cols, out->included, idx) != TF_OK) {
+            selector_result_free(out);
+            return TF_ERROR;
+        }
     }
     return TF_OK;
 }
@@ -476,7 +494,10 @@ static int selector_result_intersection(const selector_result *left,
     for (size_t i = 0; i < left->n_order; i++) {
         int idx = left->order[i];
         if (idx >= 0 && left->included[idx] && right->included[idx]) {
-            append_index(out->order, &out->n_order, out->included, idx);
+            if (append_index(out->order, &out->n_order, out->n_cols, out->included, idx) != TF_OK) {
+                selector_result_free(out);
+                return TF_ERROR;
+            }
         }
     }
     return TF_OK;
@@ -485,7 +506,11 @@ static int selector_result_intersection(const selector_result *left,
 static int selector_result_complement(const selector_result *in, selector_result *out) {
     if (selector_result_init(out, in->n_cols) != TF_OK) return TF_ERROR;
     for (size_t i = 0; i < in->n_cols; i++) {
-        if (!in->included[i]) append_index(out->order, &out->n_order, out->included, (int)i);
+        if (!in->included[i] &&
+            append_index(out->order, &out->n_order, out->n_cols, out->included, (int)i) != TF_OK) {
+            selector_result_free(out);
+            return TF_ERROR;
+        }
     }
     return TF_OK;
 }
@@ -526,7 +551,13 @@ static int selector_resolve_atomic(const char *raw,
     if (exact) {
         int exact_idx = selector_find_column(names, n_cols, exact);
         if (exact_idx >= 0) {
-            append_index(base.order, &base.n_order, base.included, exact_idx);
+            if (append_index(base.order, &base.n_order, base.n_cols, base.included, exact_idx) != TF_OK) {
+                free(func); free(arg); free(exact);
+                if (have_regex) regfree(&compiled);
+                selector_result_free(&base);
+                selector_set_error(error, "selector index overflow", raw);
+                return TF_ERROR;
+            }
         } else if (selector_has_range_syntax(exact)) {
             if (selector_apply_range(exact, 0, names, n_cols, base.included,
                                      base.order, &base.n_order, error) != TF_OK) {
@@ -571,7 +602,14 @@ static int selector_resolve_atomic(const char *raw,
                     }
                     continue;
                 }
-                append_index(base.order, &base.n_order, base.included, idx);
+                if (append_index(base.order, &base.n_order, base.n_cols, base.included, idx) != TF_OK) {
+                    selector_free_name_list(items, n_items);
+                    free(func); free(arg); free(exact);
+                    if (have_regex) regfree(&compiled);
+                    selector_result_free(&base);
+                    selector_set_error(error, "selector index overflow", raw);
+                    return TF_ERROR;
+                }
             }
             selector_free_name_list(items, n_items);
         } else {
@@ -586,7 +624,13 @@ static int selector_resolve_atomic(const char *raw,
             }
             for (size_t i = 0; i < n_cols; i++) {
                 if (selector_matches_column(func, arg, names[i], types[i], &compiled)) {
-                    append_index(base.order, &base.n_order, base.included, (int)i);
+                    if (append_index(base.order, &base.n_order, base.n_cols, base.included, (int)i) != TF_OK) {
+                        free(func); free(arg); free(exact);
+                        if (have_regex) regfree(&compiled);
+                        selector_result_free(&base);
+                        selector_set_error(error, "selector index overflow", raw);
+                        return TF_ERROR;
+                    }
                 }
             }
         }
@@ -800,6 +844,10 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
         selector_set_error(error, "selector list is empty", NULL);
         return TF_ERROR;
     }
+    if (n_cols > (size_t)INT_MAX) {
+        selector_set_error(error, "selector column count exceeds int index range", NULL);
+        return TF_ERROR;
+    }
 
     size_t alloc_cols = n_cols ? n_cols : 1;
     int *included = tf_callocarray_checked(alloc_cols, sizeof(int));
@@ -829,7 +877,13 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
 
     size_t n_order = 0;
     if (!has_positive) {
-        for (size_t i = 0; i < n_cols; i++) append_index(order, &n_order, included, (int)i);
+        for (size_t i = 0; i < n_cols; i++) {
+            if (append_index(order, &n_order, n_cols, included, (int)i) != TF_OK) {
+                free(included); free(order);
+                selector_set_error(error, "selector index overflow", NULL);
+                return TF_ERROR;
+            }
+        }
     }
 
     for (size_t si = 0; si < n_selectors; si++) {
@@ -841,7 +895,13 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
             }
             for (size_t i = 0; i < expr.n_order; i++) {
                 int idx = expr.order[i];
-                if (idx >= 0 && expr.included[idx]) append_index(order, &n_order, included, idx);
+                if (idx >= 0 && expr.included[idx] &&
+                    append_index(order, &n_order, n_cols, included, idx) != TF_OK) {
+                    selector_result_free(&expr);
+                    free(included); free(order);
+                    selector_set_error(error, "selector index overflow", selectors[si]);
+                    return TF_ERROR;
+                }
             }
             selector_result_free(&expr);
             continue;
@@ -873,7 +933,13 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
             int exact_idx = selector_find_column(names, n_cols, exact);
             if (exact_idx >= 0) {
                 if (neg) remove_index(order, n_order, included, exact_idx);
-                else append_index(order, &n_order, included, exact_idx);
+                else if (append_index(order, &n_order, n_cols, included, exact_idx) != TF_OK) {
+                    free(func); free(arg); free(exact);
+                    if (have_regex) regfree(&compiled);
+                    free(included); free(order);
+                    selector_set_error(error, "selector index overflow", selectors[si]);
+                    return TF_ERROR;
+                }
             } else if (selector_has_range_syntax(exact)) {
                 if (selector_apply_range(exact, neg, names, n_cols, included, order, &n_order, error) != TF_OK) {
                     free(func); free(arg); free(exact);
@@ -918,7 +984,14 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
                         continue;
                     }
                     if (neg) remove_index(order, n_order, included, idx);
-                    else append_index(order, &n_order, included, idx);
+                    else if (append_index(order, &n_order, n_cols, included, idx) != TF_OK) {
+                        selector_free_name_list(items, n_items);
+                        free(func); free(arg); free(exact);
+                        if (have_regex) regfree(&compiled);
+                        free(included); free(order);
+                        selector_set_error(error, "selector index overflow", selectors[si]);
+                        return TF_ERROR;
+                    }
                 }
                 selector_free_name_list(items, n_items);
             } else {
@@ -934,7 +1007,13 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
                 for (size_t i = 0; i < n_cols; i++) {
                     if (selector_matches_column(func, arg, names[i], types[i], &compiled)) {
                         if (neg) remove_index(order, n_order, included, (int)i);
-                        else append_index(order, &n_order, included, (int)i);
+                        else if (append_index(order, &n_order, n_cols, included, (int)i) != TF_OK) {
+                            free(func); free(arg); free(exact);
+                            if (have_regex) regfree(&compiled);
+                            free(included); free(order);
+                            selector_set_error(error, "selector index overflow", selectors[si]);
+                            return TF_ERROR;
+                        }
                     }
                 }
             }

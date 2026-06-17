@@ -941,9 +941,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Schema inference allows unknown runtime schemas but reports allocation failures. */
+    /* Schema inference allows unknown runtime schemas but reports invalid known-schema plans. */
+    tf_set_last_error(NULL);
     if (tf_ir_infer_schema(ir) != TF_OK) {
-        fprintf(stderr, "error: schema inference failed\n");
+        const char *detail = tf_last_error();
+        if (detail && detail[0])
+            fprintf(stderr, "error: schema inference failed: %s\n", detail);
+        else
+            fprintf(stderr, "error: schema inference failed\n");
         tf_ir_plan_free(ir);
         return 1;
     }

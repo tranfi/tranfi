@@ -224,7 +224,9 @@ static int sort_compare_rows(const sort_ctx *ctx, size_t ra, size_t rb) {
 }
 
 static int sort_compare_index(const void *ctx, size_t ra, size_t rb) {
-    return sort_compare_rows((const sort_ctx *)ctx, ra, rb);
+    int cmp = sort_compare_rows((const sort_ctx *)ctx, ra, rb);
+    if (cmp != 0) return cmp;
+    return (ra > rb) - (ra < rb);
 }
 
 static size_t *sort_batch_indices(const sort_state *st, const tf_batch *batch) {
