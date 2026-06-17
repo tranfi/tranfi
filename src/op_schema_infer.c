@@ -198,7 +198,7 @@ static int schema_infer_flush(tf_step *self, tf_batch **out,
         SCHEMA_INFER_WRITE(tf_batch_set_int64(ob, c, 7, (int64_t)non_missing));
         SCHEMA_INFER_WRITE(tf_batch_set_string(ob, c, 8, observed));
         SCHEMA_INFER_WRITE(tf_batch_set_string(ob, c, 9, warning));
-        ob->n_rows = c + 1;
+        SCHEMA_INFER_WRITE(tf_batch_expose_row(ob, c));
     }
 
     *out = ob;

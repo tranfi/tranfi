@@ -489,10 +489,13 @@ static int assert_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         out_row++;
     }
 
-    ob->n_rows = out_row;
     if (ob->n_rows > 0 || st->action == ASSERT_ANNOTATE || in->n_rows == 0) *out = ob;
     else tf_batch_free(ob);
     return TF_OK;

@@ -108,7 +108,7 @@ static tf_batch *add_tag_column(tf_batch *in, const char *tag_col, const char *t
         for (size_t c = 0; c < in->n_cols; c++) {
             if (tf_batch_copy_cell(out, r, c + 1, in, r, c) != TF_OK) goto fail;
         }
-        out->n_rows = r + 1;
+        if (tf_batch_expose_row(out, r) != TF_OK) goto fail;
     }
     return out;
 
@@ -141,7 +141,10 @@ static int stack_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
     *out = ob;
     return TF_OK;
@@ -273,7 +276,7 @@ static int stack_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
             if (tf_batch_set_null(ob, row, c + col_offset) != TF_OK) goto done;
         }
 
-        ob->n_rows = row + 1;
+        if (tf_batch_expose_row(ob, row) != TF_OK) goto done;
         row++;
         p = (nl < end) ? nl + 1 : end;
     }

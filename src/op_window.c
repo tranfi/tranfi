@@ -124,7 +124,10 @@ static int window_passthrough(tf_batch *in, tf_batch **out) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
     *out = ob;
     return TF_OK;
@@ -170,7 +173,7 @@ static int window_process(tf_step *self, tf_batch *in, tf_batch **out,
 
         if (force_null || tf_batch_is_null(in, r, ci)) {
             if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            ob->n_rows = r + 1;
+            if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             continue;
         }
 
@@ -214,10 +217,13 @@ static int window_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         st->ring[st->head] = val;
         st->head = next_head;
         st->count = next_count;
-        ob->n_rows = r + 1;
     }
 
     *out = ob;
@@ -424,11 +430,14 @@ static int bool_window_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         st->values[st->head] = value;
         st->is_null[st->head] = is_null;
         st->head = next_head;
         st->count = next_count;
-        ob->n_rows = r + 1;
     }
 
     *out = ob;

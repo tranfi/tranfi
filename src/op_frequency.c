@@ -385,7 +385,11 @@ static int frequency_flush(tf_step *self, tf_batch **out, tf_side_channels *side
             free(keys); free(counts); free(indices);
             return TF_ERROR;
         }
-        ob->n_rows = i + 1;
+        if (tf_batch_expose_row(ob, i) != TF_OK) {
+            tf_batch_free(ob);
+            free(keys); free(counts); free(indices);
+            return TF_ERROR;
+        }
     }
 
     free(keys); free(counts); free(indices);

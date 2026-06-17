@@ -79,7 +79,7 @@ static int step_process(tf_step *self, tf_batch *in, tf_batch **out,
 
         if (ci < 0 || tf_batch_is_null(in, r, ci)) {
             if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            ob->n_rows = r + 1;
+            if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             continue;
         }
 
@@ -145,13 +145,17 @@ static int step_process(tf_step *self, tf_batch *in, tf_batch **out,
 
         if (write_null) {
             if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             st->prev_val = next_prev_val;
             st->has_prev = next_has_prev;
-            ob->n_rows = r + 1;
             continue;
         }
 
         if (tf_batch_set_float64(ob, r, in->n_cols, result) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
@@ -161,7 +165,6 @@ static int step_process(tf_step *self, tf_batch *in, tf_batch **out,
         st->running_count = next_running_count;
         st->prev_val = next_prev_val;
         st->has_prev = next_has_prev;
-        ob->n_rows = r + 1;
     }
 
     *out = ob;

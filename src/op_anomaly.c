@@ -98,7 +98,10 @@ static int anomaly_passthrough(tf_batch *in, tf_batch **out) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
     *out = ob;
     return TF_OK;
@@ -144,13 +147,13 @@ static int anomaly_process(tf_step *self, tf_batch *in, tf_batch **out,
 
         if (force_null) {
             if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            ob->n_rows = r + 1;
+            if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             continue;
         }
 
         if (tf_batch_is_null(in, r, ci)) {
             if (tf_batch_set_int64(ob, r, in->n_cols, 0) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            ob->n_rows = r + 1;
+            if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             continue;
         }
 
@@ -183,10 +186,13 @@ static int anomaly_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         st->count = next_count;
         st->mean = next_mean;
         st->m2 = next_m2;
-        ob->n_rows = r + 1;
     }
 
     *out = ob;

@@ -137,7 +137,7 @@ static int derive_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
             if (set_derived_value(ob, r, col_idx, st->col_types[d], &val) != TF_OK) goto fail;
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) goto fail;
     }
 
     if (ob->n_rows > 0) {

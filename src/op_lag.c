@@ -87,9 +87,12 @@ static int lag_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         st->hist_pos = (st->hist_pos + 1) % st->offset;
         if (st->hist_count < st->offset) st->hist_count++;
-        ob->n_rows = r + 1;
     }
 
     *out = ob;

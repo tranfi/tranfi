@@ -112,7 +112,10 @@ static int lead_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = i + 1;
+        if (tf_batch_expose_row(ob, i) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     tf_batch *new_pend = tf_batch_create(in->n_cols, st->offset);
@@ -129,8 +132,12 @@ static int lead_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(new_pend, i) != TF_OK) {
+            tf_batch_free(new_pend);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
-    new_pend->n_rows = st->offset;
 
     if (st->pending) tf_batch_free(st->pending);
     st->pending = new_pend;
@@ -169,7 +176,10 @@ static int lead_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     tf_batch_free(st->pending);

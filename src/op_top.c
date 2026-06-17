@@ -269,7 +269,11 @@ static int top_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = i + 1;
+        if (tf_batch_expose_row(ob, i) != TF_OK) {
+            free(indices);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     free(indices);

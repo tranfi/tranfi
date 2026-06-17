@@ -733,7 +733,7 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
             }
             ci++;
         }
-        ob->n_rows = c + 1;
+        STATS_WRITE(tf_batch_expose_row(ob, c));
     }
 
     *out = ob;

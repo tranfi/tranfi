@@ -175,7 +175,7 @@ static int json_flatten_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
             cJSON_Delete(root);
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) goto fail;
     }
 
     if (ob->n_rows > 0) *out = ob;

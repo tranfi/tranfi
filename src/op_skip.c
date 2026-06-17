@@ -52,7 +52,10 @@ static int skip_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = i + 1;
+        if (tf_batch_expose_row(ob, i) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     st->seen = next_seen;

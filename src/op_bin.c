@@ -93,7 +93,10 @@ static int bin_passthrough(tf_batch *in, tf_batch **out) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
     *out = ob;
     return TF_OK;
@@ -165,7 +168,10 @@ static int bin_process(tf_step *self, tf_batch *in, tf_batch **out,
                 return TF_ERROR;
             }
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     *out = ob;
