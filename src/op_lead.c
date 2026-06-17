@@ -78,7 +78,10 @@ static int lead_process(tf_step *self, tf_batch *in, tf_batch **out,
                 return TF_ERROR;
             }
         }
-        new_pend->n_rows = total;
+        if (total > 0 && tf_batch_expose_row(new_pend, total - 1) != TF_OK) {
+            tf_batch_free(new_pend);
+            return TF_ERROR;
+        }
         if (st->pending) tf_batch_free(st->pending);
         st->pending = new_pend;
         return TF_OK;

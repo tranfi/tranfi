@@ -39,7 +39,10 @@ static int ensure_history(lag_state *st, const tf_batch *in) {
         tf_batch_free(h);
         return TF_ERROR;
     }
-    h->n_rows = st->offset;
+    if (tf_batch_expose_row(h, st->offset - 1) != TF_OK) {
+        tf_batch_free(h);
+        return TF_ERROR;
+    }
     st->history = h;
     return TF_OK;
 }
