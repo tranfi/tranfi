@@ -1321,7 +1321,7 @@ static int set_spill_append_selected_row(set_state *st, const set_spill_row *row
     if (set_spill_row_to_batch(st, st->spill_out_buf, dst, row) != TF_OK) return TF_ERROR;
     if (set_ensure_ordinals(&st->spill_out_ordinals, &st->spill_out_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
     st->spill_out_ordinals[dst] = row->ordinal;
-    st->spill_out_buf->n_rows = dst + 1;
+    if (tf_batch_expose_row(st->spill_out_buf, dst) != TF_OK) return TF_ERROR;
     st->spill_kept_rows++;
     if (st->mode != 4 && st->mode != 5) st->spill_distinct_rows++;
     if (st->spill_out_buf->n_rows >= st->run_rows) return set_spill_write_output_run(st);
@@ -1382,7 +1382,7 @@ static int set_spill_process_lookup_batch(set_state *st, const tf_batch *batch, 
         }
         if (set_ensure_ordinals(&st->spill_lookup_ordinals, &st->spill_lookup_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         st->spill_lookup_ordinals[dst] = st->spill_next_lookup_ordinal++;
-        st->spill_lookup_buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->spill_lookup_buf, dst) != TF_OK) return TF_ERROR;
         if (st->spill_lookup_buf->n_rows >= st->run_rows && set_spill_write_lookup_run(st) != TF_OK)
             return TF_ERROR;
     }
@@ -1643,8 +1643,9 @@ static int set_spill_output_next_batch(set_state *st, tf_batch **out, tf_side_ch
         int best = set_spill_best_reader(st, 2);
         if (best < 0) break;
         set_spill_reader *reader = &st->spill_out_readers[best];
-        if (set_spill_row_to_batch(st, ob, ob->n_rows, &reader->row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-        ob->n_rows++;
+        size_t out_row = ob->n_rows;
+        if (set_spill_row_to_batch(st, ob, out_row, &reader->row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
         int rc = set_spill_reader_advance(st, reader);
         if (rc < 0) { tf_batch_free(ob); return TF_ERROR; }
     }
@@ -1672,7 +1673,7 @@ static int set_process_spill(tf_step *self, tf_batch *in, tf_batch **out, tf_sid
         if (tf_batch_copy_row(st->spill_left_buf, dst, in, r) != TF_OK) return TF_ERROR;
         if (set_ensure_ordinals(&st->spill_left_ordinals, &st->spill_left_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         st->spill_left_ordinals[dst] = st->spill_next_left_ordinal++;
-        st->spill_left_buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->spill_left_buf, dst) != TF_OK) return TF_ERROR;
         if (st->spill_left_buf->n_rows >= st->run_rows && set_spill_write_left_run(st) != TF_OK) return TF_ERROR;
     }
     return TF_OK;
@@ -2005,7 +2006,12 @@ static int set_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
                 tf_batch_free(ob);
                 return TF_ERROR;
             }
-            ob->n_rows = ++out_row;
+            if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+                set_key_tuple_clear(&left_key);
+                tf_batch_free(ob);
+                return TF_ERROR;
+            }
+            out_row++;
         }
         set_key_tuple_clear(&left_key);
     }
@@ -2214,7 +2220,8 @@ static int set_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
         if (!keep) continue;
         if (tf_batch_copy_row(ob, out_row, in, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-        ob->n_rows = ++out_row;
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+        out_row++;
     }
 
     if (out_row > 0) *out = ob;
@@ -2326,7 +2333,7 @@ static int set_spill_process_union_file_batch(set_state *st, const tf_batch *bat
         }
         if (set_ensure_ordinals(&st->spill_left_ordinals, &st->spill_left_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         st->spill_left_ordinals[dst] = st->spill_next_left_ordinal++;
-        st->spill_left_buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->spill_left_buf, dst) != TF_OK) return TF_ERROR;
         st->union_file_rows++;
         if (st->spill_left_buf->n_rows >= st->run_rows && set_spill_write_left_run(st) != TF_OK)
             return TF_ERROR;
@@ -2699,7 +2706,8 @@ static int union_sorted_append_left(set_state *st, tf_batch *ob, size_t *out_row
     if (union_sorted_note_emit(st, side) != TF_OK) return TF_ERROR;
     if (tf_batch_ensure_capacity(ob, *out_row + 1) != TF_OK) return TF_ERROR;
     if (tf_batch_copy_row(ob, *out_row, in, row) != TF_OK) return TF_ERROR;
-    ob->n_rows = ++(*out_row);
+    if (tf_batch_expose_row(ob, *out_row) != TF_OK) return TF_ERROR;
+    (*out_row)++;
     return TF_OK;
 }
 
@@ -2709,7 +2717,8 @@ static int union_sorted_append_right(set_state *st, tf_batch *ob, size_t *out_ro
     if (union_sorted_note_emit(st, side) != TF_OK) return TF_ERROR;
     if (tf_batch_ensure_capacity(ob, *out_row + 1) != TF_OK) return TF_ERROR;
     if (tf_batch_copy_row(ob, *out_row, st->union_sorted_right_row, 0) != TF_OK) return TF_ERROR;
-    ob->n_rows = ++(*out_row);
+    if (tf_batch_expose_row(ob, *out_row) != TF_OK) return TF_ERROR;
+    (*out_row)++;
     return TF_OK;
 }
 
@@ -2874,7 +2883,11 @@ static int union_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = ++out_row;
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        out_row++;
     }
     if (out_row > 0) *out = ob;
     else tf_batch_free(ob);
@@ -3007,7 +3020,12 @@ static int union_flush_next(tf_step *self, tf_batch **out, tf_side_channels *sid
                     return TF_ERROR;
                 }
             }
-            ob->n_rows = ++out_row;
+            if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+                tf_batch_free(ob);
+                tf_batch_free(b);
+                return TF_ERROR;
+            }
+            out_row++;
         }
         tf_batch_free(b);
         if (out_row > 0) { *out = ob; return TF_OK; }

@@ -609,11 +609,15 @@ static int spill_next_batch(sort_state *st, tf_batch **out) {
     while (ob->n_rows < st->output_batch_rows) {
         int best = next_best_reader(st);
         if (best < 0) break;
-        if (spill_row_to_batch(st, ob, ob->n_rows, &st->readers[best].row) != TF_OK) {
+        size_t out_row = ob->n_rows;
+        if (spill_row_to_batch(st, ob, out_row, &st->readers[best].row) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows++;
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         int rc = reader_advance(st, &st->readers[best]);
         if (rc < 0) {
             tf_batch_free(ob);
@@ -647,7 +651,7 @@ static int sort_process(tf_step *self, tf_batch *in, tf_batch **out,
     for (size_t r = 0; r < in->n_rows; r++) {
         size_t dst_row = st->buf->n_rows;
         if (tf_batch_copy_row(st->buf, dst_row, in, r) != TF_OK) return TF_ERROR;
-        st->buf->n_rows = dst_row + 1;
+        if (tf_batch_expose_row(st->buf, dst_row) != TF_OK) return TF_ERROR;
         if (st->use_spill && st->buf->n_rows >= st->run_rows) {
             if (write_spill_run(st) != TF_OK) return TF_ERROR;
         }
@@ -672,7 +676,11 @@ static int sort_flush_in_memory(tf_step *self, tf_batch **out) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows = i + 1;
+        if (tf_batch_expose_row(ob, i) != TF_OK) {
+            free(indices);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     free(indices);

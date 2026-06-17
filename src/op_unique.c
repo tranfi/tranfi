@@ -804,7 +804,7 @@ static int append_selected_row(unique_state *st, const unique_spill_row *row) {
     if (ensure_ordinals(&st->out_ordinals, &st->out_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
     if (spill_row_to_batch(st, st->out_buf, dst, row) != TF_OK) return TF_ERROR;
     st->out_ordinals[dst] = row->ordinal;
-    st->out_buf->n_rows = dst + 1;
+    if (tf_batch_expose_row(st->out_buf, dst) != TF_OK) return TF_ERROR;
     st->spill_distinct_rows++;
     if (st->out_buf->n_rows >= st->run_rows) return write_output_run(st);
     return TF_OK;
@@ -876,8 +876,9 @@ static int output_next_batch(unique_state *st, tf_batch **out) {
         int best = best_ordinal_reader(st);
         if (best < 0) break;
         unique_run_reader *reader = &st->out_readers[best];
-        if (spill_row_to_batch(st, ob, ob->n_rows, &reader->row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-        ob->n_rows++;
+        size_t out_row = ob->n_rows;
+        if (spill_row_to_batch(st, ob, out_row, &reader->row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
         int rc = reader_advance(st, reader);
         if (rc < 0) { tf_batch_free(ob); return TF_ERROR; }
     }
@@ -933,7 +934,7 @@ static int unique_process_spill(unique_state *st, tf_batch *in) {
         if (ensure_ordinals(&st->buf_ordinals, &st->buf_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         st->buf_ordinals[dst] = st->next_ordinal++;
-        st->buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->buf, dst) != TF_OK) return TF_ERROR;
         if (st->buf->n_rows >= st->run_rows && write_key_run(st) != TF_OK) return TF_ERROR;
     }
     return TF_OK;
@@ -1014,9 +1015,9 @@ static int unique_process(tf_step *self, tf_batch *in, tf_batch **out, tf_side_c
         free(key);
         if (!emit_row) continue;
         if (tf_batch_copy_row(ob, out_row, in, r) != TF_OK) { free(col_indices); tf_batch_free(ob); return TF_ERROR; }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) { free(col_indices); tf_batch_free(ob); return TF_ERROR; }
         out_row++;
     }
-    ob->n_rows = out_row;
     free(col_indices);
     if (out_row > 0) *out = ob;
     else tf_batch_free(ob);

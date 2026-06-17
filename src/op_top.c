@@ -143,7 +143,10 @@ static int top_compact_buffer(top_state *st) {
             tf_batch_free(nb);
             return TF_ERROR;
         }
-        nb->n_rows = r + 1;
+        if (tf_batch_expose_row(nb, r) != TF_OK) {
+            tf_batch_free(nb);
+            return TF_ERROR;
+        }
     }
 
     st->buf = nb;
@@ -207,7 +210,7 @@ static int top_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (st->buf->n_rows < st->n) {
             size_t dst = st->buf->n_rows;
             if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
-            st->buf->n_rows++;
+            if (tf_batch_expose_row(st->buf, dst) != TF_OK) return TF_ERROR;
             top_heap_push(st, dst);
         } else {
             size_t worst_idx = st->heap[0];

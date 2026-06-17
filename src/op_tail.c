@@ -36,7 +36,8 @@ static int tail_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         st->head++;
         st->count++;
-        if (st->buf->n_rows < st->limit) st->buf->n_rows++;
+        if (st->buf->n_rows < st->limit &&
+            tf_batch_expose_row(st->buf, st->buf->n_rows) != TF_OK) return TF_ERROR;
     }
 
     return TF_OK;

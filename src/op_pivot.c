@@ -476,7 +476,7 @@ static int pivot_emit_row(const pivot_state *st, tf_batch *ob, size_t out_row,
         }
         if (tf_batch_set_float64(ob, out_row, oc, v) != TF_OK) return TF_ERROR;
     }
-    ob->n_rows = out_row + 1;
+    if (tf_batch_expose_row(ob, out_row) != TF_OK) return TF_ERROR;
     return TF_OK;
 }
 
@@ -1314,8 +1314,9 @@ static int pivot_output_next_batch(pivot_state *st, tf_batch **out) {
         int best = pivot_best_ordinal_reader(st);
         if (best < 0) break;
         pivot_run_reader *reader = &st->out_readers[best];
-        if (pivot_spill_row_to_batch(st, ob, ob->n_rows, &reader->row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-        ob->n_rows++;
+        size_t out_row = ob->n_rows;
+        if (pivot_spill_row_to_batch(st, ob, out_row, &reader->row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
         int rc = pivot_reader_advance(st, reader, 1);
         if (rc < 0) { tf_batch_free(ob); return TF_ERROR; }
     }
@@ -1346,7 +1347,7 @@ static int pivot_process_spill(pivot_state *st, tf_batch *in, tf_side_channels *
         if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         if (pivot_ensure_ordinals(&st->buf_ordinals, &st->buf_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         st->buf_ordinals[dst] = st->next_ordinal++;
-        st->buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->buf, dst) != TF_OK) return TF_ERROR;
         if (st->buf->n_rows >= st->run_rows && pivot_write_key_run(st) != TF_OK) return TF_ERROR;
     }
     return TF_OK;
@@ -1509,7 +1510,7 @@ static int pivot_process(tf_step *self, tf_batch *in, tf_batch **out,
     for (size_t r = 0; r < in->n_rows; r++) {
         size_t dst_row = st->buf->n_rows;
         if (tf_batch_copy_row(st->buf, dst_row, in, r) != TF_OK) return TF_ERROR;
-        st->buf->n_rows = dst_row + 1;
+        if (tf_batch_expose_row(st->buf, dst_row) != TF_OK) return TF_ERROR;
 
         if (name_ci >= 0 && !tf_batch_is_null(in, r, (size_t)name_ci)) {
             char nbuf[64];

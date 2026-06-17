@@ -536,7 +536,7 @@ static int group_agg_emit_row(group_agg_state *st, tf_batch *ob, size_t out_row,
     for (size_t k = 0; k < st->n_aggs; k++) {
         if (group_agg_set_aggregate_cell(st, ob, out_row, k, a) != TF_OK) return -1;
     }
-    ob->n_rows = out_row + 1;
+    if (tf_batch_expose_row(ob, out_row) != TF_OK) return -1;
     return 0;
 }
 
@@ -1333,8 +1333,9 @@ static int group_agg_output_next_batch(group_agg_state *st, tf_batch **out) {
         int best = group_agg_best_ordinal_reader(st);
         if (best < 0) break;
         group_run_reader *reader = &st->out_readers[best];
-        if (spill_row_to_batch(st, ob, ob->n_rows, &reader->row, 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-        ob->n_rows++;
+        size_t out_row = ob->n_rows;
+        if (spill_row_to_batch(st, ob, out_row, &reader->row, 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
         int rc = group_agg_reader_advance(st, reader, 1);
         if (rc < 0) { tf_batch_free(ob); return TF_ERROR; }
     }
@@ -1360,7 +1361,7 @@ static int group_agg_process_spill(group_agg_state *st, tf_batch *in) {
         if (ensure_ordinals(&st->buf_ordinals, &st->buf_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         st->buf_ordinals[dst] = st->next_ordinal++;
-        st->buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->buf, dst) != TF_OK) return TF_ERROR;
         if (st->buf->n_rows >= st->run_rows && group_agg_write_key_run(st) != TF_OK) return TF_ERROR;
     }
     return TF_OK;
@@ -1549,10 +1550,14 @@ static int find_or_add_group(group_agg_state *st, const char *key,
         free(dup);
         return -1;
     }
+    if (tf_batch_expose_row(map->key_batch, idx) != TF_OK) {
+        group_accum_free(&accum);
+        free(dup);
+        return -1;
+    }
     map->keys[idx] = dup;
     map->key_bytes = new_key_bytes;
     map->accums[idx] = accum;
-    map->key_batch->n_rows = idx + 1;
     map->slots[slot] = idx + 1;
     map->count++;
     if (group_agg_check_state_bytes(st, side) != 0) return -1;

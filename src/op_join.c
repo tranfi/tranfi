@@ -786,7 +786,7 @@ static int sorted_join_load_next_run(join_state *st, tf_side_channels *side) {
             if (tf_batch_ensure_capacity(st->right_run, dst + 1) != TF_OK) return TF_ERROR;
             if (tf_batch_copy_row(st->right_run, dst, st->sorted_current, st->sorted_row) != TF_OK)
                 return TF_ERROR;
-            st->right_run->n_rows = dst + 1;
+            if (tf_batch_expose_row(st->right_run, dst) != TF_OK) return TF_ERROR;
         }
 
         if (sorted_join_advance_lookup(st, side) != TF_OK) return TF_ERROR;
@@ -966,7 +966,8 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
     for (size_t b = 0; b < total_batches; b++) {
         for (size_t r = 0; r < all_batches[b]->n_rows; r++) {
             if (tf_batch_copy_row(merged, dst_row, all_batches[b], r) != TF_OK) goto fail;
-            merged->n_rows = ++dst_row;
+            if (tf_batch_expose_row(merged, dst_row) != TF_OK) goto fail;
+            dst_row++;
         }
     }
 
@@ -1785,7 +1786,7 @@ static int join_spill_append_selected_row(join_state *st, const join_spill_row *
     }
     if (join_spill_row_to_batch(st, st->spill_out_buf, dst, row) != TF_OK) return TF_ERROR;
     st->spill_out_ordinals[dst] = row->ordinal;
-    st->spill_out_buf->n_rows = dst + 1;
+    if (tf_batch_expose_row(st->spill_out_buf, dst) != TF_OK) return TF_ERROR;
     st->spill_kept_rows++;
     if (st->spill_out_buf->n_rows >= st->run_rows) return join_spill_write_output_run(st);
     return TF_OK;
@@ -1889,7 +1890,7 @@ static int join_spill_process_lookup_batch(join_state *st, const tf_batch *batch
         }
         if (join_ensure_ordinals(&st->spill_lookup_ordinals, &st->spill_lookup_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         st->spill_lookup_ordinals[dst] = st->spill_next_lookup_ordinal++;
-        st->spill_lookup_buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->spill_lookup_buf, dst) != TF_OK) return TF_ERROR;
         st->lookup_rows++;
         if (st->spill_lookup_buf->n_rows >= st->run_rows && join_spill_write_lookup_run(st) != TF_OK)
             return TF_ERROR;
@@ -2025,7 +2026,7 @@ static int join_spill_append_joined_row(join_state *st, const join_spill_row *le
     }
 
     st->spill_out_ordinals[dst] = output_ordinal;
-    st->spill_out_buf->n_rows = dst + 1;
+    if (tf_batch_expose_row(st->spill_out_buf, dst) != TF_OK) return TF_ERROR;
     st->spill_kept_rows++;
     if (st->spill_out_buf->n_rows >= st->run_rows) return join_spill_write_output_run(st);
     return TF_OK;
@@ -2079,7 +2080,10 @@ static int join_spill_collect_lookup_run(join_state *st, const join_spill_row *l
             tf_batch_free(run);
             return TF_ERROR;
         }
-        run->n_rows = dst + 1;
+        if (tf_batch_expose_row(run, dst) != TF_OK) {
+            tf_batch_free(run);
+            return TF_ERROR;
+        }
         int adv = join_spill_reader_advance(lookup, st->spill_lookup_schema_types, st->spill_lookup_n_cols);
         if (adv < 0) { tf_batch_free(run); return TF_ERROR; }
     }
@@ -2257,12 +2261,16 @@ static int join_spill_output_next_batch(join_state *st, tf_batch **out, tf_side_
         int best = join_spill_best_output_reader(st);
         if (best < 0) break;
         join_spill_reader *reader = &st->spill_out_readers[best];
-        if (join_spill_row_to_batch_typed(ob, ob->n_rows, &reader->row,
+        size_t out_row = ob->n_rows;
+        if (join_spill_row_to_batch_typed(ob, out_row, &reader->row,
                                           out_types, out_n_cols) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        ob->n_rows++;
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         int adv = join_spill_reader_advance(reader, out_types, out_n_cols);
         if (adv < 0) { tf_batch_free(ob); return TF_ERROR; }
     }
@@ -2289,7 +2297,7 @@ static int join_process_spill(join_state *st, tf_batch *in, tf_batch **out, tf_s
         if (tf_batch_copy_row(st->spill_left_buf, dst, in, r) != TF_OK) return TF_ERROR;
         if (join_ensure_ordinals(&st->spill_left_ordinals, &st->spill_left_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         st->spill_left_ordinals[dst] = st->spill_next_left_ordinal++;
-        st->spill_left_buf->n_rows = dst + 1;
+        if (tf_batch_expose_row(st->spill_left_buf, dst) != TF_OK) return TF_ERROR;
         if (st->spill_left_buf->n_rows >= st->run_rows && join_spill_write_left_run(st) != TF_OK)
             return TF_ERROR;
     }
@@ -2389,7 +2397,8 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
                 for (size_t c = 0; c < in->n_cols; c++) {
                     if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
                 }
-                ob->n_rows = ++out_row;
+                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                out_row++;
             }
         } else if (has_match) {
             for (size_t m = 0; m < st->right_run->n_rows; m++) {
@@ -2401,7 +2410,8 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
                 for (size_t k = 0; k < st->n_lookup_out; k++) {
                     if (tf_batch_copy_cell_index(ob, out_row, in->n_cols + k, st->right_run, m, st->lookup_out_cols[k]) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
                 }
-                ob->n_rows = ++out_row;
+                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                out_row++;
             }
         } else if (st->how == 1) {
             if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
@@ -2412,7 +2422,8 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
             for (size_t k = 0; k < st->n_lookup_out; k++) {
                 if (tf_batch_set_null(ob, out_row, in->n_cols + k) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             }
-            ob->n_rows = ++out_row;
+            if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            out_row++;
         }
     }
 
@@ -2486,7 +2497,8 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
                 for (size_t c = 0; c < in->n_cols; c++) {
                     if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
                 }
-                ob->n_rows = ++out_row;
+                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                out_row++;
             }
         } else if (bucket) {
             if (st->max_matches_per_row > 0 && bucket->n_rows > st->max_matches_per_row) {
@@ -2509,7 +2521,8 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
                 for (size_t k = 0; k < st->n_lookup_out; k++) {
                     if (tf_batch_copy_cell_index(ob, out_row, in->n_cols + k, st->lookup, lr, st->lookup_out_cols[k]) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
                 }
-                ob->n_rows = ++out_row;
+                if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                out_row++;
             }
         } else if (st->how == 1) {
             /* Left join: emit main + nulls */
@@ -2521,7 +2534,8 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
             for (size_t k = 0; k < st->n_lookup_out; k++) {
                 if (tf_batch_set_null(ob, out_row, in->n_cols + k) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             }
-            ob->n_rows = ++out_row;
+            if (tf_batch_expose_row(ob, out_row) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            out_row++;
         }
         /* Inner join + no match: skip */
     }

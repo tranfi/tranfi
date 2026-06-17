@@ -63,7 +63,7 @@ static int sample_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
         if (st->seen < st->n) {
             if (tf_batch_copy_row(st->buf, st->seen, in, r) != TF_OK) return TF_ERROR;
-            st->buf->n_rows = st->seen + 1;
+            if (tf_batch_expose_row(st->buf, st->seen) != TF_OK) return TF_ERROR;
         } else {
             size_t j = sample_bounded(st, st->seen + 1);
             if (j < st->n && tf_batch_copy_row(st->buf, j, in, r) != TF_OK)
