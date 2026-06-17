@@ -219,8 +219,12 @@ def audit_repo_license() -> list[str]:
         errors.append('repo: README.md still contains MIT license text')
 
     pyproject = Path('py/pyproject.toml').read_text(encoding='utf-8')
-    if 'Apache-2.0' not in pyproject:
-        errors.append('repo: py/pyproject.toml must declare Apache-2.0')
+    if 'license = "Apache-2.0"' not in pyproject:
+        errors.append('repo: py/pyproject.toml must use SPDX license = "Apache-2.0"')
+    if 'license = { text =' in pyproject:
+        errors.append('repo: py/pyproject.toml still uses deprecated license table metadata')
+    if 'license-files = ["LICENSE", "NOTICE"]' not in pyproject:
+        errors.append('repo: py/pyproject.toml must include LICENSE and NOTICE in license-files')
 
     package_json = json.loads(Path('js/package.json').read_text(encoding='utf-8'))
     if package_json.get('license') != 'Apache-2.0':
