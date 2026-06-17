@@ -4153,6 +4153,19 @@ await test('compileToSql filter', async () => {
   assert(sql.includes('"age"'), 'should quote column')
 })
 
+await test('compileToSql grep literal metacharacters', async () => {
+  const percentSql = await compileToSql('csv | grep % name | csv')
+  assert(percentSql.includes('contains(CAST("name" AS VARCHAR), \'%\')'), 'literal grep should use contains for percent')
+  assert(!percentSql.includes(' LIKE '), 'literal grep should not lower through LIKE wildcards')
+
+  const underscoreSql = await compileToSql('csv | grep _ name | csv')
+  assert(underscoreSql.includes('contains(CAST("name" AS VARCHAR), \'_\')'), 'literal grep should preserve underscore')
+
+  const backslashSql = await compileToSql(String.raw`csv | grep \ name | csv`)
+  assert(backslashSql.includes('contains(CAST("name" AS VARCHAR)'), 'literal grep should lower backslash through contains')
+  assert(!backslashSql.includes(' LIKE '), 'backslash grep should not lower through LIKE wildcards')
+})
+
 await test('compileToSql between', async () => {
   const sql = await compileToSql('csv | filter "between(col(\'age\'), 25, 35)" | csv')
   assert(sql.includes('"age" BETWEEN 25 AND 35'), 'between should lower to SQL BETWEEN')
@@ -4360,6 +4373,32 @@ if (hasDuckDB) {
     assert(text.includes('Alice'), 'should have Alice')
     assert(text.includes('Charlie'), 'should have Charlie')
     assert(!text.includes('Bob'), 'should not have Bob')
+  })
+
+  await test('duckdb grep literal metacharacters', async () => {
+    const dataRows = text => {
+      const trimmed = text.trim()
+      if (!trimmed) return []
+      return trimmed.split('\n').slice(1)
+    }
+    const cases = [
+      ['csv | grep % name | csv', 'name\na%z\nabc\nplain\n'],
+      ['csv | grep _ name | csv', 'name\na_z\nabc\nplain\n'],
+      [String.raw`csv | grep \ name | csv`, 'name\na\\z\nabc\nplain\n'],
+      ['csv | grep 2 age | csv', 'name,age\na%z,20\nabc,21\n'],
+      ['csv | grep -v 2 age | csv', 'name,age\na%z,20\nabc,21\n'],
+    ]
+    for (const [dsl, input] of cases) {
+      const native = await pipeline(dsl).run({ input })
+      const duck = await pipeline(dsl, { engine: 'duckdb' }).run({ input })
+      if (dsl === 'csv | grep 2 age | csv') {
+        assert(dataRows(native.outputText).length === 0, 'native non-string grep should emit no data rows')
+        assert(dataRows(duck.outputText).length === 0, 'DuckDB non-string grep should emit no data rows')
+      } else {
+        assert(duck.outputText === native.outputText,
+          `DuckDB grep parity failed for ${dsl}\nnative=${native.outputText}\nduck=${duck.outputText}`)
+      }
+    }
   })
 
   await test('duckdb select', async () => {

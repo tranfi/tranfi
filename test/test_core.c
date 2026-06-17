@@ -4594,6 +4594,31 @@ static void test_compile_native_valid(void) {
     tf_ir_plan_free(plan);
 }
 
+static void test_compile_to_sql_grep_literal_chars(void) {
+    const char *dsl = "csv | grep % name | csv";
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert(strstr(sql, "contains(CAST(\"name\" AS VARCHAR), '%')") != NULL);
+    assert(strstr(sql, "LIKE") == NULL);
+    tf_string_free(sql);
+
+    dsl = "csv | grep _ name | csv";
+    sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert(strstr(sql, "contains(CAST(\"name\" AS VARCHAR), '_')") != NULL);
+    tf_string_free(sql);
+
+    dsl = "csv | grep \\\\ name | csv";
+    sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert(strstr(sql, "contains(CAST(\"name\" AS VARCHAR), '\\\\')") != NULL);
+    tf_string_free(sql);
+}
+
 static void test_pipeline_create_from_ir(void) {
     const char *json =
         "{\"steps\":["
@@ -12427,6 +12452,7 @@ int main(int argc, char **argv) {
 
     printf("\nCompiler:\n");
     TEST(test_compile_native_valid);
+    TEST(test_compile_to_sql_grep_literal_chars);
     TEST(test_pipeline_create_from_ir);
     TEST(test_public_ir_api);
 

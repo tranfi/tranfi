@@ -478,6 +478,33 @@ static int append_frequency_key_expr(strbuf *sb, cJSON *cols) {
   return TF_OK;
 }
 
+static int append_grep_match_expr(strbuf *sb, const char *column,
+                                  const char *pattern, int regex) {
+  if (!sb || !column || !pattern) return TF_ERROR;
+  strbuf qcol;
+  sb_init(&qcol);
+  sql_quote_ident(&qcol, column);
+  if (qcol.failed) {
+    sb_free(&qcol);
+    return TF_ERROR;
+  }
+
+  sb_append(sb, "(CASE WHEN typeof(");
+  sb_append(sb, qcol.data);
+  sb_append(sb, ") = 'VARCHAR' THEN COALESCE(");
+  if (regex) {
+    sb_append(sb, "regexp_matches(CAST(");
+  } else {
+    sb_append(sb, "contains(CAST(");
+  }
+  sb_append(sb, qcol.data);
+  sb_append(sb, " AS VARCHAR), ");
+  sql_quote_str(sb, pattern);
+  sb_append(sb, "), FALSE) ELSE FALSE END)");
+  sb_free(&qcol);
+  return sb->failed ? TF_ERROR : TF_OK;
+}
+
 /* Emit a CTE for a transform op. prev is the name of the previous CTE/source.
  * Appends SQL like: step_N AS (SELECT ... FROM prev ...) */
 static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
@@ -716,28 +743,16 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     int regex = jbool(args, "regex", 0);
     if (!pattern) { *error = strdup("grep: missing 'pattern'"); return -1; }
     if (!column) column = "_line";
-    strbuf tmp;
-    sb_init(&tmp);
-    sql_quote_ident(&tmp, column);
-    if (regex) {
-      sb_appendf(sb, "%s AS (SELECT * FROM %s WHERE %sregexp_matches(%s, ",
-                 cte_name, prev, invert ? "NOT " : "", tmp.data);
-      sql_quote_str(sb, pattern);
-      sb_append(sb, "))");
-    } else {
-      sb_appendf(sb, "%s AS (SELECT * FROM %s WHERE ", cte_name, prev);
-      if (invert) sb_append(sb, "NOT ");
-      sb_append(sb, tmp.data);
-      sb_append(sb, " LIKE '%");
-      /* Escape pattern for LIKE */
-      for (const char *p = pattern; *p; p++) {
-        if (*p == '%' || *p == '_' || *p == '\\') sb_appendn(sb, "\\", 1);
-        if (*p == '\'') sb_append(sb, "''");
-        else sb_appendn(sb, p, 1);
-      }
-      sb_append(sb, "%')");
+    strbuf pred;
+    sb_init(&pred);
+    if (append_grep_match_expr(&pred, column, pattern, regex) != TF_OK) {
+      sb_free(&pred);
+      *error = strdup("sql: out of memory");
+      return -1;
     }
-    sb_free(&tmp);
+    sb_appendf(sb, "%s AS (SELECT * FROM %s WHERE %s%s)",
+               cte_name, prev, invert ? "NOT " : "", pred.data);
+    sb_free(&pred);
     return 0;
   }
 

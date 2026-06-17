@@ -290,6 +290,23 @@ class TestParitySelection:
     def test_grep_invert(self):
         assert_parity('csv | grep -v Ali name | csv', data=CSV_CITIES)
 
+    def test_grep_literal_sql_metacharacters(self):
+        cases = [
+            ('csv | grep % name | csv', b'name\na%z\nabc\nplain\n'),
+            ('csv | grep _ name | csv', b'name\na_z\nabc\nplain\n'),
+            (r'csv | grep \ name | csv', b'name\na\\z\nabc\nplain\n'),
+        ]
+        for dsl, data in cases:
+            assert_parity(dsl, data=data, ordered=True)
+
+    def test_grep_non_string_column(self):
+        data = b'name,age\na%z,20\nabc,21\n'
+        native = tf.pipeline('csv | grep 2 age | csv').run(input=data)
+        duck = tf.pipeline('csv | grep 2 age | csv', engine='duckdb').run(input=data)
+        assert parse_rows_ordered(native.output_text.strip())[1] == []
+        assert parse_rows_ordered(duck.output_text.strip())[1] == []
+        assert_parity('csv | grep -v 2 age | csv', data=data, ordered=True)
+
 
 class TestParityColumnOps:
     """Parity tests for column manipulation operators."""
