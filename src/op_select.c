@@ -99,13 +99,19 @@ static int select_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     return TF_OK;
 }
 
-static void select_destroy(tf_step *self) {
-    select_state *st = self->state;
+static void select_state_free(select_state *st) {
     if (st) {
-        for (size_t i = 0; i < st->n_cols; i++) free(st->col_names[i]);
+        if (st->col_names) {
+            for (size_t i = 0; i < st->n_cols; i++) free(st->col_names[i]);
+        }
         free(st->col_names);
         free(st);
     }
+}
+
+static void select_destroy(tf_step *self) {
+    if (!self) return;
+    select_state_free(self->state);
     free(self);
 }
 
@@ -120,23 +126,19 @@ tf_step *tf_select_create(const cJSON *args) {
     select_state *st = calloc(1, sizeof(select_state));
     if (!st) return NULL;
     st->n_cols = (size_t)n;
-    st->col_names = malloc(n * sizeof(char *));
-    if (!st->col_names) { free(st); return NULL; }
+    st->col_names = calloc((size_t)n, sizeof(char *));
+    if (!st->col_names) { select_state_free(st); return NULL; }
 
     for (int i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(cols, i);
-        if (!cJSON_IsString(item)) {
-            for (int j = 0; j < i; j++) free(st->col_names[j]);
-            free(st->col_names);
-            free(st);
-            return NULL;
-        }
+        if (!cJSON_IsString(item)) { select_state_free(st); return NULL; }
         st->col_names[i] = strdup(item->valuestring);
+        if (!st->col_names[i]) { select_state_free(st); return NULL; }
         if (tf_column_selector_has_syntax(item->valuestring)) st->use_selector_syntax = 1;
     }
 
     tf_step *step = calloc(1, sizeof(tf_step));
-    if (!step) { select_destroy(&(tf_step){.state = st}); return NULL; }
+    if (!step) { select_state_free(st); return NULL; }
     step->process = select_process;
     step->flush = select_flush;
     step->destroy = select_destroy;
@@ -286,15 +288,21 @@ static int relocate_flush(tf_step *self, tf_batch **out, tf_side_channels *side)
     return TF_OK;
 }
 
-static void relocate_destroy(tf_step *self) {
-    relocate_state *st = self->state;
+static void relocate_state_free(relocate_state *st) {
     if (st) {
-        for (size_t i = 0; i < st->n_move; i++) free(st->move_names[i]);
+        if (st->move_names) {
+            for (size_t i = 0; i < st->n_move; i++) free(st->move_names[i]);
+        }
         free(st->move_names);
         free(st->before);
         free(st->after);
         free(st);
     }
+}
+
+static void relocate_destroy(tf_step *self) {
+    if (!self) return;
+    relocate_state_free(self->state);
     free(self);
 }
 
@@ -315,24 +323,26 @@ tf_step *tf_relocate_create(const cJSON *args) {
     relocate_state *st = calloc(1, sizeof(relocate_state));
     if (!st) return NULL;
     st->n_move = (size_t)n;
-    st->move_names = malloc((size_t)n * sizeof(char *));
-    if (!st->move_names) { free(st); return NULL; }
+    st->move_names = calloc((size_t)n, sizeof(char *));
+    if (!st->move_names) { relocate_state_free(st); return NULL; }
 
     for (int i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(cols, i);
-        if (!cJSON_IsString(item)) {
-            for (int j = 0; j < i; j++) free(st->move_names[j]);
-            free(st->move_names);
-            free(st);
-            return NULL;
-        }
+        if (!cJSON_IsString(item)) { relocate_state_free(st); return NULL; }
         st->move_names[i] = strdup(item->valuestring);
+        if (!st->move_names[i]) { relocate_state_free(st); return NULL; }
     }
-    if (before) st->before = strdup(before->valuestring);
-    if (after) st->after = strdup(after->valuestring);
+    if (before) {
+        st->before = strdup(before->valuestring);
+        if (!st->before) { relocate_state_free(st); return NULL; }
+    }
+    if (after) {
+        st->after = strdup(after->valuestring);
+        if (!st->after) { relocate_state_free(st); return NULL; }
+    }
 
     tf_step *step = calloc(1, sizeof(tf_step));
-    if (!step) { relocate_destroy(&(tf_step){.state = st}); return NULL; }
+    if (!step) { relocate_state_free(st); return NULL; }
     step->process = relocate_process;
     step->flush = relocate_flush;
     step->destroy = relocate_destroy;

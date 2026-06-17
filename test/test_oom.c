@@ -162,6 +162,15 @@ int main(void) {
         "name,d,ts,score\n"
         "Alice,2024-03-15,2024-03-15T12:34:56Z,10\n"
         "Bob,2023-12-25,2023-12-25T08:09:10Z,20\n";
+    const char *selector_people =
+        "id,score_math,score_read,name,active,code\n"
+        "1,90.2,80.7,Alice,true,OK\n"
+        "2,70.4,95.6,Bob,false,BAD\n"
+        "3,88.8,91.2,Cara,true,OK\n";
+    const char *repair_rows =
+        "a,b,c\n"
+        "1,2\n"
+        "3,4,5,6\n";
 
     const char *union_lookup_path = "/tmp/tranfi_oom_union_lookup.csv";
     FILE *union_lookup = fopen(union_lookup_path, "wb");
@@ -215,6 +224,17 @@ int main(void) {
           "Stacked,41,SF,40,z,7,8,green\n",
           stack_file);
     assert(fclose(stack_file) == 0);
+    const char *rules_path = "/tmp/tranfi_oom_rules.json";
+    FILE *rules_file = fopen(rules_path, "wb");
+    assert(rules_file);
+    fputs("{\"name\":\"quality_file\",\"audit\":true,\"audit_limit\":3,"
+          "\"warn_failure_rate\":0.25,\"rules\":["
+          "{\"name\":\"score_nonnegative\",\"expr\":\"col('score_math') >= 0\","
+          "\"message\":\"score must be nonnegative\"},"
+          "{\"name\":\"read_under_90\",\"expr\":\"col('score_read') < 90\"}"
+          "]}",
+          rules_file);
+    assert(fclose(rules_file) == 0);
     const char *spill_root = "/tmp/tranfi_oom_spill_root";
     remove(spill_root);
     if (mkdir(spill_root, 0700) != 0 && errno != EEXIST) {
@@ -239,6 +259,12 @@ int main(void) {
             "csv batch_size=1 | hash name,city | csv",
             people,
             220
+        },
+        {
+            "selector_across_relocate",
+            "csv batch_size=1 | across starts_with(score_) round replace=false names={col}_{fn} | select all_of(id,name),any_of(score_math_round,missing),starts_with(score_) | relocate starts_with(score_) after=name | csv",
+            selector_people,
+            520
         },
         {
             "derive_cast_replace",
@@ -287,6 +313,30 @@ int main(void) {
             "csv batch_size=1 | validate \"col(age) > 25\" audit audit_limit=2 | assert \"col(score) >= 20\" action=filter audit audit_limit=2 | schema name:string age:int city:string non_null=name,age min=age:0 max=age:120 values=city:NY,LA mode=filter audit audit_limit=2 | quarantine \"col(city) == 'LA'\" name=city_block message=la | csv",
             people,
             520
+        },
+        {
+            "schema_selector_rules",
+            "csv batch_size=1 | schema columns=starts_with(score_):number,code:string non_null=starts_with(score_) min=where(number):0 max=starts_with(score_):100 regex=ends_with(code):^[A-Z]+$ mode=warn | csv",
+            selector_people,
+            520
+        },
+        {
+            "validate_rules_file",
+            "csv batch_size=1 | validate rules_file=/tmp/tranfi_oom_rules.json | csv",
+            selector_people,
+            560
+        },
+        {
+            "tee_audit_selectors",
+            "csv batch_size=1 | tee \"col(score_math) >= 80\" channel=audit columns=name,score_math limit=2 audit_columns=name audit_redact=name | csv",
+            selector_people,
+            420
+        },
+        {
+            "csv_repair_audit",
+            "csv batch_size=1 mode=repair max_error_bytes=5 audit audit_limit=1 | csv",
+            repair_rows,
+            360
         },
         {
             "aggregate_assert_grep_passthrough",
@@ -509,6 +559,7 @@ int main(void) {
     remove(bag_lookup_path);
     remove(sorted_union_lookup_path);
     remove(stack_path);
+    remove(rules_path);
     remove(spill_root);
     return 0;
 }

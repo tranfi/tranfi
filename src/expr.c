@@ -124,7 +124,16 @@ static tf_expr *parse_string_literal(parser_state *p) {
 
     tf_expr *e = make_expr(EXPR_LIT_STR);
     if (!e) return NULL;
-    e->lit_str = malloc(slen + 1);
+    size_t alloc_len = 0;
+    if (tf_size_add(slen, 1, &alloc_len) != TF_OK) {
+        tf_expr_free(e);
+        return NULL;
+    }
+    e->lit_str = tf_mallocarray_checked(alloc_len, sizeof(char));
+    if (!e->lit_str) {
+        tf_expr_free(e);
+        return NULL;
+    }
     memcpy(e->lit_str, p->src + start, slen);
     e->lit_str[slen] = '\0';
     return e;
@@ -218,7 +227,10 @@ static tf_expr *parse_atom(parser_state *p, unsigned depth) {
         }
 
         size_t numlen = p->pos - start;
-        char *numstr = malloc(numlen + 1);
+        size_t alloc_len = 0;
+        if (tf_size_add(numlen, 1, &alloc_len) != TF_OK) return NULL;
+        char *numstr = tf_mallocarray_checked(alloc_len, sizeof(char));
+        if (!numstr) return NULL;
         memcpy(numstr, p->src + start, numlen);
         numstr[numlen] = '\0';
 
@@ -251,7 +263,9 @@ static tf_expr *parse_atom(parser_state *p, unsigned depth) {
             return NULL;
         }
 
-        char *name = malloc(id_len + 1);
+        size_t name_len = 0;
+        if (tf_size_add(id_len, 1, &name_len) != TF_OK) return NULL;
+        char *name = tf_mallocarray_checked(name_len, sizeof(char));
         if (!name) return NULL;
         memcpy(name, p->src + start, id_len);
         name[id_len] = '\0';
@@ -279,10 +293,13 @@ static tf_expr *parse_atom(parser_state *p, unsigned depth) {
                            (isalnum((unsigned char)p->src[p->pos]) || p->src[p->pos] == '_'))
                         p->pos++;
                     if (p->pos == cstart) return NULL;
-                    col_name = malloc(p->pos - cstart + 1);
+                    size_t col_len = p->pos - cstart;
+                    size_t col_alloc_len = 0;
+                    if (tf_size_add(col_len, 1, &col_alloc_len) != TF_OK) return NULL;
+                    col_name = tf_mallocarray_checked(col_alloc_len, sizeof(char));
                     if (!col_name) return NULL;
-                    memcpy(col_name, p->src + cstart, p->pos - cstart);
-                    col_name[p->pos - cstart] = '\0';
+                    memcpy(col_name, p->src + cstart, col_len);
+                    col_name[col_len] = '\0';
                 }
 
                 if (!match_char(p, ')')) { free(col_name); return NULL; }
