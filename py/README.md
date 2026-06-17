@@ -390,7 +390,8 @@ result = tf.pipeline('csv | head 10 | csv', engine='duckdb').run(input=csv_bytes
 Generate SQL directly from DSL strings:
 
 ```python
-sql = tf.compile_to_sql('csv | filter "col(age) > 25" | sort -age | head 10 | csv')
+sql = tf.compile_to_sql('csv | filter "col(age) > 25" | sort -age | head 10 | csv',
+                        dialect='duckdb')
 print(sql)
 # WITH
 #   step_1 AS (SELECT * FROM input_data WHERE ("age" > 25)),
@@ -398,7 +399,9 @@ print(sql)
 # SELECT * FROM step_2
 ```
 
-Use this to run queries with your own DuckDB connection, or any SQL engine that supports CTE syntax.
+Use this to run queries with your own DuckDB connection. `dialect='sqlite'` and
+`dialect='postgres'` are recognized but rejected until those dialects have
+separate compatibility tests and SQL-generation rules.
 
 ## Advanced
 

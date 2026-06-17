@@ -41,6 +41,24 @@ var SIZE_UNITS = {
 
 var UNIQUE_DEFAULT_BLOOM_BYTES = 1024 * 1024
 
+function normalizeSqlDialect(options) {
+  var dialect = 'duckdb'
+  if (typeof options === 'string') {
+    dialect = options
+  } else if (options && typeof options === 'object') {
+    dialect = options.dialect || options.sqlDialect || dialect
+  } else if (options !== undefined && options !== null) {
+    throw new TypeError('compileToSql options must be an object or dialect string')
+  }
+  if (typeof dialect !== 'string') throw new TypeError('SQL dialect must be a string')
+  var name = dialect.toLowerCase()
+  if (name === 'duckdb') return name
+  if (name === 'sqlite' || name === 'postgres') {
+    throw new Error("SQL dialect '" + name + "' is recognized but not implemented yet; only duckdb lowering is available")
+  }
+  throw new Error("unknown SQL dialect '" + dialect + "' (expected duckdb, sqlite, or postgres)")
+}
+
 function parseMemorySize(value) {
   if (value === undefined || value === null) return null
   if (typeof value === 'number') {
@@ -298,7 +316,7 @@ function validateNativeMemoryPolicy(planJson, options) {
  *   const tf = await createTranfi()
  *
  *   // Compile DSL to SQL
- *   const sql = tf.compileToSql('csv | filter "age > 25" | csv')
+ *   const sql = tf.compileToSql('csv | filter "age > 25" | csv', { dialect: 'duckdb' })
  *
  *   // Run with DuckDB-WASM
  *   import * as duckdb from '@duckdb/duckdb-wasm'
@@ -389,7 +407,8 @@ async function createTranfi() {
     },
 
     /** Compile DSL string to SQL query */
-    compileToSql(dsl) {
+    compileToSql(dsl, options) {
+      normalizeSqlDialect(options)
       var s = allocString(dsl)
       var resultPtr = wasm.ccall('wasm_compile_to_sql', 'number', ['number', 'number'], [s.ptr, s.len])
       wasm._free(s.ptr)

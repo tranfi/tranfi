@@ -29,6 +29,14 @@ class TestCompileToSql:
         sql = tf.compile_to_sql('csv | head 10 | csv')
         assert 'LIMIT 10' in sql
 
+    def test_dialect_option(self):
+        sql = tf.compile_to_sql('csv | head 10 | csv', dialect='duckdb')
+        assert 'LIMIT 10' in sql
+        with pytest.raises(ValueError, match='recognized but not implemented'):
+            tf.compile_to_sql('csv | head 10 | csv', dialect='sqlite')
+        with pytest.raises(ValueError, match='unknown SQL dialect'):
+            tf.compile_to_sql('csv | head 10 | csv', dialect='mysql')
+
     def test_filter(self):
         sql = tf.compile_to_sql('csv | filter "col(\'age\') > 25" | csv')
         assert 'WHERE' in sql

@@ -36,6 +36,24 @@ const HOSTED_AUDIT_PRIVACY_OPS = new Set([
   'quarantine'
 ])
 
+function normalizeSqlDialect(options) {
+  let dialect = 'duckdb'
+  if (typeof options === 'string') {
+    dialect = options
+  } else if (options && typeof options === 'object') {
+    dialect = options.dialect || options.sqlDialect || dialect
+  } else if (options !== undefined && options !== null) {
+    throw new TypeError('compileToSql options must be an object or dialect string')
+  }
+  if (typeof dialect !== 'string') throw new TypeError('SQL dialect must be a string')
+  const name = dialect.toLowerCase()
+  if (name === 'duckdb') return name
+  if (name === 'sqlite' || name === 'postgres') {
+    throw new Error(`SQL dialect '${name}' is recognized but not implemented yet; only duckdb lowering is available`)
+  }
+  throw new Error(`unknown SQL dialect '${dialect}' (expected duckdb, sqlite, or postgres)`)
+}
+
 function applyHostedAuditDefaults(planJson) {
   const plan = JSON.parse(planJson)
   if (!plan || !Array.isArray(plan.steps)) return planJson
@@ -644,7 +662,8 @@ async function compileDsl(dsl) {
   return backend.compileDsl(dsl)
 }
 
-async function compileToSql(dsl) {
+async function compileToSql(dsl, options) {
+  normalizeSqlDialect(options)
   const backend = await getBackend()
   return backend.compileToSql(dsl)
 }

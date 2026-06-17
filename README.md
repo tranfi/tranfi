@@ -130,7 +130,16 @@ const tf = await createTranfi()
 const result = await tf.runDuckDB(duckdbInstance, 'csv | filter "age > 25" | csv', csvData)
 ```
 
-The CLI exposes the same lowerer as an explicit compile target. Native streaming remains the default; SQL is selected deliberately. Today the implemented dialect is DuckDB, and `--dialect sqlite` / `--dialect postgres` fail clearly until those dialects have their own compatibility rules. SQL `frequency` lowering preserves the native `value,count` output shape for explicit columns, including multi-column serialized keys and `\N` null keys; native's no-argument all-column frequency mode is not lowered because the SQL compiler does not know the source schema. Literal `grep` lowering uses typed string `contains()` rather than SQL `LIKE`, so `%`, `_`, and `\` stay literal and non-string columns keep native no-match semantics. `sample` is native/WASM-only for now: it uses Tranfi's deterministic reservoir algorithm and seed semantics, so SQL rejects it instead of delegating to dialect-specific random sampling. `stats` and its `scan` shorthand are also native/WASM-only until SQL planning can reproduce Tranfi's report schema; SQL rejects them instead of returning dialect-specific summary tables such as DuckDB `SUMMARIZE`. The same explicit-schema rule applies to schema-dependent convenience forms such as `trim` with no column list: native can trim all runtime string columns, but SQL lowering requires explicit columns until schema-aware SQL planning exists.
+The CLI exposes the same lowerer as an explicit compile target. Native streaming remains the default; SQL is selected deliberately. Today the implemented dialect is DuckDB, and `--dialect sqlite` / `--dialect postgres` fail clearly until those dialects have their own compatibility rules. Python `compile_to_sql(..., dialect="duckdb")`, Node `compileToSql(dsl, { dialect: "duckdb" })`, and standalone WASM `compileToSql(dsl, { dialect: "duckdb" })` expose the same boundary; `sqlite` and `postgres` are recognized but rejected, and unknown dialects fail before SQL generation. SQL `frequency` lowering preserves the native `value,count` output shape for explicit columns, including multi-column serialized keys and `\N` null keys; native's no-argument all-column frequency mode is not lowered because the SQL compiler does not know the source schema. Literal `grep` lowering uses typed string `contains()` rather than SQL `LIKE`, so `%`, `_`, and `\` stay literal and non-string columns keep native no-match semantics. `sample` is native/WASM-only for now: it uses Tranfi's deterministic reservoir algorithm and seed semantics, so SQL rejects it instead of delegating to dialect-specific random sampling. `stats` and its `scan` shorthand are also native/WASM-only until SQL planning can reproduce Tranfi's report schema; SQL rejects them instead of returning dialect-specific summary tables such as DuckDB `SUMMARIZE`. The same explicit-schema rule applies to schema-dependent convenience forms such as `trim` with no column list: native can trim all runtime string columns, but SQL lowering requires explicit columns until schema-aware SQL planning exists.
+
+SQL compatibility is intentionally conservative:
+
+| Surface | Native/WASM | DuckDB SQL | SQLite/Postgres |
+|---------|-------------|------------|-----------------|
+| Row/project ops | all row-local streaming ops | supported for explicit-schema forms such as `filter`, `select`, `relocate`, `rename`, `derive`, `trim cols`, `fill-null`, `cast`, `clip`, `replace`, `bin`, `grep` | recognized but rejected |
+| Ordered/window ops | bounded or blocking by contract | supported for `head`, `tail`, `skip`, `sort`, top/slice aliases, `rowid`, `rleid`, `lag`, `lead`, `shift`, `step`, and rolling aliases | recognized but rejected |
+| Aggregation/set ops | native key-state, sorted, or spill modes | supported for SQL-safe `unique`, `group-agg`, explicit-column `frequency`, joins, all-column set ops, `pivot`, `explode`, `split`, `unpivot`, and `union-all`/`stack` forms | recognized but rejected |
+| Native-only contracts | streaming side channels, audits, schema/rule checks, deterministic `sample`, `stats`/`scan`, JSON row ops, data-prep blocking ops, category encoders, host metadata | rejected or not lowered until the SQL output shape and memory contract are equivalent | recognized but rejected |
 
 ```bash
 tranfi --target sql --dialect duckdb 'csv | filter "age > 25" | sort -age | head 10 | csv'
@@ -139,7 +148,8 @@ tranfi --target sql --dialect duckdb 'csv | filter "age > 25" | sort -age | head
 The `compileToSql` function is available on all targets for direct SQL generation:
 
 ```python
-sql = tf.compile_to_sql('csv | filter "age > 25" | sort -age | head 10 | csv')
+sql = tf.compile_to_sql('csv | filter "age > 25" | sort -age | head 10 | csv',
+                        dialect='duckdb')
 # WITH
 #   step_1 AS (SELECT * FROM input_data WHERE ("age" > 25)),
 #   step_2 AS (SELECT * FROM step_1 ORDER BY "age" DESC LIMIT 10)

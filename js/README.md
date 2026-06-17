@@ -425,13 +425,20 @@ const result2 = await pipeline('csv | head 10 | csv', { engine: 'duckdb' })
 Generate SQL directly from DSL strings:
 
 ```js
-const sql = await compileToSql('csv | filter "col(age) > 25" | sort -age | head 10 | csv')
+const sql = await compileToSql(
+  'csv | filter "col(age) > 25" | sort -age | head 10 | csv',
+  { dialect: 'duckdb' }
+)
 console.log(sql)
 // WITH
 //   step_1 AS (SELECT * FROM input_data WHERE ("age" > 25)),
 //   step_2 AS (SELECT * FROM step_1 ORDER BY "age" DESC LIMIT 10)
 // SELECT * FROM step_2
 ```
+
+DuckDB is the only implemented SQL dialect today. `dialect: 'sqlite'` and
+`dialect: 'postgres'` are recognized but rejected until those dialects have
+their own compatibility tests and SQL-generation rules.
 
 ### Browser (WASM + DuckDB-WASM)
 
@@ -444,7 +451,7 @@ import * as duckdb from '@duckdb/duckdb-wasm'
 const tf = await createTranfi()
 
 // SQL generation (synchronous, no DuckDB needed)
-const sql = tf.compileToSql('csv | filter "age > 25" | csv')
+const sql = tf.compileToSql('csv | filter "age > 25" | csv', { dialect: 'duckdb' })
 
 // Full execution with DuckDB-WASM
 const db = new duckdb.AsyncDuckDB(...)

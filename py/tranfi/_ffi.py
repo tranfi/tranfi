@@ -396,8 +396,27 @@ def recipe_find_dsl(name: str) -> str:
     return s.decode('utf-8') if s else ''
 
 
-def compile_to_sql(dsl: str) -> str:
+def _normalize_sql_dialect(dialect: str) -> str:
+    if dialect is None:
+        return 'duckdb'
+    if not isinstance(dialect, str):
+        raise TypeError('dialect must be a string')
+    name = dialect.lower()
+    if name == 'duckdb':
+        return name
+    if name in ('sqlite', 'postgres'):
+        raise ValueError(
+            f"SQL dialect {name!r} is recognized but not implemented yet; "
+            "only duckdb lowering is available"
+        )
+    raise ValueError(
+        f"unknown SQL dialect {dialect!r} (expected duckdb, sqlite, or postgres)"
+    )
+
+
+def compile_to_sql(dsl: str, *, dialect: str = 'duckdb') -> str:
     """Compile a DSL string to a SQL query string."""
+    _normalize_sql_dialect(dialect)
     lib = _load_lib()
     data = dsl.encode('utf-8')
     error = ctypes.c_char_p()

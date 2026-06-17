@@ -4140,6 +4140,19 @@ await test('compileToSql basic', async () => {
   assert(sql.includes('LIMIT 10'), 'should have LIMIT')
 })
 
+await test('compileToSql dialect option', async () => {
+  const sql = await compileToSql('csv | head 10 | csv', { dialect: 'duckdb' })
+  assert(sql.includes('LIMIT 10'), 'duckdb dialect should compile')
+  await assertRejects(
+    () => compileToSql('csv | head 10 | csv', { dialect: 'sqlite' }),
+    /recognized but not implemented/
+  )
+  await assertRejects(
+    () => compileToSql('csv | head 10 | csv', { dialect: 'mysql' }),
+    /unknown SQL dialect/
+  )
+})
+
 await test('compileToSql slice head/tail', async () => {
   const headSql = await compileToSql('csv | slice-head n=2 | csv')
   assert(headSql.includes('LIMIT 2'), 'slice-head should lower to LIMIT')
@@ -4507,9 +4520,13 @@ if (createTranfi) {
   })
 
   await test('wasm compileToSql', async () => {
-    const sql = tf.compileToSql('csv | filter "col(\'age\') > 25" | csv')
+    const sql = tf.compileToSql('csv | filter "col(\'age\') > 25" | csv', { dialect: 'duckdb' })
     assert(sql.includes('WHERE'), 'should have WHERE')
     assert(sql.includes('"age"'), 'should quote column')
+    await assertRejects(
+      () => tf.compileToSql('csv | head 1 | csv', { dialect: 'postgres' }),
+      /recognized but not implemented/
+    )
   })
 
   await test('wasm run native', async () => {
