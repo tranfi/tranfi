@@ -135,6 +135,27 @@ def test_csv_comments_empty_rows_and_trim_control():
     assert header_only.output_text == 'name,score\n'
 
 
+def test_csv_header_false():
+    result = tf.pipeline([
+        tf.codec.csv(header=False, batch_size=1),
+        tf.codec.csv_encode(),
+    ]).run(input=b'Alice,30\nBob,25\n', chunk_size=2)
+    assert result.output_text == 'col1,col2\nAlice,30\nBob,25\n'
+
+    selected = tf.pipeline([
+        tf.codec.csv(header=False, batch_size=1),
+        tf.ops.select(['col2']),
+        tf.codec.csv_encode(),
+    ]).run(input=b'Alice,30\nBob,25\n', chunk_size=3)
+    assert selected.output_text == 'col2\n30\n25\n'
+
+    header_only = tf.pipeline([
+        tf.codec.csv(header=False, max_rows=0),
+        tf.codec.csv_encode(),
+    ]).run(input=b'Alice,30\nBob,25\n', chunk_size=4)
+    assert header_only.output_text == 'col1,col2\n'
+
+
 
 def make_wide_csv(n_cols):
     headers = ','.join(f'col{i}' for i in range(n_cols))

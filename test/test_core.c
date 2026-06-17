@@ -687,6 +687,34 @@ static size_t run_plan_chunked(const char *plan, const char *input, size_t chunk
     return total;
 }
 
+static void test_pipeline_csv_header_false(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"header\":false,\"batch_size\":1}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    char out[1024];
+    run_plan_chunked(plan, "Alice,30\nBob,25\n", 2, out, sizeof(out));
+    assert(strcmp(out, "col1,col2\nAlice,30\nBob,25\n") == 0);
+
+    const char *select_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"header\":false,\"batch_size\":1}},"
+        "{\"op\":\"select\",\"args\":{\"columns\":[\"col2\"]}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    run_plan_chunked(select_plan, "Alice,30\nBob,25\n", 3, out, sizeof(out));
+    assert(strcmp(out, "col2\n30\n25\n") == 0);
+
+    const char *zero_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"header\":false,\"max_rows\":0}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    run_plan_chunked(zero_plan, "Alice,30\nBob,25\n", 4, out, sizeof(out));
+    assert(strcmp(out, "col1,col2\n") == 0);
+}
+
 static void assert_csv_float_bits(const char *literal, size_t chunk) {
     const char *plan =
         "{\"steps\":["
@@ -12282,6 +12310,7 @@ int main(int argc, char **argv) {
 
     printf("\nPipeline (CSV):\n");
     TEST(test_pipeline_csv_passthrough);
+    TEST(test_pipeline_csv_header_false);
     TEST(test_pipeline_float_roundtrip_bits);
     TEST(test_pipeline_table_human_float_format);
     TEST(test_pipeline_sink_callbacks);

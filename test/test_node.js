@@ -168,6 +168,28 @@ await test('csv comments empty rows and trim control', async () => {
 })
 
 
+await test('csv header false', async () => {
+  const result = await pipeline([
+    codec.csv({ header: false, batchSize: 1 }),
+    codec.csvEncode(),
+  ]).run({ input: 'Alice,30\nBob,25\n', chunkSize: 2 })
+  assert(result.outputText === 'col1,col2\nAlice,30\nBob,25\n', 'header=false should synthesize column names and keep first row')
+
+  const selected = await pipeline([
+    codec.csv({ header: false, batchSize: 1 }),
+    ops.select(['col2']),
+    codec.csvEncode(),
+  ]).run({ input: 'Alice,30\nBob,25\n', chunkSize: 3 })
+  assert(selected.outputText === 'col2\n30\n25\n', 'header=false synthetic columns should be addressable')
+
+  const headerOnly = await pipeline([
+    codec.csv({ header: false, maxRows: 0 }),
+    codec.csvEncode(),
+  ]).run({ input: 'Alice,30\nBob,25\n', chunkSize: 4 })
+  assert(headerOnly.outputText === 'col1,col2\n', 'header=false maxRows=0 should emit synthetic schema only')
+})
+
+
 await test('fillNull audit side channel', async () => {
   const p = pipeline([
     codec.csv({ batchSize: 2, nulls: ['NA'] }),

@@ -802,6 +802,61 @@ static void csv_free_schema_arrays(char **col_names, tf_type *col_types, size_t 
     free(col_types);
 }
 
+static int csv_init_schema(csv_decoder_state *st, const field_slice *fields,
+                           size_t n_fields, int synthetic_names) {
+    char **col_names = tf_callocarray_checked(n_fields ? n_fields : 1, sizeof(char *));
+    tf_type *col_types = tf_callocarray_checked(n_fields ? n_fields : 1, sizeof(tf_type));
+    if (!col_names || !col_types) {
+        free(col_names);
+        free(col_types);
+        return TF_ERROR;
+    }
+
+    size_t schema_bytes = 0;
+    for (size_t i = 0; i < n_fields; i++) {
+        char synthetic[64];
+        const char *name_ptr = fields[i].ptr;
+        size_t name_len = fields[i].len;
+        if (synthetic_names) {
+            int n = snprintf(synthetic, sizeof(synthetic), "col%zu", i + 1);
+            if (n <= 0 || (size_t)n >= sizeof(synthetic)) {
+                csv_free_schema_arrays(col_names, col_types, i);
+                return TF_ERROR;
+            }
+            name_ptr = synthetic;
+            name_len = (size_t)n;
+        }
+
+        size_t name_bytes = 0, next_schema_bytes = 0;
+        if (tf_check_byte_limit(name_len, TF_MAX_COLUMN_NAME_BYTES,
+                                "csv", "column name") != TF_OK ||
+            tf_size_add(name_len, 1, &name_bytes) != TF_OK ||
+            tf_size_add(schema_bytes, name_bytes, &next_schema_bytes) != TF_OK ||
+            tf_check_byte_limit(next_schema_bytes, TF_MAX_SCHEMA_BYTES,
+                                "csv", "schema") != TF_OK) {
+            csv_free_schema_arrays(col_names, col_types, i);
+            return TF_ERROR;
+        }
+        char *name = malloc(name_bytes);
+        if (!name) {
+            csv_free_schema_arrays(col_names, col_types, i);
+            return TF_ERROR;
+        }
+        memcpy(name, name_ptr, name_len);
+        name[name_len] = '\0';
+        col_names[i] = name;
+        col_types[i] = TF_TYPE_NULL;
+        schema_bytes = next_schema_bytes;
+    }
+
+    st->n_cols = n_fields;
+    st->col_names = col_names;
+    st->col_types = col_types;
+    st->schema_ready = 1;
+    st->after_input_boundary = 0;
+    return TF_OK;
+}
+
 static int csv_add_null_literal_list(csv_decoder_state *st, const char *list) {
     if (!list) return TF_OK;
     const char *start = list;
@@ -1195,46 +1250,11 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
         }
     }
 
-    /* --- First line: extract column headers --- */
+    /* --- First record: extract column headers or synthesize headerless names. --- */
     if (!st->schema_ready) {
-        char **col_names = tf_callocarray_checked(n_fields ? n_fields : 1, sizeof(char *));
-        tf_type *col_types = tf_callocarray_checked(n_fields ? n_fields : 1, sizeof(tf_type));
-        if (!col_names || !col_types) {
-            free(col_names);
-            free(col_types);
-            return TF_ERROR;
-        }
-
-        size_t schema_bytes = 0;
-        for (size_t i = 0; i < n_fields; i++) {
-            /* Headers must outlive the line buffer, so we copy them */
-            size_t name_bytes = 0, next_schema_bytes = 0;
-            if (tf_check_byte_limit(st->fields[i].len, TF_MAX_COLUMN_NAME_BYTES,
-                                    "csv", "column name") != TF_OK ||
-                tf_size_add(st->fields[i].len, 1, &name_bytes) != TF_OK ||
-                tf_size_add(schema_bytes, name_bytes, &next_schema_bytes) != TF_OK ||
-                tf_check_byte_limit(next_schema_bytes, TF_MAX_SCHEMA_BYTES,
-                                    "csv", "schema") != TF_OK) {
-                csv_free_schema_arrays(col_names, col_types, i);
-                return TF_ERROR;
-            }
-            char *name = malloc(name_bytes);
-            if (!name) {
-                csv_free_schema_arrays(col_names, col_types, i);
-                return TF_ERROR;
-            }
-            memcpy(name, st->fields[i].ptr, st->fields[i].len);
-            name[st->fields[i].len] = '\0';
-            col_names[i] = name;
-            col_types[i] = TF_TYPE_NULL;
-            schema_bytes = next_schema_bytes;
-        }
-        st->n_cols = n_fields;
-        st->col_names = col_names;
-        st->col_types = col_types;
-        st->schema_ready = 1;
-        st->after_input_boundary = 0;
-        return TF_OK;
+        if (csv_init_schema(st, st->fields, n_fields, !st->has_header) != TF_OK) return TF_ERROR;
+        if (st->has_header) return TF_OK;
+        if (st->limit_rows && st->data_rows_read >= st->n_max) return TF_OK;
     }
 
     /* --- Empty lines: treat as all-null row --- */
