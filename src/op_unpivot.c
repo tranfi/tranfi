@@ -140,8 +140,8 @@ static int unpivot_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
             if (rc != TF_OK) goto fail;
 
-            if (tf_size_add(out_row, 1, &out_row) != TF_OK) goto fail;
-            ob->n_rows = out_row;
+            if (tf_batch_expose_row(ob, out_row) != TF_OK) goto fail;
+            out_row++;
         }
     }
 

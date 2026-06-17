@@ -415,8 +415,11 @@ static int assert_process_aggregate(tf_step *self, tf_batch *in, tf_batch **out)
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
-    ob->n_rows = in->n_rows;
     *out = ob;
     return TF_OK;
 }

@@ -43,13 +43,6 @@ static const char *OTHER_CATEGORY = "__other__";
 
 static size_t onehot_retained_state_bytes(const onehot_state *st);
 
-static int onehot_expose_row(tf_batch *ob, size_t row) {
-    size_t next_rows = 0;
-    if (tf_size_add(row, 1, &next_rows) != TF_OK) return TF_ERROR;
-    ob->n_rows = next_rows;
-    return TF_OK;
-}
-
 static int onehot_write_error(tf_side_channels *side, const char *msg) {
     return tf_side_write_error(side, msg);
 }
@@ -272,7 +265,7 @@ static int onehot_process(tf_step *self, tf_batch *in, tf_batch **out,
         for (size_t i = 0; i < st->n_cats; i++) {
             if (tf_batch_set_int64(ob, r, oc + i, (int)i == match ? 1 : 0) != TF_OK) goto fail;
         }
-        if (onehot_expose_row(ob, r) != TF_OK) goto fail;
+        if (tf_batch_expose_row(ob, r) != TF_OK) goto fail;
     }
 
     free(matches);

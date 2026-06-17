@@ -80,12 +80,15 @@ static int quarantine_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         out_row++;
         st->kept_rows++;
     }
 
-    ob->n_rows = out_row;
-    if (ob->n_rows > 0 || in->n_rows == 0) *out = ob;
+    if (out_row > 0 || in->n_rows == 0) *out = ob;
     else tf_batch_free(ob);
     return TF_OK;
 }

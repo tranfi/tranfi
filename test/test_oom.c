@@ -266,6 +266,12 @@ int main(void) {
             520
         },
         {
+            "aggregate_assert_grep_passthrough",
+            "csv batch_size=1 | assert aggregate=sum:score op=>= value=60 action=warn | grep missing invert=true | csv",
+            people,
+            420
+        },
+        {
             "metadata_time_ops",
             "csv batch_size=1 | source-name src default=oom | datetime d year,month | date-trunc ts month result=ts_month | relocate src after=name | csv",
             dates,

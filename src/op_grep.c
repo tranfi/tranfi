@@ -34,8 +34,6 @@ static int grep_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (col_idx < 0) {
         /* Column not found — pass through or drop all depending on invert */
         if (st->invert) {
-            *out = in;
-            /* Don't free — caller owns it, but we need to copy */
             tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
             if (!ob) return TF_ERROR;
             if (tf_batch_clone_schema(ob, in) != TF_OK) {
@@ -47,8 +45,11 @@ static int grep_process(tf_step *self, tf_batch *in, tf_batch **out,
                     tf_batch_free(ob);
                     return TF_ERROR;
                 }
+                if (tf_batch_expose_row(ob, r) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
             }
-            ob->n_rows = in->n_rows;
             *out = ob;
         }
         return TF_OK;
@@ -89,9 +90,12 @@ static int grep_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (tf_batch_expose_row(ob, out_row) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         out_row++;
     }
-    ob->n_rows = out_row;
 
     st->rows_in += in->n_rows;
     st->rows_out += out_row;

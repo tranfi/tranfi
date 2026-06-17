@@ -147,13 +147,6 @@ static int acf_process(tf_step *self, tf_batch *in, tf_batch **out,
     return TF_OK;
 }
 
-static int acf_expose_row(tf_batch *ob, size_t row) {
-    size_t next_rows = 0;
-    if (tf_size_add(row, 1, &next_rows) != TF_OK) return TF_ERROR;
-    ob->n_rows = next_rows;
-    return TF_OK;
-}
-
 static int acf_emit_nulls(acf_state *st, tf_batch **out) {
     size_t out_rows = 0;
     if (tf_size_add((size_t)st->lags, 1, &out_rows) != TF_OK) return TF_ERROR;
@@ -169,7 +162,7 @@ static int acf_emit_nulls(acf_state *st, tf_batch **out) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (acf_expose_row(ob, (size_t)k) != TF_OK) {
+        if (tf_batch_expose_row(ob, (size_t)k) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
@@ -225,7 +218,7 @@ static int acf_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (acf_expose_row(ob, (size_t)k) != TF_OK) {
+        if (tf_batch_expose_row(ob, (size_t)k) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }

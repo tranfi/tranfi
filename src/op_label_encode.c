@@ -43,13 +43,6 @@ static const char *OTHER_CATEGORY = "__other__";
 
 static size_t label_retained_state_bytes(const label_encode_state *st);
 
-static int label_encode_expose_row(tf_batch *ob, size_t row) {
-    size_t next_rows = 0;
-    if (tf_size_add(row, 1, &next_rows) != TF_OK) return TF_ERROR;
-    ob->n_rows = next_rows;
-    return TF_OK;
-}
-
 static int label_write_error(tf_side_channels *side, const char *msg) {
     return tf_side_write_error(side, msg);
 }
@@ -244,7 +237,7 @@ static int label_encode_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (label_encode_expose_row(ob, r) != TF_OK) {
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }

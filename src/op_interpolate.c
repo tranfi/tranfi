@@ -116,13 +116,6 @@ static int interpolate_parse_type_policy(const cJSON *args, interp_type_policy *
     return TF_OK;
 }
 
-static int interpolate_expose_row(tf_batch *ob, size_t row) {
-    size_t next_rows = 0;
-    if (tf_size_add(row, 1, &next_rows) != TF_OK) return TF_ERROR;
-    ob->n_rows = next_rows;
-    return TF_OK;
-}
-
 static int interpolate_passthrough(tf_batch *in, tf_batch **out) {
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) return TF_ERROR;
@@ -135,7 +128,7 @@ static int interpolate_passthrough(tf_batch *in, tf_batch **out) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (interpolate_expose_row(ob, r) != TF_OK) {
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
@@ -171,7 +164,7 @@ static int interpolate_null_output(interpolate_state *st, tf_batch *in, int ci, 
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (interpolate_expose_row(ob, r) != TF_OK) {
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
@@ -207,7 +200,7 @@ static tf_batch *copy_single_row(const tf_batch *in, size_t row) {
         tf_batch_free(row_copy);
         return NULL;
     }
-    if (interpolate_expose_row(row_copy, 0) != TF_OK) {
+    if (tf_batch_expose_row(row_copy, 0) != TF_OK) {
         tf_batch_free(row_copy);
         return NULL;
     }
@@ -238,7 +231,7 @@ static int flush_pending(interpolate_state *st, tf_batch *ob, size_t *out_row,
         }
 
         if (interpolate_set_numeric(ob, r, target_col, interp_val) != TF_OK) return TF_ERROR;
-        if (interpolate_expose_row(ob, r) != TF_OK) return TF_ERROR;
+        if (tf_batch_expose_row(ob, r) != TF_OK) return TF_ERROR;
         (*out_row)++;
     }
 
@@ -296,7 +289,7 @@ static int interpolate_process(tf_step *self, tf_batch *in, tf_batch **out,
                     tf_batch_free(ob);
                     return TF_ERROR;
                 }
-                if (interpolate_expose_row(ob, out_row) != TF_OK) {
+                if (tf_batch_expose_row(ob, out_row) != TF_OK) {
                     tf_batch_free(ob);
                     return TF_ERROR;
                 }
@@ -307,7 +300,7 @@ static int interpolate_process(tf_step *self, tf_batch *in, tf_batch **out,
                     tf_batch_free(ob);
                     return TF_ERROR;
                 }
-                if (interpolate_expose_row(ob, out_row) != TF_OK) {
+                if (tf_batch_expose_row(ob, out_row) != TF_OK) {
                     tf_batch_free(ob);
                     return TF_ERROR;
                 }
@@ -341,7 +334,7 @@ static int interpolate_process(tf_step *self, tf_batch *in, tf_batch **out,
                 tf_batch_free(ob);
                 return TF_ERROR;
             }
-            if (interpolate_expose_row(ob, out_row) != TF_OK) {
+            if (tf_batch_expose_row(ob, out_row) != TF_OK) {
                 tf_batch_free(ob);
                 return TF_ERROR;
             }
@@ -387,7 +380,7 @@ static int interpolate_flush(tf_step *self, tf_batch **out, tf_side_channels *si
                 tf_batch_free(ob);
                 return TF_ERROR;
             }
-            if (interpolate_expose_row(ob, i) != TF_OK) {
+            if (tf_batch_expose_row(ob, i) != TF_OK) {
                 tf_batch_free(ob);
                 return TF_ERROR;
             }
