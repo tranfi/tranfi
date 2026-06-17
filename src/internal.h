@@ -189,6 +189,8 @@ TF_WARN_UNUSED int tf_batch_copy_cell(tf_batch *dst, size_t dst_row, size_t dst_
                                       const tf_batch *src, size_t src_row, size_t src_col);
 TF_WARN_UNUSED int tf_batch_copy_cell_index(tf_batch *dst, size_t dst_row, size_t dst_col,
                                             const tf_batch *src, size_t src_row, int src_col);
+TF_WARN_UNUSED int tf_batch_copy_cell_as_string(tf_batch *dst, size_t dst_row, size_t dst_col,
+                                                const tf_batch *src, size_t src_row, size_t src_col);
 TF_WARN_UNUSED int tf_batch_copy_selected_row(tf_batch *dst, size_t dst_row,
                                               const tf_batch *src, size_t src_row,
                                               const size_t *cols, size_t n_cols);

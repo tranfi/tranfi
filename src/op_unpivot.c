@@ -7,7 +7,6 @@
 
 #include "internal.h"
 #include "cJSON.h"
-#include "date_utils.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -104,41 +103,8 @@ static int unpivot_process(tf_step *self, tf_batch *in, tf_batch **out,
             /* Set variable name */
             if (tf_batch_set_string(ob, out_row, n_id, in->col_names[c]) != TF_OK) goto fail;
 
-            /* Set value (convert to string) */
-            int rc = TF_OK;
-            if (tf_batch_is_null(in, r, c)) {
-                rc = tf_batch_set_null(ob, out_row, n_id + 1);
-            } else {
-                char buf[64];
-                switch (in->col_types[c]) {
-                    case TF_TYPE_STRING:
-                        rc = tf_batch_set_string(ob, out_row, n_id + 1, tf_batch_get_string(in, r, c));
-                        break;
-                    case TF_TYPE_INT64:
-                        snprintf(buf, sizeof(buf), "%lld", (long long)tf_batch_get_int64(in, r, c));
-                        rc = tf_batch_set_string(ob, out_row, n_id + 1, buf);
-                        break;
-                    case TF_TYPE_FLOAT64:
-                        if (tf_format_float64(buf, sizeof(buf), tf_batch_get_float64(in, r, c)) != TF_OK) goto fail;
-                        rc = tf_batch_set_string(ob, out_row, n_id + 1, buf);
-                        break;
-                    case TF_TYPE_BOOL:
-                        rc = tf_batch_set_string(ob, out_row, n_id + 1, tf_batch_get_bool(in, r, c) ? "true" : "false");
-                        break;
-                    case TF_TYPE_DATE:
-                        tf_date_format(tf_batch_get_date(in, r, c), buf, sizeof(buf));
-                        rc = tf_batch_set_string(ob, out_row, n_id + 1, buf);
-                        break;
-                    case TF_TYPE_TIMESTAMP:
-                        tf_timestamp_format(tf_batch_get_timestamp(in, r, c), buf, sizeof(buf));
-                        rc = tf_batch_set_string(ob, out_row, n_id + 1, buf);
-                        break;
-                    default:
-                        rc = tf_batch_set_null(ob, out_row, n_id + 1);
-                        break;
-                }
-            }
-            if (rc != TF_OK) goto fail;
+            if (tf_batch_copy_cell_as_string(ob, out_row, n_id + 1, in, r, c) != TF_OK)
+                goto fail;
 
             if (tf_batch_expose_row(ob, out_row) != TF_OK) goto fail;
             out_row++;

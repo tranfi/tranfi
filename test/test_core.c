@@ -439,6 +439,40 @@ static void test_batch_schema_copy_helpers(void) {
     cols[0] = 99;
     assert(tf_batch_copy_selected_row(selected, 0, src, 0, cols, 2) == TF_ERROR);
 
+    tf_batch *fmt_src = tf_batch_create(6, 1);
+    assert(fmt_src != NULL);
+    assert(tf_batch_set_schema(fmt_src, 0, "flag", TF_TYPE_BOOL) == TF_OK);
+    assert(tf_batch_set_schema(fmt_src, 1, "count", TF_TYPE_INT64) == TF_OK);
+    assert(tf_batch_set_schema(fmt_src, 2, "ratio", TF_TYPE_FLOAT64) == TF_OK);
+    assert(tf_batch_set_schema(fmt_src, 3, "label", TF_TYPE_STRING) == TF_OK);
+    assert(tf_batch_set_schema(fmt_src, 4, "day", TF_TYPE_DATE) == TF_OK);
+    assert(tf_batch_set_schema(fmt_src, 5, "when", TF_TYPE_TIMESTAMP) == TF_OK);
+    assert(tf_batch_set_bool(fmt_src, 0, 0, true) == TF_OK);
+    assert(tf_batch_set_int64(fmt_src, 0, 1, -42) == TF_OK);
+    assert(tf_batch_set_float64(fmt_src, 0, 2, 1.25) == TF_OK);
+    assert(tf_batch_set_string(fmt_src, 0, 3, "ok") == TF_OK);
+    assert(tf_batch_set_date(fmt_src, 0, 4, tf_date_from_ymd(2024, 3, 15)) == TF_OK);
+    assert(tf_batch_set_timestamp(fmt_src, 0, 5,
+                                  tf_timestamp_from_parts(2024, 3, 15, 12, 34, 56, 120000)) == TF_OK);
+    assert(tf_batch_expose_row(fmt_src, 0) == TF_OK);
+
+    tf_batch *fmt_dst = tf_batch_create(6, 1);
+    assert(fmt_dst != NULL);
+    for (size_t i = 0; i < 6; i++) {
+        assert(tf_batch_set_schema(fmt_dst, i, fmt_src->col_names[i], TF_TYPE_STRING) == TF_OK);
+        assert(tf_batch_copy_cell_as_string(fmt_dst, 0, i, fmt_src, 0, i) == TF_OK);
+    }
+    assert(tf_batch_expose_row(fmt_dst, 0) == TF_OK);
+    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 0), "true") == 0);
+    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 1), "-42") == 0);
+    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 2), "1.25") == 0);
+    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 3), "ok") == 0);
+    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 4), "2024-03-15") == 0);
+    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 5), "2024-03-15T12:34:56.12Z") == 0);
+    assert(tf_batch_copy_cell_as_string(fmt_src, 0, 0, fmt_dst, 0, 0) == TF_ERROR);
+
+    tf_batch_free(fmt_dst);
+    tf_batch_free(fmt_src);
     tf_batch_free(selected);
     tf_batch_free(extra);
     tf_batch_free(clone);

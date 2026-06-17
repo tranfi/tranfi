@@ -4,6 +4,7 @@
 
 #include "internal.h"
 #include "cJSON.h"
+#include "date_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -372,6 +373,47 @@ int tf_batch_copy_cell_index(tf_batch *dst, size_t dst_row, size_t dst_col,
                              const tf_batch *src, size_t src_row, int src_col) {
     if (src_col < 0) return TF_ERROR;
     return tf_batch_copy_cell(dst, dst_row, dst_col, src, src_row, (size_t)src_col);
+}
+
+int tf_batch_copy_cell_as_string(tf_batch *dst, size_t dst_row, size_t dst_col,
+                                 const tf_batch *src, size_t src_row, size_t src_col) {
+    if (!dst || !src || src_row >= src->n_rows || src_col >= src->n_cols ||
+        dst_col >= dst->n_cols || dst->col_types[dst_col] != TF_TYPE_STRING) {
+        return TF_ERROR;
+    }
+    if (tf_batch_is_null(src, src_row, src_col)) {
+        return tf_batch_set_null(dst, dst_row, dst_col);
+    }
+
+    char buf[64];
+    int n = 0;
+    switch (src->col_types[src_col]) {
+        case TF_TYPE_STRING:
+            return tf_batch_set_string(dst, dst_row, dst_col,
+                                       tf_batch_get_string(src, src_row, src_col));
+        case TF_TYPE_INT64:
+            n = snprintf(buf, sizeof(buf), "%lld",
+                         (long long)tf_batch_get_int64(src, src_row, src_col));
+            if (n < 0 || (size_t)n >= sizeof(buf)) return TF_ERROR;
+            return tf_batch_set_string(dst, dst_row, dst_col, buf);
+        case TF_TYPE_FLOAT64:
+            if (tf_format_float64(buf, sizeof(buf),
+                                  tf_batch_get_float64(src, src_row, src_col)) != TF_OK) {
+                return TF_ERROR;
+            }
+            return tf_batch_set_string(dst, dst_row, dst_col, buf);
+        case TF_TYPE_BOOL:
+            return tf_batch_set_string(dst, dst_row, dst_col,
+                                       tf_batch_get_bool(src, src_row, src_col) ? "true" : "false");
+        case TF_TYPE_DATE:
+            tf_date_format(tf_batch_get_date(src, src_row, src_col), buf, sizeof(buf));
+            return tf_batch_set_string(dst, dst_row, dst_col, buf);
+        case TF_TYPE_TIMESTAMP:
+            tf_timestamp_format(tf_batch_get_timestamp(src, src_row, src_col), buf, sizeof(buf));
+            return tf_batch_set_string(dst, dst_row, dst_col, buf);
+        default:
+            return tf_batch_set_null(dst, dst_row, dst_col);
+    }
 }
 
 int tf_batch_clone_schema(tf_batch *dst, const tf_batch *src) {

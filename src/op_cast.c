@@ -190,18 +190,19 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
 
             if (dst_t == TF_TYPE_STRING) {
-                char buf[64];
                 switch (src_t) {
-                    case TF_TYPE_INT64: snprintf(buf, sizeof(buf), "%lld", (long long)tf_batch_get_int64(in, r, c)); break;
+                    case TF_TYPE_INT64:
                     case TF_TYPE_FLOAT64:
-                        if (tf_format_float64(buf, sizeof(buf), tf_batch_get_float64(in, r, c)) != TF_OK) goto fail;
+                    case TF_TYPE_BOOL:
+                    case TF_TYPE_DATE:
+                    case TF_TYPE_TIMESTAMP:
+                        write_rc = tf_batch_copy_cell_as_string(ob, r, c, in, r, c);
                         break;
-                    case TF_TYPE_BOOL: snprintf(buf, sizeof(buf), "%s", tf_batch_get_bool(in, r, c) ? "true" : "false"); break;
-                    case TF_TYPE_DATE: tf_date_format(tf_batch_get_date(in, r, c), buf, sizeof(buf)); break;
-                    case TF_TYPE_TIMESTAMP: tf_timestamp_format(tf_batch_get_timestamp(in, r, c), buf, sizeof(buf)); break;
-                    default: buf[0] = '\0'; failure_reason = "unsupported_conversion"; break;
+                    default:
+                        failure_reason = "unsupported_conversion";
+                        write_rc = tf_batch_set_string(ob, r, c, "");
+                        break;
                 }
-                write_rc = tf_batch_set_string(ob, r, c, buf);
             } else if (dst_t == TF_TYPE_INT64) {
                 int64_t v = 0;
                 if (src_t == TF_TYPE_FLOAT64) v = (int64_t)tf_batch_get_float64(in, r, c);

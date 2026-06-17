@@ -368,6 +368,12 @@ int main(void) {
             360
         },
         {
+            "typed_string_materialization",
+            "csv batch_size=1 | cast d=string,ts=string | unpivot d,ts max_output_rows_per_batch=8 | csv",
+            dates,
+            380
+        },
+        {
             "json_schema_flatten",
             "text | json-schema required=user types=user:object mode=filter audit audit_limit=1 | json-flatten fields=/user/id:user_id:int,$.user.name:name:string | csv",
             "{\"user\":{\"id\":42,\"name\":\"Ada\"}}\n{\"other\":true}\n{\"user\":{\"id\":7,\"name\":\"Ben\"}}\n",
