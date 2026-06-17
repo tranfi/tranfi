@@ -2,9 +2,11 @@
  * op_unique.c -- Deduplicate rows by key columns.
  *
  * Default mode is a streaming hash set with optional caps. sorted=true is an
- * adjacent-key streaming mode. spill_dir enables exact external dedup without
- * retaining all keys: rows are sorted by key+ordinal to choose the first row
- * per key, then selected rows are sorted by original ordinal before emission.
+ * adjacent-key streaming mode. mode=approx uses a bounded Bloom filter and may
+ * drop first occurrences on false positives. spill_dir enables exact external
+ * dedup without retaining all keys: rows are sorted by key+ordinal to choose
+ * the first row per key, then selected rows are sorted by original ordinal
+ * before emission.
  */
 
 #include "internal.h"
@@ -21,6 +23,9 @@
 #define UNIQUE_DEFAULT_RUN_ROWS 8192
 #define UNIQUE_DEFAULT_OUTPUT_ROWS 1024
 #define UNIQUE_MIN_RUN_ROWS 16
+#define UNIQUE_DEFAULT_BLOOM_BYTES (1024u * 1024u)
+#define UNIQUE_DEFAULT_BLOOM_HASHES 7
+#define UNIQUE_MAX_BLOOM_HASHES 32
 
 typedef tf_owned_cell_value unique_cell;
 
@@ -136,6 +141,13 @@ typedef struct {
     size_t    max_state_bytes;
     int       sorted;
     int       use_spill;
+    int       approximate;
+    uint8_t  *bloom;
+    size_t    bloom_bytes;
+    size_t    bloom_bits;
+    size_t    bloom_hashes;
+    size_t    approx_inserted;
+    size_t    approx_filtered;
 
     char     *prev_key;
     int       have_prev_key;
@@ -190,6 +202,54 @@ typedef struct {
     size_t    spill_distinct_rows;
     size_t    spill_key_bytes;
 } unique_state;
+
+/* ---- Bounded approximate membership for mode=approx ---- */
+
+static uint64_t unique_hash64(const char *key) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        h ^= (uint64_t)*p;
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static uint64_t unique_mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    return x;
+}
+
+static int bloom_get_bit(const unique_state *st, size_t bit) {
+    return (st->bloom[bit >> 3] & (uint8_t)(1u << (bit & 7u))) != 0;
+}
+
+static void bloom_set_bit(unique_state *st, size_t bit) {
+    st->bloom[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+}
+
+static int unique_bloom_check_add(unique_state *st, const char *key) {
+    uint64_t h1 = unique_mix64(unique_hash64(key));
+    uint64_t h2 = unique_mix64(h1 ^ UINT64_C(0x9e3779b97f4a7c15));
+    if ((h2 & UINT64_C(1)) == 0) h2 |= UINT64_C(1);
+
+    int maybe_seen = 1;
+    for (size_t i = 0; i < st->bloom_hashes; i++) {
+        size_t bit = (size_t)((h1 + (uint64_t)i * h2) % (uint64_t)st->bloom_bits);
+        if (!bloom_get_bit(st, bit)) {
+            maybe_seen = 0;
+            break;
+        }
+    }
+    for (size_t i = 0; i < st->bloom_hashes; i++) {
+        size_t bit = (size_t)((h1 + (uint64_t)i * h2) % (uint64_t)st->bloom_bits);
+        bloom_set_bit(st, bit);
+    }
+    return maybe_seen;
+}
 
 static int unique_write_error(tf_side_channels *side, const char *msg) {
     return tf_side_write_error(side, msg);
@@ -912,6 +972,7 @@ static size_t unique_retained_state_bytes(const unique_state *st) {
         return bytes;
     }
     if (st->sorted) return unique_prev_key_bytes(st);
+    if (st->approximate) return st->bloom_bytes;
     return st->seen.key_bytes + st->seen.cap * sizeof(char *);
 }
 
@@ -989,6 +1050,13 @@ static int unique_process(tf_step *self, tf_batch *in, tf_batch **out, tf_side_c
                 if (unique_check_state_bytes(st, side) != 0) { free(col_indices); tf_batch_free(ob); return TF_ERROR; }
                 emit_row = 1;
             }
+        } else if (st->approximate) {
+            if (unique_bloom_check_add(st, key)) {
+                st->approx_filtered++;
+            } else {
+                st->approx_inserted++;
+                emit_row = 1;
+            }
         } else {
             if (!hs_contains(&st->seen, key) && st->max_keys > 0 && st->seen.count >= st->max_keys) {
                 if (unique_limit_error(st, side) != TF_OK) {
@@ -1043,8 +1111,8 @@ static int unique_flush_next(tf_step *self, tf_batch **out, tf_side_channels *si
 static int unique_append_stats(tf_step *self, tf_buffer *out) {
     if (!self || !self->state || !out) return TF_ERROR;
     unique_state *st = self->state;
-    size_t tracked_keys = st->use_spill ? st->spill_distinct_rows : (st->sorted ? (st->have_prev_key ? 1u : 0u) : st->seen.count);
-    size_t tracked_key_bytes = st->use_spill ? st->spill_key_bytes : (st->sorted ? unique_prev_key_bytes(st) : st->seen.key_bytes);
+    size_t tracked_keys = st->use_spill ? st->spill_distinct_rows : (st->sorted ? (st->have_prev_key ? 1u : 0u) : (st->approximate ? st->approx_inserted : st->seen.count));
+    size_t tracked_key_bytes = st->use_spill ? st->spill_key_bytes : (st->sorted ? unique_prev_key_bytes(st) : (st->approximate ? 0u : st->seen.key_bytes));
     size_t retained = unique_retained_state_bytes(st);
     char buf[360];
     snprintf(buf, sizeof(buf),
@@ -1052,6 +1120,15 @@ static int unique_append_stats(tf_step *self, tf_buffer *out) {
              "\"retained_state_bytes\":%zu,\"max_state_bytes\":%zu",
              tracked_keys, tracked_key_bytes, retained, st->max_state_bytes);
     if (tf_buffer_write_str(out, buf) != TF_OK) return TF_ERROR;
+    if (st->approximate) {
+        snprintf(buf, sizeof(buf),
+                 ",\"approximate\":true,\"bloom_bytes\":%zu,"
+                 "\"bloom_bits\":%zu,\"bloom_hashes\":%zu,"
+                 "\"approx_inserted\":%zu,\"approx_filtered\":%zu",
+                 st->bloom_bytes, st->bloom_bits, st->bloom_hashes,
+                 st->approx_inserted, st->approx_filtered);
+        return tf_buffer_write_str(out, buf);
+    }
     if (st->use_spill) {
         snprintf(buf, sizeof(buf),
                  ",\"spill_bytes\":%zu,\"spill_runs\":%zu,"
@@ -1073,6 +1150,7 @@ static void unique_state_free(unique_state *st) {
     free(st->key_cols);
     free(st->prev_key);
     free(st->last_spill_key);
+    free(st->bloom);
     hs_free(&st->seen);
     if (st->buf) tf_batch_free(st->buf);
     if (st->out_buf) tf_batch_free(st->out_buf);
@@ -1105,6 +1183,42 @@ tf_step *tf_unique_create(const cJSON *args) {
         cJSON *sorted = cJSON_GetObjectItemCaseSensitive(args, "sorted");
         st->sorted = cJSON_IsBool(sorted) && cJSON_IsTrue(sorted);
 
+        int mode_approx = -1;
+        cJSON *mode = cJSON_GetObjectItemCaseSensitive(args, "mode");
+        if (mode) {
+            if (!cJSON_IsString(mode) || !mode->valuestring) {
+                tf_set_last_error("unique: mode must be exact or approx");
+                unique_state_free(st);
+                return NULL;
+            }
+            if (strcmp(mode->valuestring, "approx") == 0) {
+                mode_approx = 1;
+            } else if (strcmp(mode->valuestring, "exact") == 0) {
+                mode_approx = 0;
+            } else {
+                tf_set_last_error("unique: mode must be exact or approx");
+                unique_state_free(st);
+                return NULL;
+            }
+        }
+        cJSON *approx = cJSON_GetObjectItemCaseSensitive(args, "approx");
+        if (approx) {
+            if (!cJSON_IsBool(approx)) {
+                tf_set_last_error("unique: approx must be true or false");
+                unique_state_free(st);
+                return NULL;
+            }
+            int approx_value = cJSON_IsTrue(approx) ? 1 : 0;
+            if (mode_approx >= 0 && mode_approx != approx_value) {
+                tf_set_last_error("unique: mode and approx conflict");
+                unique_state_free(st);
+                return NULL;
+            }
+            st->approximate = approx_value;
+        } else if (mode_approx >= 0) {
+            st->approximate = mode_approx;
+        }
+
         size_t parsed_size = 0;
         int has_max_keys = tf_json_get_size_arg(args, "max_keys",
                                                 1, TF_MAX_COUNT_ARG,
@@ -1117,6 +1231,18 @@ tf_step *tf_unique_create(const cJSON *args) {
                                                  &parsed_size, "unique");
         if (has_max_state < 0) { unique_state_free(st); return NULL; }
         if (has_max_state > 0) st->max_state_bytes = parsed_size;
+
+        int has_bloom_bytes = tf_json_get_size_arg(args, "bloom_bytes",
+                                                   1, TF_MAX_STATE_BYTES,
+                                                   &parsed_size, "unique");
+        if (has_bloom_bytes < 0) { unique_state_free(st); return NULL; }
+        if (has_bloom_bytes > 0) st->bloom_bytes = parsed_size;
+
+        int has_bloom_hashes = tf_json_get_size_arg(args, "bloom_hashes",
+                                                    1, UNIQUE_MAX_BLOOM_HASHES,
+                                                    &parsed_size, "unique");
+        if (has_bloom_hashes < 0) { unique_state_free(st); return NULL; }
+        if (has_bloom_hashes > 0) st->bloom_hashes = parsed_size;
 
         cJSON *spill_dir_j = cJSON_GetObjectItemCaseSensitive(args, "spill_dir");
         if (cJSON_IsString(spill_dir_j) && spill_dir_j->valuestring && spill_dir_j->valuestring[0]) {
@@ -1167,12 +1293,43 @@ tf_step *tf_unique_create(const cJSON *args) {
         }
     }
 
+    if (st->approximate) {
+        if (st->sorted) {
+            tf_set_last_error("unique: mode=approx and sorted=true are mutually exclusive");
+            unique_state_free(st);
+            return NULL;
+        }
+        if (st->use_spill) {
+            tf_set_last_error("unique: mode=approx and spill_dir are mutually exclusive");
+            unique_state_free(st);
+            return NULL;
+        }
+        if (st->max_keys > 0 || st->max_state_bytes > 0) {
+            tf_set_last_error("unique: mode=approx uses bloom_bytes, not max_keys or max_state_bytes");
+            unique_state_free(st);
+            return NULL;
+        }
+        if (st->bloom_bytes == 0) st->bloom_bytes = UNIQUE_DEFAULT_BLOOM_BYTES;
+        if (st->bloom_hashes == 0) st->bloom_hashes = UNIQUE_DEFAULT_BLOOM_HASHES;
+        if (tf_size_mul(st->bloom_bytes, 8, &st->bloom_bits) != TF_OK ||
+            st->bloom_bits == 0) {
+            tf_set_last_error("unique: bloom_bytes overflow");
+            unique_state_free(st);
+            return NULL;
+        }
+        st->bloom = tf_callocarray_checked(st->bloom_bytes, sizeof(uint8_t));
+        if (!st->bloom) { unique_state_free(st); return NULL; }
+    } else if (st->bloom_bytes > 0 || st->bloom_hashes > 0) {
+        tf_set_last_error("unique: bloom_bytes and bloom_hashes require mode=approx");
+        unique_state_free(st);
+        return NULL;
+    }
     if (st->use_spill && st->sorted) {
         tf_set_last_error("unique: spill_dir and sorted=true are mutually exclusive");
         unique_state_free(st);
         return NULL;
     }
-    if (!st->sorted && !st->use_spill && hs_init(&st->seen, 256) != 0) { unique_state_free(st); return NULL; }
+    if (!st->sorted && !st->use_spill && !st->approximate && hs_init(&st->seen, 256) != 0) { unique_state_free(st); return NULL; }
 
     tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { unique_state_free(st); return NULL; }

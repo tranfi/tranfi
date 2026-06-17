@@ -889,6 +889,55 @@ static void test_low_cardinality_unique_drains_and_stays_small(void) {
     tf_pipeline_free(p);
 }
 
+static void test_approx_unique_drains_and_stays_small(void) {
+    const char *dsl = "csv | unique id mode=approx bloom_bytes=4096 bloom_hashes=3 | csv";
+    assert_contract_for_op(dsl, "unique", TF_MEM_KEY_STATE, TF_EMIT_PER_BATCH);
+    tf_pipeline *p = create_pipeline_from_dsl(dsl);
+
+    const char *header = "id,score,group\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)header, strlen(header)) == TF_OK);
+    assert(drain_channel(p, TF_CHAN_MAIN) == 0);
+
+    char chunk[8192];
+    size_t total_out = 0;
+    size_t prefinish_drains = 0;
+    long start_kb = current_rss_kb();
+    long peak_kb = start_kb;
+
+    for (size_t row = 0; row < KEY_STATE_ROWS; row += CHUNK_ROWS) {
+        size_t n_rows = CHUNK_ROWS;
+        if (row + n_rows > KEY_STATE_ROWS) n_rows = KEY_STATE_ROWS - row;
+        size_t len = write_rows(chunk, sizeof(chunk), row, n_rows);
+        assert(tf_pipeline_push(p, (const uint8_t *)chunk, len) == TF_OK);
+        if (tf_buffer_readable(&p->output[TF_CHAN_MAIN]) > 0) prefinish_drains++;
+        total_out += drain_channel(p, TF_CHAN_MAIN);
+        assert(tf_buffer_readable(&p->output[TF_CHAN_MAIN]) == 0);
+        assert(p->output[TF_CHAN_MAIN].cap <= STREAM_CAP_LIMIT);
+        if ((row / CHUNK_ROWS) % 32 == 0) update_peak(&peak_kb);
+    }
+
+    assert(prefinish_drains > 0);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    total_out += drain_channel(p, TF_CHAN_MAIN);
+
+    uint8_t stats[8192];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(n > 0);
+    stats[n] = '\0';
+    assert(strstr((char *)stats, "\"approximate\":true") != NULL);
+    assert(strstr((char *)stats, "\"bloom_bytes\":4096") != NULL);
+    drain_channel(p, TF_CHAN_STATS);
+    update_peak(&peak_kb);
+
+    assert(p->rows_in == KEY_STATE_ROWS);
+    assert(p->rows_out > 0);
+    assert(p->rows_out < KEY_STATE_ROWS);
+    assert(total_out > 0);
+    assert_rss_delta_bounded(start_kb, peak_kb);
+
+    tf_pipeline_free(p);
+}
+
 
 static void test_low_cardinality_rowid_drains_and_stays_small(void) {
     assert_contract_for_op("csv | rowid group max_keys=97 | csv", "rowid",
@@ -1958,6 +2007,9 @@ int main(void) {
     test_low_cardinality_unique_drains_and_stays_small();
     printf("  low-cardinality unique drains and stays small PASS\n");
 
+    test_approx_unique_drains_and_stays_small();
+    printf("  approximate unique drains and stays small    PASS\n");
+
     test_low_cardinality_rowid_drains_and_stays_small();
     printf("  low-cardinality rowid drains and stays small PASS\n");
 
@@ -2012,6 +2064,6 @@ int main(void) {
     test_sorted_pivot_declared_categories_streams_current_group();
     printf("  sorted pivot declared categories stream      PASS\n");
 
-    printf("\n33/33 memory regression tests passed\n");
+    printf("\n34/34 memory regression tests passed\n");
     return 0;
 }

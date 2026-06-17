@@ -320,6 +320,12 @@ int main(void) {
             260
         },
         {
+            "key_state_unique_approx",
+            "csv batch_size=1 | unique city mode=approx bloom_bytes=4096 bloom_hashes=3 | csv",
+            people,
+            300
+        },
+        {
             "category_ops",
             "csv batch_size=1 | frequency city max_values=8 | onehot color max_categories=8 | label-encode city city_id max_categories=8 | csv",
             people,

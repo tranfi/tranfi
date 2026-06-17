@@ -1093,6 +1093,21 @@ def test_native_memory_policy():
     with pytest.raises(RuntimeError, match='max_state_bytes=2048'):
         tf.pipeline([tf.codec.csv(), tf.ops.unique(['name'], max_state_bytes=2048), tf.codec.csv_encode()]).run(input=b'name,age\nAlice,30\n')
 
+    approx_unique = tf.pipeline([
+        tf.codec.csv(batch_size=2),
+        tf.ops.unique(['city'], mode='approx', bloom_bytes=65536, bloom_hashes=4),
+        tf.codec.csv_encode(),
+    ])
+    approx_result = approx_unique.run(input=b'city,score\nNY,1\nLA,2\nNY,3\nSF,4\nLA,5\n', memory='128KB')
+    assert 'NY,1' in approx_result.output_text
+    assert 'LA,2' in approx_result.output_text
+    assert 'SF,4' in approx_result.output_text
+    assert 'NY,3' not in approx_result.output_text
+    assert '"approximate":true' in approx_result.stats_text
+    assert '"bloom_bytes":65536' in approx_result.stats_text
+    with pytest.raises(RuntimeError, match='estimated native key-state memory'):
+        approx_unique.run(input=b'city,score\nNY,1\nLA,2\n', memory='1KB')
+
     group_byte_capped = tf.pipeline([
         tf.codec.csv(),
         tf.ops.group_agg(['city'], [{'column': 'sales', 'func': 'sum', 'name': 'total'}], max_state_bytes=8192),
@@ -2699,7 +2714,13 @@ def test_key_state_cap_helpers_and_errors():
     assert dedup_sorted_args['sorted'] is True
     assert tf.ops.unique(['city'], max_keys=2)['args']['max_keys'] == 2
     assert tf.ops.unique(['city'], max_state_bytes=4096)['args']['max_state_bytes'] == 4096
+    approx_args = tf.ops.unique(['city'], mode='approx', bloom_bytes=65536, bloom_hashes=4)['args']
+    assert approx_args['mode'] == 'approx'
+    assert approx_args['bloom_bytes'] == 65536
+    assert approx_args['bloom_hashes'] == 4
+    assert tf.ops.unique(['city'], approx=True)['args']['approx'] is True
     assert tf.ops.dedup(['city'], max_state_bytes=4096)['args']['max_state_bytes'] == 4096
+    assert tf.ops.dedup(['city'], mode='approx', bloom_hashes=4)['args']['bloom_hashes'] == 4
     assert tf.ops.group_agg(['city'], [{'column': 'sales', 'func': 'sum'}], max_groups=3)['args']['max_groups'] == 3
     assert tf.ops.group_agg(['city'], [{'column': 'sales', 'func': 'sum'}], max_state_bytes=8192)['args']['max_state_bytes'] == 8192
     group_sorted_args = tf.ops.group_agg(['city'], [{'column': 'sales', 'func': 'sum'}], sorted=True)['args']

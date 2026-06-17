@@ -3076,6 +3076,18 @@ static void test_pipeline_key_state_caps(void) {
         "]}";
     assert_push_cap_error(unique_byte_plan, "city\nNY\n", "max_state_bytes=2048");
 
+    assert_pipeline_create_fails_with(
+        "{\"steps\":[{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"unique\",\"args\":{\"columns\":[\"city\"],\"mode\":\"approx\",\"max_keys\":10}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}]}",
+        "mode=approx uses bloom_bytes");
+
+    assert_pipeline_create_fails_with(
+        "{\"steps\":[{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"unique\",\"args\":{\"columns\":[\"city\"],\"mode\":\"approx\",\"sorted\":true}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}]}",
+        "mode=approx and sorted=true");
+
     const char *rowid_plan =
         "{\"steps\":["
         "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
@@ -5776,6 +5788,45 @@ static void test_pipeline_csv_unique(void) {
     tf_pipeline_free(p);
 }
 
+static void test_pipeline_csv_unique_approx(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"unique\",\"args\":{\"columns\":[\"city\"],\"mode\":\"approx\",\"bloom_bytes\":65536,\"bloom_hashes\":4}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+
+    const char *csv = "city,score\nNY,1\nLA,2\nNY,3\nSF,4\nLA,5\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+
+    uint8_t out[1024];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+
+    assert(strstr((char *)out, "NY,1") != NULL);
+    assert(strstr((char *)out, "LA,2") != NULL);
+    assert(strstr((char *)out, "SF,4") != NULL);
+    assert(strstr((char *)out, "NY,3") == NULL);
+    assert(strstr((char *)out, "LA,5") == NULL);
+
+    uint8_t stats[2048];
+    n = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(n > 0);
+    stats[n] = '\0';
+    assert(strstr((char *)stats, "\"approximate\":true") != NULL);
+    assert(strstr((char *)stats, "\"bloom_bytes\":65536") != NULL);
+    assert(strstr((char *)stats, "\"bloom_hashes\":4") != NULL);
+    assert(strstr((char *)stats, "\"approx_inserted\":3") != NULL);
+    assert(strstr((char *)stats, "\"approx_filtered\":2") != NULL);
+
+    tf_pipeline_free(p);
+}
+
 static void test_pipeline_csv_sort(void) {
     const char *plan =
         "{\"steps\":["
@@ -6067,6 +6118,24 @@ static void test_dsl_unique(void) {
     assert(plan != NULL);
     sorted = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "sorted");
     assert(cJSON_IsBool(sorted) && cJSON_IsTrue(sorted));
+    tf_ir_plan_free(plan);
+
+    const char *approx_dsl = "csv | unique city mode=approx bloom_bytes=65536 bloom_hashes=4 | csv";
+    plan = tf_dsl_parse(approx_dsl, strlen(approx_dsl), &error);
+    assert(plan != NULL);
+    cJSON *mode = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "mode");
+    cJSON *bloom_bytes = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "bloom_bytes");
+    cJSON *bloom_hashes = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "bloom_hashes");
+    assert(cJSON_IsString(mode) && strcmp(mode->valuestring, "approx") == 0);
+    assert(cJSON_IsNumber(bloom_bytes) && (int)bloom_bytes->valuedouble == 65536);
+    assert(cJSON_IsNumber(bloom_hashes) && (int)bloom_hashes->valuedouble == 4);
+    tf_ir_plan_free(plan);
+
+    const char *approx_bool_dsl = "csv | dedup city --approx | csv";
+    plan = tf_dsl_parse(approx_bool_dsl, strlen(approx_bool_dsl), &error);
+    assert(plan != NULL);
+    cJSON *approx = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "approx");
+    assert(cJSON_IsBool(approx) && cJSON_IsTrue(approx));
     tf_ir_plan_free(plan);
 }
 
@@ -8744,6 +8813,12 @@ static void test_dsl_compatibility_forms(void) {
     plan = tf_dsl_parse("csv | unique city max_keys=0 | csv", strlen("csv | unique city max_keys=0 | csv"), &error);
     assert(plan == NULL);
     assert(error != NULL && strstr(error, "max_keys") != NULL);
+    free(error);
+    error = NULL;
+
+    plan = tf_dsl_parse("csv | unique city mode=maybe | csv", strlen("csv | unique city mode=maybe | csv"), &error);
+    assert(plan == NULL);
+    assert(error != NULL && strstr(error, "mode") != NULL);
     free(error);
     error = NULL;
 
@@ -12172,6 +12247,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_csv_scan);
     TEST(test_pipeline_csv_stats_missing);
     TEST(test_pipeline_csv_unique);
+    TEST(test_pipeline_csv_unique_approx);
     TEST(test_pipeline_unique_sorted);
     TEST(test_pipeline_csv_sort);
     TEST(test_pipeline_csv_sort_desc);

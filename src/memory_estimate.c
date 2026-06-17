@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define UNIQUE_DEFAULT_BLOOM_BYTES (1024u * 1024u)
+
 static int checked_add_size(size_t *acc, size_t value) {
     if (*acc > SIZE_MAX - value) return -1;
     *acc += value;
@@ -131,6 +133,15 @@ int tf_estimate_step_state_bytes(const tf_ir_node *node, size_t *out,
             est = 2048;
             if (checked_add_mul_size(&est, n_cols, 128) != 0) goto overflow;
             *out = est;
+            return 1;
+        }
+        const char *mode = json_string_arg(args, "mode");
+        if (json_bool_arg_true(args, "approx") ||
+            (mode && strcmp(mode, "approx") == 0)) {
+            size_t bloom_bytes = 0;
+            int has_bloom = json_size_arg(args, "bloom_bytes", &bloom_bytes);
+            if (has_bloom < 0) goto overflow;
+            *out = has_bloom ? bloom_bytes : UNIQUE_DEFAULT_BLOOM_BYTES;
             return 1;
         }
         size_t max_state_bytes = 0;

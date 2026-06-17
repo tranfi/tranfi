@@ -45,6 +45,8 @@ const SIZE_UNITS = {
   tib: 1024 ** 4
 }
 
+const UNIQUE_DEFAULT_BLOOM_BYTES = 1024 ** 2
+
 function parseMemorySize(value) {
   if (value === undefined || value === null) return null
   if (typeof value === 'number') {
@@ -178,6 +180,10 @@ function estimateKeyStateStepBytes(step) {
   if (op === 'unique' || op === 'dedup') {
     const nCols = arrayLen(args.columns)
     if (args.sorted === true) return 2048 + nCols * 128
+    if (args.approx === true || args.mode === 'approx') {
+      const bloomBytes = positiveInt(args.bloom_bytes)
+      return bloomBytes !== null ? bloomBytes : UNIQUE_DEFAULT_BLOOM_BYTES
+    }
     const maxStateBytes = positiveInt(args.max_state_bytes)
     if (maxStateBytes !== null) return maxStateBytes
     const maxKeys = positiveInt(args.max_keys)

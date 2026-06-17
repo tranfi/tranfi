@@ -1874,12 +1874,53 @@ static int parse_unknown_option(const char *tok, cJSON *args,
 
 static cJSON *build_unique_args(const token_list *tokens, char **error) {
     /* unique [col1,col2] [max_keys=N] [max_state_bytes=N] [spill_dir=DIR]
-     * [spill_memory_bytes=N] [spill_run_rows=N] [spill_output_rows=N] [sorted=true|--sorted] */
+     * [spill_memory_bytes=N] [spill_run_rows=N] [spill_output_rows=N]
+     * [sorted=true|--sorted] [mode=exact|approx] [approx=true|--approx]
+     * [bloom_bytes=N] [bloom_hashes=N] */
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
     int have_sorted = 0;
+    int have_approx = 0;
+    int have_mode = 0;
     for (size_t i = 1; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
+        if (strncmp(tok, "mode=", 5) == 0) {
+            const char *mode = tok + 5;
+            if (strcmp(mode, "exact") != 0 && strcmp(mode, "approx") != 0) {
+                set_error(error, "unique mode must be exact or approx");
+                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+            }
+            if (have_mode) {
+                set_error(error, "unique mode specified more than once");
+                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+            }
+            cJSON_AddStringToObject(args, "mode", mode);
+            have_mode = 1;
+            continue;
+        }
+        if (strcmp(tok, "approx") == 0 || strcmp(tok, "--approx") == 0) {
+            if (have_approx) {
+                set_error(error, "unique approx specified more than once");
+                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+            }
+            cJSON_AddBoolToObject(args, "approx", 1);
+            have_approx = 1;
+            continue;
+        }
+        if (strncmp(tok, "approx=", 7) == 0) {
+            int approx = 0;
+            if (parse_bool_value(tok + 7, &approx) != 0) {
+                set_error(error, "unique approx must be true or false");
+                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+            }
+            if (have_approx) {
+                set_error(error, "unique approx specified more than once");
+                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+            }
+            cJSON_AddBoolToObject(args, "approx", approx);
+            have_approx = 1;
+            continue;
+        }
         size_t max_keys = 0;
         int opt = parse_positive_option(tok, "max_keys", &max_keys, error, "unique");
         if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
@@ -1892,6 +1933,19 @@ static cJSON *build_unique_args(const token_list *tokens, char **error) {
         if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
         if (opt > 0) {
             cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes);
+            continue;
+        }
+        size_t bloom_value = 0;
+        opt = parse_positive_option(tok, "bloom_bytes", &bloom_value, error, "unique");
+        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt > 0) {
+            cJSON_AddNumberToObject(args, "bloom_bytes", (double)bloom_value);
+            continue;
+        }
+        opt = parse_positive_option(tok, "bloom_hashes", &bloom_value, error, "unique");
+        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt > 0) {
+            cJSON_AddNumberToObject(args, "bloom_hashes", (double)bloom_value);
             continue;
         }
         if (strncmp(tok, "spill_dir=", 10) == 0) {

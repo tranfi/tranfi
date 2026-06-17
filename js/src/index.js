@@ -193,9 +193,13 @@ const ops = {
     return { op: 'scan', args }
   },
 
-  unique(columns, { maxKeys, maxStateBytes, sorted = false } = {}) {
+  unique(columns, { maxKeys, maxStateBytes, sorted = false, mode, approx = false, bloomBytes, bloomHashes } = {}) {
     const args = {}
     if (columns) args.columns = columns
+    if (mode !== undefined) args.mode = mode
+    if (approx) args.approx = true
+    if (bloomBytes !== undefined) args.bloom_bytes = bloomBytes
+    if (bloomHashes !== undefined) args.bloom_hashes = bloomHashes
     if (maxKeys !== undefined) args.max_keys = maxKeys
     if (maxStateBytes !== undefined) args.max_state_bytes = maxStateBytes
     if (sorted) args.sorted = true
@@ -659,9 +663,13 @@ const ops = {
     return { op: 'reorder', args: { columns } }
   },
 
-  dedup(columns, { maxKeys, maxStateBytes, sorted = false } = {}) {
+  dedup(columns, { maxKeys, maxStateBytes, sorted = false, mode, approx = false, bloomBytes, bloomHashes } = {}) {
     const args = {}
     if (columns) args.columns = columns
+    if (mode !== undefined) args.mode = mode
+    if (approx) args.approx = true
+    if (bloomBytes !== undefined) args.bloom_bytes = bloomBytes
+    if (bloomHashes !== undefined) args.bloom_hashes = bloomHashes
     if (maxKeys !== undefined) args.max_keys = maxKeys
     if (maxStateBytes !== undefined) args.max_state_bytes = maxStateBytes
     if (sorted) args.sorted = true

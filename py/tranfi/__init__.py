@@ -311,11 +311,20 @@ class ops:
         return {'op': 'scan', 'args': args}
 
     @staticmethod
-    def unique(columns=None, max_keys=None, sorted=False, max_state_bytes=None):
-        """Keep unique rows. Use sorted=True for adjacent-key streaming mode."""
+    def unique(columns=None, max_keys=None, sorted=False, max_state_bytes=None,
+               mode=None, approx=False, bloom_bytes=None, bloom_hashes=None):
+        """Keep unique rows. Use sorted=True for adjacent-key streaming mode; mode='approx' for Bloom-filter dedup."""
         args = {}
         if columns is not None:
             args['columns'] = columns
+        if mode is not None:
+            args['mode'] = mode
+        if approx:
+            args['approx'] = True
+        if bloom_bytes is not None:
+            args['bloom_bytes'] = bloom_bytes
+        if bloom_hashes is not None:
+            args['bloom_hashes'] = bloom_hashes
         if max_keys is not None:
             args['max_keys'] = max_keys
         if max_state_bytes is not None:
@@ -1030,11 +1039,20 @@ class ops:
         return {'op': 'reorder', 'args': {'columns': columns}}
 
     @staticmethod
-    def dedup(columns=None, max_keys=None, sorted=False, max_state_bytes=None):
+    def dedup(columns=None, max_keys=None, sorted=False, max_state_bytes=None,
+              mode=None, approx=False, bloom_bytes=None, bloom_hashes=None):
         """Deduplicate rows. Alias for unique. Use sorted=True for adjacent-key streaming mode."""
         args = {}
         if columns is not None:
             args['columns'] = columns
+        if mode is not None:
+            args['mode'] = mode
+        if approx:
+            args['approx'] = True
+        if bloom_bytes is not None:
+            args['bloom_bytes'] = bloom_bytes
+        if bloom_hashes is not None:
+            args['bloom_hashes'] = bloom_hashes
         if max_keys is not None:
             args['max_keys'] = max_keys
         if max_state_bytes is not None:

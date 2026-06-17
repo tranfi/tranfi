@@ -39,6 +39,8 @@ var SIZE_UNITS = {
   gib: 1024 * 1024 * 1024
 }
 
+var UNIQUE_DEFAULT_BLOOM_BYTES = 1024 * 1024
+
 function parseMemorySize(value) {
   if (value === undefined || value === null) return null
   if (typeof value === 'number') {
@@ -122,6 +124,10 @@ function estimateKeyStateStepBytes(step) {
   if (op === 'unique' || op === 'dedup') {
     var ukNCols = arrayLen(args.columns)
     if (args.sorted === true) return 2048 + ukNCols * 128
+    if (args.approx === true || args.mode === 'approx') {
+      var ukBloomBytes = positiveInt(args.bloom_bytes)
+      return ukBloomBytes !== null ? ukBloomBytes : UNIQUE_DEFAULT_BLOOM_BYTES
+    }
     var ukMaxStateBytes = positiveInt(args.max_state_bytes)
     if (ukMaxStateBytes !== null) return ukMaxStateBytes
     var ukMaxKeys = positiveInt(args.max_keys)

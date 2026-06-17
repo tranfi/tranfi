@@ -590,6 +590,18 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
 
   /* ---- unique / dedup ---- */
   if (strcmp(op, "unique") == 0 || strcmp(op, "dedup") == 0) {
+    cJSON *sorted = cJSON_GetObjectItemCaseSensitive(args, "sorted");
+    if (cJSON_IsBool(sorted) && cJSON_IsTrue(sorted)) {
+      *error = strdup("unique: sorted=true adjacent-run mode cannot be lowered to SQL");
+      return -1;
+    }
+    cJSON *mode = cJSON_GetObjectItemCaseSensitive(args, "mode");
+    cJSON *approx = cJSON_GetObjectItemCaseSensitive(args, "approx");
+    if ((cJSON_IsString(mode) && mode->valuestring && strcmp(mode->valuestring, "approx") == 0) ||
+        (cJSON_IsBool(approx) && cJSON_IsTrue(approx))) {
+      *error = strdup("unique: approximate mode cannot be lowered to SQL");
+      return -1;
+    }
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
     if (cols && cJSON_IsArray(cols) && cJSON_GetArraySize(cols) > 0) {
       strbuf dcols;

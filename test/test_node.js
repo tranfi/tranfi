@@ -1517,6 +1517,22 @@ await test('native memory policy enforces capped key-state estimates', async () 
     () => pipeline([codec.csv(), ops.unique(['name'], { maxStateBytes: 2048 }), codec.csvEncode()]).run({ input: 'name,age\nAlice,30\n' }),
     /max_state_bytes=2048/
   )
+  const approxUnique = pipeline([
+    codec.csv({ batchSize: 2 }),
+    ops.unique(['city'], { mode: 'approx', bloomBytes: 65536, bloomHashes: 4 }),
+    codec.csvEncode()
+  ])
+  const approxResult = await approxUnique.run({ input: 'city,score\nNY,1\nLA,2\nNY,3\nSF,4\nLA,5\n', memory: '128KB' })
+  assert(approxResult.outputText.includes('NY,1'), 'approx unique should emit first observed NY')
+  assert(approxResult.outputText.includes('LA,2'), 'approx unique should emit first observed LA')
+  assert(approxResult.outputText.includes('SF,4'), 'approx unique should emit first observed SF')
+  assert(!approxResult.outputText.includes('NY,3'), 'approx unique should suppress duplicate NY')
+  assert(approxResult.statsText.includes('"approximate":true'), 'approx unique stats should mark approximate mode')
+  assert(approxResult.statsText.includes('"bloom_bytes":65536'), 'approx unique stats should report Bloom bytes')
+  await assertRejects(
+    () => approxUnique.run({ input: 'city,score\nNY,1\nLA,2\n', memory: '1KB' }),
+    /estimated native key-state memory/
+  )
   const groupByteCapped = pipeline([
     codec.csv(),
     ops.groupAgg(['city'], [{ column: 'sales', func: 'sum', name: 'total' }], { maxStateBytes: 8192 }),
@@ -2620,7 +2636,11 @@ await test('key-state caps', async () => {
   assert(ops.dedup(['city'], { sorted: true }).args.sorted === true, 'dedup helper should set sorted')
   assert(ops.unique(['city'], { maxKeys: 2 }).args.max_keys === 2, 'unique helper should set max_keys')
   assert(ops.unique(['city'], { maxStateBytes: 4096 }).args.max_state_bytes === 4096, 'unique helper should set max_state_bytes')
+  assert(ops.unique(['city'], { mode: 'approx', bloomBytes: 65536, bloomHashes: 4 }).args.mode === 'approx', 'unique helper should set approx mode')
+  assert(ops.unique(['city'], { mode: 'approx', bloomBytes: 65536, bloomHashes: 4 }).args.bloom_bytes === 65536, 'unique helper should set bloom bytes')
+  assert(ops.unique(['city'], { approx: true }).args.approx === true, 'unique helper should set approx flag')
   assert(ops.dedup(['city'], { maxStateBytes: 4096 }).args.max_state_bytes === 4096, 'dedup helper should set max_state_bytes')
+  assert(ops.dedup(['city'], { mode: 'approx', bloomHashes: 4 }).args.bloom_hashes === 4, 'dedup helper should set bloom hashes')
   assert(ops.groupAgg(['city'], [{ column: 'sales', func: 'sum' }], { maxGroups: 3 }).args.max_groups === 3, 'groupAgg helper should set max_groups')
   assert(ops.groupAgg(['city'], [{ column: 'sales', func: 'sum' }], { maxStateBytes: 8192 }).args.max_state_bytes === 8192, 'groupAgg helper should set max_state_bytes')
   assert(ops.groupAgg(['city'], [{ column: 'sales', func: 'sum' }], { sorted: true }).args.sorted === true, 'groupAgg helper should set sorted')
@@ -4118,6 +4138,22 @@ await test('compileToSql rejects frequency overflow other', async () => {
     assert(String(err.message || err).includes('overflow=other is not supported by SQL lowering'), 'should explain unsupported overflow lowering')
   }
 })
+
+await test('compileToSql rejects non-global unique modes', async () => {
+  try {
+    await compileToSql('csv | unique city mode=approx bloom_bytes=65536 | csv')
+    assert(false, 'approx unique SQL lowering should throw')
+  } catch (err) {
+    assert(String(err.message || err).includes('approximate mode cannot be lowered to SQL'), 'should explain approximate unique lowering')
+  }
+  try {
+    await compileToSql('csv | unique city sorted=true | csv')
+    assert(false, 'sorted unique SQL lowering should throw')
+  } catch (err) {
+    assert(String(err.message || err).includes('sorted=true adjacent-run mode cannot be lowered to SQL'), 'should explain sorted unique lowering')
+  }
+})
+
 await test('compileToSql rejects selector helpers without schema', async () => {
   try {
     await compileToSql('csv | select starts_with(score_) | csv')

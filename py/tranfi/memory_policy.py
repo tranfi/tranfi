@@ -51,6 +51,8 @@ _SIZE_UNITS = {
     'tib': 1024 ** 4,
 }
 
+_UNIQUE_DEFAULT_BLOOM_BYTES = 1024 ** 2
+
 
 def parse_memory_size(value: Any) -> int | None:
     """Parse a byte size. Accepts None, positive ints, or strings like max:64MB."""
@@ -228,6 +230,9 @@ def estimate_key_state_step_bytes(step: Dict[str, Any]) -> int:
         n_cols = _array_len(_arg(step, 'columns'))
         if _arg(step, 'sorted') is True:
             return 2048 + n_cols * 128
+        if _arg(step, 'approx') is True or _arg(step, 'mode') == 'approx':
+            bloom_bytes = _positive_int(_arg(step, 'bloom_bytes'))
+            return bloom_bytes if bloom_bytes is not None else _UNIQUE_DEFAULT_BLOOM_BYTES
         max_state_bytes = _positive_int(_arg(step, 'max_state_bytes'))
         if max_state_bytes is not None:
             return max_state_bytes
