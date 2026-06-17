@@ -736,6 +736,24 @@ int main(void) {
             "csv batch_size=1 | interpolate x linear | normalize x audit audit_limit=2 | acf y 2 | csv",
             series,
             520
+        },
+        {
+            "data_prep_policy_modes",
+            "csv batch_size=1 | interpolate missing forward missing=null | interpolate name forward on_type_error=null | normalize missing2 missing=null | normalize name on_type_error=null | csv",
+            people,
+            620
+        },
+        {
+            "normalize_zscore_audit",
+            "csv batch_size=1 | normalize score zscore audit audit_limit=2 audit_columns=name,score audit_hash_columns=score | csv",
+            people,
+            520
+        },
+        {
+            "split_data_seeded",
+            "csv batch_size=1 | split-data 0.5 result=fold seed=123 | csv",
+            people,
+            320
         }
     };
 

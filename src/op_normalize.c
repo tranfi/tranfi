@@ -354,10 +354,6 @@ static int normalize_flush(tf_step *self, tf_batch **out, tf_side_channels *side
                 return TF_ERROR;
             }
         }
-        if (tf_size_add(r, 1, &ob->n_rows) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
 
         for (size_t i = 0; i < st->n_columns; i++) {
             col_stats *cs = &st->stats[i];
@@ -378,6 +374,10 @@ static int normalize_flush(tf_step *self, tf_batch **out, tf_side_channels *side
                 tf_batch_free(ob);
                 return TF_ERROR;
             }
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
         }
 
         if (st->audit) {
