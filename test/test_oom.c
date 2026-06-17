@@ -3,8 +3,9 @@
  *
  * This binary is linked with GNU ld --wrap hooks for malloc/calloc/realloc/
  * strdup/strndup. It fails one allocation at a time while compiling and running
- * representative pipelines. Under ASan/UBSan this catches invalid row counters,
- * use-after-free, double-free, and unchecked allocation/write paths.
+ * representative pipelines and SQL compile paths. Under ASan/UBSan this catches
+ * invalid row counters, use-after-free, double-free, and unchecked allocation/
+ * write paths.
  */
 
 #include "tranfi.h"
@@ -69,6 +70,13 @@ typedef struct oom_case {
     size_t max_fail_points;
 } oom_case;
 
+typedef struct oom_sql_case {
+    const char *name;
+    const char *dsl;
+    int expect_success;
+    size_t max_fail_points;
+} oom_sql_case;
+
 static void drain_all(tf_pipeline *p) {
     uint8_t buf[512];
     for (int chan = 0; chan < TF_NUM_CHANNELS; chan++) {
@@ -131,6 +139,45 @@ static void run_case_with_oom(const oom_case *tc) {
         oom_alloc_count = 0;
         oom_failed = 0;
         (void)run_case_once(tc);
+        oom_enabled = 0;
+        assert(oom_failed);
+    }
+}
+
+static int run_sql_case_once(const oom_sql_case *tc) {
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(tc->dsl, strlen(tc->dsl), &error);
+    int got_success = sql != NULL;
+    if (sql) tf_string_free(sql);
+    free(error);
+    if (tc->expect_success) return got_success ? TF_OK : TF_ERROR;
+    return got_success ? TF_ERROR : TF_OK;
+}
+
+static size_t count_successful_sql_allocs(const oom_sql_case *tc) {
+    oom_enabled = 1;
+    oom_fail_at = (size_t)-1;
+    oom_alloc_count = 0;
+    oom_failed = 0;
+    int rc = run_sql_case_once(tc);
+    oom_enabled = 0;
+    assert(rc == TF_OK);
+    assert(!oom_failed);
+    return oom_alloc_count;
+}
+
+static void run_sql_case_with_oom(const oom_sql_case *tc) {
+    size_t allocs = count_successful_sql_allocs(tc);
+    size_t limit = allocs;
+    if (tc->max_fail_points > 0 && limit > tc->max_fail_points) limit = tc->max_fail_points;
+    assert(limit > 0);
+
+    for (size_t fail_at = 1; fail_at <= limit; fail_at++) {
+        oom_enabled = 1;
+        oom_fail_at = fail_at;
+        oom_alloc_count = 0;
+        oom_failed = 0;
+        (void)run_sql_case_once(tc);
         oom_enabled = 0;
         assert(oom_failed);
     }
@@ -757,12 +804,75 @@ int main(void) {
         }
     };
 
+    const oom_sql_case sql_cases[] = {
+        {
+            "sql_filter_derive_sort_head",
+            "csv | filter \"col('age') > 20\" | derive total=col('score')+col('age') | select name,total | sort total | head 2 | csv",
+            1,
+            260
+        },
+        {
+            "sql_grep_trim_literals",
+            "csv | grep % name | trim name,city | csv",
+            1,
+            260
+        },
+        {
+            "sql_frequency_multi",
+            "csv | frequency city,color | csv",
+            1,
+            260
+        },
+        {
+            "sql_join_rowid_window",
+            "csv | join /tmp/tranfi_oom_join_lookup.csv on city --left | rowid city | rolling-mean score 2 mean2 | csv",
+            1,
+            360
+        },
+        {
+            "sql_unique_group",
+            "csv | unique city | group-agg city sum:score:total count:*:rows | csv",
+            1,
+            300
+        },
+        {
+            "sql_reject_sample",
+            "csv | sample 2 seed=42 | csv",
+            0,
+            180
+        },
+        {
+            "sql_reject_stats",
+            "csv | stats count,missing,complete_rate | csv",
+            0,
+            180
+        },
+        {
+            "sql_reject_scan",
+            "csv | scan | csv",
+            0,
+            180
+        },
+        {
+            "sql_reject_trim_all",
+            "csv | trim | csv",
+            0,
+            180
+        }
+    };
+
     printf("Tranfi OOM Fault-Injection Tests\n");
     printf("================================\n");
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         printf("  %-32s", cases[i].name);
         fflush(stdout);
         run_case_with_oom(&cases[i]);
+        printf("PASS\n");
+    }
+    for (size_t i = 0; i < sizeof(sql_cases) / sizeof(sql_cases[0]); i++) {
+        printf("  %-32s", sql_cases[i].name);
+        fflush(stdout);
+        run_sql_case_with_oom(&sql_cases[i]);
         printf("PASS\n");
     }
     remove(union_lookup_path);
