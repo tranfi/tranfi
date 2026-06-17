@@ -51,6 +51,9 @@ jobs:
           make test-float-rt
           make test-wide-csv
 
+      - name: TSan thread-local error regression
+        run: make test-tsan
+
   fuzz-smoke:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest

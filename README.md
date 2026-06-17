@@ -703,7 +703,7 @@ tf_pipeline_run_fd(p, in_fd, out_fd, 64 * 1024);
 make test                # all tests (C + memory + Python + Node.js + packaging gate)
 make test-memory         # generated-input memory/output-draining regressions
 make test-debug          # ASan/UBSan core + memory spill + CLI policy checks
-make test-tsan           # ThreadSanitizer thread-local error regression, host permitting
+make test-tsan           # ThreadSanitizer thread-local error regression via sanitizer runner
 make test-spill-sec      # ASan/UBSan spill symlink/private-dir security regressions
 make test-depth-limits   # ASan/UBSan parser depth-limit regressions
 make test-float-rt       # ASan/UBSan exact CSV/JSONL float round-trip regressions

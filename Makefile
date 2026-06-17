@@ -93,7 +93,7 @@ test-debug: build-debug
 	@$(ASAN_RUN) bash test/test_cli_memory_policy.sh ./build-debug/tranfi
 
 test-tsan: build-tsan
-	@TSAN_OPTIONS=halt_on_error=1 ./build-tsan/test_core test_thread_local_last_error
+	@$(SANITIZER_RUN) env TSAN_OPTIONS=halt_on_error=1 ./build-tsan/test_core test_thread_local_last_error
 
 test-oom: build-debug
 	@$(ASAN_RUN) ./build-debug/test_oom
