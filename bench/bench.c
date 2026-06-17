@@ -223,11 +223,15 @@ int main(int argc, char **argv) {
         printf("  Generated %.1f MB of text\n", (double)text_len / (1024.0 * 1024.0));
 
         bench_case text_cases[] = {
-            {"text | text",             "text | text"},
-            {"text | head 1000 | text", "text | head 1000 | text"},
-            {"text | tail 1000 | text", "text | tail 1000 | text"},
-            {"text | grep error | text","text | grep error | text"},
-            {"text | grep -v error",    "text | grep -v error | text"},
+            {"text | text",              "text | text"},
+            {"text | head 1000 | text",  "text | head 1000 | text"},
+            {"text | tail 1000 | text",  "text | tail 1000 | text"},
+            {"text | grep error | text", "text | grep error | text"},
+            {"text | grep -v error",     "text | grep -v error | text"},
+            {"text | grep -r ^error",    "text | grep -r \"^error\" | text"},
+            {"text | replace error",     "text | replace _line error ERROR | text"},
+            {"text | replace -r err/warn",
+             "text | replace --regex _line \"error|warning\" alert | text"},
         };
         size_t n_text_cases = sizeof(text_cases) / sizeof(text_cases[0]);
         for (size_t i = 0; i < n_text_cases; i++) {

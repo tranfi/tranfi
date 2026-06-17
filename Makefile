@@ -7,8 +7,10 @@ TWINE ?= twine
 PYTEST ?= $(PYTHON) -m pytest
 SANITIZER_RUN := $(shell if command -v setarch >/dev/null 2>&1 && setarch "$$(uname -m)" -R true >/dev/null 2>&1; then printf 'setarch %s -R' "$$(uname -m)"; fi)
 ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
+BENCH_ROWS ?= 1000000
+BENCH_SMOKE_ROWS ?= 10000
 
-.PHONY: all build test clean wasm app site verify fuzz fuzz-smoke fuzz-nightly fuzz-c-csv fuzz-c-expr fuzz-c-selector fuzz-c-dsl fuzz-c-jsonl fuzz-c-jsonpath
+.PHONY: all build test clean wasm app site verify bench bench-smoke fuzz fuzz-smoke fuzz-nightly fuzz-c-csv fuzz-c-expr fuzz-c-selector fuzz-c-dsl fuzz-c-jsonl fuzz-c-jsonpath
 .PHONY: build-c build-debug build-tsan build-node build-wasm build-js build-py sync-js-csrc sync-py-csrc
 .PHONY: check-js-csrc-sync check-py-csrc-sync check-csrc-sync sbom test-packaging test-packaging-install
 .PHONY: test-packaging-node test-packaging-node-install test-packaging-python test-packaging-python-install test-properties
@@ -159,6 +161,15 @@ test-packaging-node-install: test-packaging-node
 	@$(PYTHON) scripts/smoke-install-packages.py --npm-tarball "build/npm-install-smoke/tranfi-*.tgz" --node "$(NODE)" --npm "$(NPM)"
 
 test-packaging-install: test-packaging-python-install test-packaging-node-install
+
+# --- Benchmarks ---
+
+bench: build-c
+	@./build/bench $(BENCH_ROWS)
+
+bench-smoke: build-c
+	@./build/bench $(BENCH_SMOKE_ROWS) >/dev/null
+	@echo "  Bench smoke OK"
 
 # --- Fuzz testing ---
 

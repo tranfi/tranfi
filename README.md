@@ -522,7 +522,7 @@ Coreutils read directly from files (seek, mmap); tranfi streams through stdin. T
 
 Polars and DuckDB use multi-threaded parallel execution + SIMD. Tranfi is single-threaded streaming with bounded memory. The JS (Browser) column uses the same C core compiled to WASM.
 
-Run benchmarks: `./build/bench 1000000`
+Run benchmarks with `make bench BENCH_ROWS=1000000`; use `make bench-smoke` for a quick compile/run check. The native benchmark covers CSV transforms plus text passthrough, text `grep` substring/regex filters, and text `replace` substring/regex rewrites. The text decoder is line-oriented and uses length-aware writes into batch-owned memory; it avoids temporary NUL-terminated line copies, while rows that leave the decoder still own their string bytes so downstream streaming remains lifetime-safe.
 
 ## Architecture
 
