@@ -26,15 +26,14 @@ static int tail_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (!st->has_schema) {
         st->buf = tf_batch_create(in->n_cols, st->limit);
         if (!st->buf) return TF_ERROR;
-        for (size_t c = 0; c < in->n_cols; c++)
-            tf_batch_set_schema(st->buf, c, in->col_names[c], in->col_types[c]);
+        if (tf_batch_clone_schema(st->buf, in) != TF_OK) return TF_ERROR;
         st->buf->n_rows = 0;
         st->has_schema = 1;
     }
 
     for (size_t r = 0; r < in->n_rows; r++) {
         size_t dst = st->head % st->limit;
-        tf_batch_copy_row(st->buf, dst, in, r);
+        if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         st->head++;
         st->count++;
         if (st->buf->n_rows < st->limit) st->buf->n_rows++;
@@ -53,14 +52,19 @@ static int tail_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     size_t n = st->buf->n_rows;
     tf_batch *ob = tf_batch_create(st->buf->n_cols, n);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < st->buf->n_cols; c++)
-        tf_batch_set_schema(ob, c, st->buf->col_names[c], st->buf->col_types[c]);
+    if (tf_batch_clone_schema(ob, st->buf) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     /* Read from circular buffer in order */
     size_t start = (st->head >= n) ? (st->head - n) % st->limit : 0;
     for (size_t i = 0; i < n; i++) {
         size_t src = (start + i) % st->limit;
-        tf_batch_copy_row(ob, i, st->buf, src);
+        if (tf_batch_copy_row(ob, i, st->buf, src) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = i + 1;
     }
 
@@ -79,12 +83,13 @@ static void tail_destroy(tf_step *self) {
 
 tf_step *tf_tail_create(const cJSON *args) {
     if (!args) return NULL;
-    cJSON *n_json = cJSON_GetObjectItemCaseSensitive(args, "n");
-    if (!cJSON_IsNumber(n_json) || n_json->valueint <= 0) return NULL;
+    size_t n = 0;
+    int has_n = tf_json_get_size_arg(args, "n", 1, TF_MAX_OUTPUT_ROWS_PER_BATCH, &n, "tail");
+    if (has_n <= 0) return NULL;
 
     tail_state *st = calloc(1, sizeof(tail_state));
     if (!st) return NULL;
-    st->limit = (size_t)n_json->valueint;
+    st->limit = n;
 
     tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st); return NULL; }

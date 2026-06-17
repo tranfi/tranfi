@@ -8,7 +8,6 @@
 #include <string.h>
 
 #define DEFAULT_BLOCK_SIZE (64 * 1024) /* 64 KB */
-#define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
 static tf_arena_block *block_create(size_t cap) {
     tf_arena_block *blk = malloc(sizeof(tf_arena_block));
@@ -32,6 +31,7 @@ static void block_free(tf_arena_block *blk) {
 
 tf_arena *tf_arena_create(size_t block_size) {
     if (block_size == 0) block_size = DEFAULT_BLOCK_SIZE;
+    if (tf_size_align(block_size, 8, &block_size) != TF_OK) return NULL;
     tf_arena *a = malloc(sizeof(tf_arena));
     if (!a) return NULL;
     a->block_size = block_size;
@@ -43,12 +43,13 @@ tf_arena *tf_arena_create(size_t block_size) {
 
 void *tf_arena_alloc(tf_arena *a, size_t size) {
     if (!a || size == 0) return NULL;
-    size = ALIGN_UP(size, 8);
+    if (tf_size_align(size, 8, &size) != TF_OK) return NULL;
 
     /* Try current block */
-    if (a->current->used + size <= a->current->cap) {
+    size_t used_after = 0;
+    if (tf_size_add(a->current->used, size, &used_after) == TF_OK && used_after <= a->current->cap) {
         void *ptr = a->current->data + a->current->used;
-        a->current->used += size;
+        a->current->used = used_after;
         return ptr;
     }
 
@@ -67,7 +68,8 @@ void *tf_arena_alloc(tf_arena *a, size_t size) {
 
 char *tf_arena_strdup(tf_arena *a, const char *s) {
     if (!s) return NULL;
-    size_t len = strlen(s) + 1;
+    size_t len = 0;
+    if (tf_size_add(strlen(s), 1, &len) != TF_OK) return NULL;
     char *copy = tf_arena_alloc(a, len);
     if (copy) memcpy(copy, s, len);
     return copy;

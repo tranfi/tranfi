@@ -11,6 +11,7 @@
  */
 
 #include "ir.h"
+#include "tranfi.h"
 #include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,178 @@ static int node_bool_arg_true(const tf_ir_node *node, const char *name) {
 static int node_array_arg_nonempty(const tf_ir_node *node, const char *name) {
     cJSON *item = node && node->args ? cJSON_GetObjectItemCaseSensitive(node->args, name) : NULL;
     return cJSON_IsArray(item) && cJSON_GetArraySize(item) > 0;
+}
+
+
+#define TF_POLICY_PATH_MAX 4096
+
+static int path_is_absolute(const char *path) {
+    if (!path || !path[0]) return 0;
+    if (path[0] == '/' || path[0] == '\\') return 1;
+    return ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+           path[1] == ':';
+}
+
+static int append_char(char *out, size_t out_sz, size_t *len, char ch) {
+    if (*len + 1 >= out_sz) return TF_ERROR;
+    out[(*len)++] = ch;
+    out[*len] = '\0';
+    return TF_OK;
+}
+
+static int append_segment(char *out, size_t out_sz, size_t *len,
+                          const char *seg, size_t seg_len, size_t prefix_len) {
+    if (seg_len == 0) return TF_OK;
+    if (*len > 0 && out[*len - 1] != '/' &&
+        !(*len == prefix_len && prefix_len > 0 && out[prefix_len - 1] == '/')) {
+        if (append_char(out, out_sz, len, '/') != TF_OK) return TF_ERROR;
+    }
+    if (*len + seg_len >= out_sz) return TF_ERROR;
+    memcpy(out + *len, seg, seg_len);
+    *len += seg_len;
+    out[*len] = '\0';
+    return TF_OK;
+}
+
+static int pop_segment(char *out, size_t *len, size_t prefix_len) {
+    if (*len <= prefix_len) return TF_ERROR;
+    while (*len > prefix_len && out[*len - 1] != '/') (*len)--;
+    if (*len > prefix_len && out[*len - 1] == '/') (*len)--;
+    if (*len < prefix_len) *len = prefix_len;
+    out[*len] = '\0';
+    return TF_OK;
+}
+
+static int normalize_path_lexical(const char *in, char *out, size_t out_sz) {
+    if (!in || !in[0] || !out || out_sz == 0) return TF_ERROR;
+    size_t len = 0;
+    size_t prefix_len = 0;
+    const char *p = in;
+
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') {
+        if (out_sz < 3) return TF_ERROR;
+        out[len++] = p[0];
+        out[len++] = ':';
+        out[len] = '\0';
+        p += 2;
+        if (*p == '/' || *p == '\\') {
+            if (append_char(out, out_sz, &len, '/') != TF_OK) return TF_ERROR;
+            while (*p == '/' || *p == '\\') p++;
+        }
+        prefix_len = len;
+    } else if (*p == '/' || *p == '\\') {
+        if (append_char(out, out_sz, &len, '/') != TF_OK) return TF_ERROR;
+        while (*p == '/' || *p == '\\') p++;
+        prefix_len = len;
+    }
+
+    while (*p) {
+        while (*p == '/' || *p == '\\') p++;
+        const char *seg = p;
+        while (*p && *p != '/' && *p != '\\') p++;
+        size_t seg_len = (size_t)(p - seg);
+        if (seg_len == 0 || (seg_len == 1 && seg[0] == '.')) continue;
+        if (seg_len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (pop_segment(out, &len, prefix_len) != TF_OK) return TF_ERROR;
+            continue;
+        }
+        if (append_segment(out, out_sz, &len, seg, seg_len, prefix_len) != TF_OK) return TF_ERROR;
+    }
+
+    if (len == 0) {
+        if (out_sz < 2) return TF_ERROR;
+        out[0] = '.';
+        out[1] = '\0';
+    }
+    return TF_OK;
+}
+
+static int path_is_under_root(const char *root, const char *path) {
+    size_t n = strlen(root);
+    if (strcmp(root, "/") == 0) return path[0] == '/';
+    return strcmp(root, path) == 0 || (strncmp(root, path, n) == 0 && path[n] == '/');
+}
+
+static int resolve_workspace_path(const char *workspace_root, const char *logical,
+                                  char *out, size_t out_sz) {
+    char root[TF_POLICY_PATH_MAX];
+    char joined[TF_POLICY_PATH_MAX];
+    char normalized[TF_POLICY_PATH_MAX];
+    if (normalize_path_lexical(workspace_root, root, sizeof(root)) != TF_OK) return TF_ERROR;
+    if (path_is_absolute(logical)) {
+        if (normalize_path_lexical(logical, normalized, sizeof(normalized)) != TF_OK) return TF_ERROR;
+    } else {
+        int n = snprintf(joined, sizeof(joined), "%s/%s", root, logical);
+        if (n < 0 || (size_t)n >= sizeof(joined)) return TF_ERROR;
+        if (normalize_path_lexical(joined, normalized, sizeof(normalized)) != TF_OK) return TF_ERROR;
+    }
+    if (!path_is_under_root(root, normalized)) return TF_ERROR;
+    if (strlen(normalized) + 1 > out_sz) return TF_ERROR;
+    strcpy(out, normalized);
+    return TF_OK;
+}
+
+static void set_policy_error(tf_ir_plan *plan, const tf_ir_node *node,
+                             const char *arg, const char *reason) {
+    free(plan->error);
+    char buf[384];
+    snprintf(buf, sizeof(buf), "capability denied: op '%s' arg '%s' %s",
+             node && node->op ? node->op : "unknown", arg ? arg : "?", reason ? reason : "rejected");
+    plan->error = strdup(buf);
+}
+
+static int policy_rewrite_path_arg(tf_ir_plan *plan, tf_ir_node *node,
+                                   const tf_host_policy *policy,
+                                   const char *arg, int is_spill, int is_rules_file) {
+    cJSON *item = node && node->args ? cJSON_GetObjectItemCaseSensitive(node->args, arg) : NULL;
+    if (!cJSON_IsString(item) || !item->valuestring || item->valuestring[0] == '\0') return TF_OK;
+    if (!policy) return TF_OK;
+
+    if (!policy->allow_fs) {
+        set_policy_error(plan, node, arg, "requires filesystem access (allow_fs=false)");
+        return TF_ERROR;
+    }
+    if (is_spill && !policy->allow_spill) {
+        set_policy_error(plan, node, arg, "requires spill access (allow_spill=false)");
+        return TF_ERROR;
+    }
+    if (is_rules_file && !policy->allow_rules_file) {
+        set_policy_error(plan, node, arg, "requires rules_file access (allow_rules_file=false)");
+        return TF_ERROR;
+    }
+
+    if (policy->resolve_path || (policy->workspace_root && policy->workspace_root[0])) {
+        char resolved[TF_POLICY_PATH_MAX];
+        int rc = policy->resolve_path
+            ? policy->resolve_path(item->valuestring, resolved, sizeof(resolved), policy->user)
+            : resolve_workspace_path(policy->workspace_root, item->valuestring, resolved, sizeof(resolved));
+        if (rc != TF_OK || resolved[0] == '\0') {
+            set_policy_error(plan, node, arg, "was rejected by host path resolver");
+            return TF_ERROR;
+        }
+        if (!cJSON_SetValuestring(item, resolved)) {
+            set_plan_error(plan, "out of memory while resolving host path");
+            return TF_ERROR;
+        }
+    }
+    return TF_OK;
+}
+
+static int enforce_host_policy(tf_ir_plan *plan, tf_ir_node *node, const tf_host_policy *policy) {
+    if (!policy) return TF_OK;
+    if (!policy->allow_net && (node->caps & TF_CAP_NET)) {
+        set_policy_error(plan, node, "network", "requires network access (allow_net=false)");
+        return TF_ERROR;
+    }
+    if (!policy->allow_blocking && node->memory_class == TF_MEM_BLOCKING) {
+        set_policy_error(plan, node, "memory", "is blocking (allow_blocking=false)");
+        return TF_ERROR;
+    }
+    if (policy_rewrite_path_arg(plan, node, policy, "file", 0, 0) != TF_OK) return TF_ERROR;
+    if (policy_rewrite_path_arg(plan, node, policy, "spill_dir", 1, 0) != TF_OK) return TF_ERROR;
+    if (policy_rewrite_path_arg(plan, node, policy, "rules_file", 0, 1) != TF_OK) return TF_ERROR;
+    if (policy_rewrite_path_arg(plan, node, policy, "rulesFile", 0, 1) != TF_OK) return TF_ERROR;
+    return TF_OK;
 }
 
 static int node_string_arg_nonempty(const tf_ir_node *node, const char *name) {
@@ -91,6 +264,11 @@ static int node_op_is_join_spillable(const tf_ir_node *node) {
 
 static void apply_dynamic_contract(tf_ir_node *node) {
     if (!node || !node->op) return;
+    if (strcmp(node->op, "validate") == 0 &&
+        (node_string_arg_nonempty(node, "rules_file") || node_string_arg_nonempty(node, "rulesFile"))) {
+        node->caps |= TF_CAP_FS;
+        node->caps &= ~TF_CAP_BROWSER_SAFE;
+    }
     if (strcmp(node->op, "pivot") == 0) {
         if (node_string_arg_nonempty(node, "spill_dir")) {
             node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_FS | TF_CAP_DETERMINISTIC;
@@ -182,7 +360,7 @@ static void apply_dynamic_contract(tf_ir_node *node) {
     }
 }
 
-int tf_ir_validate(tf_ir_plan *plan) {
+static int tf_ir_validate_impl(tf_ir_plan *plan, const tf_host_policy *policy) {
     plan->validated = false;
     free(plan->error);
     plan->error = NULL;
@@ -273,6 +451,9 @@ int tf_ir_validate(tf_ir_plan *plan) {
                 return TF_ERROR;
             }
         }
+        if (enforce_host_policy(plan, node, policy) != TF_OK) {
+            return TF_ERROR;
+        }
     }
 
     if (!has_decoder) {
@@ -292,4 +473,14 @@ int tf_ir_validate(tf_ir_plan *plan) {
 
     plan->validated = true;
     return TF_OK;
+}
+
+
+int tf_ir_validate_with_host_policy(tf_ir_plan *plan, const tf_host_policy *policy) {
+    if (!plan) return TF_ERROR;
+    return tf_ir_validate_impl(plan, policy);
+}
+
+int tf_ir_validate(tf_ir_plan *plan) {
+    return tf_ir_validate_with_host_policy(plan, NULL);
 }

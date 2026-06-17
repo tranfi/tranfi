@@ -170,7 +170,12 @@ async function runWorkerServer(endpoint) {
         spillDir: options.spillDir
       })
     }
-    var handle = tf.createPipeline(planJson)
+    var handle = tf.createPipeline(planJson, {
+      allowFs: options.allowFs === undefined ? Boolean(options.spillDir) : Boolean(options.allowFs),
+      allowSpill: Boolean(options.spillDir),
+      allowRulesFile: Boolean(options.allowRulesFile),
+      workspaceRoot: options.workspaceRoot
+    })
     var job = {
       id: msg.id,
       handle: handle,

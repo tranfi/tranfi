@@ -12,6 +12,69 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+typedef struct cJSON cJSON;
+
+#define TF_MAX_BATCH_ROWS             ((size_t)64u * 1024u)
+#define TF_MAX_OUTPUT_ROWS_PER_BATCH  ((size_t)1024u * 1024u)
+#define TF_MAX_EXPANDING_ROWS_PER_INPUT TF_MAX_OUTPUT_ROWS_PER_BATCH
+#define TF_MAX_EXPLODE_TOKENS_PER_ROW TF_MAX_OUTPUT_ROWS_PER_BATCH
+#define TF_MAX_COLUMNS                ((size_t)64u * 1024u)
+#define TF_MAX_RECORD_BYTES           ((size_t)1024u * 1024u * 1024u)
+#define TF_MAX_CELL_BYTES             ((size_t)64u * 1024u * 1024u)
+#define TF_MAX_COLUMN_NAME_BYTES      ((size_t)4096u)
+#define TF_MAX_SCHEMA_BYTES           ((size_t)16u * 1024u * 1024u)
+#define TF_MAX_ERROR_BYTES            ((size_t)64u * 1024u * 1024u)
+#define TF_MAX_REGEX_PATTERN_BYTES    ((size_t)4096u)
+#define TF_MAX_REGEX_CELL_BYTES       ((size_t)64u * 1024u)
+#if SIZE_MAX > 9007199254740991ULL
+#define TF_MAX_SAFE_SIZE_ARG          ((size_t)9007199254740991ULL)
+#else
+#define TF_MAX_SAFE_SIZE_ARG          ((size_t)SIZE_MAX)
+#endif
+#define TF_MAX_COUNT_ARG              TF_MAX_SAFE_SIZE_ARG
+#define TF_MAX_STATE_BYTES            TF_MAX_SAFE_SIZE_ARG
+#define TF_MAX_SPILL_MEMORY_BYTES     TF_MAX_SAFE_SIZE_ARG
+#define TF_MAX_SPILL_RUN_ROWS         TF_MAX_COUNT_ARG
+#define TF_MAX_SPILL_OUTPUT_ROWS      TF_MAX_BATCH_ROWS
+#define TF_MAX_AUDIT_RECORDS          ((size_t)1000u * 1000u)
+#define TF_MAX_TABLE_WIDTH            ((size_t)4096u)
+#define TF_MAX_TABLE_ROWS             TF_MAX_COUNT_ARG
+#define TF_MAX_WINDOW_SIZE            TF_MAX_OUTPUT_ROWS_PER_BATCH
+#define TF_FLOAT64_ROUNDTRIP_FORMAT   "%.17g"
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TF_WARN_UNUSED __attribute__((warn_unused_result))
+#else
+#define TF_WARN_UNUSED
+#endif
+
+TF_WARN_UNUSED int tf_format_float64(char *buf, size_t buf_size, double value);
+TF_WARN_UNUSED int tf_size_add(size_t a, size_t b, size_t *out);
+TF_WARN_UNUSED int tf_size_mul(size_t a, size_t b, size_t *out);
+TF_WARN_UNUSED int tf_size_align(size_t x, size_t align, size_t *out);
+TF_WARN_UNUSED int tf_size_grow_pow2(size_t current, size_t min_value, size_t min_capacity, size_t *out);
+TF_WARN_UNUSED void *tf_mallocarray_checked(size_t count, size_t elem_size);
+TF_WARN_UNUSED void *tf_callocarray_checked(size_t count, size_t elem_size);
+TF_WARN_UNUSED void *tf_reallocarray_checked(void *ptr, size_t count, size_t elem_size);
+TF_WARN_UNUSED int tf_check_byte_limit(size_t n, size_t max_value,
+                                       const char *context, const char *name);
+TF_WARN_UNUSED int tf_string_length_bounded(const char *s, size_t max_value,
+                                            size_t *out, const char *context,
+                                            const char *name);
+TF_WARN_UNUSED int tf_json_get_size_arg(const cJSON *args, const char *name,
+                                        size_t min_value, size_t max_value,
+                                        size_t *out, const char *context);
+TF_WARN_UNUSED int tf_json_size_value(const cJSON *item, const char *name,
+                                      size_t min_value, size_t max_value,
+                                      size_t *out, const char *context);
+TF_WARN_UNUSED int tf_json_get_size_arg_any(const cJSON *args, const char *name,
+                                            const char *alt_name,
+                                            size_t min_value, size_t max_value,
+                                            size_t *out, const char *context);
+
+typedef int (*tf_index_compare_fn)(const void *ctx, size_t a, size_t b);
+void tf_sort_indices(size_t *indices, size_t n, tf_index_compare_fn compare, const void *ctx);
+
 /* ---- Arena allocator ---- */
 
 typedef struct tf_arena_block {
@@ -42,13 +105,14 @@ typedef struct tf_buffer {
     size_t   read_pos; /* consumer read position */
 } tf_buffer;
 
-void   tf_buffer_init(tf_buffer *b);
-int    tf_buffer_write(tf_buffer *b, const uint8_t *data, size_t len);
+void tf_buffer_init(tf_buffer *b);
+TF_WARN_UNUSED int tf_buffer_write(tf_buffer *b, const uint8_t *data, size_t len);
 size_t tf_buffer_read(tf_buffer *b, uint8_t *out, size_t len);
 size_t tf_buffer_readable(const tf_buffer *b);
-void   tf_buffer_compact(tf_buffer *b);
-int    tf_buffer_write_str(tf_buffer *b, const char *s);
-void   tf_buffer_free(tf_buffer *b);
+void tf_buffer_compact(tf_buffer *b);
+TF_WARN_UNUSED int tf_buffer_write_str(tf_buffer *b, const char *s);
+TF_WARN_UNUSED int tf_buffer_write_line(tf_buffer *b, const char *s);
+void tf_buffer_free(tf_buffer *b);
 
 /* ---- Columnar batch ---- */
 /* (tf_type is defined in ir.h, included above) */
@@ -62,20 +126,47 @@ typedef struct tf_batch {
     void       **columns;    /* array of typed column arrays */
     uint8_t    **nulls;      /* null bitmap per column (1 byte per row for simplicity) */
     tf_arena    *arena;      /* owns all memory for this batch */
+    size_t       schema_name_bytes;
 } tf_batch;
 
+typedef union tf_cell_value {
+    bool b;
+    int64_t i64;
+    double f64;
+    const char *str;
+    int32_t date;
+} tf_cell_value;
+
+/* Owned string variant used by spill rows before copying into a batch arena. */
+typedef union tf_owned_cell_value {
+    uint8_t b;
+    int64_t i64;
+    double f64;
+    int32_t date;
+    char *str;
+} tf_owned_cell_value;
+
 tf_batch *tf_batch_create(size_t n_cols, size_t capacity);
-int       tf_batch_set_schema(tf_batch *b, size_t col, const char *name, tf_type type);
-int       tf_batch_ensure_capacity(tf_batch *b, size_t min_rows);
+TF_WARN_UNUSED int tf_batch_set_schema(tf_batch *b, size_t col, const char *name, tf_type type);
+TF_WARN_UNUSED int tf_batch_ensure_capacity(tf_batch *b, size_t min_rows);
+TF_WARN_UNUSED int tf_batch_expose_row(tf_batch *b, size_t row);
 
 /* Set a value in a specific cell. String values are copied into the arena. */
-void tf_batch_set_null(tf_batch *b, size_t row, size_t col);
-void tf_batch_set_bool(tf_batch *b, size_t row, size_t col, bool val);
-void tf_batch_set_int64(tf_batch *b, size_t row, size_t col, int64_t val);
-void tf_batch_set_float64(tf_batch *b, size_t row, size_t col, double val);
-void tf_batch_set_string(tf_batch *b, size_t row, size_t col, const char *val);
-void tf_batch_set_date(tf_batch *b, size_t row, size_t col, int32_t val);
-void tf_batch_set_timestamp(tf_batch *b, size_t row, size_t col, int64_t val);
+TF_WARN_UNUSED int tf_batch_set_null(tf_batch *b, size_t row, size_t col);
+TF_WARN_UNUSED int tf_batch_set_bool(tf_batch *b, size_t row, size_t col, bool val);
+TF_WARN_UNUSED int tf_batch_set_int64(tf_batch *b, size_t row, size_t col, int64_t val);
+TF_WARN_UNUSED int tf_batch_set_float64(tf_batch *b, size_t row, size_t col, double val);
+TF_WARN_UNUSED int tf_batch_set_string(tf_batch *b, size_t row, size_t col, const char *val);
+TF_WARN_UNUSED int tf_batch_set_string_len(tf_batch *b, size_t row, size_t col,
+                                           const char *val, size_t len);
+TF_WARN_UNUSED int tf_batch_set_date(tf_batch *b, size_t row, size_t col, int32_t val);
+TF_WARN_UNUSED int tf_batch_set_timestamp(tf_batch *b, size_t row, size_t col, int64_t val);
+TF_WARN_UNUSED int tf_batch_set_cell_value(tf_batch *b, size_t row, size_t col,
+                                           tf_type type, int is_null,
+                                           const tf_cell_value *value);
+TF_WARN_UNUSED int tf_batch_set_owned_cell_value(tf_batch *b, size_t row, size_t col,
+                                                 tf_type type, int is_null,
+                                                 const tf_owned_cell_value *value);
 
 /* Get values from a cell. */
 bool      tf_batch_is_null(const tf_batch *b, size_t row, size_t col);
@@ -89,16 +180,51 @@ int64_t   tf_batch_get_timestamp(const tf_batch *b, size_t row, size_t col);
 /* Find column index by name. Returns -1 if not found. */
 int tf_batch_col_index(const tf_batch *b, const char *name);
 
-/* Copy a single row from src to dst batch. */
-int tf_batch_copy_row(tf_batch *dst, size_t dst_row,
-                      const tf_batch *src, size_t src_row);
+/* Schema and row-copy helpers. */
+TF_WARN_UNUSED int tf_batch_clone_schema(tf_batch *dst, const tf_batch *src);
+TF_WARN_UNUSED int tf_batch_clone_with_extra_cols(tf_batch *dst, const tf_batch *src,
+                                                  const char **names, const tf_type *types,
+                                                  size_t n_extra);
+TF_WARN_UNUSED int tf_batch_copy_cell(tf_batch *dst, size_t dst_row, size_t dst_col,
+                                      const tf_batch *src, size_t src_row, size_t src_col);
+TF_WARN_UNUSED int tf_batch_copy_cell_index(tf_batch *dst, size_t dst_row, size_t dst_col,
+                                            const tf_batch *src, size_t src_row, int src_col);
+TF_WARN_UNUSED int tf_batch_copy_selected_row(tf_batch *dst, size_t dst_row,
+                                              const tf_batch *src, size_t src_row,
+                                              const size_t *cols, size_t n_cols);
+TF_WARN_UNUSED int tf_batch_copy_row(tf_batch *dst, size_t dst_row,
+                                     const tf_batch *src, size_t src_row);
 
 void tf_batch_free(tf_batch *b);
 
+/* ---- Audit / side-channel row serialization helpers ---- */
+
+typedef struct tf_audit_options {
+    int include_row;
+    char **columns;
+    size_t n_columns;
+    char **redact_columns;
+    size_t n_redact_columns;
+    char **hash_columns;
+    size_t n_hash_columns;
+    size_t max_bytes;
+    size_t max_cell_bytes;
+} tf_audit_options;
+
+void tf_audit_options_init(tf_audit_options *opts, int default_include_row);
+int  tf_audit_options_parse(tf_audit_options *opts, const cJSON *args, const char *context);
+void tf_audit_options_free(tf_audit_options *opts);
+int  tf_audit_column_is_redacted(const tf_audit_options *opts, const char *column);
+int  tf_audit_column_is_hashed(const tf_audit_options *opts, const char *column);
+int  tf_audit_hash_string(const char *value, char *out, size_t out_size);
+const char *tf_audit_format_string_for_column(const tf_audit_options *opts, const char *column,
+                                              const char *value, char *buf, size_t buf_size);
+cJSON *tf_audit_cell_to_json(const tf_batch *b, size_t row, size_t col, const tf_audit_options *opts);
+cJSON *tf_audit_row_to_json(const tf_batch *b, size_t row, const tf_audit_options *opts);
+
 /* ---- Column selector helpers ---- */
 
-typedef struct cJSON cJSON;
-
+int tf_json_path_validate(const char *path);
 const cJSON *tf_json_path_resolve(const cJSON *root, const char *path);
 
 int tf_column_selector_has_syntax(const char *raw);
@@ -130,6 +256,8 @@ typedef struct tf_side_channels {
     tf_buffer *samples;
     const char *source_name;
 } tf_side_channels;
+
+TF_WARN_UNUSED int tf_side_write_error(tf_side_channels *side, const char *msg);
 
 typedef struct tf_step {
     /* Process one input batch, produce zero or one output batch.
@@ -343,12 +471,6 @@ int         tf_expr_eval(const tf_expr *e, const tf_batch *batch, size_t row, bo
 int         tf_expr_eval_val(const tf_expr *e, const tf_batch *batch, size_t row,
                              tf_eval_result *result);
 void        tf_expr_free(tf_expr *e);
-
-/* ---- Plan parser ---- */
-
-int tf_plan_parse(const char *json, size_t len,
-                  tf_decoder **decoder, tf_step ***steps, size_t *n_steps,
-                  tf_encoder **encoder, char **error);
 
 /* ---- Global error ---- */
 

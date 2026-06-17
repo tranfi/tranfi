@@ -52,12 +52,8 @@ typedef struct {
 
 static size_t rowid_retained_state_bytes(const rowid_state *st);
 
-static void rowid_set_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
+static int rowid_set_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
 static int rowid_check_state_bytes(rowid_state *st, tf_side_channels *side) {
@@ -68,27 +64,30 @@ static int rowid_check_state_bytes(rowid_state *st, tf_side_channels *side) {
     snprintf(msg, sizeof(msg),
              "rowid: max_state_bytes=%zu exceeded while tracking group row ids (%zu bytes retained)",
              st->max_state_bytes, retained);
-    rowid_set_error(side, msg);
+    if (rowid_set_error(side, msg) != TF_OK) return TF_ERROR;
     return TF_ERROR;
 }
 
 static int key_buf_init(key_buf *b) {
     b->cap = 128;
     b->len = 0;
-    b->data = malloc(b->cap);
+    b->data = tf_mallocarray_checked(b->cap, sizeof(char));
     if (!b->data) return -1;
     b->data[0] = '\0';
     return 0;
 }
 
 static int key_buf_ensure(key_buf *b, size_t extra) {
-    if (b->len + extra + 1 <= b->cap) return 0;
-    size_t new_cap = b->cap ? b->cap : 128;
-    while (new_cap < b->len + extra + 1) {
-        if (new_cap > SIZE_MAX / 2) return -1;
-        new_cap *= 2;
+    size_t need = 0;
+    if (!b || !b->data ||
+        tf_size_add(b->len, extra, &need) != TF_OK ||
+        tf_size_add(need, 1, &need) != TF_OK) {
+        return -1;
     }
-    char *tmp = realloc(b->data, new_cap);
+    if (need <= b->cap) return 0;
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(b->cap, need, 128, &new_cap) != TF_OK) return -1;
+    char *tmp = tf_reallocarray_checked(b->data, new_cap, sizeof(char));
     if (!tmp) return -1;
     b->data = tmp;
     b->cap = new_cap;
@@ -116,10 +115,12 @@ static int key_buf_appendf(key_buf *b, const char *fmt, ...) {
     if (n < 0) return -1;
     if ((size_t)n < sizeof(tmp)) return key_buf_appendn(b, tmp, (size_t)n);
 
-    char *dyn = malloc((size_t)n + 1);
+    size_t dyn_len = 0;
+    if (tf_size_add((size_t)n, 1, &dyn_len) != TF_OK) return -1;
+    char *dyn = tf_mallocarray_checked(dyn_len, sizeof(char));
     if (!dyn) return -1;
     va_start(ap, fmt);
-    vsnprintf(dyn, (size_t)n + 1, fmt, ap);
+    vsnprintf(dyn, dyn_len, fmt, ap);
     va_end(ap);
     int rc = key_buf_appendn(b, dyn, (size_t)n);
     free(dyn);
@@ -196,8 +197,8 @@ static uint32_t rowid_hash(const char *key) {
 }
 
 static int map_init(rowid_map *m, size_t cap) {
-    m->keys = calloc(cap, sizeof(char *));
-    m->counts = calloc(cap, sizeof(int64_t));
+    m->keys = tf_callocarray_checked(cap ? cap : 1, sizeof(char *));
+    m->counts = tf_callocarray_checked(cap ? cap : 1, sizeof(int64_t));
     if (!m->keys || !m->counts) {
         free(m->keys);
         free(m->counts);
@@ -212,9 +213,14 @@ static int map_init(rowid_map *m, size_t cap) {
 }
 
 static int map_grow(rowid_map *m) {
-    size_t new_cap = m->cap ? m->cap * 2 : 64;
-    char **new_keys = calloc(new_cap, sizeof(char *));
-    int64_t *new_counts = calloc(new_cap, sizeof(int64_t));
+    size_t new_cap = 0;
+    if (m->cap == 0) {
+        new_cap = 64;
+    } else if (tf_size_mul(m->cap, 2, &new_cap) != TF_OK) {
+        return -1;
+    }
+    char **new_keys = tf_callocarray_checked(new_cap, sizeof(char *));
+    int64_t *new_counts = tf_callocarray_checked(new_cap, sizeof(int64_t));
     if (!new_keys || !new_counts) {
         free(new_keys);
         free(new_counts);
@@ -247,6 +253,10 @@ static int map_increment(rowid_state *st, char *key, int64_t *out_count,
     uint32_t idx = rowid_hash(key) % st->map.cap;
     while (st->map.keys[idx]) {
         if (strcmp(st->map.keys[idx], key) == 0) {
+            if (st->map.counts[idx] == INT64_MAX) {
+                free(key);
+                return TF_ERROR;
+            }
             st->map.counts[idx]++;
             *out_count = st->map.counts[idx];
             free(key);
@@ -260,12 +270,20 @@ static int map_increment(rowid_state *st, char *key, int64_t *out_count,
         snprintf(msg, sizeof(msg),
                  "rowid: max_keys=%zu exceeded while tracking group row ids",
                  st->max_keys);
-        rowid_set_error(side, msg);
+        int err_rc = rowid_set_error(side, msg);
         free(key);
+        if (err_rc != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
 
-    if (st->map.count * 4 >= st->map.cap * 3) {
+    size_t load_count = 0;
+    size_t load_limit = 0;
+    if (tf_size_mul(st->map.count, 4, &load_count) != TF_OK ||
+        tf_size_mul(st->map.cap, 3, &load_limit) != TF_OK) {
+        free(key);
+        return TF_ERROR;
+    }
+    if (load_count >= load_limit) {
         if (map_grow(&st->map) != 0) {
             free(key);
             return TF_ERROR;
@@ -274,10 +292,19 @@ static int map_increment(rowid_state *st, char *key, int64_t *out_count,
         while (st->map.keys[idx]) idx = (idx + 1) % st->map.cap;
     }
 
+    size_t key_bytes_delta = 0;
+    size_t new_key_bytes = 0;
+    size_t new_count = 0;
+    if (tf_size_add(strlen(key), 1, &key_bytes_delta) != TF_OK ||
+        tf_size_add(st->map.key_bytes, key_bytes_delta, &new_key_bytes) != TF_OK ||
+        tf_size_add(st->map.count, 1, &new_count) != TF_OK) {
+        free(key);
+        return TF_ERROR;
+    }
     st->map.keys[idx] = key;
-    st->map.key_bytes += strlen(key) + 1;
+    st->map.key_bytes = new_key_bytes;
     st->map.counts[idx] = 1;
-    st->map.count++;
+    st->map.count = new_count;
     if (rowid_check_state_bytes(st, side) != TF_OK) return TF_ERROR;
     *out_count = 1;
     return TF_OK;
@@ -290,15 +317,16 @@ static int resolve_columns(const rowid_state *st, const tf_batch *in,
     *out_n = 0;
     if (st->n_cols == 0) return TF_OK;
 
-    int *idx = malloc(st->n_cols * sizeof(int));
+    int *idx = tf_mallocarray_checked(st->n_cols ? st->n_cols : 1, sizeof(int));
     if (!idx) return TF_ERROR;
     for (size_t i = 0; i < st->n_cols; i++) {
         idx[i] = tf_batch_col_index(in, st->cols[i]);
         if (idx[i] < 0) {
             char msg[256];
             snprintf(msg, sizeof(msg), "rowid: column '%s' not found", st->cols[i]);
-            rowid_set_error(side, msg);
+            int err_rc = rowid_set_error(side, msg);
             free(idx);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
     }
@@ -316,7 +344,12 @@ static int rowid_process(tf_step *self, tf_batch *in, tf_batch **out,
     size_t n_keys = 0;
     if (resolve_columns(st, in, &col_indices, &n_keys, side) != TF_OK) return TF_ERROR;
 
-    tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
+    size_t out_cols = 0;
+    if (tf_size_add(in->n_cols, 1, &out_cols) != TF_OK) {
+        free(col_indices);
+        return TF_ERROR;
+    }
+    tf_batch *ob = tf_batch_create(out_cols, in->n_rows);
     if (!ob) { free(col_indices); return TF_ERROR; }
     for (size_t c = 0; c < in->n_cols; c++) {
         if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
@@ -334,6 +367,11 @@ static int rowid_process(tf_step *self, tf_batch *in, tf_batch **out,
     for (size_t r = 0; r < in->n_rows; r++) {
         int64_t row_number = 0;
         if (n_keys == 0) {
+            if (st->global_count == INT64_MAX) {
+                tf_batch_free(ob);
+                free(col_indices);
+                return TF_ERROR;
+            }
             st->global_count++;
             row_number = st->global_count;
         } else {
@@ -353,6 +391,11 @@ static int rowid_process(tf_step *self, tf_batch *in, tf_batch **out,
                     }
                 } else {
                     free(key);
+                    if (st->current_group_count == INT64_MAX) {
+                        tf_batch_free(ob);
+                        free(col_indices);
+                        return TF_ERROR;
+                    }
                     st->current_group_count++;
                 }
                 row_number = st->current_group_count;
@@ -365,12 +408,12 @@ static int rowid_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
         }
 
-        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK ||
+            tf_batch_set_int64(ob, r, in->n_cols, row_number) != TF_OK) {
             tf_batch_free(ob);
             free(col_indices);
             return TF_ERROR;
         }
-        tf_batch_set_int64(ob, r, in->n_cols, row_number);
         ob->n_rows = r + 1;
     }
 
@@ -387,13 +430,28 @@ static int rowid_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 }
 
 static size_t rowid_prev_key_bytes(const rowid_state *st) {
-    return (st && st->seen_prev && st->prev_key) ? strlen(st->prev_key) + 1 : 0;
+    size_t bytes = 0;
+    if (!st || !st->seen_prev || !st->prev_key) return 0;
+    if (tf_size_add(strlen(st->prev_key), 1, &bytes) != TF_OK) return SIZE_MAX;
+    return bytes;
 }
 
 static size_t rowid_retained_state_bytes(const rowid_state *st) {
     if (!st || st->n_cols == 0) return 0;
-    if (st->sorted) return rowid_prev_key_bytes(st) + (st->seen_prev ? sizeof(int64_t) : 0);
-    return st->map.key_bytes + st->map.cap * (sizeof(char *) + sizeof(int64_t));
+    if (st->sorted) {
+        size_t bytes = rowid_prev_key_bytes(st);
+        if (st->seen_prev && tf_size_add(bytes, sizeof(int64_t), &bytes) != TF_OK) return SIZE_MAX;
+        return bytes;
+    }
+    size_t slot_width = 0;
+    size_t slot_bytes = 0;
+    size_t bytes = st->map.key_bytes;
+    if (tf_size_add(sizeof(char *), sizeof(int64_t), &slot_width) != TF_OK ||
+        tf_size_mul(st->map.cap, slot_width, &slot_bytes) != TF_OK ||
+        tf_size_add(bytes, slot_bytes, &bytes) != TF_OK) {
+        return SIZE_MAX;
+    }
+    return bytes;
 }
 
 static int rowid_append_stats(tf_step *self, tf_buffer *out) {
@@ -416,7 +474,9 @@ static int rowid_append_stats(tf_step *self, tf_buffer *out) {
 
 static void rowid_state_free(rowid_state *st) {
     if (!st) return;
-    for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
+    if (st->cols) {
+        for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
+    }
     free(st->cols);
     free(st->result);
     free(st->prev_key);
@@ -439,15 +499,23 @@ tf_step *tf_rowid_create(const cJSON *args) {
     if (!st) return NULL;
 
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
-    if (cJSON_IsArray(cols)) {
+    if (cols) {
+        if (!cJSON_IsArray(cols)) {
+            tf_set_last_error("rowid: columns must be an array");
+            rowid_state_free(st);
+            return NULL;
+        }
         int n = cJSON_GetArraySize(cols);
         if (n < 0) { rowid_state_free(st); return NULL; }
-        st->cols = calloc((size_t)n, sizeof(char *));
-        if (n > 0 && !st->cols) { rowid_state_free(st); return NULL; }
         st->n_cols = (size_t)n;
+        if (n > 0) {
+            st->cols = tf_callocarray_checked((size_t)n, sizeof(char *));
+            if (!st->cols) { rowid_state_free(st); return NULL; }
+        }
         for (int i = 0; i < n; i++) {
             cJSON *item = cJSON_GetArrayItem(cols, i);
-            if (!cJSON_IsString(item) || !item->valuestring[0]) {
+            if (!cJSON_IsString(item) || !item->valuestring || item->valuestring[0] == '\0') {
+                tf_set_last_error("rowid: column names must be non-empty strings");
                 rowid_state_free(st);
                 return NULL;
             }
@@ -457,26 +525,24 @@ tf_step *tf_rowid_create(const cJSON *args) {
     }
 
     cJSON *res = cJSON_GetObjectItemCaseSensitive(args, "result");
-    st->result = strdup(cJSON_IsString(res) && res->valuestring[0] ? res->valuestring : "_rowid");
+    st->result = strdup(cJSON_IsString(res) && res->valuestring && res->valuestring[0] ? res->valuestring : "_rowid");
     if (!st->result) { rowid_state_free(st); return NULL; }
 
     cJSON *sorted = cJSON_GetObjectItemCaseSensitive(args, "sorted");
     st->sorted = cJSON_IsBool(sorted) && cJSON_IsTrue(sorted);
 
-    cJSON *max_keys = cJSON_GetObjectItemCaseSensitive(args, "max_keys");
-    if (cJSON_IsNumber(max_keys) && max_keys->valuedouble > 0) {
-        st->max_keys = (size_t)max_keys->valuedouble;
-    }
+    size_t parsed_size = 0;
+    int has_max_keys = tf_json_get_size_arg(args, "max_keys",
+                                            1, TF_MAX_COUNT_ARG,
+                                            &parsed_size, "rowid");
+    if (has_max_keys < 0) { rowid_state_free(st); return NULL; }
+    if (has_max_keys > 0) st->max_keys = parsed_size;
 
-    cJSON *max_state_bytes = cJSON_GetObjectItemCaseSensitive(args, "max_state_bytes");
-    if (max_state_bytes) {
-        if (!cJSON_IsNumber(max_state_bytes) || max_state_bytes->valuedouble <= 0) {
-            tf_set_last_error("rowid: max_state_bytes must be positive");
-            rowid_state_free(st);
-            return NULL;
-        }
-        st->max_state_bytes = (size_t)max_state_bytes->valuedouble;
-    }
+    int has_max_state = tf_json_get_size_arg(args, "max_state_bytes",
+                                             1, TF_MAX_STATE_BYTES,
+                                             &parsed_size, "rowid");
+    if (has_max_state < 0) { rowid_state_free(st); return NULL; }
+    if (has_max_state > 0) st->max_state_bytes = parsed_size;
 
     tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { rowid_state_free(st); return NULL; }

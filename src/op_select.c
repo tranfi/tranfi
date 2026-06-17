@@ -17,46 +17,11 @@ typedef struct {
     int     use_selector_syntax;
 } select_state;
 
-static void select_write_error(tf_side_channels *side, const char *msg) {
-    if (!side || !side->errors || !msg) return;
+static int select_write_error(tf_side_channels *side, const char *msg) {
+    if (!side || !side->errors || !msg) return TF_OK;
     char buf[256];
-    snprintf(buf, sizeof(buf), "{\"op\":\"select\",\"error\":\"%s\"}\n", msg);
-    tf_buffer_write_str(side->errors, buf);
-}
-
-static int select_copy_indices(tf_batch *ob, const tf_batch *in, size_t row,
-                               const int *indices, size_t n_indices) {
-    for (size_t i = 0; i < n_indices; i++) {
-        int ci = indices[i];
-        if (ci < 0 || tf_batch_is_null(in, row, (size_t)ci)) {
-            tf_batch_set_null(ob, row, i);
-            continue;
-        }
-        switch (in->col_types[ci]) {
-            case TF_TYPE_BOOL:
-                tf_batch_set_bool(ob, row, i, tf_batch_get_bool(in, row, (size_t)ci));
-                break;
-            case TF_TYPE_INT64:
-                tf_batch_set_int64(ob, row, i, tf_batch_get_int64(in, row, (size_t)ci));
-                break;
-            case TF_TYPE_FLOAT64:
-                tf_batch_set_float64(ob, row, i, tf_batch_get_float64(in, row, (size_t)ci));
-                break;
-            case TF_TYPE_STRING:
-                tf_batch_set_string(ob, row, i, tf_batch_get_string(in, row, (size_t)ci));
-                break;
-            case TF_TYPE_DATE:
-                tf_batch_set_date(ob, row, i, tf_batch_get_date(in, row, (size_t)ci));
-                break;
-            case TF_TYPE_TIMESTAMP:
-                tf_batch_set_timestamp(ob, row, i, tf_batch_get_timestamp(in, row, (size_t)ci));
-                break;
-            default:
-                tf_batch_set_null(ob, row, i);
-                break;
-        }
-    }
-    return TF_OK;
+    snprintf(buf, sizeof(buf), "{\"op\":\"select\",\"error\":\"%s\"}", msg);
+    return tf_buffer_write_line(side->errors, buf);
 }
 
 static int select_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -72,8 +37,9 @@ static int select_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (tf_column_selectors_resolve(st->col_names, st->n_cols,
                                         in->col_names, in->col_types, in->n_cols,
                                         &indices, &n_indices, &error) != TF_OK) {
-            select_write_error(side, error ? error : "selector resolution failed");
+            int err_rc = select_write_error(side, error ? error : "selector resolution failed");
             free(error);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
     } else {
@@ -82,11 +48,12 @@ static int select_process(tf_step *self, tf_batch *in, tf_batch **out,
         for (size_t i = 0; i < st->n_cols; i++) {
             indices[i] = tf_batch_col_index(in, st->col_names[i]);
             if (indices[i] < 0 && side && side->errors) {
-                char buf[128];
-                snprintf(buf, sizeof(buf),
-                         "{\"op\":\"select\",\"error\":\"column '%s' not found\"}\n",
-                         st->col_names[i]);
-                tf_buffer_write_str(side->errors, buf);
+                char msg[128];
+                snprintf(msg, sizeof(msg), "column '%s' not found", st->col_names[i]);
+                if (select_write_error(side, msg) != TF_OK) {
+                    free(indices);
+                    return TF_ERROR;
+                }
             }
         }
     }
@@ -94,21 +61,31 @@ static int select_process(tf_step *self, tf_batch *in, tf_batch **out,
     tf_batch *ob = tf_batch_create(n_indices, in->n_rows);
     if (!ob) { free(indices); return TF_ERROR; }
 
+    size_t *selected_cols = malloc(n_indices * sizeof(size_t));
+    if (!selected_cols) { free(indices); tf_batch_free(ob); return TF_ERROR; }
     for (size_t i = 0; i < n_indices; i++) {
         int ci = indices[i];
         if (ci >= 0) {
-            tf_batch_set_schema(ob, i, in->col_names[ci], in->col_types[ci]);
+            selected_cols[i] = (size_t)ci;
+            if (tf_batch_set_schema(ob, i, in->col_names[(size_t)ci], in->col_types[(size_t)ci]) != TF_OK) {
+                free(selected_cols); free(indices); tf_batch_free(ob); return TF_ERROR;
+            }
         } else {
-            tf_batch_set_schema(ob, i, st->col_names[i], TF_TYPE_NULL);
+            selected_cols[i] = SIZE_MAX;
+            if (tf_batch_set_schema(ob, i, st->col_names[i], TF_TYPE_NULL) != TF_OK) {
+                free(selected_cols); free(indices); tf_batch_free(ob); return TF_ERROR;
+            }
         }
     }
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_ensure_capacity(ob, r + 1);
-        select_copy_indices(ob, in, r, indices, n_indices);
+        if (tf_batch_copy_selected_row(ob, r, in, r, selected_cols, n_indices) != TF_OK) {
+            free(selected_cols); free(indices); tf_batch_free(ob); return TF_ERROR;
+        }
         ob->n_rows = r + 1;
     }
 
+    free(selected_cols);
     free(indices);
     *out = ob;
     return TF_OK;
@@ -173,13 +150,13 @@ typedef struct {
     char   *after;
 } relocate_state;
 
-static void relocate_write_error(tf_side_channels *side, const char *msg, const char *name) {
-    if (!side || !side->errors) return;
+static int relocate_write_error(tf_side_channels *side, const char *msg, const char *name) {
+    if (!side || !side->errors) return TF_OK;
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "{\"op\":\"relocate\",\"error\":\"%s '%s'\"}\n",
+             "{\"op\":\"relocate\",\"error\":\"%s '%s'\"}",
              msg, name ? name : "");
-    tf_buffer_write_str(side->errors, buf);
+    return tf_buffer_write_line(side->errors, buf);
 }
 
 static int relocate_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -194,8 +171,9 @@ static int relocate_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (tf_column_selectors_resolve(st->move_names, st->n_move,
                                     in->col_names, in->col_types, in->n_cols,
                                     &move_idx, &n_move, &selector_error) != TF_OK) {
-        relocate_write_error(side, selector_error ? selector_error : "selector resolution failed", "");
+        int err_rc = relocate_write_error(side, selector_error ? selector_error : "selector resolution failed", "");
         free(selector_error);
+        if (err_rc != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
 
@@ -209,8 +187,9 @@ static int relocate_process(tf_step *self, tf_batch *in, tf_batch **out,
     for (size_t i = 0; i < n_move; i++) {
         int ci = move_idx[i];
         if (ci < 0 || (size_t)ci >= n_in || is_moving[ci]) {
-            relocate_write_error(side, "invalid relocated column", "");
+            int err_rc = relocate_write_error(side, "invalid relocated column", "");
             free(move_idx); free(is_moving); free(order);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         is_moving[ci] = 1;
@@ -221,13 +200,15 @@ static int relocate_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (anchor) {
         anchor_idx = tf_batch_col_index(in, anchor);
         if (anchor_idx < 0) {
-            relocate_write_error(side, "anchor column not found", anchor);
+            int err_rc = relocate_write_error(side, "anchor column not found", anchor);
             free(move_idx); free(is_moving); free(order);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         if (is_moving[anchor_idx]) {
-            relocate_write_error(side, "anchor column is being relocated", anchor);
+            int err_rc = relocate_write_error(side, "anchor column is being relocated", anchor);
             free(move_idx); free(is_moving); free(order);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
     }
@@ -252,8 +233,9 @@ static int relocate_process(tf_step *self, tf_batch *in, tf_batch **out,
     }
 
     if (n_order != n_in) {
-        relocate_write_error(side, "internal order size mismatch", "");
+        int err_rc = relocate_write_error(side, "internal order size mismatch", "");
         free(move_idx); free(is_moving); free(order);
+        if (err_rc != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
 
@@ -263,46 +245,29 @@ static int relocate_process(tf_step *self, tf_batch *in, tf_batch **out,
         return TF_ERROR;
     }
 
+    size_t *selected_cols = malloc(n_in * sizeof(size_t));
+    if (!selected_cols) {
+        free(move_idx); free(is_moving); free(order); tf_batch_free(ob);
+        return TF_ERROR;
+    }
     for (size_t i = 0; i < n_in; i++) {
         int ci = order[i];
-        tf_batch_set_schema(ob, i, in->col_names[ci], in->col_types[ci]);
+        selected_cols[i] = (size_t)ci;
+        if (tf_batch_set_schema(ob, i, in->col_names[(size_t)ci], in->col_types[(size_t)ci]) != TF_OK) {
+            free(selected_cols); free(move_idx); free(is_moving); free(order); tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_ensure_capacity(ob, r + 1);
-        for (size_t i = 0; i < n_in; i++) {
-            int ci = order[i];
-            if (tf_batch_is_null(in, r, ci)) {
-                tf_batch_set_null(ob, r, i);
-                continue;
-            }
-            switch (in->col_types[ci]) {
-                case TF_TYPE_BOOL:
-                    tf_batch_set_bool(ob, r, i, tf_batch_get_bool(in, r, ci));
-                    break;
-                case TF_TYPE_INT64:
-                    tf_batch_set_int64(ob, r, i, tf_batch_get_int64(in, r, ci));
-                    break;
-                case TF_TYPE_FLOAT64:
-                    tf_batch_set_float64(ob, r, i, tf_batch_get_float64(in, r, ci));
-                    break;
-                case TF_TYPE_STRING:
-                    tf_batch_set_string(ob, r, i, tf_batch_get_string(in, r, ci));
-                    break;
-                case TF_TYPE_DATE:
-                    tf_batch_set_date(ob, r, i, tf_batch_get_date(in, r, ci));
-                    break;
-                case TF_TYPE_TIMESTAMP:
-                    tf_batch_set_timestamp(ob, r, i, tf_batch_get_timestamp(in, r, ci));
-                    break;
-                default:
-                    tf_batch_set_null(ob, r, i);
-                    break;
-            }
+        if (tf_batch_copy_selected_row(ob, r, in, r, selected_cols, n_in) != TF_OK) {
+            free(selected_cols); free(move_idx); free(is_moving); free(order); tf_batch_free(ob);
+            return TF_ERROR;
         }
         ob->n_rows = r + 1;
     }
 
+    free(selected_cols);
     free(move_idx);
     free(is_moving);
     free(order);

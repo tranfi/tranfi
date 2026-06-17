@@ -137,7 +137,7 @@ CSV_WITH_FILL_DOWN = (
 def run_tf(steps, data=CSV_DATA, allow_blocking=False):
     """Run tranfi pipeline, return output as DataFrame."""
     p = tf.pipeline(steps)
-    result = p.run(input=data, allow_blocking=allow_blocking)
+    result = p.run(input=data, allow_blocking=allow_blocking, allow_fs=True)
     text = result.output_text.strip()
     if not text:
         return pd.DataFrame()
@@ -147,7 +147,7 @@ def run_tf(steps, data=CSV_DATA, allow_blocking=False):
 def run_tf_dsl(dsl, data=CSV_DATA, allow_blocking=False):
     """Run tranfi DSL pipeline, return output as DataFrame."""
     p = tf.pipeline(dsl)
-    result = p.run(input=data, allow_blocking=allow_blocking)
+    result = p.run(input=data, allow_blocking=allow_blocking, allow_fs=True)
     text = result.output_text.strip()
     if not text:
         return pd.DataFrame()
@@ -157,7 +157,7 @@ def run_tf_dsl(dsl, data=CSV_DATA, allow_blocking=False):
 def run_tf_raw(steps, data=CSV_DATA, allow_blocking=False):
     """Run tranfi pipeline, return raw text output."""
     p = tf.pipeline(steps)
-    result = p.run(input=data, allow_blocking=allow_blocking)
+    result = p.run(input=data, allow_blocking=allow_blocking, allow_fs=True)
     return result.output_text
 
 

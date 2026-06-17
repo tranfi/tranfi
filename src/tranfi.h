@@ -9,6 +9,7 @@
 #ifndef TRANFI_H
 #define TRANFI_H
 
+#include "config.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -80,6 +81,26 @@ typedef struct tf_pipeline_progress {
  */
 typedef int (*tf_pipeline_progress_fn)(const tf_pipeline_progress *progress, void *user);
 
+
+/*
+ * Host policy for embedded or untrusted execution surfaces.
+ * File-taking pipeline args are validated before native construction; when
+ * workspace_root or resolve_path is provided, accepted paths are rewritten to
+ * the resolved host path in the mutable IR used for execution.
+ */
+typedef int (*tf_resolve_path_fn)(const char *logical, char *out, size_t out_sz, void *user);
+
+typedef struct tf_host_policy {
+    bool allow_fs;
+    bool allow_net;
+    bool allow_spill;
+    bool allow_blocking;
+    bool allow_rules_file;
+    const char *workspace_root;
+    tf_resolve_path_fn resolve_path;
+    void *user;
+} tf_host_policy;
+
 /* Read-only columnar batch accessors for batch callbacks. */
 size_t      tf_batch_num_rows(const tf_batch *b);
 size_t      tf_batch_num_cols(const tf_batch *b);
@@ -100,6 +121,8 @@ int64_t     tf_batch_get_timestamp(const tf_batch *b, size_t row, size_t col);
  * use tf_last_error() instead).
  */
 tf_pipeline *tf_pipeline_create(const char *plan_json, size_t len);
+tf_pipeline *tf_pipeline_create_with_host_policy(const char *plan_json, size_t len,
+                                             const tf_host_policy *policy);
 
 /* Free all resources associated with a pipeline. */
 void tf_pipeline_free(tf_pipeline *p);
@@ -221,6 +244,7 @@ char *tf_ir_plan_to_json(const tf_ir_plan *plan);
 
 /* Validate an IR plan. Returns TF_OK or TF_ERROR. */
 int tf_ir_plan_validate(tf_ir_plan *plan);
+int tf_ir_plan_validate_with_host_policy(tf_ir_plan *plan, const tf_host_policy *policy);
 
 /* Infer schemas through an IR plan. Best-effort, non-fatal. */
 int tf_ir_plan_infer_schema(tf_ir_plan *plan);
@@ -230,9 +254,13 @@ void tf_ir_plan_destroy(tf_ir_plan *plan);
 
 /* Create a pipeline from a pre-built IR plan. */
 tf_pipeline *tf_pipeline_create_from_ir(const tf_ir_plan *plan);
+tf_pipeline *tf_pipeline_create_from_ir_with_host_policy(const tf_ir_plan *plan,
+                                                      const tf_host_policy *policy);
 
 /* Compile a DSL string to a JSON recipe. Caller frees with tf_string_free(). */
 char *tf_compile_dsl(const char *dsl, size_t len, char **error);
+char *tf_compile_dsl_with_host_policy(const char *dsl, size_t len,
+                                      const tf_host_policy *policy, char **error);
 
 /* Compile a DSL string directly to SQL. Caller frees with tf_string_free(). */
 char *tf_compile_to_sql(const char *dsl, size_t len, char **error);

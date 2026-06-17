@@ -3,3 +3,6 @@ tranfi
 Copyright (c) 2026 Anton Zemlyansky and contributors
 
 This package is part of the tranfi project and is licensed under the Apache License, Version 2.0.
+
+Third-party components:
+- cJSON 1.7.19, MIT License. Copyright (c) 2009-2017 Dave Gamble and cJSON contributors.

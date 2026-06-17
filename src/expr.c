@@ -35,6 +35,7 @@ typedef struct {
     const char *src;
     size_t      pos;
     size_t      len;
+    int         depth_error;
 } parser_state;
 
 static void skip_ws(parser_state *p) {
@@ -91,7 +92,15 @@ static void consume_cmp_op(parser_state *p, cmp_op op) {
 
 /* ---- Recursive descent parser ---- */
 
-static tf_expr *parse_expr(parser_state *p);
+#define TF_EXPR_MAX_DEPTH 256
+
+static tf_expr *parse_expr_d(parser_state *p, unsigned depth);
+
+static int expr_depth_exceeded(parser_state *p, unsigned depth) {
+    if (depth <= TF_EXPR_MAX_DEPTH) return 0;
+    p->depth_error = 1;
+    return 1;
+}
 
 static tf_expr *make_expr(expr_kind kind) {
     tf_expr *e = calloc(1, sizeof(tf_expr));
@@ -124,10 +133,10 @@ static tf_expr *parse_string_literal(parser_state *p) {
 /* Parse a comma-separated argument list inside parentheses.
  * Assumes '(' has already been consumed. Consumes the closing ')'.
  * Returns allocated array of expressions, sets *n_args. */
-static tf_expr **parse_arg_list(parser_state *p, int *n_args) {
+static tf_expr **parse_arg_list(parser_state *p, int *n_args, unsigned depth) {
     *n_args = 0;
-    int cap = 4;
-    tf_expr **args = malloc(cap * sizeof(tf_expr *));
+    size_t cap = 4;
+    tf_expr **args = tf_mallocarray_checked(cap, sizeof(tf_expr *));
     if (!args) return NULL;
 
     skip_ws(p);
@@ -138,13 +147,20 @@ static tf_expr **parse_arg_list(parser_state *p, int *n_args) {
     }
 
     for (;;) {
-        tf_expr *arg = parse_expr(p);
+        tf_expr *arg = parse_expr_d(p, depth);
         if (!arg) goto fail;
-        if (*n_args >= cap) {
-            cap *= 2;
-            tf_expr **na = realloc(args, cap * sizeof(tf_expr *));
+        if ((size_t)*n_args >= cap) {
+            size_t need = 0;
+            size_t new_cap = 0;
+            if (tf_size_add((size_t)*n_args, 1, &need) != TF_OK ||
+                tf_size_grow_pow2(cap, need, 4, &new_cap) != TF_OK) {
+                tf_expr_free(arg);
+                goto fail;
+            }
+            tf_expr **na = tf_reallocarray_checked(args, new_cap, sizeof(tf_expr *));
             if (!na) { tf_expr_free(arg); goto fail; }
             args = na;
+            cap = new_cap;
         }
         args[(*n_args)++] = arg;
         skip_ws(p);
@@ -164,14 +180,15 @@ fail:
     return NULL;
 }
 
-static tf_expr *parse_atom(parser_state *p) {
+static tf_expr *parse_atom(parser_state *p, unsigned depth) {
+    if (expr_depth_exceeded(p, depth)) return NULL;
     skip_ws(p);
     if (p->pos >= p->len) return NULL;
 
     /* Parenthesized expression */
     if (p->src[p->pos] == '(') {
         p->pos++;
-        tf_expr *e = parse_expr(p);
+        tf_expr *e = parse_expr_d(p, depth + 1);
         if (!e) return NULL;
         if (!match_char(p, ')')) { tf_expr_free(e); return NULL; }
         return e;
@@ -277,7 +294,7 @@ static tf_expr *parse_atom(parser_state *p) {
 
             /* General function call: name(arg1, arg2, ...) */
             int n_args = 0;
-            tf_expr **args = parse_arg_list(p, &n_args);
+            tf_expr **args = parse_arg_list(p, &n_args, depth + 1);
             if (!args) { free(name); return NULL; }
 
             tf_expr *e = make_expr(EXPR_FUNC_CALL);
@@ -304,12 +321,13 @@ static tf_expr *parse_atom(parser_state *p) {
 }
 
 /* Unary minus: -expr */
-static tf_expr *parse_unary(parser_state *p) {
+static tf_expr *parse_unary(parser_state *p, unsigned depth) {
+    if (expr_depth_exceeded(p, depth)) return NULL;
     skip_ws(p);
     if (p->pos < p->len && p->src[p->pos] == '-') {
         /* Check it's not a comparison op like != */
         p->pos++;
-        tf_expr *child = parse_unary(p);
+        tf_expr *child = parse_unary(p, depth + 1);
         if (!child) return NULL;
         /* Optimize: fold literal negation */
         if (child->kind == EXPR_LIT_INT) {
@@ -325,12 +343,12 @@ static tf_expr *parse_unary(parser_state *p) {
         e->child = child;
         return e;
     }
-    return parse_atom(p);
+    return parse_atom(p, depth);
 }
 
 /* Multiplicative: unary (('*' | '/') unary)* */
-static tf_expr *parse_mul(parser_state *p) {
-    tf_expr *left = parse_unary(p);
+static tf_expr *parse_mul(parser_state *p, unsigned depth) {
+    tf_expr *left = parse_unary(p, depth);
     if (!left) return NULL;
 
     for (;;) {
@@ -340,7 +358,7 @@ static tf_expr *parse_mul(parser_state *p) {
         if (op_char != '*' && op_char != '/') break;
         p->pos++;
 
-        tf_expr *right = parse_unary(p);
+        tf_expr *right = parse_unary(p, depth);
         if (!right) { tf_expr_free(left); return NULL; }
 
         expr_kind kind = (op_char == '*') ? EXPR_MUL : EXPR_DIV;
@@ -354,8 +372,8 @@ static tf_expr *parse_mul(parser_state *p) {
 }
 
 /* Additive: mul_expr (('+' | '-') mul_expr)* */
-static tf_expr *parse_add(parser_state *p) {
-    tf_expr *left = parse_mul(p);
+static tf_expr *parse_add(parser_state *p, unsigned depth) {
+    tf_expr *left = parse_mul(p, depth);
     if (!left) return NULL;
 
     for (;;) {
@@ -368,7 +386,7 @@ static tf_expr *parse_add(parser_state *p) {
          * Since we're at the add level, '+' and '-' are always arithmetic. */
         p->pos++;
 
-        tf_expr *right = parse_mul(p);
+        tf_expr *right = parse_mul(p, depth);
         if (!right) { tf_expr_free(left); return NULL; }
 
         expr_kind kind = (op_char == '+') ? EXPR_ADD : EXPR_SUB;
@@ -381,14 +399,14 @@ static tf_expr *parse_add(parser_state *p) {
     return left;
 }
 
-static tf_expr *parse_cmp(parser_state *p) {
-    tf_expr *left = parse_add(p);
+static tf_expr *parse_cmp(parser_state *p, unsigned depth) {
+    tf_expr *left = parse_add(p, depth);
     if (!left) return NULL;
 
     cmp_op op;
     if (peek_cmp_op(p, &op)) {
         consume_cmp_op(p, op);
-        tf_expr *right = parse_add(p);
+        tf_expr *right = parse_add(p, depth);
         if (!right) { tf_expr_free(left); return NULL; }
 
         tf_expr *e = make_expr(EXPR_CMP);
@@ -402,23 +420,24 @@ static tf_expr *parse_cmp(parser_state *p) {
     return left;
 }
 
-static tf_expr *parse_not(parser_state *p) {
+static tf_expr *parse_not(parser_state *p, unsigned depth) {
+    if (expr_depth_exceeded(p, depth)) return NULL;
     if (match_keyword(p, "not")) {
-        tf_expr *child = parse_not(p);
+        tf_expr *child = parse_not(p, depth + 1);
         if (!child) return NULL;
         tf_expr *e = make_expr(EXPR_NOT);
         if (!e) { tf_expr_free(child); return NULL; }
         e->child = child;
         return e;
     }
-    return parse_cmp(p);
+    return parse_cmp(p, depth);
 }
 
-static tf_expr *parse_and(parser_state *p) {
-    tf_expr *left = parse_not(p);
+static tf_expr *parse_and(parser_state *p, unsigned depth) {
+    tf_expr *left = parse_not(p, depth);
     if (!left) return NULL;
     while (match_keyword(p, "and")) {
-        tf_expr *right = parse_not(p);
+        tf_expr *right = parse_not(p, depth);
         if (!right) { tf_expr_free(left); return NULL; }
         tf_expr *e = make_expr(EXPR_AND);
         if (!e) { tf_expr_free(left); tf_expr_free(right); return NULL; }
@@ -429,11 +448,11 @@ static tf_expr *parse_and(parser_state *p) {
     return left;
 }
 
-static tf_expr *parse_or(parser_state *p) {
-    tf_expr *left = parse_and(p);
+static tf_expr *parse_or(parser_state *p, unsigned depth) {
+    tf_expr *left = parse_and(p, depth);
     if (!left) return NULL;
     while (match_keyword(p, "or")) {
-        tf_expr *right = parse_and(p);
+        tf_expr *right = parse_and(p, depth);
         if (!right) { tf_expr_free(left); return NULL; }
         tf_expr *e = make_expr(EXPR_OR);
         if (!e) { tf_expr_free(left); tf_expr_free(right); return NULL; }
@@ -444,8 +463,9 @@ static tf_expr *parse_or(parser_state *p) {
     return left;
 }
 
-static tf_expr *parse_expr(parser_state *p) {
-    return parse_or(p);
+static tf_expr *parse_expr_d(parser_state *p, unsigned depth) {
+    if (expr_depth_exceeded(p, depth)) return NULL;
+    return parse_or(p, depth);
 }
 
 tf_expr *tf_expr_parse(const char *text) {
@@ -453,10 +473,10 @@ tf_expr *tf_expr_parse(const char *text) {
         tf_set_last_error("expression: empty expression");
         return NULL;
     }
-    parser_state p = { .src = text, .pos = 0, .len = strlen(text) };
-    tf_expr *e = parse_expr(&p);
+    parser_state p = { .src = text, .pos = 0, .len = strlen(text), .depth_error = 0 };
+    tf_expr *e = parse_expr_d(&p, 0);
     if (!e) {
-        tf_set_last_error("expression: invalid syntax");
+        tf_set_last_error(p.depth_error ? "expression: nesting too deep" : "expression: invalid syntax");
         return NULL;
     }
     /* Ensure we consumed all input */
@@ -520,8 +540,8 @@ typedef struct {
  * Uses a ring buffer approach: each call gets a slot, wrapping around. */
 #define SCRATCH_SLOTS 8
 #define SCRATCH_SLOT_SIZE 4096
-static char scratch_buf[SCRATCH_SLOTS][SCRATCH_SLOT_SIZE];
-static int scratch_idx = 0;
+static _Thread_local char scratch_buf[SCRATCH_SLOTS][SCRATCH_SLOT_SIZE];
+static _Thread_local size_t scratch_idx = 0;
 
 static char *scratch_alloc(void) {
     char *slot = scratch_buf[scratch_idx % SCRATCH_SLOTS];
@@ -844,7 +864,9 @@ static const char *val_to_str(eval_val v, char *buf, size_t buf_sz) {
     switch (v.tag) {
         case VAL_STR:  return v.s;
         case VAL_INT:  snprintf(buf, buf_sz, "%lld", (long long)v.i); return buf;
-        case VAL_FLOAT: snprintf(buf, buf_sz, "%g", v.f); return buf;
+        case VAL_FLOAT:
+            if (tf_format_float64(buf, buf_sz, v.f) != TF_OK && buf_sz > 0) buf[0] = '\0';
+            return buf;
         case VAL_BOOL: return v.b ? "true" : "false";
         case VAL_DATE: tf_date_format(v.date, buf, buf_sz); return buf;
         case VAL_TIMESTAMP: tf_timestamp_format(v.ts, buf, buf_sz); return buf;

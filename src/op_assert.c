@@ -10,6 +10,7 @@
 
 #include "internal.h"
 #include "cJSON.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,7 @@ typedef struct {
     size_t         audit_limit;
     size_t         audit_emitted;
     int            audit;
+    tf_audit_options audit_opts;
 
     assert_agg_kind agg_kind;
     assert_cmp      cmp;
@@ -68,6 +70,8 @@ typedef struct {
     int             agg_col_index;
     int             agg_col_resolved;
     double          threshold;
+    double          tolerance;
+    int             relative_tolerance;
     size_t          agg_rows;
     size_t          agg_non_null;
     size_t          agg_missing;
@@ -161,10 +165,15 @@ static int agg_needs_numeric(assert_agg_kind kind) {
 
 static int parse_number_arg(const cJSON *item, double *out) {
     if (cJSON_IsNumber(item)) { *out = item->valuedouble; return 1; }
-    if (cJSON_IsString(item) && item->valuestring && item->valuestring[0]) {
+    if (cJSON_IsString(item) && item->valuestring) {
+        const char *s = item->valuestring;
+        while (*s && isspace((unsigned char)*s)) s++;
+        if (!*s) return 0;
         char *end = NULL;
-        double v = strtod(item->valuestring, &end);
-        if (end && *end == '\0') { *out = v; return 1; }
+        double v = strtod(s, &end);
+        if (!end || end == s) return 0;
+        while (*end && isspace((unsigned char)*end)) end++;
+        if (*end == '\0') { *out = v; return 1; }
     }
     return 0;
 }
@@ -200,15 +209,24 @@ static int parse_aggregate_spec(const cJSON *args, assert_agg_kind *kind, char *
     return 1;
 }
 
-static int compare_aggregate(double actual, double threshold, assert_cmp cmp) {
-    const double eps = 1e-12;
+static double aggregate_tolerance(double actual, double threshold, double tolerance,
+                                  int relative_tolerance) {
+    if (tolerance <= 0.0) return 0.0;
+    if (!relative_tolerance) return tolerance;
+    return tolerance * fmax(1.0, fmax(fabs(actual), fabs(threshold)));
+}
+
+static int compare_aggregate(double actual, double threshold, assert_cmp cmp,
+                             double tolerance, int relative_tolerance) {
+    double eps = aggregate_tolerance(actual, threshold, tolerance, relative_tolerance);
+    double diff = fabs(actual - threshold);
     switch (cmp) {
-        case ASSERT_CMP_EQ: return fabs(actual - threshold) <= eps;
-        case ASSERT_CMP_NE: return fabs(actual - threshold) > eps;
+        case ASSERT_CMP_EQ: return diff <= eps;
+        case ASSERT_CMP_NE: return diff > eps;
         case ASSERT_CMP_LT: return actual < threshold;
-        case ASSERT_CMP_LTE: return actual <= threshold || fabs(actual - threshold) <= eps;
+        case ASSERT_CMP_LTE: return actual <= threshold || diff <= eps;
         case ASSERT_CMP_GT: return actual > threshold;
-        case ASSERT_CMP_GTE: return actual >= threshold || fabs(actual - threshold) <= eps;
+        case ASSERT_CMP_GTE: return actual >= threshold || diff <= eps;
         default: return 0;
     }
 }
@@ -253,37 +271,6 @@ static int append_json_string_field(tf_buffer *out, const char *field, const cha
     return rc;
 }
 
-static cJSON *batch_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL:
-            return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64:
-            return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64:
-            return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING:
-            return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE:
-            return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP:
-            return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default:
-            return cJSON_CreateNull();
-    }
-}
-
-static cJSON *batch_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = batch_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
-    }
-    return obj;
-}
-
 static int emit_assert_audit(assert_state *st, const tf_batch *b, size_t row,
                              tf_side_channels *side, const char *event) {
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
@@ -299,23 +286,22 @@ static int emit_assert_audit(assert_state *st, const tf_batch *b, size_t row,
     cJSON_AddStringToObject(obj, "expr", st->expr_text ? st->expr_text : "");
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    cJSON *row_obj = batch_row_to_json(b, row);
+    cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->stats, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    int rc = tf_buffer_write_line(side->stats, line);
     free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
 }
 
-static void emit_failure(assert_state *st, const tf_batch *b, size_t row,
-                         tf_side_channels *side, int include_row) {
-    if (!side || !side->errors) return;
+static int emit_failure(assert_state *st, const tf_batch *b, size_t row,
+                        tf_side_channels *side, int include_row) {
+    if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
-    if (!obj) return;
+    if (!obj) return TF_ERROR;
     cJSON_AddStringToObject(obj, "type", "assert_failure");
     cJSON_AddStringToObject(obj, "op", "assert");
     cJSON_AddStringToObject(obj, "action", assert_action_name(st->action));
@@ -325,22 +311,21 @@ static void emit_failure(assert_state *st, const tf_batch *b, size_t row,
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
     if (include_row) {
-        cJSON *row_obj = batch_row_to_json(b, row);
+        cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
         if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     }
     char *line = cJSON_PrintUnformatted(obj);
-    if (line) {
-        tf_buffer_write_str(side->errors, line);
-        tf_buffer_write_str(side->errors, "\n");
-        free(line);
-    }
     cJSON_Delete(obj);
+    if (!line) return TF_ERROR;
+    int rc = tf_buffer_write_line(side->errors, line);
+    free(line);
+    return rc;
 }
 
-static void emit_aggregate_failure(assert_state *st, tf_side_channels *side, double actual, int has_actual) {
-    if (!side || !side->errors) return;
+static int emit_aggregate_failure(assert_state *st, tf_side_channels *side, double actual, int has_actual) {
+    if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
-    if (!obj) return;
+    if (!obj) return TF_ERROR;
     cJSON_AddStringToObject(obj, "type", "assert_failure");
     cJSON_AddStringToObject(obj, "op", "assert");
     cJSON_AddStringToObject(obj, "reason", "aggregate_assert_failed");
@@ -351,6 +336,8 @@ static void emit_aggregate_failure(assert_state *st, tf_side_channels *side, dou
     if (st->agg_col && st->agg_col[0]) cJSON_AddStringToObject(obj, "column", st->agg_col);
     cJSON_AddStringToObject(obj, "comparison", assert_cmp_name(st->cmp));
     cJSON_AddNumberToObject(obj, "threshold", st->threshold);
+    cJSON_AddNumberToObject(obj, "tolerance", st->tolerance);
+    cJSON_AddBoolToObject(obj, "relative_tolerance", st->relative_tolerance ? 1 : 0);
     if (has_actual) cJSON_AddNumberToObject(obj, "actual", actual);
     else cJSON_AddNullToObject(obj, "actual");
     cJSON_AddNumberToObject(obj, "rows", (double)st->agg_rows);
@@ -358,23 +345,11 @@ static void emit_aggregate_failure(assert_state *st, tf_side_channels *side, dou
     cJSON_AddNumberToObject(obj, "missing", (double)st->agg_missing);
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
     char *line = cJSON_PrintUnformatted(obj);
-    if (line) {
-        tf_buffer_write_str(side->errors, line);
-        tf_buffer_write_str(side->errors, "\n");
-        free(line);
-    }
     cJSON_Delete(obj);
-}
-
-static int copy_schema(tf_batch *dst, const tf_batch *src, size_t extra_cols, const char *result) {
-    for (size_t c = 0; c < src->n_cols; c++) {
-        if (tf_batch_set_schema(dst, c, src->col_names[c], src->col_types[c]) != TF_OK) return TF_ERROR;
-    }
-    if (extra_cols > 0) {
-        if (tf_batch_set_schema(dst, src->n_cols, result && result[0] ? result : "_assert", TF_TYPE_BOOL) != TF_OK)
-            return TF_ERROR;
-    }
-    return TF_OK;
+    if (!line) return TF_ERROR;
+    int rc = tf_buffer_write_line(side->errors, line);
+    free(line);
+    return rc;
 }
 
 static int resolve_aggregate_column(assert_state *st, const tf_batch *in) {
@@ -434,7 +409,7 @@ static int assert_process_aggregate(tf_step *self, tf_batch *in, tf_batch **out)
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    if (copy_schema(ob, in, 0, NULL) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    if (tf_batch_clone_schema(ob, in) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
             tf_batch_free(ob);
@@ -456,7 +431,14 @@ static int assert_process(tf_step *self, tf_batch *in, tf_batch **out,
     size_t extra = st->action == ASSERT_ANNOTATE ? 1u : 0u;
     tf_batch *ob = tf_batch_create(in->n_cols + extra, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    if (copy_schema(ob, in, extra, st->result) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    if (extra) {
+        const char *names[] = {st->result && st->result[0] ? st->result : "_assert"};
+        const tf_type types[] = {TF_TYPE_BOOL};
+        if (tf_batch_clone_with_extra_cols(ob, in, names, types, 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    } else if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     size_t out_row = 0;
     for (size_t r = 0; r < in->n_rows; r++) {
@@ -467,18 +449,27 @@ static int assert_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (!ok) {
             st->failures++;
             if (st->action == ASSERT_FAIL) {
-                emit_failure(st, in, r, side, 1);
                 char msg[512];
                 snprintf(msg, sizeof(msg), "assert failed at row %zu: %s", st->row_index,
                          st->message && st->message[0] ? st->message : (st->expr_text ? st->expr_text : "rule failed"));
                 tf_set_last_error(msg);
+                if (emit_failure(st, in, r, side, 1) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
                 tf_batch_free(ob);
                 return TF_ERROR;
             }
             if (st->action == ASSERT_WARN) {
-                emit_failure(st, in, r, side, 1);
+                if (emit_failure(st, in, r, side, 1) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
             } else if (st->action == ASSERT_QUARANTINE) {
-                emit_failure(st, in, r, side, 1);
+                if (emit_failure(st, in, r, side, 1) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
                 continue;
             } else if (st->action == ASSERT_FILTER) {
                 if (emit_assert_audit(st, in, r, side, "row_dropped") != TF_OK) {
@@ -493,7 +484,11 @@ static int assert_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (st->action == ASSERT_ANNOTATE) tf_batch_set_bool(ob, out_row, in->n_cols, ok);
+        if (st->action == ASSERT_ANNOTATE &&
+            tf_batch_set_bool(ob, out_row, in->n_cols, ok) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         out_row++;
     }
 
@@ -511,11 +506,11 @@ static int assert_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     double actual = 0.0;
     int has_actual = aggregate_value(st, &actual);
     st->agg_evaluated = 1;
-    st->agg_passed = has_actual && compare_aggregate(actual, st->threshold, st->cmp);
+    st->agg_passed = has_actual && compare_aggregate(actual, st->threshold, st->cmp, st->tolerance, st->relative_tolerance);
     if (st->agg_passed) return TF_OK;
 
     st->failures = 1;
-    emit_aggregate_failure(st, side, actual, has_actual);
+    if (emit_aggregate_failure(st, side, actual, has_actual) != TF_OK) return TF_ERROR;
     if (st->action == ASSERT_WARN) return TF_OK;
 
     char msg[512];
@@ -542,8 +537,9 @@ static int assert_append_stats(tf_step *self, tf_buffer *out) {
     if (st->agg_col && append_json_string_field(out, "aggregate_column", st->agg_col) != TF_OK) return TF_ERROR;
     if (append_json_string_field(out, "comparison", assert_cmp_name(st->cmp)) != TF_OK) return TF_ERROR;
     char buf[320];
-    snprintf(buf, sizeof(buf), ",\"threshold\":%.17g,\"aggregate_rows\":%zu,\"aggregate_non_null\":%zu,\"aggregate_missing\":%zu,\"aggregate_passed\":%s",
-             st->threshold, st->agg_rows, st->agg_non_null, st->agg_missing,
+    snprintf(buf, sizeof(buf), ",\"threshold\":%.17g,\"tolerance\":%.17g,\"relative_tolerance\":%s,\"aggregate_rows\":%zu,\"aggregate_non_null\":%zu,\"aggregate_missing\":%zu,\"aggregate_passed\":%s",
+             st->threshold, st->tolerance, st->relative_tolerance ? "true" : "false",
+             st->agg_rows, st->agg_non_null, st->agg_missing,
              st->agg_evaluated && st->agg_passed ? "true" : "false");
     if (tf_buffer_write_str(out, buf) != TF_OK) return TF_ERROR;
     if (has_actual) snprintf(buf, sizeof(buf), ",\"aggregate_value\":%.17g", actual);
@@ -562,6 +558,7 @@ static void assert_destroy(tf_step *self) {
         free(st->result);
         free(st->agg_text);
         free(st->agg_col);
+        tf_audit_options_free(&st->audit_opts);
         free(st);
     }
     free(self);
@@ -608,7 +605,10 @@ tf_step *tf_assert_create(const cJSON *args) {
     st->action = action;
     st->mode = has_aggregate ? ASSERT_MODE_AGGREGATE : ASSERT_MODE_ROW;
     st->audit_limit = 1000;
+    tf_audit_options_init(&st->audit_opts, 1);
     st->agg_col_index = -1;
+    st->tolerance = 1e-12;
+    st->relative_tolerance = 1;
 
     if (st->mode == ASSERT_MODE_ROW) {
         st->expr = tf_expr_parse(expr_json->valuestring);
@@ -644,19 +644,44 @@ tf_step *tf_assert_create(const cJSON *args) {
             assert_state_free(st);
             return NULL;
         }
+        cJSON *tol_json = cJSON_GetObjectItemCaseSensitive(args, "tolerance");
+        if (!tol_json) tol_json = cJSON_GetObjectItemCaseSensitive(args, "tol");
+        if (tol_json) {
+            if (!parse_number_arg(tol_json, &st->tolerance) || !isfinite(st->tolerance) || st->tolerance < 0.0) {
+                tf_set_last_error("assert: aggregate tolerance must be a non-negative finite number");
+                assert_state_free(st);
+                return NULL;
+            }
+        }
+        cJSON *rel_json = cJSON_GetObjectItemCaseSensitive(args, "rel");
+        if (!rel_json) rel_json = cJSON_GetObjectItemCaseSensitive(args, "relative");
+        if (rel_json) {
+            if (!cJSON_IsBool(rel_json)) {
+                tf_set_last_error("assert: aggregate rel must be true or false");
+                assert_state_free(st);
+                return NULL;
+            }
+            st->relative_tolerance = cJSON_IsTrue(rel_json) ? 1 : 0;
+        }
     }
 
     cJSON *audit_json = cJSON_GetObjectItemCaseSensitive(args, "audit");
     st->audit = cJSON_IsTrue(audit_json) ? 1 : 0;
+    if (tf_audit_options_parse(&st->audit_opts, args, "assert") != TF_OK) {
+        assert_state_free(st);
+        return NULL;
+    }
     cJSON *audit_limit_json = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
     if (!audit_limit_json) audit_limit_json = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
     if (audit_limit_json) {
-        if (!cJSON_IsNumber(audit_limit_json) || audit_limit_json->valuedouble <= 0) {
-            tf_set_last_error("assert: audit_limit must be a positive integer");
+        size_t parsed_limit = 0;
+        if (tf_json_get_size_arg_any(args, "audit_limit", "auditLimit",
+                                     1, TF_MAX_AUDIT_RECORDS,
+                                     &parsed_limit, "assert") < 0) {
             assert_state_free(st);
             return NULL;
         }
-        st->audit_limit = (size_t)audit_limit_json->valuedouble;
+        st->audit_limit = parsed_limit;
     }
 
     cJSON *name_json = cJSON_GetObjectItemCaseSensitive(args, "name");

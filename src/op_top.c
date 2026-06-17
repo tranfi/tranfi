@@ -6,6 +6,7 @@
 
 #include "internal.h"
 #include "cJSON.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -76,8 +77,7 @@ static int top_compare_cells(const tf_batch *a, size_t ra,
 }
 
 static int top_heap_worse(const top_state *st, size_t a, size_t b) {
-    int ci = st->col_idx >= 0 ? st->col_idx : 0;
-    return top_compare_cells(st->buf, a, st->buf, b, ci, st->desc) > 0;
+    return top_compare_cells(st->buf, a, st->buf, b, st->col_idx, st->desc) > 0;
 }
 
 static void top_heap_swap(size_t *a, size_t *b) {
@@ -134,11 +134,9 @@ static int top_compact_buffer(top_state *st) {
     tf_batch *nb = tf_batch_create(old->n_cols, cap);
     if (!nb) return TF_ERROR;
 
-    for (size_t c = 0; c < old->n_cols; c++) {
-        if (tf_batch_set_schema(nb, c, old->col_names[c], old->col_types[c]) != TF_OK) {
-            tf_batch_free(nb);
-            return TF_ERROR;
-        }
+    if (tf_batch_clone_schema(nb, old) != TF_OK) {
+        tf_batch_free(nb);
+        return TF_ERROR;
     }
     for (size_t r = 0; r < old->n_rows; r++) {
         if (tf_batch_copy_row(nb, r, old, r) != TF_OK) {
@@ -155,6 +153,43 @@ static int top_compact_buffer(top_state *st) {
     return TF_OK;
 }
 
+static int top_init_schema(top_state *st, const tf_batch *in) {
+    size_t cap = st->n > 0 ? st->n : 1;
+    tf_batch *buf = tf_batch_create(in->n_cols, cap);
+    if (!buf) return TF_ERROR;
+
+    size_t *heap = NULL;
+    if (st->n > 0) {
+        heap = calloc(st->n, sizeof(size_t));
+        if (!heap) {
+            tf_batch_free(buf);
+            return TF_ERROR;
+        }
+    }
+
+    int col_idx = tf_batch_col_index(in, st->column);
+    if (col_idx < 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "top: column '%s' not found", st->column ? st->column : "");
+        tf_set_last_error(msg);
+        free(heap);
+        tf_batch_free(buf);
+        return TF_ERROR;
+    }
+
+    if (tf_batch_clone_schema(buf, in) != TF_OK) {
+        free(heap);
+        tf_batch_free(buf);
+        return TF_ERROR;
+    }
+
+    st->buf = buf;
+    st->heap = heap;
+    st->col_idx = col_idx;
+    st->has_schema = 1;
+    return TF_OK;
+}
+
 static int top_process(tf_step *self, tf_batch *in, tf_batch **out,
                        tf_side_channels *side) {
     (void)side;
@@ -162,22 +197,12 @@ static int top_process(tf_step *self, tf_batch *in, tf_batch **out,
     *out = NULL;
 
     if (!st->has_schema) {
-        size_t cap = st->n > 0 ? st->n : 1;
-        st->buf = tf_batch_create(in->n_cols, cap);
-        if (!st->buf) return TF_ERROR;
-        if (st->n > 0) {
-            st->heap = calloc(st->n, sizeof(size_t));
-            if (!st->heap) return TF_ERROR;
-        }
-        for (size_t c = 0; c < in->n_cols; c++)
-            tf_batch_set_schema(st->buf, c, in->col_names[c], in->col_types[c]);
-        st->col_idx = tf_batch_col_index(in, st->column);
-        st->has_schema = 1;
+        if (top_init_schema(st, in) != TF_OK) return TF_ERROR;
     }
 
     if (st->n == 0) return TF_OK;
 
-    int ci = st->col_idx >= 0 ? st->col_idx : 0;
+    int ci = st->col_idx;
     for (size_t r = 0; r < in->n_rows; r++) {
         if (st->buf->n_rows < st->n) {
             size_t dst = st->buf->n_rows;
@@ -201,15 +226,18 @@ static int top_process(tf_step *self, tf_batch *in, tf_batch **out,
     return TF_OK;
 }
 
-/* Sort comparator context */
-typedef struct { const tf_batch *batch; int col_idx; int desc; } top_sort_ctx;
-static top_sort_ctx *g_top_ctx;
+typedef struct {
+    const tf_batch *batch;
+    int col_idx;
+    int desc;
+} top_sort_ctx;
 
-static int top_compare(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    return top_compare_cells(g_top_ctx->batch, ra, g_top_ctx->batch, rb,
-                             g_top_ctx->col_idx, g_top_ctx->desc);
+static int top_sort_cmp(const top_sort_ctx *ctx, size_t a, size_t b) {
+    return top_compare_cells(ctx->batch, a, ctx->batch, b, ctx->col_idx, ctx->desc);
+}
+
+static int top_sort_cmp_index(const void *ctx, size_t a, size_t b) {
+    return top_sort_cmp((const top_sort_ctx *)ctx, a, b);
 }
 
 static int top_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
@@ -225,17 +253,22 @@ static int top_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     if (!indices) return TF_ERROR;
     for (size_t i = 0; i < n; i++) indices[i] = i;
 
-    top_sort_ctx ctx = { .batch = st->buf, .col_idx = st->col_idx >= 0 ? st->col_idx : 0, .desc = st->desc };
-    g_top_ctx = &ctx;
-    qsort(indices, n, sizeof(size_t), top_compare);
-    g_top_ctx = NULL;
+    top_sort_ctx ctx = { .batch = st->buf, .col_idx = st->col_idx, .desc = st->desc };
+    tf_sort_indices(indices, n, top_sort_cmp_index, &ctx);
 
     tf_batch *ob = tf_batch_create(st->buf->n_cols, n);
     if (!ob) { free(indices); return TF_ERROR; }
-    for (size_t c = 0; c < st->buf->n_cols; c++)
-        tf_batch_set_schema(ob, c, st->buf->col_names[c], st->buf->col_types[c]);
+    if (tf_batch_clone_schema(ob, st->buf) != TF_OK) {
+        free(indices);
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
     for (size_t i = 0; i < n; i++) {
-        tf_batch_copy_row(ob, i, st->buf, indices[i]);
+        if (tf_batch_copy_row(ob, i, st->buf, indices[i]) != TF_OK) {
+            free(indices);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = i + 1;
     }
 
@@ -257,14 +290,19 @@ static void top_destroy(tf_step *self) {
 
 tf_step *tf_top_create(const cJSON *args) {
     if (!args) return NULL;
-    cJSON *n_j = cJSON_GetObjectItemCaseSensitive(args, "n");
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
-    if (!cJSON_IsNumber(n_j) || !cJSON_IsString(col_j)) return NULL;
-    if (n_j->valueint < 0) return NULL;
+    size_t n = 0;
+    int has_n = tf_json_get_size_arg(args, "n", 0, TF_MAX_OUTPUT_ROWS_PER_BATCH, &n, "top");
+    if (has_n <= 0) return NULL;
+    if (!cJSON_IsString(col_j) || !col_j->valuestring || col_j->valuestring[0] == '\0') {
+        tf_set_last_error("top: column must be a non-empty string");
+        return NULL;
+    }
 
     top_state *st = calloc(1, sizeof(top_state));
     if (!st) return NULL;
-    st->n = (size_t)n_j->valueint;
+    st->n = n;
+    st->col_idx = -1;
     st->column = strdup(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 

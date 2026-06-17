@@ -21,30 +21,48 @@ typedef struct {
     size_t  audit_limit;
     size_t  audit_emitted;
     int     audit;
+    tf_audit_options audit_opts;
 } replace_state;
 
-static cJSON *replace_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (!b || col >= b->n_cols || row >= b->n_rows || tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default: return cJSON_CreateNull();
+static int replace_ensure_buffer(char **buf, size_t *cap, size_t need) {
+    if (!buf || !cap) return TF_ERROR;
+    if (need > 0) {
+        size_t payload_len = need - 1; /* reserve space for the trailing NUL */
+        if (tf_check_byte_limit(payload_len, TF_MAX_CELL_BYTES, "replace", "output cell") != TF_OK) {
+            return TF_ERROR;
+        }
     }
+    if (need <= *cap) return TF_OK;
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(*cap, need, 64, &new_cap) != TF_OK) return TF_ERROR;
+    size_t max_cap = 0;
+    if (tf_size_add(TF_MAX_CELL_BYTES, 1, &max_cap) != TF_OK) return TF_ERROR;
+    if (new_cap > max_cap) new_cap = need;
+    char *nb = tf_reallocarray_checked(*buf, new_cap, sizeof(char));
+    if (!nb) return TF_ERROR;
+    *buf = nb;
+    *cap = new_cap;
+    return TF_OK;
 }
 
-static cJSON *replace_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = replace_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
+static int replace_append_bytes(char **buf, size_t *cap, size_t *len,
+                                const char *src, size_t n) {
+    if (!buf || !cap || !len || (!src && n > 0)) return TF_ERROR;
+    size_t end = 0;
+    size_t need = 0;
+    if (tf_size_add(*len, n, &end) != TF_OK ||
+        tf_size_add(end, 1, &need) != TF_OK) {
+        return TF_ERROR;
     }
-    return obj;
+    if (replace_ensure_buffer(buf, cap, need) != TF_OK) return TF_ERROR;
+    if (n > 0) memcpy(*buf + *len, src, n);
+    *len = end;
+    (*buf)[*len] = '\0';
+    return TF_OK;
+}
+
+static int replace_append_char(char **buf, size_t *cap, size_t *len, char ch) {
+    return replace_append_bytes(buf, cap, len, &ch, 1);
 }
 
 static int emit_replace_audit(replace_state *st, const tf_batch *b, size_t row, size_t col,
@@ -58,20 +76,30 @@ static int emit_replace_audit(replace_state *st, const tf_batch *b, size_t row, 
     cJSON_AddStringToObject(obj, "event", "value_changed");
     cJSON_AddStringToObject(obj, "reason", "replace_match");
     cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "column", b->col_names[col] ? b->col_names[col] : "");
-    cJSON_AddStringToObject(obj, "pattern", st->pattern ? st->pattern : "");
-    cJSON_AddStringToObject(obj, "replacement", st->replacement ? st->replacement : "");
+    const char *column_name = b->col_names[col] ? b->col_names[col] : "";
+    cJSON_AddStringToObject(obj, "column", column_name);
+    char pattern_buf[256];
+    char replacement_buf[256];
+    char before_buf[256];
+    char after_buf[256];
+    const char *safe_pattern = tf_audit_format_string_for_column(&st->audit_opts, column_name,
+                                                                 st->pattern, pattern_buf, sizeof(pattern_buf));
+    const char *safe_replacement = tf_audit_format_string_for_column(&st->audit_opts, column_name,
+                                                                     st->replacement, replacement_buf, sizeof(replacement_buf));
+    cJSON_AddStringToObject(obj, "pattern", safe_pattern ? safe_pattern : "");
+    cJSON_AddStringToObject(obj, "replacement", safe_replacement ? safe_replacement : "");
     cJSON_AddBoolToObject(obj, "regex", st->use_regex ? 1 : 0);
     cJSON_AddNumberToObject(obj, "row", (double)row_no);
-    cJSON_AddStringToObject(obj, "before", before ? before : "");
-    cJSON_AddStringToObject(obj, "after", after ? after : "");
-    cJSON *row_obj = replace_row_to_json(b, row);
+    const char *safe_before = tf_audit_format_string_for_column(&st->audit_opts, column_name, before, before_buf, sizeof(before_buf));
+    const char *safe_after = tf_audit_format_string_for_column(&st->audit_opts, column_name, after, after_buf, sizeof(after_buf));
+    cJSON_AddStringToObject(obj, "before", safe_before ? safe_before : "");
+    cJSON_AddStringToObject(obj, "after", safe_after ? safe_after : "");
+    cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->stats, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    int rc = tf_buffer_write_line(side->stats, line);
     free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
@@ -85,10 +113,15 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_copy_row(ob, r, in, r);
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = r + 1;
     }
 
@@ -99,10 +132,8 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
             for (size_t r = 0; r < ob->n_rows; r++) {
                 if (tf_batch_is_null(ob, r, (size_t)ci)) continue;
                 const char *val = tf_batch_get_string(ob, r, (size_t)ci);
-                size_t val_len = strlen(val);
-                size_t buf_cap = val_len * 2 + 64;
-                char *buf = malloc(buf_cap);
-                if (!buf) continue;
+                size_t buf_cap = 0;
+                char *buf = NULL;
                 size_t buf_len = 0;
                 const char *p = val;
                 regmatch_t match;
@@ -111,63 +142,71 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
                     replaced = 1;
                     size_t prefix = (size_t)match.rm_so;
                     size_t match_len = (size_t)(match.rm_eo - match.rm_so);
+                    if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, prefix) != TF_OK) {
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
                     /* Expand replacement: & refers to whole match */
-                    size_t rep_need = 0;
-                    for (const char *rp = st->replacement; *rp; rp++) {
-                        if (*rp == '&') rep_need += match_len;
-                        else rep_need++;
-                    }
-                    size_t need = buf_len + prefix + rep_need + 1;
-                    if (need > buf_cap) {
-                        buf_cap = need * 2;
-                        char *nb = realloc(buf, buf_cap);
-                        if (!nb) { free(buf); buf = NULL; break; }
-                        buf = nb;
-                    }
-                    memcpy(buf + buf_len, p, prefix);
-                    buf_len += prefix;
                     for (const char *rp = st->replacement; *rp; rp++) {
                         if (*rp == '&') {
-                            memcpy(buf + buf_len, p + match.rm_so, match_len);
-                            buf_len += match_len;
+                            if (replace_append_bytes(&buf, &buf_cap, &buf_len,
+                                                     p + match.rm_so, match_len) != TF_OK) {
+                                free(buf);
+                                tf_batch_free(ob);
+                                return TF_ERROR;
+                            }
                         } else {
-                            buf[buf_len++] = *rp;
+                            if (replace_append_char(&buf, &buf_cap, &buf_len, *rp) != TF_OK) {
+                                free(buf);
+                                tf_batch_free(ob);
+                                return TF_ERROR;
+                            }
                         }
                     }
                     p += match.rm_eo;
                     if (match_len == 0) {
                         /* Zero-length match: copy one char to avoid infinite loop */
                         if (*p) {
-                            if (buf_len + 2 > buf_cap) {
-                                buf_cap = (buf_len + 2) * 2;
-                                char *nb = realloc(buf, buf_cap);
-                                if (!nb) { free(buf); buf = NULL; break; }
-                                buf = nb;
+                            if (replace_append_char(&buf, &buf_cap, &buf_len, *p++) != TF_OK) {
+                                free(buf);
+                                tf_batch_free(ob);
+                                return TF_ERROR;
                             }
-                            buf[buf_len++] = *p++;
                         } else break;
                     }
                 }
-                if (buf && replaced) {
+                if (replaced) {
                     /* Copy remaining */
                     size_t rest = strlen(p);
-                    if (buf_len + rest + 1 > buf_cap) {
-                        buf_cap = buf_len + rest + 1;
-                        char *nb = realloc(buf, buf_cap);
-                        if (!nb) { free(buf); continue; }
-                        buf = nb;
-                    }
-                    memcpy(buf + buf_len, p, rest);
-                    buf_len += rest;
-                    buf[buf_len] = '\0';
-                    const char *before = val;
-                    tf_batch_set_string(ob, r, (size_t)ci, buf);
-                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
-                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before, after, side) != TF_OK) {
+                    if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, rest) != TF_OK) {
                         free(buf);
                         tf_batch_free(ob);
                         return TF_ERROR;
                     }
+                    char *before_copy = NULL;
+                    if (st->audit && st->audit_emitted < st->audit_limit) {
+                        before_copy = strdup(val);
+                        if (!before_copy) {
+                            free(buf);
+                            tf_batch_free(ob);
+                            return TF_ERROR;
+                        }
+                    }
+                    if (tf_batch_set_string(ob, r, (size_t)ci, buf) != TF_OK) {
+                        free(before_copy);
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
+                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
+                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before_copy ? before_copy : val, after, side) != TF_OK) {
+                        free(before_copy);
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
+                    free(before_copy);
                 }
                 free(buf);
             }
@@ -179,38 +218,51 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
                 for (size_t r = 0; r < ob->n_rows; r++) {
                     if (tf_batch_is_null(ob, r, (size_t)ci)) continue;
                     const char *val = tf_batch_get_string(ob, r, (size_t)ci);
-                    /* Count occurrences */
-                    size_t count = 0;
                     const char *p = val;
-                    while ((p = strstr(p, st->pattern)) != NULL) { count++; p += pat_len; }
-                    if (count == 0) continue;
+                    if (!strstr(p, st->pattern)) continue;
 
-                    size_t val_len = strlen(val);
-                    size_t new_len = rep_len >= pat_len
-                        ? val_len + count * (rep_len - pat_len)
-                        : val_len - count * (pat_len - rep_len);
-                    char *buf = malloc(new_len + 1);
-                    if (!buf) continue;
-                    char *dst = buf;
-                    p = val;
+                    size_t buf_cap = 0;
+                    size_t buf_len = 0;
+                    char *buf = NULL;
                     const char *found;
                     while ((found = strstr(p, st->pattern)) != NULL) {
                         size_t prefix = (size_t)(found - p);
-                        memcpy(dst, p, prefix);
-                        dst += prefix;
-                        memcpy(dst, st->replacement, rep_len);
-                        dst += rep_len;
+                        if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, prefix) != TF_OK ||
+                            replace_append_bytes(&buf, &buf_cap, &buf_len, st->replacement, rep_len) != TF_OK) {
+                            free(buf);
+                            tf_batch_free(ob);
+                            return TF_ERROR;
+                        }
                         p = found + pat_len;
                     }
-                    strcpy(dst, p);
-                    const char *before = val;
-                    tf_batch_set_string(ob, r, (size_t)ci, buf);
-                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
-                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before, after, side) != TF_OK) {
+                    if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, strlen(p)) != TF_OK) {
                         free(buf);
                         tf_batch_free(ob);
                         return TF_ERROR;
                     }
+                    char *before_copy = NULL;
+                    if (st->audit && st->audit_emitted < st->audit_limit) {
+                        before_copy = strdup(val);
+                        if (!before_copy) {
+                            free(buf);
+                            tf_batch_free(ob);
+                            return TF_ERROR;
+                        }
+                    }
+                    if (tf_batch_set_string(ob, r, (size_t)ci, buf) != TF_OK) {
+                        free(before_copy);
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
+                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
+                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before_copy ? before_copy : val, after, side) != TF_OK) {
+                        free(before_copy);
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
+                    free(before_copy);
                     free(buf);
                 }
             }
@@ -229,6 +281,7 @@ static int replace_flush(tf_step *self, tf_batch **out, tf_side_channels *side) 
 static void replace_state_free(replace_state *st) {
     if (!st) return;
     if (st->use_regex) regfree(&st->compiled);
+    tf_audit_options_free(&st->audit_opts);
     free(st->column);
     free(st->pattern);
     free(st->replacement);
@@ -250,6 +303,7 @@ tf_step *tf_replace_create(const cJSON *args) {
 
     replace_state *st = calloc(1, sizeof(replace_state));
     if (!st) return NULL;
+    tf_audit_options_init(&st->audit_opts, 1);
     st->column = strdup(col_j->valuestring);
     st->pattern = strdup(pat_j->valuestring);
     st->replacement = strdup(rep_j->valuestring);
@@ -264,12 +318,19 @@ tf_step *tf_replace_create(const cJSON *args) {
     cJSON *audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
     if (!audit_limit_j) audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
     if (audit_limit_j) {
-        if (!cJSON_IsNumber(audit_limit_j) || audit_limit_j->valuedouble <= 0) {
-            tf_set_last_error("replace: audit_limit must be a positive integer");
+        size_t parsed_limit = 0;
+        if (tf_json_get_size_arg_any(args, "audit_limit", "auditLimit",
+                                     1, TF_MAX_AUDIT_RECORDS,
+                                     &parsed_limit, "replace") < 0) {
             replace_state_free(st);
             return NULL;
         }
-        st->audit_limit = (size_t)audit_limit_j->valuedouble;
+        st->audit_limit = parsed_limit;
+    }
+
+    if (tf_audit_options_parse(&st->audit_opts, args, "replace") != TF_OK) {
+        replace_state_free(st);
+        return NULL;
     }
 
     if (st->use_regex) {

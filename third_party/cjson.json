@@ -1,0 +1,30 @@
+{
+  "name": "cJSON",
+  "version": "1.7.19",
+  "source": "https://github.com/DaveGamble/cJSON",
+  "tag": "v1.7.19",
+  "commit": "c859b25da02955fef659d658b8f324b5cde87be3",
+  "license": "MIT",
+  "vendored_files": [
+    "src/cJSON.c",
+    "src/cJSON.h"
+  ],
+  "compiled_files": [
+    "src/cJSON.c"
+  ],
+  "excluded_upstream_files": [
+    "cJSON_Utils.c",
+    "cJSON_Utils.h",
+    "test/",
+    "fuzzing/"
+  ],
+  "local_patches": [
+    "src/cJSON.c: global_error is thread-local so cJSON_GetErrorPtr() does not share mutable parse-error state across concurrent pipelines"
+  ],
+  "security": {
+    "CVE-2025-57052": {
+      "status": "not_reachable_and_upgraded",
+      "reason": "The vulnerable upstream function is in cJSON_Utils.c, which Tranfi does not vendor or compile; vendored cJSON core files are upgraded to 1.7.19, the upstream fixed release."
+    }
+  }
+}

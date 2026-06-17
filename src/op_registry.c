@@ -1,7 +1,6 @@
 /*
  * op_registry.c — Declarative registry of all built-in ops.
  *
- * Replaces the hard-coded strcmp chain in plan.c.
  * Each entry describes an op's kind, capabilities, arguments,
  * schema inference callback, and native constructor.
  */
@@ -532,16 +531,19 @@ static int infer_schema_schema_infer(const tf_ir_node *node,
 
 static int infer_schema_add_int64_column(const tf_schema *in, tf_schema *out, const char *name) {
     if (!in->known) { out->known = false; out->col_names = NULL; out->col_types = NULL; out->n_cols = 0; return TF_OK; }
-    out->n_cols = in->n_cols + 1;
+    if (tf_size_add(in->n_cols, 1, &out->n_cols) != TF_OK) return TF_ERROR;
     out->col_names = calloc(out->n_cols, sizeof(char *));
     out->col_types = calloc(out->n_cols, sizeof(tf_type));
+    if (!out->col_names || !out->col_types) { tf_schema_free(out); return TF_ERROR; }
     out->known = true;
     for (size_t i = 0; i < in->n_cols; i++) {
         out->col_names[i] = strdup(in->col_names[i]);
         out->col_types[i] = in->col_types[i];
+        if (!out->col_names[i]) { tf_schema_free(out); return TF_ERROR; }
     }
     out->col_names[in->n_cols] = strdup(name);
     out->col_types[in->n_cols] = TF_TYPE_INT64;
+    if (!out->col_names[in->n_cols]) { tf_schema_free(out); return TF_ERROR; }
     return TF_OK;
 }
 
@@ -583,7 +585,7 @@ static int infer_schema_source_name(const tf_ir_node *node,
     if (!cJSON_IsString(res)) res = cJSON_GetObjectItemCaseSensitive(node->args, "as");
     if (cJSON_IsString(res) && res->valuestring[0] != '\0') name = res->valuestring;
 
-    out->n_cols = in->n_cols + 1;
+    if (tf_size_add(in->n_cols, 1, &out->n_cols) != TF_OK) return TF_ERROR;
     out->col_names = calloc(out->n_cols, sizeof(char *));
     out->col_types = calloc(out->n_cols, sizeof(tf_type));
     if (!out->col_names || !out->col_types) {
@@ -594,6 +596,10 @@ static int infer_schema_source_name(const tf_ir_node *node,
     for (size_t i = 0; i < in->n_cols; i++) {
         out->col_names[i] = strdup(in->col_names[i]);
         out->col_types[i] = in->col_types[i];
+        if (!out->col_names[i]) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
     }
     out->col_names[in->n_cols] = strdup(name);
     out->col_types[in->n_cols] = TF_TYPE_STRING;
@@ -611,11 +617,19 @@ static int infer_schema_frequency(const tf_ir_node *node,
     out->n_cols = 2;
     out->col_names = calloc(2, sizeof(char *));
     out->col_types = calloc(2, sizeof(tf_type));
-    out->known = true;
+    if (!out->col_names || !out->col_types) {
+        tf_schema_free(out);
+        return TF_ERROR;
+    }
     out->col_names[0] = strdup("value");
     out->col_types[0] = TF_TYPE_STRING;
     out->col_names[1] = strdup("count");
     out->col_types[1] = TF_TYPE_INT64;
+    if (!out->col_names[0] || !out->col_names[1]) {
+        tf_schema_free(out);
+        return TF_ERROR;
+    }
+    out->known = true;
     return TF_OK;
 }
 
@@ -661,16 +675,28 @@ static int infer_schema_append_source_column(const tf_ir_node *node,
         name = fallback;
     }
 
-    out->n_cols = in->n_cols + 1;
+    if (tf_size_add(in->n_cols, 1, &out->n_cols) != TF_OK) return TF_ERROR;
     out->col_names = calloc(out->n_cols, sizeof(char *));
     out->col_types = calloc(out->n_cols, sizeof(tf_type));
+    if (!out->col_names || !out->col_types) {
+        tf_schema_free(out);
+        return TF_ERROR;
+    }
     out->known = true;
     for (size_t i = 0; i < in->n_cols; i++) {
         out->col_names[i] = strdup(in->col_names[i]);
         out->col_types[i] = in->col_types[i];
+        if (!out->col_names[i]) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
     }
     out->col_names[in->n_cols] = strdup(name);
     out->col_types[in->n_cols] = in->col_types[ci];
+    if (!out->col_names[in->n_cols]) {
+        tf_schema_free(out);
+        return TF_ERROR;
+    }
     return TF_OK;
 }
 
@@ -857,23 +883,36 @@ static int infer_schema_group_agg(const tf_ir_node *node,
     cJSON *aggs = cJSON_GetObjectItemCaseSensitive(node->args, "aggs");
     int ng = group_by ? cJSON_GetArraySize(group_by) : 0;
     int na = aggs ? cJSON_GetArraySize(aggs) : 0;
-    out->n_cols = ng + na;
-    out->col_names = calloc(out->n_cols, sizeof(char *));
-    out->col_types = calloc(out->n_cols, sizeof(tf_type));
-    out->known = true;
+    if (ng < 0 || na < 0) return TF_ERROR;
+    out->n_cols = (size_t)ng + (size_t)na;
+    out->col_names = calloc(out->n_cols ? out->n_cols : 1, sizeof(char *));
+    out->col_types = calloc(out->n_cols ? out->n_cols : 1, sizeof(tf_type));
+    if (!out->col_names || !out->col_types) {
+        tf_schema_free(out);
+        return TF_ERROR;
+    }
     for (int i = 0; i < ng; i++) {
         cJSON *item = cJSON_GetArrayItem(group_by, i);
         const char *name = cJSON_IsString(item) ? item->valuestring : "?";
         out->col_names[i] = strdup(name);
+        if (!out->col_names[i]) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
         int input_idx = schema_col_index(in, name);
         out->col_types[i] = input_idx >= 0 ? in->col_types[input_idx] : TF_TYPE_STRING;
     }
     for (int i = 0; i < na; i++) {
         cJSON *item = cJSON_GetArrayItem(aggs, i);
         cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
-        out->col_names[ng + i] = strdup(name_j && cJSON_IsString(name_j) ? name_j->valuestring : "?");
-        out->col_types[ng + i] = TF_TYPE_FLOAT64;
+        out->col_names[(size_t)ng + (size_t)i] = strdup(name_j && cJSON_IsString(name_j) ? name_j->valuestring : "?");
+        if (!out->col_names[(size_t)ng + (size_t)i]) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
+        out->col_types[(size_t)ng + (size_t)i] = TF_TYPE_FLOAT64;
     }
+    out->known = true;
     return TF_OK;
 }
 
@@ -881,32 +920,34 @@ static int infer_schema_group_agg(const tf_ir_node *node,
 static int infer_schema_stats(const tf_ir_node *node,
                               const tf_schema *in, tf_schema *out) {
     (void)in;
-    /* Determine which stats are requested */
-    int w_count=0, w_missing=0, w_complete_rate=0;
-    int w_sum=0, w_avg=0, w_min=0, w_max=0;
-    int w_var=0, w_stddev=0, w_median=0, w_p25=0, w_p75=0;
-    int w_skewness=0, w_kurtosis=0, w_distinct=0, w_hist=0, w_sample=0;
-    cJSON *stats_arr = cJSON_GetObjectItemCaseSensitive(node->args, "stats");
-    if (stats_arr && cJSON_IsArray(stats_arr)) {
-        int n = cJSON_GetArraySize(stats_arr);
+    int w_count = 0, w_missing = 0, w_complete_rate = 0;
+    int w_sum = 0, w_avg = 0, w_min = 0, w_max = 0;
+    int w_var = 0, w_stddev = 0;
+    int w_median = 0, w_p25 = 0, w_p75 = 0;
+    int w_skewness = 0, w_kurtosis = 0;
+    int w_distinct = 0, w_hist = 0, w_sample = 0;
+
+    cJSON *arr = node ? cJSON_GetObjectItemCaseSensitive(node->args, "stats") : NULL;
+    if (arr && cJSON_IsArray(arr)) {
+        int n = cJSON_GetArraySize(arr);
         for (int i = 0; i < n; i++) {
-            cJSON *item = cJSON_GetArrayItem(stats_arr, i);
+            cJSON *item = cJSON_GetArrayItem(arr, i);
             if (!cJSON_IsString(item)) continue;
             const char *s = item->valuestring;
             if (strcmp(s, "count") == 0) w_count = 1;
             else if (strcmp(s, "missing") == 0) w_missing = 1;
             else if (strcmp(s, "complete_rate") == 0) w_complete_rate = 1;
             else if (strcmp(s, "sum") == 0) w_sum = 1;
-            else if (strcmp(s, "avg") == 0) w_avg = 1;
+            else if (strcmp(s, "avg") == 0 || strcmp(s, "mean") == 0) w_avg = 1;
             else if (strcmp(s, "min") == 0) w_min = 1;
             else if (strcmp(s, "max") == 0) w_max = 1;
-            else if (strcmp(s, "var") == 0) w_var = 1;
-            else if (strcmp(s, "stddev") == 0) w_stddev = 1;
+            else if (strcmp(s, "var") == 0 || strcmp(s, "variance") == 0) w_var = 1;
+            else if (strcmp(s, "stddev") == 0 || strcmp(s, "sd") == 0) w_stddev = 1;
             else if (strcmp(s, "median") == 0) w_median = 1;
-            else if (strcmp(s, "p25") == 0) w_p25 = 1;
-            else if (strcmp(s, "p75") == 0) w_p75 = 1;
-            else if (strcmp(s, "skewness") == 0) w_skewness = 1;
-            else if (strcmp(s, "kurtosis") == 0) w_kurtosis = 1;
+            else if (strcmp(s, "p25") == 0 || strcmp(s, "q1") == 0) w_p25 = 1;
+            else if (strcmp(s, "p75") == 0 || strcmp(s, "q3") == 0) w_p75 = 1;
+            else if (strcmp(s, "skewness") == 0 || strcmp(s, "skew") == 0) w_skewness = 1;
+            else if (strcmp(s, "kurtosis") == 0 || strcmp(s, "kurt") == 0) w_kurtosis = 1;
             else if (strcmp(s, "distinct") == 0) w_distinct = 1;
             else if (strcmp(s, "hist") == 0) w_hist = 1;
             else if (strcmp(s, "sample") == 0) w_sample = 1;
@@ -945,27 +986,43 @@ static int infer_schema_stats(const tf_ir_node *node,
     out->col_names = calloc(n_cols, sizeof(char *));
     out->col_types = calloc(n_cols, sizeof(tf_type));
     out->n_cols = n_cols;
+    if (!out->col_names || !out->col_types) {
+        tf_schema_free(out);
+        return TF_ERROR;
+    }
     out->known = true;
 
     size_t ci = 0;
-    out->col_names[ci] = strdup("column"); out->col_types[ci++] = TF_TYPE_STRING;
-    if (w_count) { out->col_names[ci] = strdup("count"); out->col_types[ci++] = TF_TYPE_INT64; }
-    if (w_missing) { out->col_names[ci] = strdup("missing"); out->col_types[ci++] = TF_TYPE_INT64; }
-    if (w_complete_rate) { out->col_names[ci] = strdup("complete_rate"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_sum) { out->col_names[ci] = strdup("sum"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_avg) { out->col_names[ci] = strdup("avg"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_min) { out->col_names[ci] = strdup("min"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_max) { out->col_names[ci] = strdup("max"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_var) { out->col_names[ci] = strdup("var"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_stddev) { out->col_names[ci] = strdup("stddev"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_median) { out->col_names[ci] = strdup("median"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_p25) { out->col_names[ci] = strdup("p25"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_p75) { out->col_names[ci] = strdup("p75"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_skewness) { out->col_names[ci] = strdup("skewness"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_kurtosis) { out->col_names[ci] = strdup("kurtosis"); out->col_types[ci++] = TF_TYPE_FLOAT64; }
-    if (w_distinct) { out->col_names[ci] = strdup("distinct"); out->col_types[ci++] = TF_TYPE_INT64; }
-    if (w_hist) { out->col_names[ci] = strdup("hist"); out->col_types[ci++] = TF_TYPE_STRING; }
-    if (w_sample) { out->col_names[ci] = strdup("sample"); out->col_types[ci++] = TF_TYPE_STRING; }
+#define ADD_STAT_COLUMN(name, type) do { \
+        out->col_names[ci] = strdup((name)); \
+        out->col_types[ci] = (type); \
+        if (!out->col_names[ci]) { \
+            tf_schema_free(out); \
+            return TF_ERROR; \
+        } \
+        ci++; \
+    } while (0)
+
+    ADD_STAT_COLUMN("column", TF_TYPE_STRING);
+    if (w_count)         ADD_STAT_COLUMN("count", TF_TYPE_INT64);
+    if (w_missing)       ADD_STAT_COLUMN("missing", TF_TYPE_INT64);
+    if (w_complete_rate) ADD_STAT_COLUMN("complete_rate", TF_TYPE_FLOAT64);
+    if (w_sum)           ADD_STAT_COLUMN("sum", TF_TYPE_FLOAT64);
+    if (w_avg)           ADD_STAT_COLUMN("avg", TF_TYPE_FLOAT64);
+    if (w_min)           ADD_STAT_COLUMN("min", TF_TYPE_FLOAT64);
+    if (w_max)           ADD_STAT_COLUMN("max", TF_TYPE_FLOAT64);
+    if (w_var)           ADD_STAT_COLUMN("var", TF_TYPE_FLOAT64);
+    if (w_stddev)        ADD_STAT_COLUMN("stddev", TF_TYPE_FLOAT64);
+    if (w_median)        ADD_STAT_COLUMN("median", TF_TYPE_FLOAT64);
+    if (w_p25)           ADD_STAT_COLUMN("p25", TF_TYPE_FLOAT64);
+    if (w_p75)           ADD_STAT_COLUMN("p75", TF_TYPE_FLOAT64);
+    if (w_skewness)      ADD_STAT_COLUMN("skewness", TF_TYPE_FLOAT64);
+    if (w_kurtosis)      ADD_STAT_COLUMN("kurtosis", TF_TYPE_FLOAT64);
+    if (w_distinct)      ADD_STAT_COLUMN("distinct", TF_TYPE_INT64);
+    if (w_hist)          ADD_STAT_COLUMN("hist", TF_TYPE_STRING);
+    if (w_sample)        ADD_STAT_COLUMN("sample", TF_TYPE_STRING);
+#undef ADD_STAT_COLUMN
+
     return TF_OK;
 }
 
@@ -980,9 +1037,18 @@ static tf_arg_desc csv_decode_args[] = {
     {"strict",    "bool",   false, "false"},
     {"max_error_bytes", "int", false, "4096"},
     {"max_record_bytes", "int", false, "67108864"},
+    {"max_columns", "int", false, "8192"},
     {"nulls",    "string|array", false, """"},
     {"na",       "string|array", false, """"},
     {"quoted_nulls", "bool", false, "true"},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc csv_encode_args[] = {
@@ -994,6 +1060,8 @@ static tf_arg_desc jsonl_decode_args[] = {
     {"batch_size", "int", false, "1024"},
     {"on_error", "string", false, "skip"},
     {"max_error_bytes", "int", false, "4096"},
+    {"max_record_bytes", "int", false, "67108864"},
+    {"max_columns", "int", false, "8192"},
 };
 
 static tf_arg_desc jsonl_encode_args[] = {
@@ -1002,6 +1070,9 @@ static tf_arg_desc jsonl_encode_args[] = {
 
 static tf_arg_desc text_decode_args[] = {
     {"batch_size", "int", false, "1024"},
+    {"max_error_bytes", "int", false, "4096"},
+    {"max_record_bytes", "int", false, "67108864"},
+    {"max_columns", "int", false, "8192"},
 };
 
 static tf_arg_desc text_encode_args[] = {
@@ -1017,6 +1088,14 @@ static tf_arg_desc grep_args[] = {
 
 static tf_arg_desc filter_args[] = {
     {"expr", "string", true, NULL},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "int", false, NULL},
+    {"audit_max_cell_bytes", "int", false, NULL},
 };
 
 static tf_arg_desc select_args[] = {
@@ -1066,6 +1145,10 @@ static tf_arg_desc unique_args[] = {
     {"columns", "string[]", false, NULL},
     {"max_keys", "int", false, NULL},
     {"max_state_bytes", "int", false, NULL},
+    {"spill_dir", "string", false, NULL},
+    {"spill_memory_bytes", "int", false, NULL},
+    {"spill_run_rows", "int", false, NULL},
+    {"spill_output_rows", "int", false, NULL},
     {"sorted", "bool", false, "false"},
 };
 
@@ -1083,6 +1166,12 @@ static tf_arg_desc validate_args[] = {
     {"rules_file", "string", false, NULL},
     {"audit", "bool", false, "false"},
     {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "int", false, NULL},
+    {"audit_max_cell_bytes", "int", false, NULL},
     {"max_failures", "int", false, NULL},
     {"max_failure_rate", "number", false, NULL},
     {"warn_failure_rate", "number", false, NULL},
@@ -1096,18 +1185,32 @@ static tf_arg_desc assert_args[] = {
     {"column", "string", false, NULL},
     {"op", "string", false, NULL},
     {"value", "number", false, NULL},
+    {"tolerance", "number", false, "1e-12"},
+    {"rel", "bool", false, "true"},
     {"action", "string", false, "\"fail\""},
     {"name", "string", false, "\"assert\""},
     {"message", "string", false, "\"\""},
     {"result", "string", false, "\"_assert\""},
     {"audit", "bool", false, "false"},
     {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "int", false, NULL},
+    {"audit_max_cell_bytes", "int", false, NULL},
 };
 
 static tf_arg_desc quarantine_args[] = {
     {"expr", "string", true, NULL},
     {"name", "string", false, "\"quarantine\""},
     {"message", "string", false, "\"\""},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc tee_args[] = {
@@ -1118,6 +1221,12 @@ static tf_arg_desc tee_args[] = {
     {"every", "int", false, "1"},
     {"name", "string", false, "\"tee\""},
     {"include_row", "bool", false, "true"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc schema_args[] = {
@@ -1129,6 +1238,14 @@ static tf_arg_desc schema_args[] = {
     {"min", "map", false, NULL},
     {"max", "map", false, NULL},
     {"regex", "map", false, NULL},
+    {"max_regex_pattern_bytes", "int", false, "4096"},
+    {"max_regex_cell_bytes", "int", false, "65536"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "int", false, NULL},
+    {"audit_max_cell_bytes", "int", false, NULL},
     {"mode", "string", false, "\"fail\""},
     {"action", "string", false, "\"fail\""},
     {"name", "string", false, "\"schema\""},
@@ -1146,10 +1263,26 @@ static tf_arg_desc trim_args[] = {
 
 static tf_arg_desc fill_null_args[] = {
     {"mapping", "map", true, NULL},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc cast_args[] = {
     {"mapping", "map", true, NULL},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc clip_args[] = {
@@ -1163,6 +1296,14 @@ static tf_arg_desc replace_args[] = {
     {"pattern", "string", true, NULL},
     {"replacement", "string", true, NULL},
     {"regex", "bool", false, "false"},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc hash_args[] = {
@@ -1172,6 +1313,8 @@ static tf_arg_desc hash_args[] = {
 static tf_arg_desc bin_args[] = {
     {"column", "string", true, NULL},
     {"boundaries", "float[]", true, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc fill_down_args[] = {
@@ -1189,12 +1332,16 @@ static tf_arg_desc window_args[] = {
     {"size", "int", true, NULL},
     {"func", "string", true, NULL},
     {"result", "string", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc rolling_args[] = {
     {"column", "string", true, NULL},
     {"size", "int", true, NULL},
     {"result", "string", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc rolling_bool_args[] = {
@@ -1207,6 +1354,10 @@ static tf_arg_desc rolling_bool_args[] = {
 static tf_arg_desc explode_args[] = {
     {"column", "string", true, NULL},
     {"delimiter", "string", false, "\",\""},
+    {"max_tokens_per_row", "int", false, NULL},
+    {"max_output_rows_per_input_row", "int", false, NULL},
+    {"max_output_rows_per_batch", "int", false, NULL},
+    {"max_token_bytes", "int", false, NULL},
 };
 
 static tf_arg_desc split_args[] = {
@@ -1217,6 +1368,8 @@ static tf_arg_desc split_args[] = {
 
 static tf_arg_desc unpivot_args[] = {
     {"columns", "string[]", true, NULL},
+    {"max_output_rows_per_input_row", "int", false, NULL},
+    {"max_output_rows_per_batch", "int", false, NULL},
 };
 
 static tf_arg_desc tail_args[] = {
@@ -1232,6 +1385,7 @@ static tf_arg_desc top_args[] = {
 
 static tf_arg_desc sample_args[] = {
     {"n", "int", true, NULL},
+    {"seed", "int|string", false, "0"},
 };
 
 static tf_arg_desc group_agg_args[] = {
@@ -1239,6 +1393,10 @@ static tf_arg_desc group_agg_args[] = {
     {"aggs", "map[]", true, NULL},
     {"max_groups", "int", false, NULL},
     {"max_state_bytes", "int", false, NULL},
+    {"spill_dir", "string", false, NULL},
+    {"spill_memory_bytes", "int", false, NULL},
+    {"spill_run_rows", "int", false, NULL},
+    {"spill_output_rows", "int", false, NULL},
     {"sorted", "bool", false, "false"},
 };
 
@@ -1248,11 +1406,21 @@ static tf_arg_desc frequency_args[] = {
     {"max_state_bytes", "int", false, NULL},
     {"overflow", "string", false, "\"error\""},
     {"other", "string", false, "\"__other__\""},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc datetime_args[] = {
     {"column", "string", true, NULL},
     {"extract", "string[]", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc pivot_args[] = {
@@ -1278,6 +1446,10 @@ static tf_arg_desc join_args[] = {
     {"max_state_bytes", "int", false, NULL},
     {"max_matches_per_row", "int", false, NULL},
     {"max_output_rows", "int", false, NULL},
+    {"spill_dir", "string", false, NULL},
+    {"spill_memory_bytes", "int", false, NULL},
+    {"spill_run_rows", "int", false, NULL},
+    {"spill_output_rows", "int", false, NULL},
     {"sorted", "bool", false, "false"},
 };
 
@@ -1358,6 +1530,8 @@ static tf_arg_desc date_trunc_args[] = {
     {"column", "string", true, NULL},
     {"trunc", "string", true, NULL},
     {"result", "string", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc onehot_args[] = {
@@ -1382,6 +1556,8 @@ static tf_arg_desc ewma_args[] = {
     {"column", "string", true, NULL},
     {"alpha", "float", true, NULL},
     {"result", "string", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc diff_args[] = {
@@ -1394,6 +1570,8 @@ static tf_arg_desc anomaly_args[] = {
     {"column", "string", true, NULL},
     {"threshold", "float", false, "3.0"},
     {"result", "string", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc split_data_args[] = {
@@ -1410,16 +1588,30 @@ static tf_arg_desc source_name_args[] = {
 static tf_arg_desc interpolate_args[] = {
     {"column", "string", true, NULL},
     {"method", "string", false, "\"linear\""},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc normalize_args[] = {
     {"columns", "string[]", true, NULL},
     {"method", "string", false, "\"minmax\""},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "size", false, "0"},
+    {"audit_max_cell_bytes", "size", false, "0"},
 };
 
 static tf_arg_desc acf_args[] = {
     {"column", "string", true, NULL},
     {"lags", "int", false, "20"},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc json_extract_args[] = {
@@ -1442,6 +1634,14 @@ static tf_arg_desc json_schema_args[] = {
     {"schema", "object|string|bool", true, NULL},
     {"mode", "string", false, "\"annotate\""},
     {"result", "string", false, "\"_valid\""},
+    {"audit", "bool", false, "false"},
+    {"audit_limit", "int", false, "1000"},
+    {"audit_include_row", "bool", false, "true"},
+    {"audit_columns", "string[]", false, NULL},
+    {"audit_redact", "string[]", false, NULL},
+    {"audit_hash_columns", "string[]", false, NULL},
+    {"audit_max_bytes", "int", false, NULL},
+    {"audit_max_cell_bytes", "int", false, NULL},
 };
 
 static tf_arg_desc json_flatten_args[] = {
@@ -1496,7 +1696,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_DATA_DEPENDENT,
         .state_estimate = "O(batch_size * columns)",
         .args = csv_decode_args,
-        .n_args = 4,
+        .n_args = 20,
         .infer_schema = infer_schema_unknown,
         .create_native = (void *(*)(const cJSON *))tf_csv_decoder_create,
     },
@@ -1594,7 +1794,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_STABLE,
         .state_estimate = "O(batch_rows * columns)",
         .args = filter_args,
-        .n_args = 1,
+        .n_args = 9,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_filter_create,
     },
@@ -1748,9 +1948,9 @@ static tf_op_entry builtin_ops[] = {
         .memory_class = TF_MEM_KEY_STATE,
         .emit_class = TF_EMIT_PER_BATCH,
         .schema_class = TF_SCHEMA_STABLE,
-        .state_estimate = "O(1) sorted, O(distinct_keys) unsorted or capped by max_keys/max_state_bytes",
+        .state_estimate = "O(1) sorted, O(distinct_keys) unsorted or capped by max_keys/max_state_bytes, or O(spill_run_rows * columns) RAM with spill_dir",
         .args = unique_args,
-        .n_args = 3,
+        .n_args = 8,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_unique_create,
     },
@@ -1822,7 +2022,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(batch_rows * columns)",
         .args = validate_args,
-        .n_args = 1,
+        .n_args = 16,
         .infer_schema = infer_schema_validate,
         .create_native = (void *(*)(const cJSON *))tf_validate_create,
     },
@@ -1836,7 +2036,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(batch_rows * columns) row mode, O(1) aggregate mode",
         .args = assert_args,
-        .n_args = 11,
+        .n_args = 19,
         .infer_schema = infer_schema_assert,
         .create_native = (void *(*)(const cJSON *))tf_assert_create,
     },
@@ -1850,7 +2050,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_STABLE,
         .state_estimate = "O(batch_rows * columns)",
         .args = quarantine_args,
-        .n_args = 3,
+        .n_args = 9,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_quarantine_create,
     },
@@ -1864,7 +2064,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_STABLE,
         .state_estimate = "O(batch_rows * selected_columns)",
         .args = tee_args,
-        .n_args = 7,
+        .n_args = 13,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_tee_create,
     },
@@ -1920,7 +2120,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_STABLE,
         .state_estimate = "O(batch_rows * columns)",
         .args = fill_null_args,
-        .n_args = 1,
+        .n_args = 9,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_fill_null_create,
     },
@@ -1934,7 +2134,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(batch_rows * columns)",
         .args = cast_args,
-        .n_args = 1,
+        .n_args = 9,
         .infer_schema = infer_schema_passthrough,  /* type changes at runtime */
         .create_native = (void *(*)(const cJSON *))tf_cast_create,
     },
@@ -1962,7 +2162,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_STABLE,
         .state_estimate = "O(batch_rows)",
         .args = replace_args,
-        .n_args = 4,
+        .n_args = 12,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_replace_create,
     },
@@ -1990,7 +2190,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(boundaries)",
         .args = bin_args,
-        .n_args = 2,
+        .n_args = 4,
         .infer_schema = infer_schema_passthrough,  /* adds column at runtime */
         .create_native = (void *(*)(const cJSON *))tf_bin_create,
     },
@@ -2033,7 +2233,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(window_size)",
         .args = window_args,
-        .n_args = 4,
+        .n_args = 6,
         .infer_schema = infer_schema_passthrough,  /* adds column at runtime */
         .create_native = (void *(*)(const cJSON *))tf_window_create,
     },
@@ -2047,7 +2247,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(window_size)",
         .args = rolling_args,
-        .n_args = 3,
+        .n_args = 5,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_rolling_sum_create,
     },
@@ -2061,7 +2261,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(window_size)",
         .args = rolling_args,
-        .n_args = 3,
+        .n_args = 5,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_rolling_mean_create,
     },
@@ -2075,7 +2275,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(window_size)",
         .args = rolling_args,
-        .n_args = 3,
+        .n_args = 5,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_rolling_min_create,
     },
@@ -2089,7 +2289,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(window_size)",
         .args = rolling_args,
-        .n_args = 3,
+        .n_args = 5,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_rolling_max_create,
     },
@@ -2273,7 +2473,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_STABLE,
         .state_estimate = "O(n)",
         .args = sample_args,
-        .n_args = 1,
+        .n_args = 2,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_sample_create,
     },
@@ -2285,9 +2485,9 @@ static tf_op_entry builtin_ops[] = {
         .memory_class = TF_MEM_KEY_STATE,
         .emit_class = TF_EMIT_MIXED,
         .schema_class = TF_SCHEMA_PARAMETRIC,
-        .state_estimate = "O(1) sorted, O(distinct_groups) unsorted or capped by max_groups/max_state_bytes",
+        .state_estimate = "O(1) sorted, O(distinct_groups) unsorted or capped by max_groups/max_state_bytes, or O(spill_run_rows * columns) RAM with spill_dir",
         .args = group_agg_args,
-        .n_args = 5,
+        .n_args = 9,
         .infer_schema = infer_schema_group_agg,
         .create_native = (void *(*)(const cJSON *))tf_group_agg_create,
     },
@@ -2301,7 +2501,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(distinct_values) or capped by max_values/max_state_bytes",
         .args = frequency_args,
-        .n_args = 5,
+        .n_args = 13,
         .infer_schema = infer_schema_frequency,
         .create_native = (void *(*)(const cJSON *))tf_frequency_create,
     },
@@ -2316,7 +2516,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(batch_rows)",
         .args = datetime_args,
-        .n_args = 2,
+        .n_args = 4,
         .infer_schema = infer_schema_passthrough,  /* adds columns at runtime */
         .create_native = (void *(*)(const cJSON *))tf_datetime_create,
     },
@@ -2358,7 +2558,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(batch_rows + schema_nodes)",
         .args = json_schema_args,
-        .n_args = 4,
+        .n_args = 12,
         .infer_schema = infer_schema_json_schema,
         .create_native = (void *(*)(const cJSON *))tf_json_schema_create,
     },
@@ -2413,9 +2613,9 @@ static tf_op_entry builtin_ops[] = {
         .memory_class = TF_MEM_KEY_STATE,
         .emit_class = TF_EMIT_PER_BATCH,
         .schema_class = TF_SCHEMA_DATA_DEPENDENT,
-        .state_estimate = "O(current_lookup_run) sorted, O(lookup_rows + lookup_keys + output_batch) unsorted or capped by max_lookup_*/max_state_bytes/max_output_rows",
+        .state_estimate = "O(current_lookup_run) sorted, O(lookup_rows + lookup_keys + output_batch) unsorted or capped by max_lookup_*/max_state_bytes/max_output_rows, or O(spill_run_rows * columns + max_matches_per_row) RAM with spill_dir",
         .args = join_args,
-        .n_args = 10,
+        .n_args = 14,
         .infer_schema = infer_schema_passthrough,  /* schema depends on lookup file */
         .create_native = (void *(*)(const cJSON *))tf_join_create,
     },
@@ -2427,9 +2627,9 @@ static tf_op_entry builtin_ops[] = {
         .memory_class = TF_MEM_KEY_STATE,
         .emit_class = TF_EMIT_PER_BATCH,
         .schema_class = TF_SCHEMA_STABLE,
-        .state_estimate = "O(1) sorted, O(lookup_keys) unsorted or capped by max_lookup_*/max_state_bytes/max_output_rows",
+        .state_estimate = "O(1) sorted, O(lookup_keys) unsorted or capped by max_lookup_*/max_state_bytes/max_output_rows, or O(spill_run_rows * columns) RAM with spill_dir",
         .args = join_args,
-        .n_args = 10,
+        .n_args = 14,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_semi_join_create,
     },
@@ -2441,9 +2641,9 @@ static tf_op_entry builtin_ops[] = {
         .memory_class = TF_MEM_KEY_STATE,
         .emit_class = TF_EMIT_PER_BATCH,
         .schema_class = TF_SCHEMA_STABLE,
-        .state_estimate = "O(1) sorted, O(lookup_keys) unsorted or capped by max_lookup_*/max_state_bytes/max_output_rows",
+        .state_estimate = "O(1) sorted, O(lookup_keys) unsorted or capped by max_lookup_*/max_state_bytes/max_output_rows, or O(spill_run_rows * columns) RAM with spill_dir",
         .args = join_args,
-        .n_args = 10,
+        .n_args = 14,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_anti_join_create,
     },
@@ -2625,7 +2825,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(batch_rows)",
         .args = date_trunc_args,
-        .n_args = 3,
+        .n_args = 5,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_date_trunc_create,
     },
@@ -2667,7 +2867,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(1)",
         .args = ewma_args,
-        .n_args = 3,
+        .n_args = 5,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_ewma_create,
     },
@@ -2695,7 +2895,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(1)",
         .args = anomaly_args,
-        .n_args = 3,
+        .n_args = 5,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_anomaly_create,
     },
@@ -2720,10 +2920,10 @@ static tf_op_entry builtin_ops[] = {
         .caps = TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC,
         .memory_class = TF_MEM_BLOCKING,
         .emit_class = TF_EMIT_ON_FLUSH,
-        .schema_class = TF_SCHEMA_STABLE,
+        .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(input_rows)",
         .args = interpolate_args,
-        .n_args = 2,
+        .n_args = 4,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_interpolate_create,
     },
@@ -2737,7 +2937,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(input_rows)",
         .args = normalize_args,
-        .n_args = 2,
+        .n_args = 12,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_normalize_create,
     },
@@ -2751,7 +2951,7 @@ static tf_op_entry builtin_ops[] = {
         .schema_class = TF_SCHEMA_PARAMETRIC,
         .state_estimate = "O(input_rows)",
         .args = acf_args,
-        .n_args = 2,
+        .n_args = 4,
         .infer_schema = infer_schema_passthrough,
         .create_native = (void *(*)(const cJSON *))tf_acf_create,
     },

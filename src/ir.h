@@ -8,6 +8,7 @@
 #ifndef TF_IR_H
 #define TF_IR_H
 
+#include "config.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -16,6 +17,7 @@
 typedef struct cJSON cJSON;
 typedef struct tf_ir_node tf_ir_node;
 typedef struct tf_schema tf_schema;
+typedef struct tf_host_policy tf_host_policy;
 
 /* ---- Capability flags ---- */
 
@@ -175,6 +177,7 @@ char       *tf_ir_to_sql(const tf_ir_plan *plan, char **error);
 /* ---- IR passes ---- */
 
 int tf_ir_validate(tf_ir_plan *plan);
+int tf_ir_validate_with_host_policy(tf_ir_plan *plan, const tf_host_policy *policy);
 int tf_ir_infer_schema(tf_ir_plan *plan);
 
 /* ---- Expression eval result ---- */

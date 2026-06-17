@@ -21,102 +21,41 @@ static int skip_process(tf_step *self, tf_batch *in, tf_batch **out,
     skip_state *st = self->state;
     *out = NULL;
 
-    if (st->seen >= st->n) {
-        /* Already past skip region — pass through all rows */
-        tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
-        if (!ob) return TF_ERROR;
-        for (size_t c = 0; c < in->n_cols; c++) {
-            tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    size_t emit_start = 0;
+    size_t next_seen = st->seen;
+    if (st->seen < st->n) {
+        size_t remaining_skip = st->n - st->seen;
+        if (remaining_skip >= in->n_rows) {
+            /* Skip entire batch */
+            st->seen += in->n_rows;
+            return TF_OK;
         }
-        for (size_t r = 0; r < in->n_rows; r++) {
-            tf_batch_ensure_capacity(ob, r + 1);
-            for (size_t c = 0; c < in->n_cols; c++) {
-                if (tf_batch_is_null(in, r, c)) {
-                    tf_batch_set_null(ob, r, c);
-                    continue;
-                }
-                switch (in->col_types[c]) {
-                    case TF_TYPE_BOOL:
-                        tf_batch_set_bool(ob, r, c, tf_batch_get_bool(in, r, c));
-                        break;
-                    case TF_TYPE_INT64:
-                        tf_batch_set_int64(ob, r, c, tf_batch_get_int64(in, r, c));
-                        break;
-                    case TF_TYPE_FLOAT64:
-                        tf_batch_set_float64(ob, r, c, tf_batch_get_float64(in, r, c));
-                        break;
-                    case TF_TYPE_STRING:
-                        tf_batch_set_string(ob, r, c, tf_batch_get_string(in, r, c));
-                        break;
-                    case TF_TYPE_DATE:
-                        tf_batch_set_date(ob, r, c, tf_batch_get_date(in, r, c));
-                        break;
-                    case TF_TYPE_TIMESTAMP:
-                        tf_batch_set_timestamp(ob, r, c, tf_batch_get_timestamp(in, r, c));
-                        break;
-                    default:
-                        tf_batch_set_null(ob, r, c);
-                        break;
-                }
-            }
-            ob->n_rows = r + 1;
-        }
-        *out = ob;
-        return TF_OK;
+        emit_start = remaining_skip;
+        next_seen = st->n;
     }
 
-    size_t remaining_skip = st->n - st->seen;
-
-    if (remaining_skip >= in->n_rows) {
-        /* Skip entire batch */
-        st->seen += in->n_rows;
-        return TF_OK;
-    }
-
-    /* Partial skip — emit rows after the skip region */
-    size_t emit_start = remaining_skip;
     size_t emit_count = in->n_rows - emit_start;
-    st->seen = st->n;
+    if (emit_count == 0) {
+        st->seen = next_seen;
+        return TF_OK;
+    }
 
     tf_batch *ob = tf_batch_create(in->n_cols, emit_count);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++) {
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
     for (size_t i = 0; i < emit_count; i++) {
         size_t r = emit_start + i;
-        tf_batch_ensure_capacity(ob, i + 1);
-        for (size_t c = 0; c < in->n_cols; c++) {
-            if (tf_batch_is_null(in, r, c)) {
-                tf_batch_set_null(ob, i, c);
-                continue;
-            }
-            switch (in->col_types[c]) {
-                case TF_TYPE_BOOL:
-                    tf_batch_set_bool(ob, i, c, tf_batch_get_bool(in, r, c));
-                    break;
-                case TF_TYPE_INT64:
-                    tf_batch_set_int64(ob, i, c, tf_batch_get_int64(in, r, c));
-                    break;
-                case TF_TYPE_FLOAT64:
-                    tf_batch_set_float64(ob, i, c, tf_batch_get_float64(in, r, c));
-                    break;
-                case TF_TYPE_STRING:
-                    tf_batch_set_string(ob, i, c, tf_batch_get_string(in, r, c));
-                    break;
-                case TF_TYPE_DATE:
-                    tf_batch_set_date(ob, i, c, tf_batch_get_date(in, r, c));
-                    break;
-                case TF_TYPE_TIMESTAMP:
-                    tf_batch_set_timestamp(ob, i, c, tf_batch_get_timestamp(in, r, c));
-                    break;
-                default:
-                    tf_batch_set_null(ob, i, c);
-                    break;
-            }
+        if (tf_batch_copy_row(ob, i, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
         }
         ob->n_rows = i + 1;
     }
+
+    st->seen = next_seen;
     *out = ob;
     return TF_OK;
 }
@@ -134,12 +73,13 @@ static void skip_destroy(tf_step *self) {
 
 tf_step *tf_skip_create(const cJSON *args) {
     if (!args) return NULL;
-    cJSON *n_json = cJSON_GetObjectItemCaseSensitive(args, "n");
-    if (!cJSON_IsNumber(n_json) || n_json->valueint <= 0) return NULL;
+    size_t n = 0;
+    int has_n = tf_json_get_size_arg(args, "n", 0, TF_MAX_COUNT_ARG, &n, "skip");
+    if (has_n <= 0) return NULL;
 
     skip_state *st = calloc(1, sizeof(skip_state));
     if (!st) return NULL;
-    st->n = (size_t)n_json->valueint;
+    st->n = n;
     st->seen = 0;
 
     tf_step *step = calloc(1, sizeof(tf_step));

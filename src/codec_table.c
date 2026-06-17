@@ -51,7 +51,7 @@ static char *cell_to_string(tf_batch *b, size_t row, size_t col) {
         case TF_TYPE_STRING:
             return strdup(tf_batch_get_string(b, row, col));
         case TF_TYPE_DATE: {
-            char dbuf[16];
+            char dbuf[32];
             tf_date_format(tf_batch_get_date(b, row, col), dbuf, sizeof(dbuf));
             return strdup(dbuf);
         }
@@ -65,33 +65,74 @@ static char *cell_to_string(tf_batch *b, size_t row, size_t col) {
     }
 }
 
+static int table_capture_schema(table_encoder_state *st, const tf_batch *in) {
+    st->n_cols = in->n_cols < TABLE_MAX_COLS ? in->n_cols : TABLE_MAX_COLS;
+    if (st->n_cols == 0) return TF_OK;
+    size_t bytes = 0;
+    if (tf_size_mul(st->n_cols, sizeof(char *), &bytes) != TF_OK) return TF_ERROR;
+    st->col_names = malloc(bytes);
+    if (!st->col_names) return TF_ERROR;
+    memset(st->col_names, 0, bytes);
+    for (size_t i = 0; i < st->n_cols; i++) {
+        st->col_names[i] = strdup(in->col_names[i] ? in->col_names[i] : "");
+        if (!st->col_names[i]) return TF_ERROR;
+    }
+    return TF_OK;
+}
+
+static int table_ensure_value_capacity(table_encoder_state *st, size_t min_rows) {
+    if (st->n_cols == 0 || min_rows <= st->capacity) return TF_OK;
+    size_t new_cap = 0;
+    size_t cells = 0;
+    size_t bytes = 0;
+    if (tf_size_grow_pow2(st->capacity, min_rows, 64, &new_cap) != TF_OK ||
+        tf_size_mul(new_cap, st->n_cols, &cells) != TF_OK ||
+        tf_size_mul(cells, sizeof(char *), &bytes) != TF_OK) {
+        return TF_ERROR;
+    }
+    char **new_values = realloc(st->values, bytes);
+    if (!new_values) return TF_ERROR;
+    st->values = new_values;
+    st->capacity = new_cap;
+    return TF_OK;
+}
+
+static int table_write_repeat(tf_buffer *out, char ch, size_t count) {
+    char pad[256];
+    memset(pad, ch, sizeof(pad));
+    while (count > 0) {
+        size_t chunk = count < sizeof(pad) ? count : sizeof(pad);
+        if (tf_buffer_write(out, (const uint8_t *)pad, chunk) != TF_OK) return TF_ERROR;
+        count -= chunk;
+    }
+    return TF_OK;
+}
+
 static int table_encode(tf_encoder *self, tf_batch *in, tf_buffer *out) {
     table_encoder_state *st = self->state;
     (void)out;
 
     /* Capture column names on first batch */
     if (!st->col_names && in->n_cols > 0) {
-        st->n_cols = in->n_cols < TABLE_MAX_COLS ? in->n_cols : TABLE_MAX_COLS;
-        st->col_names = malloc(st->n_cols * sizeof(char *));
-        for (size_t i = 0; i < st->n_cols; i++) {
-            st->col_names[i] = strdup(in->col_names[i]);
-        }
+        if (table_capture_schema(st, in) != TF_OK) return TF_ERROR;
     }
 
     /* Buffer all cell values as strings */
     for (size_t r = 0; r < in->n_rows; r++) {
         if (st->max_rows > 0 && st->n_rows >= st->max_rows) break;
-
-        if (st->n_rows >= st->capacity) {
-            size_t new_cap = st->capacity == 0 ? 64 : st->capacity * 2;
-            st->values = realloc(st->values, new_cap * st->n_cols * sizeof(char *));
-            if (!st->values) return TF_ERROR;
-            st->capacity = new_cap;
-        }
+        if (table_ensure_value_capacity(st, st->n_rows + 1) != TF_OK) return TF_ERROR;
 
         size_t base = st->n_rows * st->n_cols;
-        for (size_t c = 0; c < st->n_cols; c++) {
+        size_t c = 0;
+        for (; c < st->n_cols; c++) {
             st->values[base + c] = cell_to_string(in, r, c);
+            if (!st->values[base + c]) {
+                for (size_t j = 0; j < c; j++) {
+                    free(st->values[base + j]);
+                    st->values[base + j] = NULL;
+                }
+                return TF_ERROR;
+            }
         }
         st->n_rows++;
     }
@@ -105,6 +146,7 @@ static int table_flush(tf_encoder *self, tf_buffer *out) {
 
     /* Compute column widths */
     size_t *widths = calloc(st->n_cols, sizeof(size_t));
+    if (!widths) return TF_ERROR;
     for (size_t c = 0; c < st->n_cols; c++) {
         widths[c] = strlen(st->col_names[c]);
     }
@@ -120,59 +162,55 @@ static int table_flush(tf_encoder *self, tf_buffer *out) {
             widths[c] = st->max_width;
     }
 
-    char pad[256];
+#define TABLE_WRITE(data, len) \
+    do { \
+        if (tf_buffer_write(out, (const uint8_t *)(data), (len)) != TF_OK) goto fail; \
+    } while (0)
 
     /* Header row */
-    tf_buffer_write(out, (const uint8_t *)"| ", 2);
+    TABLE_WRITE("| ", 2);
     for (size_t c = 0; c < st->n_cols; c++) {
-        if (c > 0) tf_buffer_write(out, (const uint8_t *)" | ", 3);
+        if (c > 0) TABLE_WRITE(" | ", 3);
         const char *name = st->col_names[c];
         size_t nlen = strlen(name);
         size_t w = widths[c];
         if (nlen > w) nlen = w;
-        tf_buffer_write(out, (const uint8_t *)name, nlen);
-        if (nlen < w) {
-            size_t plen = w - nlen;
-            if (plen > sizeof(pad)) plen = sizeof(pad);
-            memset(pad, ' ', plen);
-            tf_buffer_write(out, (const uint8_t *)pad, plen);
-        }
+        TABLE_WRITE(name, nlen);
+        if (nlen < w && table_write_repeat(out, ' ', w - nlen) != TF_OK) goto fail;
     }
-    tf_buffer_write(out, (const uint8_t *)" |\n", 3);
+    TABLE_WRITE(" |\n", 3);
 
     /* Separator row */
-    tf_buffer_write(out, (const uint8_t *)"| ", 2);
+    TABLE_WRITE("| ", 2);
     for (size_t c = 0; c < st->n_cols; c++) {
-        if (c > 0) tf_buffer_write(out, (const uint8_t *)" | ", 3);
-        size_t w = widths[c];
-        if (w > sizeof(pad)) w = sizeof(pad);
-        memset(pad, '-', w);
-        tf_buffer_write(out, (const uint8_t *)pad, w);
+        if (c > 0) TABLE_WRITE(" | ", 3);
+        if (table_write_repeat(out, '-', widths[c]) != TF_OK) goto fail;
     }
-    tf_buffer_write(out, (const uint8_t *)" |\n", 3);
+    TABLE_WRITE(" |\n", 3);
 
     /* Data rows */
     for (size_t r = 0; r < st->n_rows; r++) {
-        tf_buffer_write(out, (const uint8_t *)"| ", 2);
+        TABLE_WRITE("| ", 2);
         for (size_t c = 0; c < st->n_cols; c++) {
-            if (c > 0) tf_buffer_write(out, (const uint8_t *)" | ", 3);
+            if (c > 0) TABLE_WRITE(" | ", 3);
             const char *val = st->values[r * st->n_cols + c];
             size_t vlen = strlen(val);
             size_t w = widths[c];
             if (vlen > w) vlen = w;
-            tf_buffer_write(out, (const uint8_t *)val, vlen);
-            if (vlen < w) {
-                size_t plen = w - vlen;
-                if (plen > sizeof(pad)) plen = sizeof(pad);
-                memset(pad, ' ', plen);
-                tf_buffer_write(out, (const uint8_t *)pad, plen);
-            }
+            TABLE_WRITE(val, vlen);
+            if (vlen < w && table_write_repeat(out, ' ', w - vlen) != TF_OK) goto fail;
         }
-        tf_buffer_write(out, (const uint8_t *)" |\n", 3);
+        TABLE_WRITE(" |\n", 3);
     }
 
+#undef TABLE_WRITE
     free(widths);
     return TF_OK;
+
+fail:
+#undef TABLE_WRITE
+    free(widths);
+    return TF_ERROR;
 }
 
 static void table_encoder_destroy(tf_encoder *self) {
@@ -199,13 +237,18 @@ tf_encoder *tf_table_encoder_create(const cJSON *args) {
     st->max_rows = 0;
 
     if (args) {
-        cJSON *mw = cJSON_GetObjectItemCaseSensitive(args, "max_width");
-        if (cJSON_IsNumber(mw) && mw->valueint > 0)
-            st->max_width = (size_t)mw->valueint;
+        size_t parsed_size = 0;
+        int has_max_width = tf_json_get_size_arg(args, "max_width",
+                                                 1, TF_MAX_TABLE_WIDTH,
+                                                 &parsed_size, "table");
+        if (has_max_width < 0) { free(st); return NULL; }
+        if (has_max_width > 0) st->max_width = parsed_size;
 
-        cJSON *mr = cJSON_GetObjectItemCaseSensitive(args, "max_rows");
-        if (cJSON_IsNumber(mr) && mr->valueint > 0)
-            st->max_rows = (size_t)mr->valueint;
+        int has_max_rows = tf_json_get_size_arg(args, "max_rows",
+                                                0, TF_MAX_TABLE_ROWS,
+                                                &parsed_size, "table");
+        if (has_max_rows < 0) { free(st); return NULL; }
+        if (has_max_rows > 0) st->max_rows = parsed_size;
     }
 
     tf_encoder *enc = malloc(sizeof(tf_encoder));

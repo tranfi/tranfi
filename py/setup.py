@@ -59,7 +59,19 @@ setup(
             'tranfi._native',
             sources=sources,
             include_dirs=[csrc],
-            extra_compile_args=['-std=c11', '-O2', '-D_POSIX_C_SOURCE=200809L'],
+            extra_compile_args=[
+                '-std=c11',
+                '-O2',
+                '-D_POSIX_C_SOURCE=200809L',
+                '-D_FORTIFY_SOURCE=3',
+                '-Werror=implicit-function-declaration',
+                '-Werror=incompatible-pointer-types',
+                '-Wformat',
+                '-Werror=format-security',
+                '-Werror=unused-result',
+                '-fno-common',
+                '-fstack-protector-strong',
+            ],
             libraries=['m'],
         )
     ]

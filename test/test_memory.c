@@ -346,6 +346,65 @@ static int memory_counting_sink(int channel, const uint8_t *data, size_t len, vo
     return TF_OK;
 }
 
+
+static void assert_no_newline_record_cap_stays_bounded(const char *dsl,
+                                                       const char *prefix,
+                                                       const char *expected_error,
+                                                       const char *expected_diag) {
+    tf_pipeline *p = create_pipeline_from_dsl(dsl);
+    assert(tf_pipeline_push(p, (const uint8_t *)prefix, strlen(prefix)) == TF_OK);
+    drain_channel(p, TF_CHAN_MAIN);
+    drain_channel(p, TF_CHAN_ERRORS);
+
+    char chunk[4096];
+    memset(chunk, 'x', sizeof(chunk));
+    long start_kb = current_rss_kb();
+    long peak_kb = start_kb;
+    int failed = 0;
+
+    for (size_t i = 0; i < 64; i++) {
+        int rc = tf_pipeline_push(p, (const uint8_t *)chunk, sizeof(chunk));
+        update_peak(&peak_kb);
+        if (rc == TF_ERROR) {
+            failed = 1;
+            break;
+        }
+        drain_channel(p, TF_CHAN_MAIN);
+        assert(tf_buffer_readable(&p->output[TF_CHAN_MAIN]) == 0);
+        assert(p->output[TF_CHAN_MAIN].cap <= STREAM_CAP_LIMIT);
+    }
+
+    assert(failed);
+    const char *err = tf_pipeline_error(p);
+    assert(err != NULL);
+    assert(strstr(err, expected_error) != NULL);
+
+    uint8_t errors[2048];
+    size_t e = tf_pipeline_pull(p, TF_CHAN_ERRORS, errors, sizeof(errors) - 1);
+    assert(e > 0);
+    errors[e] = '\0';
+    assert(strstr((char *)errors, expected_diag) != NULL);
+    assert(strstr((char *)errors, "record exceeds max_record_bytes") != NULL);
+
+    update_peak(&peak_kb);
+    assert_rss_delta_bounded(start_kb, peak_kb);
+    tf_pipeline_free(p);
+}
+
+static void test_text_jsonl_record_caps_bound_no_newline_input(void) {
+    assert_no_newline_record_cap_stays_bounded(
+        "text max_record_bytes=32768 max_error_bytes=32 | text",
+        "ok\n",
+        "text record exceeds max_record_bytes",
+        "text_record_too_large");
+
+    assert_no_newline_record_cap_stays_bounded(
+        "jsonl max_record_bytes=32768 max_error_bytes=32 | csv",
+        "{\"id\":1}\n{\"name\":\"",
+        "jsonl record exceeds max_record_bytes",
+        "jsonl_record_too_large");
+}
+
 static void test_row_local_pipeline_sink_stays_drained(void) {
     tf_pipeline *p = create_pipeline_from_dsl(
         "csv | filter \"col(score) >= 0\" | select id,score | csv");
@@ -1863,6 +1922,9 @@ int main(void) {
     test_row_local_pipeline_sink_stays_drained();
     printf("  row-local pipeline sink auto-drains          PASS\n");
 
+    test_text_jsonl_record_caps_bound_no_newline_input();
+    printf("  text/jsonl record caps bound no-newline input PASS\n");
+
     test_bounded_flush_latent_top_stays_small();
     printf("  bounded flush-latent top stays small         PASS\n");
 
@@ -1950,6 +2012,6 @@ int main(void) {
     test_sorted_pivot_declared_categories_streams_current_group();
     printf("  sorted pivot declared categories stream      PASS\n");
 
-    printf("\n32/32 memory regression tests passed\n");
+    printf("\n33/33 memory regression tests passed\n");
     return 0;
 }

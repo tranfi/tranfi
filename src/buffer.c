@@ -19,10 +19,11 @@ void tf_buffer_init(tf_buffer *b) {
 }
 
 static int buffer_ensure(tf_buffer *b, size_t extra) {
-    size_t needed = b->len + extra;
+    size_t needed = 0;
+    if (tf_size_add(b->len, extra, &needed) != TF_OK) return TF_ERROR;
     if (needed <= b->cap) return TF_OK;
-    size_t new_cap = b->cap ? b->cap : INITIAL_CAP;
-    while (new_cap < needed) new_cap *= 2;
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(b->cap, needed, INITIAL_CAP, &new_cap) != TF_OK) return TF_ERROR;
     uint8_t *new_data = realloc(b->data, new_cap);
     if (!new_data) return TF_ERROR;
     b->data = new_data;
@@ -33,13 +34,27 @@ static int buffer_ensure(tf_buffer *b, size_t extra) {
 int tf_buffer_write(tf_buffer *b, const uint8_t *data, size_t len) {
     if (len == 0) return TF_OK;
     if (buffer_ensure(b, len) != TF_OK) return TF_ERROR;
+    size_t new_len = 0;
+    if (tf_size_add(b->len, len, &new_len) != TF_OK) return TF_ERROR;
     memcpy(b->data + b->len, data, len);
-    b->len += len;
+    b->len = new_len;
     return TF_OK;
 }
 
 int tf_buffer_write_str(tf_buffer *b, const char *s) {
     return tf_buffer_write(b, (const uint8_t *)s, strlen(s));
+}
+
+int tf_buffer_write_line(tf_buffer *b, const char *s) {
+    int rc = tf_buffer_write_str(b, s);
+    if (rc == TF_OK) rc = tf_buffer_write(b, (const uint8_t *)"\n", 1);
+    return rc;
+}
+
+int tf_side_write_error(tf_side_channels *side, const char *msg) {
+    if (msg) tf_set_last_error(msg);
+    if (!side || !side->errors || !msg) return TF_OK;
+    return tf_buffer_write_line(side->errors, msg);
 }
 
 size_t tf_buffer_read(tf_buffer *b, uint8_t *out, size_t len) {

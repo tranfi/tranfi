@@ -21,50 +21,8 @@ typedef struct {
     tf_batch *pending;
 } lead_state;
 
-static void lead_set_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
-}
-
-static int copy_cell(tf_batch *dst, size_t dst_row, size_t dst_col,
-                     const tf_batch *src, size_t src_row, size_t src_col) {
-    if (tf_batch_is_null(src, src_row, src_col)) {
-        tf_batch_set_null(dst, dst_row, dst_col);
-        return TF_OK;
-    }
-
-    switch (src->col_types[src_col]) {
-        case TF_TYPE_BOOL:
-            tf_batch_set_bool(dst, dst_row, dst_col,
-                              tf_batch_get_bool(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_INT64:
-            tf_batch_set_int64(dst, dst_row, dst_col,
-                               tf_batch_get_int64(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_FLOAT64:
-            tf_batch_set_float64(dst, dst_row, dst_col,
-                                 tf_batch_get_float64(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_STRING:
-            tf_batch_set_string(dst, dst_row, dst_col,
-                                tf_batch_get_string(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_DATE:
-            tf_batch_set_date(dst, dst_row, dst_col,
-                              tf_batch_get_date(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_TIMESTAMP:
-            tf_batch_set_timestamp(dst, dst_row, dst_col,
-                                   tf_batch_get_timestamp(src, src_row, src_col));
-            return TF_OK;
-        default:
-            tf_batch_set_null(dst, dst_row, dst_col);
-            return TF_OK;
-    }
+static int lead_set_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
 static const tf_batch *source_at(const lead_state *st, const tf_batch *in,
@@ -93,7 +51,7 @@ static int lead_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (ci < 0) {
         char msg[256];
         snprintf(msg, sizeof(msg), "lead: column '%s' not found", st->column);
-        lead_set_error(side, msg);
+        if (lead_set_error(side, msg) != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
 
@@ -103,11 +61,9 @@ static int lead_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (total <= st->offset) {
         tf_batch *new_pend = tf_batch_create(in->n_cols, total);
         if (!new_pend) return TF_ERROR;
-        for (size_t c = 0; c < in->n_cols; c++) {
-            if (tf_batch_set_schema(new_pend, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-                tf_batch_free(new_pend);
-                return TF_ERROR;
-            }
+        if (tf_batch_clone_schema(new_pend, in) != TF_OK) {
+            tf_batch_free(new_pend);
+            return TF_ERROR;
         }
         size_t row = 0;
         for (size_t r = 0; r < pend_count; r++) {
@@ -129,15 +85,11 @@ static int lead_process(tf_step *self, tf_batch *in, tf_batch **out,
     }
 
     size_t emit_count = total - st->offset;
+    const char *extra_names[1] = {st->result};
+    tf_type extra_types[1] = {in->col_types[ci]};
     tf_batch *ob = tf_batch_create(in->n_cols + 1, emit_count);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
-    if (tf_batch_set_schema(ob, in->n_cols, st->result, in->col_types[ci]) != TF_OK) {
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
         tf_batch_free(ob);
         return TF_ERROR;
     }
@@ -153,21 +105,22 @@ static int lead_process(tf_step *self, tf_batch *in, tf_batch **out,
         int lead_ci = tf_batch_col_index(lead_src, st->column);
         if (lead_ci < 0) {
             tf_batch_free(ob);
-            lead_set_error(side, "lead: buffered schema lost selected column");
+            if (lead_set_error(side, "lead: buffered schema lost selected column") != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
-        copy_cell(ob, i, in->n_cols, lead_src, lead_row, (size_t)lead_ci);
+        if (tf_batch_copy_cell(ob, i, in->n_cols, lead_src, lead_row, (size_t)lead_ci) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = i + 1;
     }
 
     tf_batch *new_pend = tf_batch_create(in->n_cols, st->offset);
     if (!new_pend) { tf_batch_free(ob); return TF_ERROR; }
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(new_pend, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(new_pend);
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
+    if (tf_batch_clone_schema(new_pend, in) != TF_OK) {
+        tf_batch_free(new_pend);
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
     for (size_t i = 0; i < st->offset; i++) {
         size_t src_idx = total - st->offset + i;
@@ -194,19 +147,15 @@ static int lead_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     tf_batch *pend = st->pending;
     int ci = tf_batch_col_index(pend, st->column);
     if (ci < 0) {
-        lead_set_error(side, "lead: buffered schema lost selected column");
+        if (lead_set_error(side, "lead: buffered schema lost selected column") != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
 
+    const char *extra_names[1] = {st->result};
+    tf_type extra_types[1] = {pend->col_types[ci]};
     tf_batch *ob = tf_batch_create(pend->n_cols + 1, pend->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < pend->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, pend->col_names[c], pend->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
-    if (tf_batch_set_schema(ob, pend->n_cols, st->result, pend->col_types[ci]) != TF_OK) {
+    if (tf_batch_clone_with_extra_cols(ob, pend, extra_names, extra_types, 1) != TF_OK) {
         tf_batch_free(ob);
         return TF_ERROR;
     }
@@ -216,7 +165,10 @@ static int lead_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        tf_batch_set_null(ob, r, pend->n_cols);
+        if (tf_batch_set_null(ob, r, pend->n_cols) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = r + 1;
     }
 
@@ -247,9 +199,12 @@ tf_step *tf_lead_create(const cJSON *args) {
     st->column = strdup(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 
-    cJSON *off_j = cJSON_GetObjectItemCaseSensitive(args, "offset");
-    st->offset = (cJSON_IsNumber(off_j) && off_j->valueint > 0) ?
-                 (size_t)off_j->valueint : 1;
+    size_t offset = 1;
+    int has_offset = tf_json_get_size_arg(args, "offset",
+                                          1, TF_MAX_WINDOW_SIZE,
+                                          &offset, "lead");
+    if (has_offset < 0) { free(st->column); free(st); return NULL; }
+    st->offset = offset;
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j) && res_j->valuestring[0]) {

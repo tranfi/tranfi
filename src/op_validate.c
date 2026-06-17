@@ -8,6 +8,7 @@
 
 #include "internal.h"
 #include "cJSON.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -45,34 +46,11 @@ typedef struct {
     double   warn_failure_rate;
     int      has_warn_failure_rate;
     int      audit;
+    tf_audit_options audit_opts;
 } validate_state;
 
 static double validate_failure_rate(size_t failed, size_t checked) {
     return checked ? (double)failed / (double)checked : 0.0;
-}
-
-static cJSON *validate_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (!b || col >= b->n_cols || row >= b->n_rows || tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default: return cJSON_CreateNull();
-    }
-}
-
-static cJSON *validate_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = validate_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
-    }
-    return obj;
 }
 
 static void validate_rule_free(validate_rule *rule) {
@@ -88,10 +66,16 @@ static int add_validate_rule(validate_state *st, const char *expr_text,
     if (!st || !expr_text || !expr_text[0]) return TF_ERROR;
     tf_expr *expr = tf_expr_parse(expr_text);
     if (!expr) return TF_ERROR;
-    validate_rule *nr = realloc(st->rules, (st->n_rules + 1) * sizeof(validate_rule));
+    size_t next = 0;
+    if (tf_size_add(st->n_rules, 1, &next) != TF_OK) {
+        tf_expr_free(expr);
+        return TF_ERROR;
+    }
+    validate_rule *nr = tf_reallocarray_checked(st->rules, next, sizeof(validate_rule));
     if (!nr) { tf_expr_free(expr); return TF_ERROR; }
     st->rules = nr;
-    validate_rule *rule = &st->rules[st->n_rules++];
+    validate_rule *rule = &st->rules[st->n_rules];
+    st->n_rules = next;
     memset(rule, 0, sizeof(*rule));
     rule->expr = expr;
     rule->expr_text = strdup(expr_text);
@@ -121,13 +105,12 @@ static int emit_validate_audit(validate_state *st, validate_rule *rule,
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
     if (rule->message && rule->message[0]) cJSON_AddStringToObject(obj, "message", rule->message);
     else if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    cJSON *row_obj = validate_row_to_json(b, row);
+    cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->stats, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    int rc = tf_buffer_write_line(side->stats, line);
     free(line);
     if (rc == TF_OK) {
         st->audit_emitted++;
@@ -136,36 +119,33 @@ static int emit_validate_audit(validate_state *st, validate_rule *rule,
     return rc;
 }
 
-static void emit_validate_threshold_error(validate_state *st, tf_side_channels *side) {
+static int emit_validate_threshold_error(validate_state *st, tf_side_channels *side) {
     char msg[512];
     snprintf(msg, sizeof(msg),
              "validate max_failures exceeded at row %zu: failed_rows=%zu max_failures=%zu",
              st->row_index, st->failed_rows, st->max_failures);
     tf_set_last_error(msg);
-    if (side && side->errors) {
-        cJSON *obj = cJSON_CreateObject();
-        if (obj) {
-            cJSON_AddStringToObject(obj, "type", "validate_failure");
-            cJSON_AddStringToObject(obj, "op", "validate");
-            cJSON_AddStringToObject(obj, "event", "threshold_exceeded");
-            cJSON_AddStringToObject(obj, "reason", "max_failures_exceeded");
-            cJSON_AddStringToObject(obj, "severity", "error");
-            cJSON_AddStringToObject(obj, "name", st->name ? st->name : "validate");
-            cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-            cJSON_AddNumberToObject(obj, "checked_rows", (double)st->checked_rows);
-            cJSON_AddNumberToObject(obj, "failed_rows", (double)st->failed_rows);
-            cJSON_AddNumberToObject(obj, "failure_rate", validate_failure_rate(st->failed_rows, st->checked_rows));
-            cJSON_AddNumberToObject(obj, "max_failures", (double)st->max_failures);
-            if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-            char *line = cJSON_PrintUnformatted(obj);
-            if (line) {
-                tf_buffer_write_str(side->errors, line);
-                tf_buffer_write_str(side->errors, "\n");
-                free(line);
-            }
-            cJSON_Delete(obj);
-        }
-    }
+    if (!side || !side->errors) return TF_OK;
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) return TF_ERROR;
+    cJSON_AddStringToObject(obj, "type", "validate_failure");
+    cJSON_AddStringToObject(obj, "op", "validate");
+    cJSON_AddStringToObject(obj, "event", "threshold_exceeded");
+    cJSON_AddStringToObject(obj, "reason", "max_failures_exceeded");
+    cJSON_AddStringToObject(obj, "severity", "error");
+    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "validate");
+    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
+    cJSON_AddNumberToObject(obj, "checked_rows", (double)st->checked_rows);
+    cJSON_AddNumberToObject(obj, "failed_rows", (double)st->failed_rows);
+    cJSON_AddNumberToObject(obj, "failure_rate", validate_failure_rate(st->failed_rows, st->checked_rows));
+    cJSON_AddNumberToObject(obj, "max_failures", (double)st->max_failures);
+    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
+    char *line = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!line) return TF_ERROR;
+    int rc = tf_buffer_write_line(side->errors, line);
+    free(line);
+    return rc;
 }
 
 static int emit_validate_rate_event(validate_state *st, tf_side_channels *side,
@@ -189,8 +169,7 @@ static int emit_validate_rate_event(validate_state *st, tf_side_channels *side,
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->errors, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->errors, "\n");
+    int rc = tf_buffer_write_line(side->errors, line);
     free(line);
     return rc;
 }
@@ -219,15 +198,23 @@ static int validate_process(tf_step *self, tf_batch *in, tf_batch **out,
     validate_state *st = self->state;
     *out = NULL;
 
-    tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
+    size_t out_cols = 0;
+    if (tf_size_add(in->n_cols, 1, &out_cols) != TF_OK) return TF_ERROR;
+    tf_batch *ob = tf_batch_create(out_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
-    tf_batch_set_schema(ob, in->n_cols, "_valid", TF_TYPE_BOOL);
+    const char *extra_names[] = {"_valid"};
+    const tf_type extra_types[] = {TF_TYPE_BOOL};
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     for (size_t r = 0; r < in->n_rows; r++) {
         st->row_index++;
-        tf_batch_copy_row(ob, r, in, r);
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         int row_valid = 1;
         st->checked_rows++;
         for (size_t i = 0; i < st->n_rules; i++) {
@@ -248,10 +235,16 @@ static int validate_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
         if (row_valid) st->passed_rows++;
         else st->failed_rows++;
-        tf_batch_set_bool(ob, r, in->n_cols, row_valid ? true : false);
+        if (tf_batch_set_bool(ob, r, in->n_cols, row_valid ? true : false) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = r + 1;
         if (!row_valid && st->has_max_failures && st->failed_rows > st->max_failures) {
-            emit_validate_threshold_error(st, side);
+            if (emit_validate_threshold_error(st, side) != TF_OK) {
+                tf_batch_free(ob);
+                return TF_ERROR;
+            }
             tf_batch_free(ob);
             return TF_ERROR;
         }
@@ -334,6 +327,7 @@ static void validate_state_free(validate_state *st) {
     free(st->rules);
     free(st->name);
     free(st->message);
+    tf_audit_options_free(&st->audit_opts);
     free(st);
 }
 
@@ -487,6 +481,7 @@ tf_step *tf_validate_create(const cJSON *args) {
     validate_state *st = calloc(1, sizeof(validate_state));
     if (!st) return NULL;
     st->audit_limit = 1000;
+    tf_audit_options_init(&st->audit_opts, 1);
 
     int rules_file_status = 0;
     cJSON *rules_doc = load_validate_rules_file(args, &rules_file_status);
@@ -502,30 +497,49 @@ tf_step *tf_validate_create(const cJSON *args) {
     st->audit = cJSON_IsTrue(audit_json) ? 1 : 0;
     const cJSON *audit_limit_json = validate_arg(args, rules_doc, "audit_limit", "auditLimit");
     if (audit_limit_json) {
-        if (!cJSON_IsNumber(audit_limit_json) || audit_limit_json->valuedouble <= 0) {
-            tf_set_last_error("validate: audit_limit must be a positive integer");
+        size_t parsed_limit = 0;
+        const cJSON *arg_limit = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
+        const cJSON *arg_limit_alt = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
+        const char *limit_name = arg_limit ? "audit_limit" :
+                                 (arg_limit_alt ? "auditLimit" : "audit_limit");
+        if (tf_json_size_value(audit_limit_json, limit_name,
+                               1, TF_MAX_AUDIT_RECORDS,
+                               &parsed_limit, "validate") < 0) {
             cJSON_Delete(rules_doc);
             validate_state_free(st);
             return NULL;
         }
-        st->audit_limit = (size_t)audit_limit_json->valuedouble;
+        st->audit_limit = parsed_limit;
+    }
+
+    if (tf_audit_options_parse(&st->audit_opts, args, "validate") != TF_OK) {
+        cJSON_Delete(rules_doc);
+        validate_state_free(st);
+        return NULL;
     }
 
     const cJSON *max_failures_json = validate_arg(args, rules_doc, "max_failures", "maxFailures");
     if (max_failures_json) {
-        if (!cJSON_IsNumber(max_failures_json) || max_failures_json->valuedouble < 0) {
-            tf_set_last_error("validate: max_failures must be a non-negative integer");
+        size_t parsed_limit = 0;
+        const cJSON *arg_limit = cJSON_GetObjectItemCaseSensitive(args, "max_failures");
+        const cJSON *arg_limit_alt = cJSON_GetObjectItemCaseSensitive(args, "maxFailures");
+        const char *limit_name = arg_limit ? "max_failures" :
+                                 (arg_limit_alt ? "maxFailures" : "max_failures");
+        if (tf_json_size_value(max_failures_json, limit_name,
+                               0, TF_MAX_COUNT_ARG,
+                               &parsed_limit, "validate") < 0) {
             cJSON_Delete(rules_doc);
             validate_state_free(st);
             return NULL;
         }
-        st->max_failures = (size_t)max_failures_json->valuedouble;
+        st->max_failures = parsed_limit;
         st->has_max_failures = 1;
     }
 
     const cJSON *max_rate_json = validate_arg(args, rules_doc, "max_failure_rate", "maxFailureRate");
     if (max_rate_json) {
-        if (!cJSON_IsNumber(max_rate_json) || max_rate_json->valuedouble < 0.0 || max_rate_json->valuedouble > 1.0) {
+        if (!cJSON_IsNumber(max_rate_json) || !isfinite(max_rate_json->valuedouble) ||
+            max_rate_json->valuedouble < 0.0 || max_rate_json->valuedouble > 1.0) {
             tf_set_last_error("validate: max_failure_rate must be between 0 and 1");
             cJSON_Delete(rules_doc);
             validate_state_free(st);
@@ -537,7 +551,8 @@ tf_step *tf_validate_create(const cJSON *args) {
 
     const cJSON *warn_rate_json = validate_arg(args, rules_doc, "warn_failure_rate", "warnFailureRate");
     if (warn_rate_json) {
-        if (!cJSON_IsNumber(warn_rate_json) || warn_rate_json->valuedouble < 0.0 || warn_rate_json->valuedouble > 1.0) {
+        if (!cJSON_IsNumber(warn_rate_json) || !isfinite(warn_rate_json->valuedouble) ||
+            warn_rate_json->valuedouble < 0.0 || warn_rate_json->valuedouble > 1.0) {
             tf_set_last_error("validate: warn_failure_rate must be between 0 and 1");
             cJSON_Delete(rules_doc);
             validate_state_free(st);

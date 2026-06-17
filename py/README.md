@@ -136,17 +136,17 @@ Codecs convert between raw bytes and columnar batches. Every pipeline starts wit
 
 | Method | Description |
 |--------|-------------|
-| `codec.csv(delimiter, header, batch_size, repair, mode, strict, max_error_bytes, max_record_bytes, nulls, quoted_nulls, skip, n_max, max_rows, comment, trim_ws, skip_empty_rows)` | CSV decoder. `mode='strict'` fails on field-count mismatches; `repair=True` / `mode='repair'` emits repair diagnostics; `max_record_bytes` bounds buffered records; `nulls=['NA']` adds null sentinels; `skip=2`, `n_max=100`, `comment='#'`, `trim_ws=False`, and `skip_empty_rows=True` control row-local parsing |
+| `codec.csv(delimiter, header, batch_size, repair, mode, strict, max_error_bytes, max_record_bytes, max_columns, nulls, quoted_nulls, skip, n_max, max_rows, comment, trim_ws, skip_empty_rows, audit, audit_limit, audit_include_row, audit_columns, audit_redact, audit_hash_columns, audit_max_bytes, audit_max_cell_bytes)` | CSV decoder. `mode='strict'` fails on field-count mismatches; `repair=True` / `mode='repair'` emits repair diagnostics; `max_record_bytes` bounds buffered records; `nulls=['NA']` adds null sentinels; `skip=2`, `n_max=100`, `comment='#'`, `trim_ws=False`, and `skip_empty_rows=True` control row-local parsing; repair audit/raw diagnostics support privacy controls with pseudo-column `raw` |
 | `codec.csv_encode(delimiter)` | CSV encoder |
-| `codec.jsonl(batch_size, on_error, max_error_bytes)` | JSON Lines decoder. `on_error` is `skip`, `fail`, `warn`, or `quarantine` |
+| `codec.jsonl(batch_size, on_error, max_error_bytes, max_record_bytes)` | JSON Lines decoder. `on_error` is `skip`, `fail`, `warn`, or `quarantine` |
 | `codec.jsonl_encode()` | JSON Lines encoder |
-| `codec.text(batch_size)` | Line-oriented text decoder (single `_line` column) |
+| `codec.text(batch_size, max_error_bytes, max_record_bytes)` | Line-oriented text decoder (single `_line` column) |
 | `codec.text_encode()` | Text encoder |
 | `codec.table_encode(max_width, max_rows)` | Pretty-print Markdown table |
 
-CSV treats unquoted empty fields as null by default. Pass `nulls=['NA', 'NULL']` to add sentinel strings; pass `quoted_nulls=False` when quoted sentinels like `"NA"` or `""` should remain strings. Default field-count handling is permissive for compatibility. Use `mode='strict'` or `strict=True` to fail on row/header width mismatches. Use `repair=True` or `mode='repair'` to pad/truncate and collect JSONL diagnostics in `result.errors`; `max_error_bytes` bounds raw previews. `max_record_bytes` defaults to `67108864` bytes, caps the current record buffer before a newline is seen, and raises with a `csv_record_too_large` diagnostic when exceeded; pass `0` to disable the guard. `skip=2` discards preamble records before header/schema discovery; comments are applied after skipped rows. `n_max=100` / `max_rows=100` keeps at most that many decoded data rows after skip/comment/header handling and uses only one counter; `n_max=0` preserves a header-only schema batch. `comment='#'` removes text after an unquoted marker and skips comment-only rows; quoted markers are preserved. Unquoted spaces/tabs are trimmed by default; pass `trim_ws=False` to preserve them. Blank physical rows after the header are preserved as all-null rows by default; pass `skip_empty_rows=True` to drop them.
+CSV treats unquoted empty fields as null by default. Pass `nulls=['NA', 'NULL']` to add sentinel strings; pass `quoted_nulls=False` when quoted sentinels like `"NA"` or `""` should remain strings. Default field-count handling is permissive for compatibility. Use `mode='strict'` or `strict=True` to fail on row/header width mismatches. Use `repair=True` or `mode='repair'` to pad/truncate and collect JSONL diagnostics in `result.errors`; `max_error_bytes` bounds raw previews, and `audit_include_row`, `audit_columns`, `audit_redact`, `audit_hash_columns`, `audit_max_bytes`, and `audit_max_cell_bytes` govern repair audit/raw payloads with the raw preview exposed as pseudo-column `raw`. `max_record_bytes` defaults to `67108864` bytes, caps the current record buffer before a newline is seen, and raises with a `csv_record_too_large` diagnostic when exceeded; pass `0` to disable the guard. `max_columns` defaults to `8192`; records above the cap raise with a bounded `csv_too_many_columns` diagnostic instead of silently dropping columns. Decoder size options are checked before execution: `batch_size` must be `1..65536`, `max_error_bytes` must be `0..67108864`, `max_record_bytes` must be `0..1073741824`, and `max_columns` must be `1..65536`. `skip=2` discards preamble records before header/schema discovery; comments are applied after skipped rows. `n_max=100` / `max_rows=100` keeps at most that many decoded data rows after skip/comment/header handling and uses only one counter; `n_max=0` preserves a header-only schema batch. `comment='#'` removes text after an unquoted marker and skips comment-only rows; quoted markers are preserved. Unquoted spaces/tabs are trimmed by default; pass `trim_ws=False` to preserve them. Blank physical rows after the header are preserved as all-null rows by default; pass `skip_empty_rows=True` to drop them.
 
-Malformed JSONL records are skipped by default. Set `on_error='warn'` or `on_error='quarantine'` to keep valid rows and collect JSONL diagnostics in `result.errors`; set `on_error='fail'` to raise on the first malformed line. `max_error_bytes` bounds the raw preview stored in diagnostics.
+Malformed JSONL records are skipped by default. Set `on_error='warn'` or `on_error='quarantine'` to keep valid rows and collect JSONL diagnostics in `result.errors`; set `on_error='fail'` to raise on the first malformed line. `max_error_bytes` bounds the raw preview stored in diagnostics, and `max_record_bytes` applies the same current-line guard as CSV/text.
 
 Cross-codec pipelines work naturally:
 
@@ -164,19 +164,19 @@ tf.pipeline([tf.codec.jsonl(), tf.ops.sort(['name']), tf.codec.csv_encode()])
 
 | Method | Description |
 |--------|-------------|
-| `ops.filter(expr)` | Keep rows matching expression |
+| `ops.filter(expr, audit=False, audit_limit=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Keep rows matching expression; optional dropped-row audit records support row omission, column allowlists, redaction, hashes, and payload caps |
 | `ops.head(n)` | First N rows |
 | `ops.tail(n)` | Last N rows |
 | `ops.skip(n)` | Skip first N rows |
 | `ops.top(n, column, desc=True)` | Top N by column value |
-| `ops.sample(n)` | Reservoir sampling (uniform random) |
+| `ops.sample(n, seed=0)` | Deterministic bounded reservoir sampling; use `seed='random'` for nondeterministic mode |
 | `ops.grep(pattern, invert, column, regex)` | Substring/regex filter |
-| `ops.validate(expr=None, rules=None, rules_file=None, audit=False, audit_limit=None, max_failures=None, warn_failure_rate=None, max_failure_rate=None, name=None, message=None)` | Add `_valid` boolean column, keep all rows; supports inline rules or local JSON rule-suite files; step stats include checked/passed/failed/failure-rate counters; optional bounded failure audit records and count/rate thresholds |
-| `ops.assert_(expr=None, action='fail', name='assert', message='', result='_assert', aggregate=None, op=None, value=None, column=None)` | Row-local data-quality rule or finish-time O(1) aggregate assertion; aggregate mode supports `count`, `sum:col`, `avg:col`, `min:col`, `max:col`, `missing:col`, and `non_null:col` with `fail`/`warn` |
-| `ops.quarantine(expr, name=None, message=None)` | Route rows matching expression to `errors` and drop them from main output |
-| `ops.schema(columns=None, required=None, non_null=None, nullable=None, values=None, min=None, max=None, regex=None, mode='fail', result='_schema')` | Row-local table schema contract; fail, warn, filter, quarantine, or annotate |
+| `ops.validate(expr=None, rules=None, rules_file=None, audit=False, audit_limit=None, max_failures=None, warn_failure_rate=None, max_failure_rate=None, name=None, message=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Add `_valid` boolean column, keep all rows; supports inline rules or local JSON rule-suite files; bounded failure audit records support count/rate thresholds plus privacy controls |
+| `ops.assert_(expr=None, action='fail', name='assert', message='', result='_assert', aggregate=None, op=None, value=None, column=None, tolerance=None, rel=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Row-local data-quality rule or finish-time O(1) aggregate assertion; row-local failure side-channel records support privacy controls |
+| `ops.quarantine(expr, name=None, message=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Route rows matching expression to `errors` and drop them from main output; row payloads support privacy controls |
+| `ops.schema(columns=None, required=None, non_null=None, nullable=None, values=None, min=None, max=None, regex=None, mode='fail', result='_schema', max_regex_pattern_bytes=None, max_regex_cell_bytes=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Row-local table schema contract; fail, warn, filter, quarantine, or annotate; regex budgets default to 4096-byte patterns and 65536-byte cells; schema audit/error records support row omission, column allowlists, redaction, stable non-cryptographic hashes, and row/cell payload caps |
 | `ops.schema_infer(rows=None)` | Bounded decoded-type/nullability schema report; defaults to 10000 sampled rows |
-| `ops.tee(expr=None, channel='samples', columns=None, limit=1000, every=1, name='tee')` | Preserve main rows and write bounded JSONL row snapshots to a side channel |
+| `ops.tee(expr=None, channel='samples', columns=None, limit=1000, every=1, name='tee', include_row=True, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Preserve main rows and write bounded JSONL row snapshots to a side channel; row payloads support privacy controls |
 
 ### Column operations
 
@@ -188,14 +188,18 @@ tf.pipeline([tf.codec.jsonl(), tf.ops.sort(['name']), tf.codec.csv_encode()])
 | `ops.derive(columns)` | Computed columns: `derive({'total': expr("col('a')*col('b')")})` |
 | `ops.source_name(result='_source', default='')` | Append the current host source path/name as a row-local string column |
 | `ops.across(columns, fn=..., functions=..., names=..., replace=...)` | Apply row-local functions over selected columns |
-| `ops.cast(audit=False, audit_limit=None, **mapping)` | Type conversion; optional bounded value/coercion audit records |
+| `ops.cast(audit=False, audit_limit=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None, **mapping)` | Type conversion; optional bounded value/coercion audit records support privacy controls |
 | `ops.trim(columns)` | Strip whitespace |
-| `ops.fill_null(audit=False, audit_limit=None, **mapping)` | Replace nulls: `fill_null(age='0')` |
+| `ops.fill_null(audit=False, audit_limit=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None, **mapping)` | Replace nulls; optional bounded audit records support privacy controls |
 | `ops.fill_down(columns)` | Forward-fill nulls |
 | `ops.clip(column, min, max)` | Clamp numeric values |
-| `ops.replace(column, pattern, replacement, regex=False, audit=False, audit_limit=None)` | String find/replace |
+| `ops.replace(column, pattern, replacement, regex=False, audit=False, audit_limit=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | String find/replace; optional bounded audit records support privacy controls |
 | `ops.hash(columns)` | Add `_hash` column (DJB2) |
-| `ops.bin(column, boundaries)` | Discretize into bins |
+| `ops.bin(column, boundaries, missing=None, on_type_error=None)` | Discretize into bins with strict numeric-source defaults |
+| `ops.ewma(column, alpha, result=None, missing=None, on_type_error=None)` | Exponentially weighted moving average |
+| `ops.anomaly(column, threshold=3.0, result=None, missing=None, on_type_error=None)` | Streaming z-score anomaly flag |
+| `ops.normalize(columns, method='minmax', audit=False, audit_limit=None, missing=None, on_type_error=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Blocking minmax/zscore normalization; optional audit records support privacy controls |
+| `ops.acf(column, lags=20, missing=None, on_type_error=None)` | Blocking autocorrelation table |
 
 `columns` may contain exact names or selector strings: `id:score`, `starts_with(score_)`, `ends_with(_id)`, `contains(temp)`, `matches(^score_)`, `where(numeric)`, strict `all_of(score,name)`, lenient `any_of(optional,score)`, exclusions with `!name` or `-name`, and boolean selector algebra such as `starts_with(score_)&where(numeric)`, `starts_with(score_)&!ends_with(raw)`, or `!(id:score)`. Ranges use input schema order and can be reversed. Helper matching is case-insensitive; exact names are case-sensitive. These selectors are resolved by the native schema-aware `select`, `relocate`, and `across` ops in `O(columns)` without retaining rows; SQL lowering rejects selector helpers without a known schema.
 
@@ -213,7 +217,7 @@ Example: `tf.ops.across(['starts_with(score_)'], fn='round')` replaces selected 
 | Method | Description |
 |--------|-------------|
 | `ops.stats(stats_list)` | Column statistics. Stats: `count`, `min`, `max`, `sum`, `avg`, `stddev`, `variance`, `median`, `p25`, `p75`, `p90`, `p99`, `distinct`, `hist`, `sample` |
-| `ops.frequency(columns, max_values=None, max_state_bytes=None, overflow=None, other=None, audit=False, audit_limit=None)` | Value counts; `overflow="other"` can emit bounded category-overflow audit records |
+| `ops.frequency(columns, max_values=None, max_state_bytes=None, overflow=None, other=None, audit=False, audit_limit=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Value counts; `overflow="other"` can emit bounded category-overflow audit records with privacy controls |
 | `ops.group_agg(group_by, aggs)` | Group by + aggregate. `count` on a column counts non-null values; `column='*'` counts rows. |
 
 ```python
@@ -230,8 +234,8 @@ tf.ops.group_agg(['city'], [
 | Method | Description |
 |--------|-------------|
 | `ops.step(column, func, result)` | Running aggregation: `running-sum`, `running-avg`, `running-min`, `running-max`, `lag` |
-| `ops.window(column, size, func, result)` | Sliding window: `avg`, `sum`, `min`, `max` |
-| `ops.rolling_sum/mean/min/max(column, size, result)` | Named trailing fixed-row numeric windows |
+| `ops.window(column, size, func, result=None, missing=None, on_type_error=None)` | Sliding window: `avg`, `sum`, `min`, `max`; default missing/non-numeric source fails |
+| `ops.rolling_sum/mean/min/max(column, size, result=None, missing=None, on_type_error=None)` | Named trailing fixed-row numeric windows; default missing/non-numeric source fails |
 | `ops.rolling_any/all(column, size, result, nulls='ignore')` | Boolean trailing windows; `nulls`: `ignore`, `false`, `true`, `propagate` |
 | `ops.lead(column, offset, result)` | Lookahead N rows |
 | `ops.lag(column, offset, result)` | Previous-row shift |
@@ -243,26 +247,29 @@ tf.ops.group_agg(['city'], [
 
 | Method | Description |
 |--------|-------------|
-| `ops.explode(column, delimiter)` | Split delimited string into rows |
+| `ops.explode(column, delimiter, max_tokens_per_row, max_output_rows_per_input_row, max_output_rows_per_batch, max_token_bytes)` | Split delimited string into rows with optional expansion caps |
 | `ops.split(column, names, delimiter)` | Split column into multiple columns |
-| `ops.unpivot(columns)` | Wide to long (melt) |
+| `ops.unpivot(columns, max_output_rows_per_input_row, max_output_rows_per_batch)` | Wide to long (melt) with optional expansion caps |
 | `ops.stack(file, tag, tag_value)` | Vertically concatenate another CSV file |
+
+`explode` caps fail fast with `max_tokens_per_row`, `max_output_rows_per_input_row`, `max_output_rows_per_batch`, or `max_token_bytes` when a single row or batch would expand beyond the configured limit. `unpivot` supports `max_output_rows_per_input_row` and `max_output_rows_per_batch`.
 
 ### Date/time
 
 | Method | Description |
 |--------|-------------|
-| `ops.datetime(column, extract)` | Extract parts: `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday` |
-| `ops.date_trunc(column, trunc, result)` | Truncate to: `year`, `month`, `day`, `hour`, `minute`, `second` |
+| `ops.datetime(column, extract, missing=None, on_type_error=None)` | Extract parts: `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday` |
+| `ops.date_trunc(column, trunc, result=None, missing=None, on_type_error=None)` | Truncate to: `year`, `month`, `day`, `hour`, `minute`, `second` |
 
 ### Other
 
 | Method | Description |
 |--------|-------------|
 | `ops.flatten()` | Flatten nested columns |
+| `ops.interpolate(column, method='linear', missing=None, on_type_error=None)` | Fill nulls in a numeric column; default missing/non-numeric source fails |
 | `ops.json_extract(path, result, column='_line', type='string')` | Extract JSON Pointer/simple JSONPath value into a new column |
 | `ops.json_filter(path, op='exists', value=None, column='_line', type='auto')` | Filter rows by JSON Pointer/simple JSONPath predicate |
-| `ops.json_schema(schema, column='_line', mode='annotate', result='_valid')` | Validate JSON text with a supported JSON Schema subset |
+| `ops.json_schema(schema, column='_line', mode='annotate', result='_valid', audit=False, audit_limit=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Validate JSON text with a supported JSON Schema subset; filter-mode audit records support privacy controls |
 | `ops.json_flatten(fields, column='_line')` | Append declared JSON Pointer/simple JSONPath fields as bounded output columns |
 | `ops.reorder(columns)` | Alias for `select` |
 | `ops.dedup(columns)` | Alias for `unique` |
@@ -359,6 +366,8 @@ tf.pipeline('csv | unique city max_keys=10000 | csv').run(input_file='data.csv',
 
 Native Python execution supports spill-backed `sort`, capped unsorted `pivot`, unsorted `unique`/`dedup`, unsorted `group-agg`, capped unsorted `join` inner/left, unsorted `semi-join`/`anti-join`, unsorted set operations, and duplicate-eliminating `union` when `spill_dir` is provided. For large outputs, use `on_output=...` with `collect_output=False` or `iter_chunks(spill_dir=...)`; those paths drain finish-time merge output through the C sink callback or `tf_pipeline_finish_step()` instead of retaining it in the C output buffer. With `engine='duckdb'`, `memory` maps to DuckDB `memory_limit` and `spill_dir` maps to `temp_directory`.
 
+Plan-internal file reads are denied by default in Python. Pass `allow_fs=True` for trusted local lookup files used by `join`, set operations, `union`, or `stack`; pass both `allow_fs=True` and `allow_rules_file=True` for `validate rules_file=...`; pass `workspace_root=...` to pin resolved core plan paths inside a trusted directory. Supplying `spill_dir` opts into local filesystem spill for that host-provided directory. `input_file` and `input_files` are host source adapters and are not controlled by `allow_fs`.
+
 ## DuckDB engine
 
 Run pipelines on DuckDB instead of the native C streaming core. The DSL is transpiled to SQL in C, then executed by DuckDB.
@@ -427,4 +436,4 @@ p = tf.pipeline(recipe='{"steps":[{"op":"codec.csv.decode","args":{}},{"op":"hea
 
 ## Architecture
 
-The Python package is a thin ctypes wrapper around `libtranfi.so`, the same C11 core used by the CLI, Node.js, and WASM targets. Data flows through columnar batches with typed columns (`bool`, `int64`, `float64`, `string`, `date`, `timestamp`) and per-cell null bitmaps. `run(input_file=...)` streams input in chunks and drains native main output after each push; by default it still collects the final output for convenience. `.gz` input files are decompressed in the host source adapter with `gzip.open()`; use `compression='none'` to force raw bytes or `compression='gzip'` to force gzip. Use `on_output=...` with `collect_output=False` or `iter_chunks()` for large outputs. Native execution is strict by default: row-local and bounded-state operators stream, blocking operators require `allow_blocking=True` or an external engine, and capped key-state plans can be checked with `memory='64MB'`.
+The Python package is a thin ctypes wrapper around `libtranfi.so`, the same C11 core used by the CLI, Node.js, and WASM targets. Data flows through columnar batches with typed columns (`bool`, `int64`, `float64`, `string`, `date`, `timestamp`) and per-cell null bitmaps. `run(input_file=...)` streams input in chunks and drains native main output after each push; by default it still collects the final output for convenience. `.gz` input files are decompressed in the host source adapter with `gzip.open()`; use `compression='none'` to force raw bytes or `compression='gzip'` to force gzip. Use `on_output=...` with `collect_output=False` or `iter_chunks()` for large outputs. Native execution is strict by default: row-local and bounded-state operators stream, blocking operators require `allow_blocking=True` or an external engine, capped key-state plans can be checked with `memory='64MB'`, and core plan file reads require explicit host-policy options.

@@ -6,6 +6,7 @@
  */
 
 #include "internal.h"
+#include "spill.h"
 #include "cJSON.h"
 #include "date_utils.h"
 #include <stdlib.h>
@@ -48,13 +49,7 @@ typedef struct {
     size_t  key_bytes;
 } group_map;
 
-typedef union {
-    uint8_t b;
-    int64_t i64;
-    double f64;
-    int32_t date;
-    char *str;
-} group_spill_cell;
+typedef tf_owned_cell_value group_spill_cell;
 
 typedef struct {
     uint64_t ordinal;
@@ -86,6 +81,7 @@ typedef struct {
     group_map   map;
 
     char       *spill_dir;
+    tf_spill_session *spill;
     size_t      spill_memory_bytes;
     size_t      configured_run_rows;
     size_t      run_rows;
@@ -139,27 +135,16 @@ typedef struct {
 
 static size_t group_agg_retained_state_bytes(const group_agg_state *st);
 
-static void group_agg_write_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
+static int group_agg_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
-static size_t json_size_arg(const cJSON *args, const char *name) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(args, name);
-    if (!cJSON_IsNumber(item) || item->valuedouble <= 0.0) return 0;
-    if (item->valuedouble > (double)SIZE_MAX) return SIZE_MAX;
-    return (size_t)item->valuedouble;
-}
-
-static void group_agg_limit_error(const group_agg_state *st, tf_side_channels *side) {
+static int group_agg_limit_error(const group_agg_state *st, tf_side_channels *side) {
     char msg[160];
     snprintf(msg, sizeof(msg),
              "group-agg: max_groups=%zu exceeded while tracking exact groups",
              st->max_groups);
-    group_agg_write_error(side, msg);
+    return group_agg_write_error(side, msg);
 }
 
 static int group_agg_check_state_bytes(group_agg_state *st, tf_side_channels *side) {
@@ -170,7 +155,7 @@ static int group_agg_check_state_bytes(group_agg_state *st, tf_side_channels *si
     snprintf(msg, sizeof(msg),
              "group-agg: max_state_bytes=%zu exceeded while tracking exact groups (%zu bytes retained)",
              st->max_state_bytes, retained);
-    group_agg_write_error(side, msg);
+    if (group_agg_write_error(side, msg) != TF_OK) return -1;
     return -1;
 }
 
@@ -185,9 +170,16 @@ static agg_func parse_agg_func(const char *s) {
 
 static int key_append(char **buf, size_t *buf_cap, size_t *buf_len,
                       const char *data, size_t data_len) {
-    while (*buf_len + data_len + 1 >= *buf_cap) {
-        size_t new_cap = *buf_cap * 2;
-        char *tmp = realloc(*buf, new_cap);
+    size_t need = 0;
+    size_t min_cap = 0;
+    if (tf_size_add(*buf_len, data_len, &need) != TF_OK ||
+        tf_size_add(need, 1, &min_cap) != TF_OK) {
+        return -1;
+    }
+    if (min_cap >= *buf_cap) {
+        size_t new_cap = 0;
+        if (tf_size_grow_pow2(*buf_cap, min_cap, 256, &new_cap) != TF_OK) return -1;
+        char *tmp = tf_reallocarray_checked(*buf, new_cap, sizeof(char));
         if (!tmp) return -1;
         *buf = tmp;
         *buf_cap = new_cap;
@@ -317,19 +309,22 @@ static size_t group_hash(const char *key) {
 
 static int group_accum_init(group_accum *a, size_t n_aggs) {
     memset(a, 0, sizeof(*a));
-    a->n_aggs = n_aggs;
-    a->sums = calloc(n_aggs, sizeof(double));
-    a->mins = malloc(n_aggs * sizeof(double));
-    a->maxs = malloc(n_aggs * sizeof(double));
-    a->counts = calloc(n_aggs, sizeof(size_t));
-    if (!a->sums || !a->mins || !a->maxs || !a->counts) {
-        free(a->sums);
-        free(a->mins);
-        free(a->maxs);
-        free(a->counts);
-        memset(a, 0, sizeof(*a));
+    double *sums = tf_callocarray_checked(n_aggs, sizeof(double));
+    double *mins = tf_mallocarray_checked(n_aggs, sizeof(double));
+    double *maxs = tf_mallocarray_checked(n_aggs, sizeof(double));
+    size_t *counts = tf_callocarray_checked(n_aggs, sizeof(size_t));
+    if (!sums || !mins || !maxs || !counts) {
+        free(sums);
+        free(mins);
+        free(maxs);
+        free(counts);
         return -1;
     }
+    a->n_aggs = n_aggs;
+    a->sums = sums;
+    a->mins = mins;
+    a->maxs = maxs;
+    a->counts = counts;
     for (size_t i = 0; i < n_aggs; i++) { a->mins[i] = 1e308; a->maxs[i] = -1e308; }
     return 0;
 }
@@ -345,10 +340,16 @@ static int group_map_init(group_map *map) {
     memset(map, 0, sizeof(*map));
     map->cap = 64;
     map->slot_cap = 256;
-    map->keys = calloc(map->cap, sizeof(char *));
-    map->accums = calloc(map->cap, sizeof(group_accum));
-    map->slots = calloc(map->slot_cap, sizeof(size_t));
-    if (!map->keys || !map->accums || !map->slots) return -1;
+    map->keys = tf_callocarray_checked(map->cap, sizeof(char *));
+    map->accums = tf_callocarray_checked(map->cap, sizeof(group_accum));
+    map->slots = tf_callocarray_checked(map->slot_cap, sizeof(size_t));
+    if (!map->keys || !map->accums || !map->slots) {
+        free(map->keys);
+        free(map->accums);
+        free(map->slots);
+        memset(map, 0, sizeof(*map));
+        return -1;
+    }
     return 0;
 }
 
@@ -378,7 +379,7 @@ static size_t group_map_find_slot(const group_map *map, const char *key, int *fo
 }
 
 static int group_map_rehash(group_map *map, size_t new_slot_cap) {
-    size_t *new_slots = calloc(new_slot_cap, sizeof(size_t));
+    size_t *new_slots = tf_callocarray_checked(new_slot_cap, sizeof(size_t));
     if (!new_slots) return -1;
 
     for (size_t group_idx = 0; group_idx < map->count; group_idx++) {
@@ -396,18 +397,22 @@ static int group_map_rehash(group_map *map, size_t new_slot_cap) {
 static int group_map_ensure_group_capacity(group_map *map, size_t min_groups) {
     if (min_groups <= map->cap) return 0;
     size_t old_cap = map->cap;
-    size_t new_cap = map->cap ? map->cap : 64;
-    while (new_cap < min_groups) new_cap *= 2;
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(map->cap, min_groups, 64, &new_cap) != TF_OK) return -1;
 
-    char **new_keys = realloc(map->keys, new_cap * sizeof(char *));
+    char **new_keys = tf_reallocarray_checked(map->keys, new_cap, sizeof(char *));
     if (!new_keys) return -1;
     map->keys = new_keys;
-    memset(map->keys + old_cap, 0, (new_cap - old_cap) * sizeof(char *));
+    size_t zero_count = new_cap - old_cap;
+    size_t zero_bytes = 0;
+    if (tf_size_mul(zero_count, sizeof(char *), &zero_bytes) != TF_OK) return -1;
+    memset(map->keys + old_cap, 0, zero_bytes);
 
-    group_accum *new_accums = realloc(map->accums, new_cap * sizeof(group_accum));
+    group_accum *new_accums = tf_reallocarray_checked(map->accums, new_cap, sizeof(group_accum));
     if (!new_accums) return -1;
     map->accums = new_accums;
-    memset(map->accums + old_cap, 0, (new_cap - old_cap) * sizeof(group_accum));
+    if (tf_size_mul(zero_count, sizeof(group_accum), &zero_bytes) != TF_OK) return -1;
+    memset(map->accums + old_cap, 0, zero_bytes);
     map->cap = new_cap;
     return 0;
 }
@@ -425,43 +430,20 @@ static int ensure_key_batch(group_agg_state *st, const tf_batch *in, int *group_
     return 0;
 }
 
-static void copy_group_key_values(tf_batch *keys, size_t dst_row,
-                                  const tf_batch *in, size_t src_row,
-                                  int *group_indices, size_t n_group_cols) {
+static int copy_group_key_values(tf_batch *keys, size_t dst_row,
+                                 const tf_batch *in, size_t src_row,
+                                 int *group_indices, size_t n_group_cols) {
     for (size_t k = 0; k < n_group_cols; k++) {
         int ci = group_indices[k];
-        if (ci < 0 || tf_batch_is_null(in, src_row, ci)) {
-            tf_batch_set_null(keys, dst_row, k);
+        if (ci < 0) {
+            if (tf_batch_set_null(keys, dst_row, k) != TF_OK) return TF_ERROR;
             continue;
         }
-        switch (keys->col_types[k]) {
-            case TF_TYPE_BOOL:
-                tf_batch_set_bool(keys, dst_row, k, tf_batch_get_bool(in, src_row, ci));
-                break;
-            case TF_TYPE_INT64:
-                tf_batch_set_int64(keys, dst_row, k, tf_batch_get_int64(in, src_row, ci));
-                break;
-            case TF_TYPE_FLOAT64:
-                tf_batch_set_float64(keys, dst_row, k, tf_batch_get_float64(in, src_row, ci));
-                break;
-            case TF_TYPE_STRING: {
-                const char *s = tf_batch_get_string(in, src_row, ci);
-                tf_batch_set_string(keys, dst_row, k, s ? s : "");
-                break;
-            }
-            case TF_TYPE_DATE:
-                tf_batch_set_date(keys, dst_row, k, tf_batch_get_date(in, src_row, ci));
-                break;
-            case TF_TYPE_TIMESTAMP:
-                tf_batch_set_timestamp(keys, dst_row, k, tf_batch_get_timestamp(in, src_row, ci));
-                break;
-            default:
-                tf_batch_set_null(keys, dst_row, k);
-                break;
-        }
+        if (tf_batch_copy_cell(keys, dst_row, k, in, src_row, (size_t)ci) != TF_OK)
+            return TF_ERROR;
     }
+    return TF_OK;
 }
-
 
 static int ensure_sorted_key_batch(group_agg_state *st, const tf_batch *in, int *group_indices) {
     if (st->sorted_key_batch) return 0;
@@ -502,9 +484,9 @@ static void group_accum_add_row(group_accum *a, const group_agg_state *st,
     }
 }
 
-static void group_agg_set_aggregate_cell(group_agg_state *st, tf_batch *ob,
-                                         size_t row, size_t agg_idx,
-                                         const group_accum *a) {
+static int group_agg_set_aggregate_cell(group_agg_state *st, tf_batch *ob,
+                                        size_t row, size_t agg_idx,
+                                        const group_accum *a) {
     size_t col = st->n_group_cols + agg_idx;
     double v = 0;
     int is_null = 0;
@@ -529,8 +511,8 @@ static void group_agg_set_aggregate_cell(group_agg_state *st, tf_batch *ob,
             else v = a->maxs[agg_idx];
             break;
     }
-    if (is_null) tf_batch_set_null(ob, row, col);
-    else tf_batch_set_float64(ob, row, col, v);
+    return is_null ? tf_batch_set_null(ob, row, col)
+                   : tf_batch_set_float64(ob, row, col, v);
 }
 
 static int group_agg_set_output_schema(group_agg_state *st, tf_batch *ob,
@@ -552,7 +534,7 @@ static int group_agg_emit_row(group_agg_state *st, tf_batch *ob, size_t out_row,
     if (key_batch && tf_batch_copy_row(ob, out_row, key_batch, key_row) != TF_OK) return -1;
 
     for (size_t k = 0; k < st->n_aggs; k++) {
-        group_agg_set_aggregate_cell(st, ob, out_row, k, a);
+        if (group_agg_set_aggregate_cell(st, ob, out_row, k, a) != TF_OK) return -1;
     }
     ob->n_rows = out_row + 1;
     return 0;
@@ -560,9 +542,9 @@ static int group_agg_emit_row(group_agg_state *st, tf_batch *ob, size_t out_row,
 
 static int ensure_ordinals(uint64_t **ord, size_t *cap, size_t need) {
     if (*cap >= need) return TF_OK;
-    size_t new_cap = *cap ? *cap * 2 : 16;
-    while (new_cap < need) new_cap *= 2;
-    uint64_t *tmp = realloc(*ord, new_cap * sizeof(uint64_t));
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(*cap, need, 16, &new_cap) != TF_OK) return TF_ERROR;
+    uint64_t *tmp = tf_reallocarray_checked(*ord, new_cap, sizeof(uint64_t));
     if (!tmp) return TF_ERROR;
     *ord = tmp;
     *cap = new_cap;
@@ -638,8 +620,8 @@ static int group_agg_init_spill_schema(group_agg_state *st, const tf_batch *in) 
     if (st->has_schema) return TF_OK;
 
     st->n_schema_cols = in->n_cols;
-    st->schema_names = calloc(in->n_cols ? in->n_cols : 1, sizeof(char *));
-    st->schema_types = calloc(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
+    st->schema_names = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(char *));
+    st->schema_types = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
     if (!st->schema_names || !st->schema_types) return TF_ERROR;
     for (size_t c = 0; c < in->n_cols; c++) {
         st->schema_names[c] = strdup(in->col_names[c] ? in->col_names[c] : "");
@@ -647,15 +629,15 @@ static int group_agg_init_spill_schema(group_agg_state *st, const tf_batch *in) 
         st->schema_types[c] = in->col_types[c];
     }
 
-    st->group_indices = calloc(st->n_group_cols ? st->n_group_cols : 1, sizeof(int));
-    st->agg_indices = calloc(st->n_aggs ? st->n_aggs : 1, sizeof(int));
+    st->group_indices = tf_callocarray_checked(st->n_group_cols ? st->n_group_cols : 1, sizeof(int));
+    st->agg_indices = tf_callocarray_checked(st->n_aggs ? st->n_aggs : 1, sizeof(int));
     if (!st->group_indices || !st->agg_indices) return TF_ERROR;
     for (size_t k = 0; k < st->n_group_cols; k++) st->group_indices[k] = tf_batch_col_index(in, st->group_cols[k]);
     for (size_t k = 0; k < st->n_aggs; k++) st->agg_indices[k] = tf_batch_col_index(in, st->aggs[k].column);
 
     st->n_out_schema_cols = st->n_group_cols + st->n_aggs;
-    st->out_schema_names = calloc(st->n_out_schema_cols ? st->n_out_schema_cols : 1, sizeof(char *));
-    st->out_schema_types = calloc(st->n_out_schema_cols ? st->n_out_schema_cols : 1, sizeof(tf_type));
+    st->out_schema_names = tf_callocarray_checked(st->n_out_schema_cols ? st->n_out_schema_cols : 1, sizeof(char *));
+    st->out_schema_types = tf_callocarray_checked(st->n_out_schema_cols ? st->n_out_schema_cols : 1, sizeof(tf_type));
     if (!st->out_schema_names || !st->out_schema_types) return TF_ERROR;
     for (size_t k = 0; k < st->n_group_cols; k++) {
         int ci = st->group_indices[k];
@@ -730,35 +712,25 @@ static int compare_batch_group_key_rows(const group_agg_state *st, const tf_batc
     return (oa > ob) - (oa < ob);
 }
 
-static const group_agg_state *g_group_key_sort_state;
-static int compare_group_key_indices(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    return compare_batch_group_key_rows(g_group_key_sort_state, g_group_key_sort_state->buf, ra, rb);
-}
+typedef struct {
+    const group_agg_state *st;
+    int by_ordinal;
+} group_agg_sort_ctx;
 
-static const group_agg_state *g_group_ordinal_sort_state;
-static int compare_group_ordinal_indices(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    uint64_t oa = g_group_ordinal_sort_state->out_ordinals[ra];
-    uint64_t ob = g_group_ordinal_sort_state->out_ordinals[rb];
+static int group_agg_compare_indices(const void *ctx, size_t ra, size_t rb) {
+    const group_agg_sort_ctx *sort = (const group_agg_sort_ctx *)ctx;
+    if (!sort->by_ordinal) return compare_batch_group_key_rows(sort->st, sort->st->buf, ra, rb);
+    uint64_t oa = sort->st->out_ordinals[ra];
+    uint64_t ob = sort->st->out_ordinals[rb];
     return (oa > ob) - (oa < ob);
 }
 
 static size_t *group_agg_sorted_indices(size_t n, int by_ordinal, const group_agg_state *st) {
-    size_t *idx = malloc((n ? n : 1) * sizeof(size_t));
+    size_t *idx = tf_mallocarray_checked(n ? n : 1, sizeof(size_t));
     if (!idx) return NULL;
     for (size_t i = 0; i < n; i++) idx[i] = i;
-    if (by_ordinal) {
-        g_group_ordinal_sort_state = st;
-        qsort(idx, n, sizeof(size_t), compare_group_ordinal_indices);
-        g_group_ordinal_sort_state = NULL;
-    } else {
-        g_group_key_sort_state = st;
-        qsort(idx, n, sizeof(size_t), compare_group_key_indices);
-        g_group_key_sort_state = NULL;
-    }
+    group_agg_sort_ctx ctx = { .st = st, .by_ordinal = by_ordinal };
+    tf_sort_indices(idx, n, group_agg_compare_indices, &ctx);
     return idx;
 }
 
@@ -790,23 +762,15 @@ static int write_cell(FILE *f, const tf_batch *b, size_t r, size_t c) {
     }
 }
 
-static char *group_agg_make_run_path(group_agg_state *st, int output_run) {
-    size_t dir_len = strlen(st->spill_dir);
-    size_t cap = dir_len + 128;
-    char *path = malloc(cap);
-    if (!path) return NULL;
-    snprintf(path, cap, "%s%stranfi-group-agg-%s-%ld-%zu.bin",
-             st->spill_dir,
-             (dir_len > 0 && st->spill_dir[dir_len - 1] == '/') ? "" : "/",
-             output_run ? "out" : "key",
-             (long)getpid(), output_run ? st->out_run_seq++ : st->run_seq++);
-    return path;
-}
-
 static int append_path(char ***paths, size_t *n, size_t *cap, char *path) {
     if (*n == *cap) {
-        size_t new_cap = *cap ? *cap * 2 : 8;
-        char **tmp = realloc(*paths, new_cap * sizeof(char *));
+        size_t need = 0;
+        size_t new_cap = 0;
+        if (tf_size_add(*n, 1, &need) != TF_OK ||
+            tf_size_grow_pow2(*cap, need, 8, &new_cap) != TF_OK) {
+            return TF_ERROR;
+        }
+        char **tmp = tf_reallocarray_checked(*paths, new_cap, sizeof(char *));
         if (!tmp) return TF_ERROR;
         *paths = tmp;
         *cap = new_cap;
@@ -817,16 +781,9 @@ static int append_path(char ***paths, size_t *n, size_t *cap, char *path) {
 
 static int group_agg_write_batch_run(group_agg_state *st, tf_batch *batch, const uint64_t *ordinals,
                                      size_t *indices, size_t n, int output_run) {
-    char *path = group_agg_make_run_path(st, output_run);
-    if (!path) return TF_ERROR;
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "group-agg spill: cannot create '%s': %s", path, strerror(errno));
-        tf_set_last_error(msg);
-        free(path);
-        return TF_ERROR;
-    }
+    char *path = NULL;
+    FILE *f = tf_spill_open_run_file(st->spill, output_run ? "group-agg-out" : "group-agg-key", &path);
+    if (!f) return TF_ERROR;
     for (size_t i = 0; i < n; i++) {
         size_t r = indices[i];
         uint64_t ordinal = ordinals[r];
@@ -904,9 +861,15 @@ static void spill_row_clear(group_spill_row *row, const tf_type *types, size_t n
 
 static int spill_row_init(group_spill_row *row, size_t n_cols) {
     row->ordinal = 0;
-    row->nulls = calloc(n_cols ? n_cols : 1, sizeof(uint8_t));
-    row->cells = calloc(n_cols ? n_cols : 1, sizeof(group_spill_cell));
-    if (!row->nulls || !row->cells) return TF_ERROR;
+    row->nulls = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(uint8_t));
+    row->cells = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(group_spill_cell));
+    if (!row->nulls || !row->cells) {
+        free(row->nulls);
+        free(row->cells);
+        row->nulls = NULL;
+        row->cells = NULL;
+        return TF_ERROR;
+    }
     for (size_t c = 0; c < n_cols; c++) row->nulls[c] = 1;
     return TF_OK;
 }
@@ -1082,24 +1045,21 @@ static char *build_spill_row_key(const group_agg_state *st, const group_spill_ro
     return buf;
 }
 
-static int spill_row_to_batch(const group_agg_state *st, tf_batch *out, size_t dst_row, const group_spill_row *row, int output_schema) {
+static int set_spill_row_cell(tf_batch *out, size_t dst_row, size_t dst_col,
+                              const group_spill_row *row, size_t src_col, tf_type type) {
+    return tf_batch_set_owned_cell_value(out, dst_row, dst_col, type,
+                                         row->nulls[src_col], &row->cells[src_col]);
+}
+
+static int spill_row_to_batch(const group_agg_state *st, tf_batch *out,
+                              size_t dst_row, const group_spill_row *row,
+                              int output_schema) {
     const tf_type *types = output_schema ? st->out_schema_types : st->schema_types;
     size_t n_cols = output_schema ? st->n_out_schema_cols : st->n_schema_cols;
     if (tf_batch_ensure_capacity(out, dst_row + 1) != TF_OK) return TF_ERROR;
     for (size_t c = 0; c < n_cols; c++) {
-        if (row->nulls[c]) {
-            tf_batch_set_null(out, dst_row, c);
-            continue;
-        }
-        switch (types[c]) {
-            case TF_TYPE_BOOL: tf_batch_set_bool(out, dst_row, c, row->cells[c].b != 0); break;
-            case TF_TYPE_INT64: tf_batch_set_int64(out, dst_row, c, row->cells[c].i64); break;
-            case TF_TYPE_FLOAT64: tf_batch_set_float64(out, dst_row, c, row->cells[c].f64); break;
-            case TF_TYPE_STRING: tf_batch_set_string(out, dst_row, c, row->cells[c].str); break;
-            case TF_TYPE_DATE: tf_batch_set_date(out, dst_row, c, row->cells[c].date); break;
-            case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(out, dst_row, c, row->cells[c].i64); break;
-            default: tf_batch_set_null(out, dst_row, c); break;
-        }
+        if (set_spill_row_cell(out, dst_row, c, row, c, types[c]) != TF_OK)
+            return TF_ERROR;
     }
     return TF_OK;
 }
@@ -1139,7 +1099,7 @@ static int group_agg_open_readers(group_agg_state *st, int output_readers) {
     group_run_reader **readers = output_readers ? &st->out_readers : &st->readers;
     size_t *n_readers = output_readers ? &st->n_out_readers : &st->n_readers;
     if (n_paths == 0) return TF_OK;
-    *readers = calloc(n_paths, sizeof(group_run_reader));
+    *readers = tf_callocarray_checked(n_paths, sizeof(group_run_reader));
     if (!*readers) return TF_ERROR;
     *n_readers = n_paths;
     size_t n_cols = group_agg_reader_cols(st, output_readers);
@@ -1178,24 +1138,18 @@ static int group_agg_best_ordinal_reader(const group_agg_state *st) {
     return best;
 }
 
-static int copy_spill_group_key_values(tf_batch *keys, const group_agg_state *st, const group_spill_row *row) {
+static int copy_spill_group_key_values(tf_batch *keys, const group_agg_state *st,
+                                       const group_spill_row *row) {
     if (tf_batch_ensure_capacity(keys, 1) != TF_OK) return TF_ERROR;
     for (size_t k = 0; k < st->n_group_cols; k++) {
         int ci = st->group_indices[k];
-        if (ci < 0 || row->nulls[(size_t)ci]) {
-            tf_batch_set_null(keys, 0, k);
+        if (ci < 0) {
+            if (tf_batch_set_null(keys, 0, k) != TF_OK) return TF_ERROR;
             continue;
         }
         size_t c = (size_t)ci;
-        switch (keys->col_types[k]) {
-            case TF_TYPE_BOOL: tf_batch_set_bool(keys, 0, k, row->cells[c].b != 0); break;
-            case TF_TYPE_INT64: tf_batch_set_int64(keys, 0, k, row->cells[c].i64); break;
-            case TF_TYPE_FLOAT64: tf_batch_set_float64(keys, 0, k, row->cells[c].f64); break;
-            case TF_TYPE_STRING: tf_batch_set_string(keys, 0, k, row->cells[c].str ? row->cells[c].str : ""); break;
-            case TF_TYPE_DATE: tf_batch_set_date(keys, 0, k, row->cells[c].date); break;
-            case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(keys, 0, k, row->cells[c].i64); break;
-            default: tf_batch_set_null(keys, 0, k); break;
-        }
+        if (set_spill_row_cell(keys, 0, k, row, c, keys->col_types[k]) != TF_OK)
+            return TF_ERROR;
     }
     keys->n_rows = 1;
     return TF_OK;
@@ -1225,8 +1179,8 @@ static void group_accum_add_spill_row(group_accum *a, const group_agg_state *st,
 static int group_agg_append_spill_group(group_agg_state *st, const tf_batch *key_batch,
                                         const group_accum *accum, uint64_t first_ordinal) {
     size_t dst = st->out_buf->n_rows;
-    if (group_agg_emit_row(st, st->out_buf, dst, key_batch, 0, accum) != 0) return TF_ERROR;
     if (ensure_ordinals(&st->out_ordinals, &st->out_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
+    if (group_agg_emit_row(st, st->out_buf, dst, key_batch, 0, accum) != 0) return TF_ERROR;
     st->out_ordinals[dst] = first_ordinal;
     st->spill_distinct_groups++;
     if (st->out_buf->n_rows >= st->run_rows) return group_agg_write_output_run(st);
@@ -1242,9 +1196,25 @@ static int group_agg_start_spill_group(group_agg_state *st, const char *key,
     *current_key = strdup(key);
     if (!*current_key) return TF_ERROR;
     *current_key_batch = group_agg_create_key_batch(st);
-    if (!*current_key_batch) return TF_ERROR;
-    if (copy_spill_group_key_values(*current_key_batch, st, row) != TF_OK) return TF_ERROR;
-    if (group_accum_init(accum, st->n_aggs) != 0) return TF_ERROR;
+    if (!*current_key_batch) {
+        free(*current_key);
+        *current_key = NULL;
+        return TF_ERROR;
+    }
+    if (copy_spill_group_key_values(*current_key_batch, st, row) != TF_OK) {
+        tf_batch_free(*current_key_batch);
+        *current_key_batch = NULL;
+        free(*current_key);
+        *current_key = NULL;
+        return TF_ERROR;
+    }
+    if (group_accum_init(accum, st->n_aggs) != 0) {
+        tf_batch_free(*current_key_batch);
+        *current_key_batch = NULL;
+        free(*current_key);
+        *current_key = NULL;
+        return TF_ERROR;
+    }
     *first_ordinal = row->ordinal;
     return TF_OK;
 }
@@ -1254,8 +1224,15 @@ static int group_agg_finish_spill_group(group_agg_state *st, char **current_key,
                                         group_accum *accum,
                                         uint64_t first_ordinal) {
     if (!*current_key || !*current_key_batch) return TF_OK;
-    st->spill_key_bytes += strlen(*current_key) + 1;
-    int rc = group_agg_append_spill_group(st, *current_key_batch, accum, first_ordinal);
+    size_t key_bytes_delta = 0;
+    size_t new_spill_key_bytes = 0;
+    int rc = TF_ERROR;
+    if (tf_size_add(strlen(*current_key), 1, &key_bytes_delta) == TF_OK &&
+        tf_size_add(st->spill_key_bytes, key_bytes_delta,
+                    &new_spill_key_bytes) == TF_OK) {
+        st->spill_key_bytes = new_spill_key_bytes;
+        rc = group_agg_append_spill_group(st, *current_key_batch, accum, first_ordinal);
+    }
     group_accum_free(accum);
     memset(accum, 0, sizeof(*accum));
     free(*current_key);
@@ -1336,6 +1313,8 @@ static int group_agg_begin_output_merge(group_agg_state *st) {
     if (st->out_buf) { tf_batch_free(st->out_buf); st->out_buf = NULL; }
     free(st->out_ordinals); st->out_ordinals = NULL; st->out_ordinal_cap = 0;
     if (st->n_out_runs == 0) {
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->output_merge_done = 1;
         return TF_OK;
     }
@@ -1363,6 +1342,8 @@ static int group_agg_output_next_batch(group_agg_state *st, tf_batch **out) {
         tf_batch_free(ob);
         group_agg_close_readers(st, 1);
         group_agg_remove_paths(&st->out_run_paths, &st->n_out_runs, &st->cap_out_runs);
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->output_merge_done = 1;
         return TF_OK;
     }
@@ -1376,8 +1357,8 @@ static int group_agg_process_spill(group_agg_state *st, tf_batch *in) {
     if (group_agg_init_spill_schema(st, in) != TF_OK) return TF_ERROR;
     for (size_t r = 0; r < in->n_rows; r++) {
         size_t dst = st->buf->n_rows;
-        if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         if (ensure_ordinals(&st->buf_ordinals, &st->buf_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
+        if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         st->buf_ordinals[dst] = st->next_ordinal++;
         st->buf->n_rows = dst + 1;
         if (st->buf->n_rows >= st->run_rows && group_agg_write_key_run(st) != TF_OK) return TF_ERROR;
@@ -1389,7 +1370,10 @@ static int group_agg_start_sorted_group(group_agg_state *st, char *key,
                                         const tf_batch *in, size_t row,
                                         int *group_indices, tf_side_channels *side) {
     if (st->max_groups > 0 && st->sorted_groups_started >= st->max_groups) {
-        group_agg_limit_error(st, side);
+        if (group_agg_limit_error(st, side) != TF_OK) {
+            free(key);
+            return -1;
+        }
         free(key);
         return -1;
     }
@@ -1411,10 +1395,15 @@ static int group_agg_start_sorted_group(group_agg_state *st, char *key,
         return -1;
     }
 
+    if (copy_group_key_values(st->sorted_key_batch, 0, in, row, group_indices, st->n_group_cols) != TF_OK) {
+        group_accum_free(&st->sorted_accum);
+        memset(&st->sorted_accum, 0, sizeof(st->sorted_accum));
+        free(key);
+        return -1;
+    }
     st->sorted_key = key;
     st->sorted_have_current = 1;
     st->sorted_groups_started++;
-    copy_group_key_values(st->sorted_key_batch, 0, in, row, group_indices, st->n_group_cols);
     st->sorted_key_batch->n_rows = 1;
     if (group_agg_check_state_bytes(st, side) != 0) return -1;
     return 0;
@@ -1425,8 +1414,8 @@ static int group_agg_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
     group_agg_state *st = self->state;
     *out = NULL;
 
-    int *group_indices = malloc(st->n_group_cols * sizeof(int));
-    int *agg_indices = malloc(st->n_aggs * sizeof(int));
+    int *group_indices = tf_mallocarray_checked(st->n_group_cols, sizeof(int));
+    int *agg_indices = tf_mallocarray_checked(st->n_aggs, sizeof(int));
     if (!group_indices || !agg_indices) {
         free(group_indices);
         free(agg_indices);
@@ -1519,28 +1508,50 @@ static int find_or_add_group(group_agg_state *st, const char *key,
     if (found) return (int)(map->slots[slot] - 1);
 
     if (st->max_groups > 0 && map->count >= st->max_groups) {
-        group_agg_limit_error(st, side);
+        if (group_agg_limit_error(st, side) != TF_OK) return -1;
         return -1;
     }
 
-    if (map->count * 4 >= map->slot_cap * 3) {
-        if (group_map_rehash(map, map->slot_cap * 2) != 0) return -1;
+    size_t load_count = 0;
+    size_t load_limit = 0;
+    if (tf_size_mul(map->count, 4, &load_count) != TF_OK ||
+        tf_size_mul(map->slot_cap, 3, &load_limit) != TF_OK) {
+        return -1;
+    }
+    if (load_count >= load_limit) {
+        size_t new_slot_cap = 0;
+        if (tf_size_mul(map->slot_cap, 2, &new_slot_cap) != TF_OK) return -1;
+        if (group_map_rehash(map, new_slot_cap) != 0) return -1;
         slot = group_map_find_slot(map, key, &found);
     }
-    if (group_map_ensure_group_capacity(map, map->count + 1) != 0) return -1;
+    size_t next_count = 0;
+    if (tf_size_add(map->count, 1, &next_count) != TF_OK) return -1;
+    if (group_map_ensure_group_capacity(map, next_count) != 0) return -1;
     if (ensure_key_batch(st, in, group_indices) != 0) return -1;
-    if (tf_batch_ensure_capacity(map->key_batch, map->count + 1) != TF_OK) return -1;
+    if (tf_batch_ensure_capacity(map->key_batch, next_count) != TF_OK) return -1;
 
     char *dup = strdup(key);
     if (!dup) return -1;
     group_accum accum;
     if (group_accum_init(&accum, st->n_aggs) != 0) { free(dup); return -1; }
+    size_t key_bytes_delta = 0;
+    size_t new_key_bytes = 0;
+    if (tf_size_add(strlen(dup), 1, &key_bytes_delta) != TF_OK ||
+        tf_size_add(map->key_bytes, key_bytes_delta, &new_key_bytes) != TF_OK) {
+        group_accum_free(&accum);
+        free(dup);
+        return -1;
+    }
 
     size_t idx = map->count;
+    if (copy_group_key_values(map->key_batch, idx, in, row, group_indices, st->n_group_cols) != TF_OK) {
+        group_accum_free(&accum);
+        free(dup);
+        return -1;
+    }
     map->keys[idx] = dup;
-    map->key_bytes += strlen(dup) + 1;
+    map->key_bytes = new_key_bytes;
     map->accums[idx] = accum;
-    copy_group_key_values(map->key_batch, idx, in, row, group_indices, st->n_group_cols);
     map->key_batch->n_rows = idx + 1;
     map->slots[slot] = idx + 1;
     map->count++;
@@ -1555,8 +1566,8 @@ static int group_agg_process(tf_step *self, tf_batch *in, tf_batch **out,
     *out = NULL;
     if (st->use_spill) return group_agg_process_spill(st, in);
 
-    int *group_indices = malloc(st->n_group_cols * sizeof(int));
-    int *agg_indices = malloc(st->n_aggs * sizeof(int));
+    int *group_indices = tf_mallocarray_checked(st->n_group_cols, sizeof(int));
+    int *agg_indices = tf_mallocarray_checked(st->n_aggs, sizeof(int));
     if (!group_indices || !agg_indices) { free(group_indices); free(agg_indices); return TF_ERROR; }
 
     for (size_t k = 0; k < st->n_group_cols; k++)
@@ -1591,30 +1602,16 @@ static int group_agg_flush(tf_step *self, tf_batch **out, tf_side_channels *side
     tf_batch *ob = tf_batch_create(n_out_cols, st->map.count);
     if (!ob) return TF_ERROR;
 
-    for (size_t k = 0; k < st->n_group_cols; k++) {
-        tf_type type = st->map.key_batch ? st->map.key_batch->col_types[k] : TF_TYPE_STRING;
-        if (tf_batch_set_schema(ob, k, st->group_cols[k], type) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-    }
-    for (size_t k = 0; k < st->n_aggs; k++) {
-        if (tf_batch_set_schema(ob, st->n_group_cols + k, st->aggs[k].name, TF_TYPE_FLOAT64) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
+    if (group_agg_set_output_schema(st, ob, st->map.key_batch) != 0) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
 
     for (size_t g = 0; g < st->map.count; g++) {
-        tf_batch_ensure_capacity(ob, g + 1);
-
-        if (st->map.key_batch && tf_batch_copy_row(ob, g, st->map.key_batch, g) != TF_OK) {
+        if (group_agg_emit_row(st, ob, g, st->map.key_batch, g, &st->map.accums[g]) != 0) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-
-        group_accum *a = &st->map.accums[g];
-        for (size_t k = 0; k < st->n_aggs; k++) {
-            group_agg_set_aggregate_cell(st, ob, g, k, a);
-        }
-        ob->n_rows = g + 1;
     }
 
     *out = ob;
@@ -1736,9 +1733,13 @@ static int group_agg_append_stats(tf_step *self, tf_buffer *out) {
 
 static void group_agg_state_free(group_agg_state *st) {
     if (st) {
-        for (size_t i = 0; i < st->n_group_cols; i++) free(st->group_cols[i]);
+        if (st->group_cols) {
+            for (size_t i = 0; i < st->n_group_cols; i++) free(st->group_cols[i]);
+        }
         free(st->group_cols);
-        for (size_t i = 0; i < st->n_aggs; i++) { free(st->aggs[i].column); free(st->aggs[i].name); }
+        if (st->aggs) {
+            for (size_t i = 0; i < st->n_aggs; i++) { free(st->aggs[i].column); free(st->aggs[i].name); }
+        }
         free(st->aggs);
         if (st->sorted_have_current) group_accum_free(&st->sorted_accum);
         free(st->sorted_key);
@@ -1761,6 +1762,7 @@ static void group_agg_state_free(group_agg_state *st) {
         for (size_t i = 0; i < st->n_out_schema_cols; i++) free(st->out_schema_names ? st->out_schema_names[i] : NULL);
         free(st->out_schema_names);
         free(st->out_schema_types);
+        tf_spill_cleanup(st->spill);
         free(st->spill_dir);
         group_map_free(&st->map);
         free(st);
@@ -1790,12 +1792,23 @@ tf_step *tf_group_agg_create(const cJSON *args) {
         st->use_spill = 1;
         st->spill_dir = strdup(spill_dir_j->valuestring);
         if (!st->spill_dir) { group_agg_state_free(st); return NULL; }
-        st->spill_memory_bytes = json_size_arg(args, "spill_memory_bytes");
-        st->configured_run_rows = json_size_arg(args, "spill_run_rows");
-        st->output_batch_rows = json_size_arg(args, "spill_output_rows");
-        if (st->output_batch_rows == 0 || st->output_batch_rows == SIZE_MAX) st->output_batch_rows = GROUP_AGG_DEFAULT_OUTPUT_ROWS;
-        if (st->configured_run_rows == SIZE_MAX) st->configured_run_rows = 0;
-        if (st->spill_memory_bytes == SIZE_MAX) st->spill_memory_bytes = 0;
+        if (tf_spill_session_create(st->spill_dir, &st->spill) != TF_OK) { group_agg_state_free(st); return NULL; }
+        size_t parsed_size = 0;
+        int has_spill_memory = tf_json_get_size_arg(args, "spill_memory_bytes",
+                                                    1, TF_MAX_SPILL_MEMORY_BYTES,
+                                                    &parsed_size, "group-agg");
+        if (has_spill_memory < 0) { group_agg_state_free(st); return NULL; }
+        if (has_spill_memory > 0) st->spill_memory_bytes = parsed_size;
+        int has_spill_rows = tf_json_get_size_arg(args, "spill_run_rows",
+                                                  1, TF_MAX_SPILL_RUN_ROWS,
+                                                  &parsed_size, "group-agg");
+        if (has_spill_rows < 0) { group_agg_state_free(st); return NULL; }
+        if (has_spill_rows > 0) st->configured_run_rows = parsed_size;
+        int has_output_rows = tf_json_get_size_arg(args, "spill_output_rows",
+                                                   1, TF_MAX_SPILL_OUTPUT_ROWS,
+                                                   &parsed_size, "group-agg");
+        if (has_output_rows < 0) { group_agg_state_free(st); return NULL; }
+        if (has_output_rows > 0) st->output_batch_rows = parsed_size;
     }
 
     if (st->use_spill && st->sorted) {
@@ -1805,23 +1818,21 @@ tf_step *tf_group_agg_create(const cJSON *args) {
     }
     if (!st->sorted && !st->use_spill && group_map_init(&st->map) != 0) { group_agg_state_free(st); return NULL; }
 
-    cJSON *max_groups = cJSON_GetObjectItemCaseSensitive(args, "max_groups");
-    if (cJSON_IsNumber(max_groups) && max_groups->valuedouble > 0) {
-        st->max_groups = (size_t)max_groups->valuedouble;
-    }
+    size_t parsed_size = 0;
+    int has_max_groups = tf_json_get_size_arg(args, "max_groups",
+                                              1, TF_MAX_COUNT_ARG,
+                                              &parsed_size, "group-agg");
+    if (has_max_groups < 0) { group_agg_state_free(st); return NULL; }
+    if (has_max_groups > 0) st->max_groups = parsed_size;
 
-    cJSON *max_state_bytes = cJSON_GetObjectItemCaseSensitive(args, "max_state_bytes");
-    if (max_state_bytes) {
-        if (!cJSON_IsNumber(max_state_bytes) || max_state_bytes->valuedouble <= 0) {
-            tf_set_last_error("group-agg: max_state_bytes must be positive");
-            group_agg_state_free(st);
-            return NULL;
-        }
-        st->max_state_bytes = (size_t)max_state_bytes->valuedouble;
-    }
+    int has_max_state = tf_json_get_size_arg(args, "max_state_bytes",
+                                             1, TF_MAX_STATE_BYTES,
+                                             &parsed_size, "group-agg");
+    if (has_max_state < 0) { group_agg_state_free(st); return NULL; }
+    if (has_max_state > 0) st->max_state_bytes = parsed_size;
 
     int ng = cJSON_GetArraySize(group_by);
-    st->group_cols = calloc(ng, sizeof(char *));
+    st->group_cols = tf_callocarray_checked((size_t)ng, sizeof(char *));
     st->n_group_cols = ng;
     if (ng > 0 && !st->group_cols) { group_agg_state_free(st); return NULL; }
     for (int i = 0; i < ng; i++) {
@@ -1833,7 +1844,7 @@ tf_step *tf_group_agg_create(const cJSON *args) {
     }
 
     int na = cJSON_GetArraySize(aggs_j);
-    st->aggs = calloc(na, sizeof(agg_spec));
+    st->aggs = tf_callocarray_checked((size_t)na, sizeof(agg_spec));
     st->n_aggs = na;
     if (na > 0 && !st->aggs) { group_agg_state_free(st); return NULL; }
     for (int i = 0; i < na; i++) {

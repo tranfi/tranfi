@@ -26,50 +26,8 @@ typedef struct {
     size_t    hist_pos;
 } lag_state;
 
-static void lag_set_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
-}
-
-static int copy_cell(tf_batch *dst, size_t dst_row, size_t dst_col,
-                     const tf_batch *src, size_t src_row, size_t src_col) {
-    if (tf_batch_is_null(src, src_row, src_col)) {
-        tf_batch_set_null(dst, dst_row, dst_col);
-        return TF_OK;
-    }
-
-    switch (src->col_types[src_col]) {
-        case TF_TYPE_BOOL:
-            tf_batch_set_bool(dst, dst_row, dst_col,
-                              tf_batch_get_bool(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_INT64:
-            tf_batch_set_int64(dst, dst_row, dst_col,
-                               tf_batch_get_int64(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_FLOAT64:
-            tf_batch_set_float64(dst, dst_row, dst_col,
-                                 tf_batch_get_float64(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_STRING:
-            tf_batch_set_string(dst, dst_row, dst_col,
-                                tf_batch_get_string(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_DATE:
-            tf_batch_set_date(dst, dst_row, dst_col,
-                              tf_batch_get_date(src, src_row, src_col));
-            return TF_OK;
-        case TF_TYPE_TIMESTAMP:
-            tf_batch_set_timestamp(dst, dst_row, dst_col,
-                                   tf_batch_get_timestamp(src, src_row, src_col));
-            return TF_OK;
-        default:
-            tf_batch_set_null(dst, dst_row, dst_col);
-            return TF_OK;
-    }
+static int lag_set_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
 static int ensure_history(lag_state *st, const tf_batch *in) {
@@ -77,11 +35,9 @@ static int ensure_history(lag_state *st, const tf_batch *in) {
 
     tf_batch *h = tf_batch_create(in->n_cols, st->offset);
     if (!h) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(h, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(h);
-            return TF_ERROR;
-        }
+    if (tf_batch_clone_schema(h, in) != TF_OK) {
+        tf_batch_free(h);
+        return TF_ERROR;
     }
     h->n_rows = st->offset;
     st->history = h;
@@ -97,20 +53,16 @@ static int lag_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (ci < 0) {
         char msg[256];
         snprintf(msg, sizeof(msg), "lag: column '%s' not found", st->column);
-        lag_set_error(side, msg);
+        if (lag_set_error(side, msg) != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
     if (ensure_history(st, in) != TF_OK) return TF_ERROR;
 
+    const char *extra_names[1] = {st->result};
+    tf_type extra_types[1] = {in->col_types[ci]};
     tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
-    if (tf_batch_set_schema(ob, in->n_cols, st->result, in->col_types[ci]) != TF_OK) {
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
         tf_batch_free(ob);
         return TF_ERROR;
     }
@@ -122,9 +74,13 @@ static int lag_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
 
         if (st->hist_count < st->offset) {
-            tf_batch_set_null(ob, r, in->n_cols);
-        } else {
-            copy_cell(ob, r, in->n_cols, st->history, st->hist_pos, (size_t)ci);
+            if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) {
+                tf_batch_free(ob);
+                return TF_ERROR;
+            }
+        } else if (tf_batch_copy_cell(ob, r, in->n_cols, st->history, st->hist_pos, (size_t)ci) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
         }
 
         if (tf_batch_copy_row(st->history, st->hist_pos, in, r) != TF_OK) {
@@ -168,9 +124,12 @@ static tf_step *lag_create_with_suffix(const cJSON *args, const char *suffix) {
     st->column = strdup(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 
-    cJSON *off_j = cJSON_GetObjectItemCaseSensitive(args, "offset");
-    st->offset = (cJSON_IsNumber(off_j) && off_j->valueint > 0) ?
-                 (size_t)off_j->valueint : 1;
+    size_t offset = 1;
+    int has_offset = tf_json_get_size_arg(args, "offset",
+                                          1, TF_MAX_WINDOW_SIZE,
+                                          &offset, "lag");
+    if (has_offset < 0) { free(st->column); free(st); return NULL; }
+    st->offset = offset;
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j) && res_j->valuestring[0]) {

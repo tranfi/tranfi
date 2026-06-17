@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
+#include <math.h>
 
 typedef struct {
     char    *name;
@@ -24,19 +26,21 @@ typedef struct {
     tf_type    *col_types;       /* resolved type per derived column */
 } derive_state;
 
-/* Evaluate first row to determine derived column types */
-static void resolve_types(derive_state *st, const tf_batch *in) {
-    st->col_types = calloc(st->n_cols, sizeof(tf_type));
-    if (!st->col_types) return;
+/* Evaluate first row to determine derived column types. */
+static int resolve_types(derive_state *st, const tf_batch *in) {
+    st->col_types = calloc(st->n_cols ? st->n_cols : 1, sizeof(tf_type));
+    if (!st->col_types) return TF_ERROR;
 
     for (size_t d = 0; d < st->n_cols; d++) {
         if (in->n_rows == 0) {
-            /* No rows to sample; default to FLOAT64 for arithmetic */
             st->col_types[d] = TF_TYPE_FLOAT64;
             continue;
         }
         tf_eval_result val;
-        tf_expr_eval_val(st->cols[d].expr, in, 0, &val);
+        if (tf_expr_eval_val(st->cols[d].expr, in, 0, &val) != TF_OK) {
+            st->col_types[d] = TF_TYPE_FLOAT64;
+            continue;
+        }
         switch (val.type) {
             case TF_TYPE_INT64:   st->col_types[d] = TF_TYPE_INT64; break;
             case TF_TYPE_FLOAT64: st->col_types[d] = TF_TYPE_FLOAT64; break;
@@ -48,60 +52,49 @@ static void resolve_types(derive_state *st, const tf_batch *in) {
         }
     }
     st->types_resolved = 1;
+    return TF_OK;
 }
 
-static void set_derived_value(tf_batch *ob, size_t row, size_t col,
-                              tf_type col_type, const tf_eval_result *val) {
-    if (val->type == TF_TYPE_NULL) {
-        tf_batch_set_null(ob, row, col);
-        return;
-    }
+static int derive_double_to_i64(double v, int64_t *out) {
+    if (!isfinite(v) || v < (double)INT64_MIN || v > (double)INT64_MAX) return TF_ERROR;
+    *out = (int64_t)v;
+    return TF_OK;
+}
 
-    /* Convert value to the column's type */
+static int set_derived_value(tf_batch *ob, size_t row, size_t col,
+                             tf_type col_type, const tf_eval_result *val) {
+    if (!val || val->type == TF_TYPE_NULL) return tf_batch_set_null(ob, row, col);
+
     switch (col_type) {
         case TF_TYPE_INT64:
-            if (val->type == TF_TYPE_INT64)
-                tf_batch_set_int64(ob, row, col, val->i);
-            else if (val->type == TF_TYPE_FLOAT64)
-                tf_batch_set_int64(ob, row, col, (int64_t)val->f);
-            else
-                tf_batch_set_null(ob, row, col);
-            break;
+            if (val->type == TF_TYPE_INT64) return tf_batch_set_int64(ob, row, col, val->i);
+            if (val->type == TF_TYPE_FLOAT64) {
+                int64_t iv = 0;
+                if (derive_double_to_i64(val->f, &iv) != TF_OK) return tf_batch_set_null(ob, row, col);
+                return tf_batch_set_int64(ob, row, col, iv);
+            }
+            return tf_batch_set_null(ob, row, col);
         case TF_TYPE_FLOAT64:
-            if (val->type == TF_TYPE_FLOAT64)
-                tf_batch_set_float64(ob, row, col, val->f);
-            else if (val->type == TF_TYPE_INT64)
-                tf_batch_set_float64(ob, row, col, (double)val->i);
-            else
-                tf_batch_set_null(ob, row, col);
-            break;
+            if (val->type == TF_TYPE_FLOAT64) return tf_batch_set_float64(ob, row, col, val->f);
+            if (val->type == TF_TYPE_INT64) return tf_batch_set_float64(ob, row, col, (double)val->i);
+            return tf_batch_set_null(ob, row, col);
         case TF_TYPE_STRING:
-            if (val->type == TF_TYPE_STRING)
-                tf_batch_set_string(ob, row, col, val->s);
-            else
-                tf_batch_set_null(ob, row, col);
-            break;
+            if (val->type == TF_TYPE_STRING) {
+                if (!val->s) return tf_batch_set_null(ob, row, col);
+                return tf_batch_set_string(ob, row, col, val->s);
+            }
+            return tf_batch_set_null(ob, row, col);
         case TF_TYPE_BOOL:
-            if (val->type == TF_TYPE_BOOL)
-                tf_batch_set_bool(ob, row, col, val->b);
-            else
-                tf_batch_set_null(ob, row, col);
-            break;
+            if (val->type == TF_TYPE_BOOL) return tf_batch_set_bool(ob, row, col, val->b);
+            return tf_batch_set_null(ob, row, col);
         case TF_TYPE_DATE:
-            if (val->type == TF_TYPE_DATE)
-                tf_batch_set_date(ob, row, col, val->date);
-            else
-                tf_batch_set_null(ob, row, col);
-            break;
+            if (val->type == TF_TYPE_DATE) return tf_batch_set_date(ob, row, col, val->date);
+            return tf_batch_set_null(ob, row, col);
         case TF_TYPE_TIMESTAMP:
-            if (val->type == TF_TYPE_TIMESTAMP)
-                tf_batch_set_timestamp(ob, row, col, val->i);
-            else
-                tf_batch_set_null(ob, row, col);
-            break;
+            if (val->type == TF_TYPE_TIMESTAMP) return tf_batch_set_timestamp(ob, row, col, val->i);
+            return tf_batch_set_null(ob, row, col);
         default:
-            tf_batch_set_null(ob, row, col);
-            break;
+            return tf_batch_set_null(ob, row, col);
     }
 }
 
@@ -111,67 +104,38 @@ static int derive_process(tf_step *self, tf_batch *in, tf_batch **out,
     derive_state *st = self->state;
     *out = NULL;
 
-    /* Resolve types on first batch */
-    if (!st->types_resolved) {
-        resolve_types(st, in);
-    }
+    if (!st->types_resolved && resolve_types(st, in) != TF_OK) return TF_ERROR;
 
-    size_t out_n_cols = in->n_cols + st->n_cols;
+    size_t out_n_cols = 0;
+    if (tf_size_add(in->n_cols, st->n_cols, &out_n_cols) != TF_OK) return TF_ERROR;
+
     tf_batch *ob = tf_batch_create(out_n_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
 
-    /* Copy input schema */
-    for (size_t c = 0; c < in->n_cols; c++) {
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    const char **extra_names = calloc(st->n_cols ? st->n_cols : 1, sizeof(char *));
+    if (!extra_names) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
-    /* Set derived column schemas with resolved types */
-    for (size_t d = 0; d < st->n_cols; d++) {
-        tf_batch_set_schema(ob, in->n_cols + d, st->cols[d].name, st->col_types[d]);
+    for (size_t d = 0; d < st->n_cols; d++) extra_names[d] = st->cols[d].name;
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, st->col_types, st->n_cols) != TF_OK) {
+        free(extra_names);
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
+    free(extra_names);
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_ensure_capacity(ob, r + 1);
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) goto fail;
 
-        /* Copy input columns */
-        for (size_t c = 0; c < in->n_cols; c++) {
-            if (tf_batch_is_null(in, r, c)) {
-                tf_batch_set_null(ob, r, c);
-                continue;
-            }
-            switch (in->col_types[c]) {
-                case TF_TYPE_BOOL:
-                    tf_batch_set_bool(ob, r, c, tf_batch_get_bool(in, r, c));
-                    break;
-                case TF_TYPE_INT64:
-                    tf_batch_set_int64(ob, r, c, tf_batch_get_int64(in, r, c));
-                    break;
-                case TF_TYPE_FLOAT64:
-                    tf_batch_set_float64(ob, r, c, tf_batch_get_float64(in, r, c));
-                    break;
-                case TF_TYPE_STRING:
-                    tf_batch_set_string(ob, r, c, tf_batch_get_string(in, r, c));
-                    break;
-                case TF_TYPE_DATE:
-                    tf_batch_set_date(ob, r, c, tf_batch_get_date(in, r, c));
-                    break;
-                case TF_TYPE_TIMESTAMP:
-                    tf_batch_set_timestamp(ob, r, c, tf_batch_get_timestamp(in, r, c));
-                    break;
-                default:
-                    tf_batch_set_null(ob, r, c);
-                    break;
-            }
-        }
-
-        /* Evaluate derived columns */
         for (size_t d = 0; d < st->n_cols; d++) {
             size_t col_idx = in->n_cols + d;
             tf_eval_result val;
             if (tf_expr_eval_val(st->cols[d].expr, in, r, &val) != TF_OK) {
-                tf_batch_set_null(ob, r, col_idx);
+                if (tf_batch_set_null(ob, r, col_idx) != TF_OK) goto fail;
                 continue;
             }
-            set_derived_value(ob, r, col_idx, st->col_types[d], &val);
+            if (set_derived_value(ob, r, col_idx, st->col_types[d], &val) != TF_OK) goto fail;
         }
         ob->n_rows = r + 1;
     }
@@ -182,6 +146,10 @@ static int derive_process(tf_step *self, tf_batch *in, tf_batch **out,
         tf_batch_free(ob);
     }
     return TF_OK;
+
+fail:
+    tf_batch_free(ob);
+    return TF_ERROR;
 }
 
 static int derive_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {

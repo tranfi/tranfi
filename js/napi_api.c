@@ -20,14 +20,98 @@
         }                                                       \
     } while (0)
 
-/*ాcreate_pipeline(planJson: string) → External */
+
+static int get_named_bool(napi_env env, napi_value obj, const char *name, bool default_value, bool *out) {
+    bool has = false;
+    napi_status st = napi_has_named_property(env, obj, name, &has);
+    if (st != napi_ok || !has) { *out = default_value; return 0; }
+    napi_value value;
+    st = napi_get_named_property(env, obj, name, &value);
+    if (st != napi_ok) { *out = default_value; return 0; }
+    napi_valuetype type;
+    st = napi_typeof(env, value, &type);
+    if (st != napi_ok || type == napi_undefined || type == napi_null) { *out = default_value; return 0; }
+    if (type != napi_boolean) {
+        napi_throw_type_error(env, NULL, "host policy option must be boolean");
+        return -1;
+    }
+    bool b = false;
+    st = napi_get_value_bool(env, value, &b);
+    if (st != napi_ok) return -1;
+    *out = b;
+    return 0;
+}
+
+static int get_named_bool_alias(napi_env env, napi_value obj, const char *camel,
+                                const char *snake, bool default_value, bool *out) {
+    bool has = false;
+    if (napi_has_named_property(env, obj, camel, &has) == napi_ok && has)
+        return get_named_bool(env, obj, camel, default_value, out);
+    return get_named_bool(env, obj, snake, default_value, out);
+}
+
+static char *get_named_string(napi_env env, napi_value obj, const char *name) {
+    bool has = false;
+    if (napi_has_named_property(env, obj, name, &has) != napi_ok || !has) return NULL;
+    napi_value value;
+    if (napi_get_named_property(env, obj, name, &value) != napi_ok) return NULL;
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type == napi_undefined || type == napi_null) return NULL;
+    if (type != napi_string) {
+        napi_throw_type_error(env, NULL, "workspaceRoot must be a string");
+        return (char *)-1;
+    }
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, value, NULL, 0, &len) != napi_ok) return (char *)-1;
+    char *s = malloc(len + 1);
+    if (!s) return (char *)-1;
+    if (napi_get_value_string_utf8(env, value, s, len + 1, &len) != napi_ok) {
+        free(s);
+        return (char *)-1;
+    }
+    return s;
+}
+
+static int parse_host_policy_options(napi_env env, napi_value value, tf_host_policy *policy,
+                                     char **workspace_root) {
+    memset(policy, 0, sizeof(*policy));
+    policy->allow_blocking = true;
+    *workspace_root = NULL;
+    if (!value) return 0;
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type == napi_undefined || type == napi_null) return 0;
+    if (type != napi_object) {
+        napi_throw_type_error(env, NULL, "createPipeline options must be an object");
+        return -1;
+    }
+    if (get_named_bool_alias(env, value, "allowFs", "allow_fs", false, &policy->allow_fs) != 0) return -1;
+    if (get_named_bool_alias(env, value, "allowNet", "allow_net", false, &policy->allow_net) != 0) return -1;
+    if (get_named_bool_alias(env, value, "allowSpill", "allow_spill", false, &policy->allow_spill) != 0) return -1;
+    if (get_named_bool_alias(env, value, "allowRulesFile", "allow_rules_file", false, &policy->allow_rules_file) != 0) return -1;
+    if (get_named_bool_alias(env, value, "allowBlocking", "allow_blocking", true, &policy->allow_blocking) != 0) return -1;
+    *workspace_root = get_named_string(env, value, "workspaceRoot");
+    if (*workspace_root == (char *)-1) { *workspace_root = NULL; return -1; }
+    if (!*workspace_root) *workspace_root = get_named_string(env, value, "workspace_root");
+    if (*workspace_root == (char *)-1) { *workspace_root = NULL; return -1; }
+    policy->workspace_root = *workspace_root && (*workspace_root)[0] ? *workspace_root : NULL;
+    return 0;
+}
+
+/* createPipeline(planJson: string, options?: HostPolicy) → External */
 static napi_value napi_create_pipeline(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1];
+    size_t argc = 2;
+    napi_value argv[2] = {0};
     NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
 
     if (argc < 1) {
         napi_throw_error(env, NULL, "createPipeline requires plan JSON string");
+        return NULL;
+    }
+
+    tf_host_policy policy;
+    char *workspace_root = NULL;
+    if (parse_host_policy_options(env, argc >= 2 ? argv[1] : NULL, &policy, &workspace_root) != 0) {
+        free(workspace_root);
         return NULL;
     }
 
@@ -36,8 +120,9 @@ static napi_value napi_create_pipeline(napi_env env, napi_callback_info info) {
     char *json = malloc(str_len + 1);
     NAPI_CALL(env, napi_get_value_string_utf8(env, argv[0], json, str_len + 1, &str_len));
 
-    tf_pipeline *p = tf_pipeline_create(json, str_len);
+    tf_pipeline *p = tf_pipeline_create_with_host_policy(json, str_len, &policy);
     free(json);
+    free(workspace_root);
 
     if (!p) {
         const char *err = tf_last_error();

@@ -41,9 +41,16 @@ static tf_pipeline *get_handle(int h) {
 #define EXPORT
 #endif
 
-EXPORT
-int wasm_pipeline_create(const char *json, int len) {
-    tf_pipeline *p = tf_pipeline_create(json, (size_t)len);
+static int wasm_pipeline_create_policy(const char *json, int len,
+                                       int allow_fs, int allow_spill,
+                                       int allow_rules_file, const char *workspace_root) {
+    tf_host_policy policy = {0};
+    policy.allow_fs = allow_fs != 0;
+    policy.allow_spill = allow_spill != 0;
+    policy.allow_rules_file = allow_rules_file != 0;
+    policy.allow_blocking = true;
+    policy.workspace_root = workspace_root && workspace_root[0] ? workspace_root : NULL;
+    tf_pipeline *p = tf_pipeline_create_with_host_policy(json, (size_t)len, &policy);
     if (!p) return -1;
     int h = alloc_handle(p);
     if (h < 0) {
@@ -51,6 +58,19 @@ int wasm_pipeline_create(const char *json, int len) {
         return -1;
     }
     return h;
+}
+
+EXPORT
+int wasm_pipeline_create(const char *json, int len) {
+    return wasm_pipeline_create_policy(json, len, 0, 0, 0, NULL);
+}
+
+EXPORT
+int wasm_pipeline_create_with_policy(const char *json, int len, int allow_fs,
+                                     int allow_spill, int allow_rules_file,
+                                     const char *workspace_root) {
+    return wasm_pipeline_create_policy(json, len, allow_fs, allow_spill,
+                                       allow_rules_file, workspace_root);
 }
 
 EXPORT

@@ -27,6 +27,7 @@ typedef struct {
     size_t            audit_limit;
     size_t            audit_emitted;
     int               audit;
+    tf_audit_options  audit_opts;
 } json_schema_state;
 
 static int type_name_valid(const char *s) {
@@ -67,6 +68,18 @@ static int properties_supported(const cJSON *props) {
     return 1;
 }
 
+static int schema_size_keyword_supported(const cJSON *item, const char *key) {
+    size_t parsed = 0;
+    size_t max_value = (strcmp(key, "minLength") == 0 || strcmp(key, "maxLength") == 0)
+        ? TF_MAX_RECORD_BYTES
+        : TF_MAX_COUNT_ARG;
+    return tf_json_size_value(item, key, 0, max_value, &parsed, "json-schema") == 1;
+}
+
+static int schema_number_keyword_supported(const cJSON *item) {
+    return cJSON_IsNumber(item) && isfinite(item->valuedouble);
+}
+
 static int schema_supported(const cJSON *schema) {
     if (cJSON_IsBool(schema)) return 1;
     if (!cJSON_IsObject(schema)) return 0;
@@ -91,11 +104,16 @@ static int schema_supported(const cJSON *schema) {
         } else if (strcmp(key, "const") == 0) {
             continue;
         } else if (strcmp(key, "minLength") == 0 || strcmp(key, "maxLength") == 0 ||
-                   strcmp(key, "minimum") == 0 || strcmp(key, "maximum") == 0 ||
                    strcmp(key, "minItems") == 0 || strcmp(key, "maxItems") == 0) {
-            if (!cJSON_IsNumber(child)) return 0;
+            if (!schema_size_keyword_supported(child, key)) return 0;
+        } else if (strcmp(key, "minimum") == 0 || strcmp(key, "maximum") == 0) {
+            if (!schema_number_keyword_supported(child)) return 0;
         } else if (strcmp(key, "exclusiveMinimum") == 0 || strcmp(key, "exclusiveMaximum") == 0) {
-            if (!cJSON_IsNumber(child) && !cJSON_IsBool(child)) return 0;
+            if (cJSON_IsNumber(child)) {
+                if (!schema_number_keyword_supported(child)) return 0;
+            } else if (!cJSON_IsBool(child)) {
+                return 0;
+            }
         } else {
             return 0;
         }
@@ -157,8 +175,17 @@ static int validate_string_constraints(const cJSON *schema, const cJSON *value) 
     if (!min_len && !max_len) return 1;
     if (!cJSON_IsString(value)) return 0;
     size_t len = strlen(value->valuestring ? value->valuestring : "");
-    if (min_len && len < (size_t)min_len->valuedouble) return 0;
-    if (max_len && len > (size_t)max_len->valuedouble) return 0;
+    size_t limit = 0;
+    if (min_len) {
+        if (tf_json_size_value(min_len, "minLength", 0, TF_MAX_RECORD_BYTES,
+                               &limit, "json-schema") != 1) return 0;
+        if (len < limit) return 0;
+    }
+    if (max_len) {
+        if (tf_json_size_value(max_len, "maxLength", 0, TF_MAX_RECORD_BYTES,
+                               &limit, "json-schema") != 1) return 0;
+        if (len > limit) return 0;
+    }
     return 1;
 }
 
@@ -210,9 +237,19 @@ static int validate_array_constraints(const cJSON *schema, const cJSON *value) {
     if (!items && !min_items && !max_items) return 1;
     if (!cJSON_IsArray(value)) return 0;
 
-    int n = cJSON_GetArraySize((cJSON *)value);
-    if (min_items && n < (int)min_items->valuedouble) return 0;
-    if (max_items && n > (int)max_items->valuedouble) return 0;
+    int raw_n = cJSON_GetArraySize((cJSON *)value);
+    size_t n = raw_n > 0 ? (size_t)raw_n : 0;
+    size_t limit = 0;
+    if (min_items) {
+        if (tf_json_size_value(min_items, "minItems", 0, TF_MAX_COUNT_ARG,
+                               &limit, "json-schema") != 1) return 0;
+        if (n < limit) return 0;
+    }
+    if (max_items) {
+        if (tf_json_size_value(max_items, "maxItems", 0, TF_MAX_COUNT_ARG,
+                               &limit, "json-schema") != 1) return 0;
+        if (n > limit) return 0;
+    }
     if (items) {
         const cJSON *item = NULL;
         cJSON_ArrayForEach(item, value) {
@@ -241,30 +278,6 @@ static const char *json_schema_mode_name(json_schema_mode mode) {
     return mode == JSON_SCHEMA_FILTER ? "filter" : "annotate";
 }
 
-static cJSON *json_schema_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default: return cJSON_CreateNull();
-    }
-}
-
-static cJSON *json_schema_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = json_schema_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
-    }
-    return obj;
-}
-
 static int emit_json_schema_audit(json_schema_state *st, const tf_batch *b, size_t row,
                                   tf_side_channels *side, const char *actual) {
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
@@ -278,15 +291,18 @@ static int emit_json_schema_audit(json_schema_state *st, const tf_batch *b, size
     cJSON_AddStringToObject(obj, "mode", json_schema_mode_name(st->mode));
     cJSON_AddStringToObject(obj, "rule", "json-schema");
     cJSON_AddStringToObject(obj, "column", st->column ? st->column : "_line");
-    cJSON_AddStringToObject(obj, "actual", actual ? actual : "schema_mismatch");
+    char actual_buf[256];
+    cJSON_AddStringToObject(obj, "actual",
+                            tf_audit_format_string_for_column(&st->audit_opts, st->column,
+                                                              actual ? actual : "schema_mismatch",
+                                                              actual_buf, sizeof(actual_buf)));
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    cJSON *row_obj = json_schema_row_to_json(b, row);
+    cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->stats, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    int rc = tf_buffer_write_line(side->stats, line);
     free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
@@ -300,17 +316,16 @@ static int json_schema_process(tf_step *self, tf_batch *in, tf_batch **out,
     size_t out_cols = in->n_cols + (st->mode == JSON_SCHEMA_ANNOTATE ? 1 : 0);
     tf_batch *ob = tf_batch_create(out_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
     if (st->mode == JSON_SCHEMA_ANNOTATE) {
-        if (tf_batch_set_schema(ob, in->n_cols, st->result, TF_TYPE_BOOL) != TF_OK) {
+        const char *extra_names[] = {st->result};
+        const tf_type extra_types[] = {TF_TYPE_BOOL};
+        if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
+    } else if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
 
     int ci = tf_batch_col_index(in, st->column);
@@ -357,7 +372,12 @@ static int json_schema_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (st->mode == JSON_SCHEMA_ANNOTATE) tf_batch_set_bool(ob, out_row, in->n_cols, valid != 0);
+        if (st->mode == JSON_SCHEMA_ANNOTATE &&
+            tf_batch_set_bool(ob, out_row, in->n_cols, valid != 0) != TF_OK) {
+            if (root) cJSON_Delete(root);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = ++out_row;
         if (root) cJSON_Delete(root);
     }
@@ -376,6 +396,7 @@ static void json_schema_state_free(json_schema_state *st) {
     free(st->column);
     free(st->result);
     if (st->schema) cJSON_Delete(st->schema);
+    tf_audit_options_free(&st->audit_opts);
     free(st);
 }
 
@@ -436,20 +457,24 @@ tf_step *tf_json_schema_create(const cJSON *args) {
     st->schema = schema;
     st->mode = mode;
     st->audit_limit = 1000;
+    tf_audit_options_init(&st->audit_opts, 1);
     cJSON *audit_j = cJSON_GetObjectItemCaseSensitive(args, "audit");
     st->audit = cJSON_IsTrue(audit_j) ? 1 : 0;
     cJSON *audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
     if (!audit_limit_j) audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
     if (audit_limit_j) {
-        if (!cJSON_IsNumber(audit_limit_j) || audit_limit_j->valuedouble <= 0) {
-            cJSON_Delete(schema);
-            free(st->column);
-            free(st->result);
-            free(st);
-            tf_set_last_error("json-schema: audit_limit must be a positive integer");
+        size_t parsed_limit = 0;
+        if (tf_json_get_size_arg_any(args, "audit_limit", "auditLimit",
+                                     1, TF_MAX_AUDIT_RECORDS,
+                                     &parsed_limit, "json-schema") < 0) {
+            json_schema_state_free(st);
             return NULL;
         }
-        st->audit_limit = (size_t)audit_limit_j->valuedouble;
+        st->audit_limit = parsed_limit;
+    }
+    if (tf_audit_options_parse(&st->audit_opts, args, "json-schema") != TF_OK) {
+        json_schema_state_free(st);
+        return NULL;
     }
     if (!st->column || !st->result) {
         json_schema_state_free(st);

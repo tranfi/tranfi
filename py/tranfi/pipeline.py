@@ -140,7 +140,8 @@ class Pipeline:
             input_files=None, source_column: str = None,
             on_output=None, collect_output: bool = True,
             chunk_size: int = CHUNK_SIZE, allow_blocking: bool = False,
-            memory=None, spill_dir: str = None,
+            memory=None, spill_dir: str = None, allow_fs=None,
+            allow_rules_file: bool = False, workspace_root: str = None,
             compression: str = 'auto') -> PipelineResult:
         """
         Run the pipeline.
@@ -157,6 +158,9 @@ class Pipeline:
             allow_blocking: Permit native full-input blocking steps for known-small data.
             memory: Optional native memory limit, e.g. "64MB" or "max:64MB".
             spill_dir: Native spill directory for supported operators such as sort.
+            allow_fs: Permit core plan file args such as join/stack/rules_file.
+            allow_rules_file: Permit validate rules_file in addition to allow_fs.
+            workspace_root: Optional root used to resolve and pin core plan paths.
 
         Returns:
             PipelineResult with output, errors, stats, samples. When
@@ -183,7 +187,11 @@ class Pipeline:
         plan_json = self._to_plan_json()
         plan_json = _inject_source_name_step(plan_json, source_column)
         plan_json = prepare_native_plan(plan_json, allow_blocking=allow_blocking, memory=memory, spill_dir=spill_dir)
-        handle = _ffi.pipeline_create(plan_json)
+        effective_allow_fs = bool(spill_dir) if allow_fs is None else bool(allow_fs)
+        handle = _ffi.pipeline_create(plan_json, allow_fs=effective_allow_fs,
+                                      allow_spill=bool(spill_dir),
+                                      allow_rules_file=allow_rules_file,
+                                      workspace_root=workspace_root)
         output_chunks = []
         sink_error = []
         sink_ref = None
@@ -266,7 +274,8 @@ class Pipeline:
     def iter_chunks(self, *, input: bytes = None, input_file: str = None,
                     input_files=None, source_column: str = None,
                     chunk_size: int = CHUNK_SIZE, allow_blocking: bool = False,
-                    memory=None, spill_dir: str = None,
+                    memory=None, spill_dir: str = None, allow_fs=None,
+                    allow_rules_file: bool = False, workspace_root: str = None,
                     compression: str = 'auto'):
         """Yield main-output chunks while the native pipeline runs."""
         compression = _normalize_compression(compression)
@@ -286,7 +295,11 @@ class Pipeline:
         plan_json = self._to_plan_json()
         plan_json = _inject_source_name_step(plan_json, source_column)
         plan_json = prepare_native_plan(plan_json, allow_blocking=allow_blocking, memory=memory, spill_dir=spill_dir)
-        handle = _ffi.pipeline_create(plan_json)
+        effective_allow_fs = bool(spill_dir) if allow_fs is None else bool(allow_fs)
+        handle = _ffi.pipeline_create(plan_json, allow_fs=effective_allow_fs,
+                                      allow_spill=bool(spill_dir),
+                                      allow_rules_file=allow_rules_file,
+                                      workspace_root=workspace_root)
 
         def drain_main():
             while True:

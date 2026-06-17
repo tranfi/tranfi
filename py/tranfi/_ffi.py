@@ -16,6 +16,19 @@ _SINK_CALLBACK = ctypes.CFUNCTYPE(
 )
 
 
+class _TfHostPolicy(ctypes.Structure):
+    _fields_ = [
+        ('allow_fs', ctypes.c_bool),
+        ('allow_net', ctypes.c_bool),
+        ('allow_spill', ctypes.c_bool),
+        ('allow_blocking', ctypes.c_bool),
+        ('allow_rules_file', ctypes.c_bool),
+        ('workspace_root', ctypes.c_char_p),
+        ('resolve_path', ctypes.c_void_p),
+        ('user', ctypes.c_void_p),
+    ]
+
+
 def _find_lib():
     """Find libtranfi shared library."""
     # 1. Check TRANFI_LIB_PATH environment variable
@@ -81,6 +94,11 @@ def _load_lib():
     # tf_pipeline_create
     _lib.tf_pipeline_create.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
     _lib.tf_pipeline_create.restype = ctypes.c_void_p
+
+    # tf_pipeline_create_with_host_policy
+    _lib.tf_pipeline_create_with_host_policy.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                                                          ctypes.POINTER(_TfHostPolicy)]
+    _lib.tf_pipeline_create_with_host_policy.restype = ctypes.c_void_p
 
     # tf_pipeline_free
     _lib.tf_pipeline_free.argtypes = [ctypes.c_void_p]
@@ -186,11 +204,37 @@ def _load_lib():
 
 # --- Thin Python wrappers ---
 
-def pipeline_create(plan_json: str) -> int:
+def _host_policy(*, allow_fs=False, allow_net=False, allow_spill=False,
+                 allow_blocking=True, allow_rules_file=False, workspace_root=None):
+    workspace_bytes = None if workspace_root in (None, '') else os.fspath(workspace_root).encode('utf-8')
+    policy = _TfHostPolicy(
+        bool(allow_fs),
+        bool(allow_net),
+        bool(allow_spill),
+        bool(allow_blocking),
+        bool(allow_rules_file),
+        workspace_bytes,
+        None,
+        None,
+    )
+    return policy, workspace_bytes
+
+
+def pipeline_create(plan_json: str, *, allow_fs=False, allow_net=False,
+                    allow_spill=False, allow_blocking=True,
+                    allow_rules_file=False, workspace_root=None) -> int:
     """Create a pipeline from JSON plan. Returns handle (pointer as int)."""
     lib = _load_lib()
     data = plan_json.encode('utf-8')
-    handle = lib.tf_pipeline_create(data, len(data))
+    policy, workspace_bytes = _host_policy(
+        allow_fs=allow_fs,
+        allow_net=allow_net,
+        allow_spill=allow_spill,
+        allow_blocking=allow_blocking,
+        allow_rules_file=allow_rules_file,
+        workspace_root=workspace_root,
+    )
+    handle = lib.tf_pipeline_create_with_host_policy(data, len(data), ctypes.byref(policy))
     if not handle:
         err = lib.tf_last_error()
         msg = err.decode('utf-8') if err else 'unknown error'
@@ -366,23 +410,16 @@ def compile_to_sql(dsl: str) -> str:
     return result
 
 
-def pipeline_create_from_json(plan_json: str) -> int:
+def pipeline_create_from_json(plan_json: str, *, allow_fs=False, allow_net=False,
+                              allow_spill=False, allow_blocking=True,
+                              allow_rules_file=False, workspace_root=None) -> int:
     """Create a pipeline from a JSON recipe string. Returns handle."""
-    lib = _load_lib()
-    data = plan_json.encode('utf-8')
-    error = ctypes.c_char_p()
-    ir = lib.tf_ir_plan_from_json(data, len(data), ctypes.byref(error))
-    if not ir:
-        msg = error.value.decode('utf-8') if error.value else 'unknown error'
-        raise RuntimeError(f"Failed to parse recipe: {msg}")
-    rc = lib.tf_ir_plan_validate(ir)
-    if rc != 0:
-        lib.tf_ir_plan_destroy(ir)
-        raise RuntimeError("Recipe validation failed")
-    handle = lib.tf_pipeline_create_from_ir(ir)
-    lib.tf_ir_plan_destroy(ir)
-    if not handle:
-        err = lib.tf_last_error()
-        msg = err.decode('utf-8') if err else 'unknown error'
-        raise RuntimeError(f"Failed to create pipeline from recipe: {msg}")
-    return handle
+    return pipeline_create(
+        plan_json,
+        allow_fs=allow_fs,
+        allow_net=allow_net,
+        allow_spill=allow_spill,
+        allow_blocking=allow_blocking,
+        allow_rules_file=allow_rules_file,
+        workspace_root=workspace_root,
+    )

@@ -5,12 +5,15 @@ NPM ?= npm
 NODE ?= node
 TWINE ?= twine
 PYTEST ?= $(PYTHON) -m pytest
+SANITIZER_RUN := $(shell if command -v setarch >/dev/null 2>&1 && setarch "$$(uname -m)" -R true >/dev/null 2>&1; then printf 'setarch %s -R' "$$(uname -m)"; fi)
+ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
 
-.PHONY: all build test clean wasm app site verify fuzz
-.PHONY: build-c build-debug build-node build-wasm build-js build-py sync-js-csrc sync-py-csrc
-.PHONY: check-js-csrc-sync check-py-csrc-sync check-csrc-sync test-packaging test-packaging-install
+.PHONY: all build test clean wasm app site verify fuzz fuzz-c-csv fuzz-c-expr fuzz-c-selector fuzz-c-dsl fuzz-c-jsonl fuzz-c-jsonpath
+.PHONY: build-c build-debug build-tsan build-node build-wasm build-js build-py sync-js-csrc sync-py-csrc
+.PHONY: check-js-csrc-sync check-py-csrc-sync check-csrc-sync sbom test-packaging test-packaging-install
 .PHONY: test-packaging-node test-packaging-node-install test-packaging-python test-packaging-python-install test-properties
-.PHONY: test-c test-memory test-debug test-python test-node test-parity
+.PHONY: test-c test-memory test-debug test-tsan test-oom test-python test-node test-parity
+.PHONY: test-spill-sec test-depth-limits test-float-rt test-wide-csv
 .PHONY: publish-python publish-node publish-github
 
 all: build test
@@ -31,6 +34,12 @@ build-debug:
 	@cd build-debug && make -j$$(nproc) 2>&1 | tail -1
 	@echo "  C core (Debug+ASan/UBSan) OK"
 
+build-tsan:
+	@mkdir -p build-tsan
+	@cd build-tsan && cmake .. -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug -DTRANFI_SANITIZER=thread > /dev/null 2>&1
+	@cd build-tsan && make -j$$(nproc) test_core 2>&1 | tail -1
+	@echo "  C core (TSan) OK"
+
 sync-js-csrc:
 	@cd js && $(NODE) scripts/sync-csrc.js
 
@@ -45,6 +54,9 @@ check-py-csrc-sync:
 
 check-csrc-sync:
 	@$(PYTHON) scripts/check-csrc-sync.py
+
+sbom:
+	@$(PYTHON) scripts/generate-sbom.py --out build/tranfi-sbom.spdx.json
 
 build-node: build-c sync-js-csrc check-js-csrc-sync
 	@cd js && $(NPM) run build:native 2>&1 | tail -1
@@ -76,9 +88,36 @@ test-memory: build-c
 	@./build/test_memory
 
 test-debug: build-debug
-	@ASAN_OPTIONS=detect_leaks=0 ./build-debug/test_core
-	@ASAN_OPTIONS=detect_leaks=0 ./build-debug/test_memory
-	@ASAN_OPTIONS=detect_leaks=0 bash test/test_cli_memory_policy.sh ./build-debug/tranfi
+	@$(ASAN_RUN) ./build-debug/test_core
+	@$(ASAN_RUN) ./build-debug/test_memory
+	@$(ASAN_RUN) bash test/test_cli_memory_policy.sh ./build-debug/tranfi
+
+test-tsan: build-tsan
+	@TSAN_OPTIONS=halt_on_error=1 ./build-tsan/test_core test_thread_local_last_error
+
+test-oom: build-debug
+	@$(ASAN_RUN) ./build-debug/test_oom
+
+test-spill-sec: build-debug
+	@$(ASAN_RUN) ./build-debug/test_core \
+		test_spill_session_security_basics \
+		test_spill_session_cleanup_after_abort \
+		test_spill_sort_uses_private_session_dir
+
+test-depth-limits: build-debug
+	@$(ASAN_RUN) ./build-debug/test_core \
+		test_expr_depth_limit \
+		test_selector_depth_limit \
+		test_json_path_depth_limit
+
+test-float-rt: build-debug
+	@$(ASAN_RUN) ./build-debug/test_core \
+		test_pipeline_float_roundtrip_bits
+
+test-wide-csv: build-debug
+	@$(ASAN_RUN) ./build-debug/test_core \
+		test_pipeline_csv_wide_columns \
+		test_pipeline_csv_max_columns
 
 test-python: build-c
 	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
@@ -95,13 +134,13 @@ test-properties: build-c
 	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_properties.py -v --tb=short
 
-test-packaging: check-csrc-sync test-packaging-python test-packaging-node test-packaging-install
+test-packaging: check-csrc-sync sbom test-packaging-python test-packaging-node test-packaging-install
 
-test-packaging-python: sync-py-csrc check-py-csrc-sync
+test-packaging-python: sbom sync-py-csrc check-py-csrc-sync
 	@cd py && rm -rf dist build *.egg-info && $(PYTHON) -m build --sdist
 	@$(PYTHON) scripts/audit-package-artifacts.py --python-sdist "py/dist/tranfi-*.tar.gz"
 
-test-packaging-node: sync-js-csrc check-js-csrc-sync
+test-packaging-node: sbom sync-js-csrc check-js-csrc-sync
 	@mkdir -p build
 	@cd js && npm_config_cache=/tmp/npm-pack-audit $(NPM) pack --dry-run --json > ../build/npm-pack-dry-run.json
 	@$(PYTHON) scripts/audit-package-artifacts.py --npm-json build/npm-pack-dry-run.json
@@ -119,20 +158,49 @@ test-packaging-install: test-packaging-python-install test-packaging-node-instal
 
 # --- Fuzz testing ---
 
-fuzz: build/fuzz_csv
-	@mkdir -p corpus/csv
-	./build/fuzz_csv corpus/csv -max_len=4096 -timeout=5
+fuzz: fuzz-c-csv fuzz-c-expr fuzz-c-selector fuzz-c-dsl fuzz-c-jsonl fuzz-c-jsonpath
 
+fuzz-c-csv: build/fuzz_csv
+	@mkdir -p corpus/csv
+	$(ASAN_RUN) ./build/fuzz_csv corpus/csv $(FUZZ_ARGS)
+
+fuzz-c-expr: build/fuzz_expr
+	@mkdir -p corpus/expr
+	$(ASAN_RUN) ./build/fuzz_expr corpus/expr $(FUZZ_ARGS)
+
+fuzz-c-selector: build/fuzz_selector
+	@mkdir -p corpus/selector
+	$(ASAN_RUN) ./build/fuzz_selector corpus/selector $(FUZZ_ARGS)
+
+fuzz-c-dsl: build/fuzz_dsl
+	@mkdir -p corpus/dsl
+	$(ASAN_RUN) ./build/fuzz_dsl corpus/dsl $(FUZZ_ARGS)
+
+fuzz-c-jsonl: build/fuzz_jsonl
+	@mkdir -p corpus/jsonl
+	$(ASAN_RUN) ./build/fuzz_jsonl corpus/jsonl $(FUZZ_ARGS)
+
+fuzz-c-jsonpath: build/fuzz_jsonpath
+	@mkdir -p corpus/jsonpath
+	$(ASAN_RUN) ./build/fuzz_jsonpath corpus/jsonpath $(FUZZ_ARGS)
+
+FUZZ_CC ?= clang
+FUZZ_ARGS ?= -runs=256 -max_len=4096 -timeout=5
 FUZZ_SRC = $(filter-out src/main.c,$(wildcard src/*.c))
-build/fuzz_csv:
+FUZZ_CFLAGS = -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
+	-D_POSIX_C_SOURCE=200809L -I src \
+	-Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
+	-Wformat -Werror=format-security \
+	-Werror=unused-result \
+	-fno-common -fstack-protector-strong
+
+build/fuzz_%: test/fuzz_%.c
 	@mkdir -p build
-	clang -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
-		-D_POSIX_C_SOURCE=200809L -I src \
-		test/fuzz_csv.c $(FUZZ_SRC) -lm -o build/fuzz_csv
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $< $(FUZZ_SRC) -lm -o $@
 
 # --- Verify (full suite with sanitizers) ---
 
-verify: build-debug test-debug test-python test-node test-packaging
+verify: build-debug test-debug test-spill-sec test-depth-limits test-float-rt test-wide-csv test-oom test-python test-node test-packaging
 
 # --- App targets ---
 

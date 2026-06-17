@@ -32,20 +32,26 @@ static int diff_process(tf_step *self, tf_batch *in, tf_batch **out,
     diff_state *st = self->state;
     *out = NULL;
 
+    const char *extra_names[1] = {st->result};
+    tf_type extra_types[1] = {TF_TYPE_FLOAT64};
     tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
-    tf_batch_set_schema(ob, in->n_cols, st->result, TF_TYPE_FLOAT64);
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     int ci = tf_batch_col_index(in, st->column);
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_copy_row(ob, r, in, r);
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
 
         if (ci < 0 || tf_batch_is_null(in, r, ci)) {
-            tf_batch_set_null(ob, r, in->n_cols);
-            ob->n_rows = r + 1;
+            if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             continue;
         }
 
@@ -54,12 +60,12 @@ static int diff_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (st->count < st->order) {
             /* Not enough history yet -- shift and insert at front
              * so prev[0] is always the most recent value */
+            if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             for (int k = st->count; k > 0; k--)
                 st->prev[k] = st->prev[k - 1];
             st->prev[0] = val;
             st->count++;
-            tf_batch_set_null(ob, r, in->n_cols);
-            ob->n_rows = r + 1;
             continue;
         }
 
@@ -81,8 +87,14 @@ static int diff_process(tf_step *self, tf_batch *in, tf_batch **out,
             result += sign * binom * st->prev[k - 1];
         }
 
-        tf_batch_set_float64(ob, r, in->n_cols, result);
-        ob->n_rows = r + 1;
+        if (tf_batch_set_float64(ob, r, in->n_cols, result) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
 
         /* Shift prev buffer: move everything down, put val at [0] */
         for (int k = st->order - 1; k > 0; k--)
@@ -112,11 +124,12 @@ tf_step *tf_diff_create(const cJSON *args) {
     diff_state *st = calloc(1, sizeof(diff_state));
     if (!st) return NULL;
     st->column = strdup(col_j->valuestring);
+    if (!st->column) { free(st); return NULL; }
 
-    cJSON *order_j = cJSON_GetObjectItemCaseSensitive(args, "order");
-    st->order = (cJSON_IsNumber(order_j) && order_j->valueint > 0) ?
-                order_j->valueint : 1;
-    if (st->order > MAX_DIFF_ORDER) st->order = MAX_DIFF_ORDER;
+    size_t order = 1;
+    int has_order = tf_json_get_size_arg(args, "order", 1, MAX_DIFF_ORDER, &order, "diff");
+    if (has_order < 0) { free(st->column); free(st); return NULL; }
+    st->order = (int)order;
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {
@@ -126,6 +139,7 @@ tf_step *tf_diff_create(const cJSON *args) {
         snprintf(buf, sizeof(buf), "%s_diff", st->column);
         st->result = strdup(buf);
     }
+    if (!st->result) { free(st->column); free(st); return NULL; }
 
     tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st); return NULL; }

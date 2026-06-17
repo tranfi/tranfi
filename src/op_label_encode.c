@@ -43,30 +43,33 @@ static const char *OTHER_CATEGORY = "__other__";
 
 static size_t label_retained_state_bytes(const label_encode_state *st);
 
-static void label_write_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
+static int label_encode_expose_row(tf_batch *ob, size_t row) {
+    size_t next_rows = 0;
+    if (tf_size_add(row, 1, &next_rows) != TF_OK) return TF_ERROR;
+    ob->n_rows = next_rows;
+    return TF_OK;
 }
 
-static void label_unknown_error(const label_encode_state *st, const char *val,
-                                tf_side_channels *side) {
+static int label_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
+}
+
+static int label_unknown_error(const label_encode_state *st, const char *val,
+                               tf_side_channels *side) {
     char msg[256];
     snprintf(msg, sizeof(msg),
              "label-encode: unknown category '%s' for column '%s'",
              val ? val : "", st->column ? st->column : "");
-    label_write_error(side, msg);
+    return label_write_error(side, msg);
 }
 
-static void label_limit_error(const label_encode_state *st, const char *val,
-                              tf_side_channels *side) {
+static int label_limit_error(const label_encode_state *st, const char *val,
+                             tf_side_channels *side) {
     char msg[256];
     snprintf(msg, sizeof(msg),
              "label-encode: max_categories=%zu exceeded while tracking category '%s'",
              st->max_categories, val ? val : "");
-    label_write_error(side, msg);
+    return label_write_error(side, msg);
 }
 
 static int label_check_state_bytes(label_encode_state *st, tf_side_channels *side) {
@@ -77,7 +80,7 @@ static int label_check_state_bytes(label_encode_state *st, tf_side_channels *sid
     snprintf(msg, sizeof(msg),
              "label-encode: max_state_bytes=%zu exceeded while tracking categories (%zu bytes retained)",
              st->max_state_bytes, retained);
-    label_write_error(side, msg);
+    if (label_write_error(side, msg) != TF_OK) return TF_ERROR;
     return TF_ERROR;
 }
 
@@ -108,8 +111,13 @@ static int assign_entry(label_encode_state *st, const char *val) {
     int existing = find_entry(st, val);
     if (existing >= 0) return existing;
     if (st->n_entries >= st->cap) {
-        size_t newcap = st->cap ? st->cap * 2 : 16;
-        label_entry *tmp = realloc(st->entries, newcap * sizeof(label_entry));
+        size_t min_cap = 0, newcap = 0;
+        if (tf_size_add(st->n_entries, 1, &min_cap) != TF_OK ||
+            tf_size_grow_pow2(st->cap, min_cap, 16, &newcap) != TF_OK) {
+            return -1;
+        }
+        label_entry *tmp = tf_reallocarray_checked(st->entries, newcap,
+                                                   sizeof(label_entry));
         if (!tmp) return -1;
         st->entries = tmp;
         st->cap = newcap;
@@ -127,7 +135,7 @@ static int resolve_other(label_encode_state *st, int64_t *label,
     int other = find_entry(st, OTHER_CATEGORY);
     if (other >= 0) { *label = st->entries[other].label; return 0; }
     if (st->max_categories > 0 && st->n_entries >= st->max_categories) {
-        label_limit_error(st, OTHER_CATEGORY, side);
+        if (label_limit_error(st, OTHER_CATEGORY, side) != TF_OK) return -1;
         return -1;
     }
     other = assign_entry(st, OTHER_CATEGORY);
@@ -147,7 +155,7 @@ static int resolve_unknown(label_encode_state *st, const char *val,
         case TF_CAT_UNKNOWN_OTHER:
             return resolve_other(st, label, side);
         case TF_CAT_UNKNOWN_ERROR:
-            label_unknown_error(st, val, side);
+            if (label_unknown_error(st, val, side) != TF_OK) return -1;
             return -1;
         case TF_CAT_UNKNOWN_ADD:
         default:
@@ -182,7 +190,7 @@ static int resolve_label(label_encode_state *st, const char *val,
     if (st->max_categories > 0 && st->n_entries >= st->max_categories) {
         int rc = resolve_unknown(st, val, label, is_null, side);
         if (rc == 0) return 0;
-        label_limit_error(st, val, side);
+        if (label_limit_error(st, val, side) != TF_OK) return -1;
         return -1;
     }
 
@@ -198,34 +206,48 @@ static int label_encode_process(tf_step *self, tf_batch *in, tf_batch **out,
     label_encode_state *st = self->state;
     *out = NULL;
 
-    tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
+    size_t out_cols = 0;
+    if (tf_size_add(in->n_cols, 1, &out_cols) != TF_OK) return TF_ERROR;
+    tf_batch *ob = tf_batch_create(out_cols, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
-    tf_batch_set_schema(ob, in->n_cols, st->result, TF_TYPE_INT64);
+    const char *extra_names[1] = { st->result };
+    const tf_type extra_types[1] = { TF_TYPE_INT64 };
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     int ci = tf_batch_col_index(in, st->column);
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_copy_row(ob, r, in, r);
-
-        if (ci < 0 || tf_batch_is_null(in, r, ci)) {
-            tf_batch_set_null(ob, r, in->n_cols);
-            ob->n_rows = r + 1;
-            continue;
-        }
-
-        char buf[64];
-        const char *val = get_string_value(in, r, ci, buf, sizeof(buf));
-        int64_t label = 0;
-        int is_null = 0;
-        if (resolve_label(st, val, &label, &is_null, side) != 0) {
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (is_null) tf_batch_set_null(ob, r, in->n_cols);
-        else tf_batch_set_int64(ob, r, in->n_cols, label);
-        ob->n_rows = r + 1;
+
+        int rc = TF_OK;
+        if (ci < 0 || tf_batch_is_null(in, r, ci)) {
+            rc = tf_batch_set_null(ob, r, in->n_cols);
+        } else {
+            char buf[64];
+            const char *val = get_string_value(in, r, ci, buf, sizeof(buf));
+            int64_t label = 0;
+            int is_null = 0;
+            if (resolve_label(st, val, &label, &is_null, side) != 0) {
+                tf_batch_free(ob);
+                return TF_ERROR;
+            }
+            rc = is_null ? tf_batch_set_null(ob, r, in->n_cols)
+                         : tf_batch_set_int64(ob, r, in->n_cols, label);
+        }
+        if (rc != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        if (label_encode_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     *out = ob;
@@ -324,25 +346,18 @@ tf_step *tf_label_encode_create(const cJSON *args) {
     }
     if (!st->result) { label_encode_state_free(st); return NULL; }
 
-    cJSON *max_j = cJSON_GetObjectItemCaseSensitive(args, "max_categories");
-    if (max_j) {
-        if (!cJSON_IsNumber(max_j) || max_j->valuedouble <= 0) {
-            tf_set_last_error("label-encode: max_categories must be positive");
-            label_encode_state_free(st);
-            return NULL;
-        }
-        st->max_categories = (size_t)max_j->valuedouble;
-    }
+    size_t parsed_size = 0;
+    int has_max_categories = tf_json_get_size_arg(args, "max_categories",
+                                                  1, TF_MAX_COUNT_ARG,
+                                                  &parsed_size, "label-encode");
+    if (has_max_categories < 0) { label_encode_state_free(st); return NULL; }
+    if (has_max_categories > 0) st->max_categories = parsed_size;
 
-    cJSON *max_state_j = cJSON_GetObjectItemCaseSensitive(args, "max_state_bytes");
-    if (max_state_j) {
-        if (!cJSON_IsNumber(max_state_j) || max_state_j->valuedouble <= 0) {
-            tf_set_last_error("label-encode: max_state_bytes must be positive");
-            label_encode_state_free(st);
-            return NULL;
-        }
-        st->max_state_bytes = (size_t)max_state_j->valuedouble;
-    }
+    int has_max_state = tf_json_get_size_arg(args, "max_state_bytes",
+                                             1, TF_MAX_STATE_BYTES,
+                                             &parsed_size, "label-encode");
+    if (has_max_state < 0) { label_encode_state_free(st); return NULL; }
+    if (has_max_state > 0) st->max_state_bytes = parsed_size;
 
     int unknown_specified = 0;
     if (parse_unknown_policy(args, &st->unknown, &unknown_specified) != 0) {

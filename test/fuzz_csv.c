@@ -7,7 +7,7 @@
  * Build:
  *   clang -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
  *     -D_POSIX_C_SOURCE=200809L -I src \
- *     test/fuzz_csv.c src/*.c -lm -o build/fuzz_csv
+ *     test/fuzz_csv.c src/all-c-files -lm -o build/fuzz_csv
  *
  * Run:
  *   mkdir -p corpus/csv

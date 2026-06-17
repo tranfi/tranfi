@@ -86,12 +86,8 @@ static int rleid_buf_appendf(rleid_buf *b, const char *fmt, ...) {
     return rc;
 }
 
-static void rleid_set_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
+static int rleid_set_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
 static int append_cell_key(rleid_buf *b, const tf_batch *in, size_t row, int ci) {
@@ -157,7 +153,7 @@ static char *format_rleid_key(const tf_batch *in, size_t row, const int *col_ind
 static int resolve_columns(const rleid_state *st, const tf_batch *in, int **out_indices,
                            size_t *out_n, tf_side_channels *side) {
     if (st->n_cols == 0) {
-        rleid_set_error(side, "rleid: columns must not be empty");
+        if (rleid_set_error(side, "rleid: columns must not be empty") != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
     int *idx = malloc(st->n_cols * sizeof(int));
@@ -167,8 +163,9 @@ static int resolve_columns(const rleid_state *st, const tf_batch *in, int **out_
         if (idx[i] < 0) {
             char msg[256];
             snprintf(msg, sizeof(msg), "rleid: column '%s' not found", st->cols[i]);
-            rleid_set_error(side, msg);
+            int err_rc = rleid_set_error(side, msg);
             free(idx);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
     }
@@ -186,11 +183,15 @@ static int rleid_process(tf_step *self, tf_batch *in, tf_batch **out,
     size_t n_keys = 0;
     if (resolve_columns(st, in, &col_indices, &n_keys, side) != TF_OK) return TF_ERROR;
 
+    const char *extra_names[1] = {st->result};
+    tf_type extra_types[1] = {TF_TYPE_INT64};
     tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
     if (!ob) { free(col_indices); return TF_ERROR; }
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
-    tf_batch_set_schema(ob, in->n_cols, st->result, TF_TYPE_INT64);
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
+        tf_batch_free(ob);
+        free(col_indices);
+        return TF_ERROR;
+    }
 
     for (size_t r = 0; r < in->n_rows; r++) {
         char *key = format_rleid_key(in, r, col_indices, n_keys);
@@ -208,7 +209,11 @@ static int rleid_process(tf_step *self, tf_batch *in, tf_batch **out,
             free(col_indices);
             return TF_ERROR;
         }
-        tf_batch_set_int64(ob, r, in->n_cols, st->current_id);
+        if (tf_batch_set_int64(ob, r, in->n_cols, st->current_id) != TF_OK) {
+            tf_batch_free(ob);
+            free(col_indices);
+            return TF_ERROR;
+        }
         ob->n_rows = r + 1;
     }
 
@@ -226,7 +231,9 @@ static int rleid_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 
 static void rleid_state_free(rleid_state *st) {
     if (!st) return;
-    for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
+    if (st->cols) {
+        for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
+    }
     free(st->cols);
     free(st->result);
     free(st->prev_key);
@@ -242,7 +249,10 @@ static void rleid_destroy(tf_step *self) {
 tf_step *tf_rleid_create(const cJSON *args) {
     if (!args) return NULL;
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
-    if (!cJSON_IsArray(cols) || cJSON_GetArraySize(cols) <= 0) return NULL;
+    if (!cJSON_IsArray(cols) || cJSON_GetArraySize(cols) <= 0) {
+        tf_set_last_error("rleid: columns must be a non-empty array");
+        return NULL;
+    }
 
     rleid_state *st = calloc(1, sizeof(rleid_state));
     if (!st) return NULL;
@@ -253,7 +263,8 @@ tf_step *tf_rleid_create(const cJSON *args) {
     st->n_cols = (size_t)n;
     for (int i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(cols, i);
-        if (!cJSON_IsString(item) || item->valuestring[0] == '\0') {
+        if (!cJSON_IsString(item) || !item->valuestring || item->valuestring[0] == '\0') {
+            tf_set_last_error("rleid: column names must be non-empty strings");
             rleid_state_free(st);
             return NULL;
         }
@@ -262,8 +273,13 @@ tf_step *tf_rleid_create(const cJSON *args) {
     }
 
     cJSON *res = cJSON_GetObjectItemCaseSensitive(args, "result");
-    st->result = strdup(cJSON_IsString(res) ? res->valuestring : "_rleid");
-    if (!st->result || st->result[0] == '\0') { rleid_state_free(st); return NULL; }
+    if (cJSON_IsString(res) && (!res->valuestring || res->valuestring[0] == '\0')) {
+        tf_set_last_error("rleid: result must be a non-empty string");
+        rleid_state_free(st);
+        return NULL;
+    }
+    st->result = strdup(cJSON_IsString(res) && res->valuestring ? res->valuestring : "_rleid");
+    if (!st->result) { rleid_state_free(st); return NULL; }
 
     tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { rleid_state_free(st); return NULL; }

@@ -75,55 +75,46 @@ static int parse_bool_string(const char *s, int *out) {
     return 0;
 }
 
-static void set_flattened_value(tf_batch *ob, size_t row, size_t col,
-                                tf_type type, const cJSON *val) {
+static int set_flattened_value(tf_batch *ob, size_t row, size_t col,
+                               tf_type type, const cJSON *val) {
     if (!val || cJSON_IsNull(val)) {
-        tf_batch_set_null(ob, row, col);
-        return;
+        return tf_batch_set_null(ob, row, col);
     }
 
     switch (type) {
         case TF_TYPE_STRING: {
             if (cJSON_IsString(val)) {
-                tf_batch_set_string(ob, row, col, val->valuestring ? val->valuestring : "");
-            } else {
-                char *printed = cJSON_PrintUnformatted((cJSON *)val);
-                if (printed) {
-                    tf_batch_set_string(ob, row, col, printed);
-                    free(printed);
-                } else {
-                    tf_batch_set_null(ob, row, col);
-                }
+                return tf_batch_set_string(ob, row, col, val->valuestring ? val->valuestring : "");
             }
-            break;
+            char *printed = cJSON_PrintUnformatted((cJSON *)val);
+            if (!printed) return tf_batch_set_null(ob, row, col);
+            int rc = tf_batch_set_string(ob, row, col, printed);
+            free(printed);
+            return rc;
         }
         case TF_TYPE_INT64: {
             int64_t out = 0;
-            if (cJSON_IsNumber(val)) tf_batch_set_int64(ob, row, col, (int64_t)val->valuedouble);
-            else if (cJSON_IsBool(val)) tf_batch_set_int64(ob, row, col, cJSON_IsTrue(val) ? 1 : 0);
-            else if (cJSON_IsString(val) && parse_strict_int64(val->valuestring, &out)) tf_batch_set_int64(ob, row, col, out);
-            else tf_batch_set_null(ob, row, col);
-            break;
+            if (cJSON_IsNumber(val)) return tf_batch_set_int64(ob, row, col, (int64_t)val->valuedouble);
+            if (cJSON_IsBool(val)) return tf_batch_set_int64(ob, row, col, cJSON_IsTrue(val) ? 1 : 0);
+            if (cJSON_IsString(val) && parse_strict_int64(val->valuestring, &out)) return tf_batch_set_int64(ob, row, col, out);
+            return tf_batch_set_null(ob, row, col);
         }
         case TF_TYPE_FLOAT64: {
             double out = 0.0;
-            if (cJSON_IsNumber(val)) tf_batch_set_float64(ob, row, col, val->valuedouble);
-            else if (cJSON_IsBool(val)) tf_batch_set_float64(ob, row, col, cJSON_IsTrue(val) ? 1.0 : 0.0);
-            else if (cJSON_IsString(val) && parse_strict_double(val->valuestring, &out)) tf_batch_set_float64(ob, row, col, out);
-            else tf_batch_set_null(ob, row, col);
-            break;
+            if (cJSON_IsNumber(val)) return tf_batch_set_float64(ob, row, col, val->valuedouble);
+            if (cJSON_IsBool(val)) return tf_batch_set_float64(ob, row, col, cJSON_IsTrue(val) ? 1.0 : 0.0);
+            if (cJSON_IsString(val) && parse_strict_double(val->valuestring, &out)) return tf_batch_set_float64(ob, row, col, out);
+            return tf_batch_set_null(ob, row, col);
         }
         case TF_TYPE_BOOL: {
             int out = 0;
-            if (cJSON_IsBool(val)) tf_batch_set_bool(ob, row, col, cJSON_IsTrue(val));
-            else if (cJSON_IsNumber(val)) tf_batch_set_bool(ob, row, col, val->valuedouble != 0.0);
-            else if (cJSON_IsString(val) && parse_bool_string(val->valuestring, &out)) tf_batch_set_bool(ob, row, col, out != 0);
-            else tf_batch_set_null(ob, row, col);
-            break;
+            if (cJSON_IsBool(val)) return tf_batch_set_bool(ob, row, col, cJSON_IsTrue(val));
+            if (cJSON_IsNumber(val)) return tf_batch_set_bool(ob, row, col, val->valuedouble != 0.0);
+            if (cJSON_IsString(val) && parse_bool_string(val->valuestring, &out)) return tf_batch_set_bool(ob, row, col, out != 0);
+            return tf_batch_set_null(ob, row, col);
         }
         default:
-            tf_batch_set_null(ob, row, col);
-            break;
+            return tf_batch_set_null(ob, row, col);
     }
 }
 
@@ -133,30 +124,41 @@ static int json_flatten_process(tf_step *self, tf_batch *in, tf_batch **out,
     json_flatten_state *st = self->state;
     *out = NULL;
 
+    const char **extra_names = NULL;
+    tf_type *extra_types = NULL;
+    if (st->n_fields > 0) {
+        extra_names = malloc(st->n_fields * sizeof(char *));
+        extra_types = malloc(st->n_fields * sizeof(tf_type));
+        if (!extra_names || !extra_types) {
+            free(extra_names);
+            free(extra_types);
+            return TF_ERROR;
+        }
+        for (size_t i = 0; i < st->n_fields; i++) {
+            extra_names[i] = st->fields[i].name;
+            extra_types[i] = st->fields[i].type;
+        }
+    }
+
     tf_batch *ob = tf_batch_create(in->n_cols + st->n_fields, in->n_rows > 0 ? in->n_rows : 1);
-    if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
+    if (!ob) { free(extra_names); free(extra_types); return TF_ERROR; }
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, st->n_fields) != TF_OK) {
+        tf_batch_free(ob);
+        free(extra_names);
+        free(extra_types);
+        return TF_ERROR;
     }
-    for (size_t i = 0; i < st->n_fields; i++) {
-        if (tf_batch_set_schema(ob, in->n_cols + i, st->fields[i].name, st->fields[i].type) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
+    free(extra_names);
+    free(extra_types);
 
     int ci = tf_batch_col_index(in, st->column);
     int can_parse = ci >= 0 && in->col_types[(size_t)ci] == TF_TYPE_STRING;
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) goto fail;
+        for (size_t i = 0; i < st->n_fields; i++) {
+            if (tf_batch_set_null(ob, r, in->n_cols + i) != TF_OK) goto fail;
         }
-        for (size_t i = 0; i < st->n_fields; i++) tf_batch_set_null(ob, r, in->n_cols + i);
 
         cJSON *root = NULL;
         if (can_parse && !tf_batch_is_null(in, r, (size_t)ci)) {
@@ -166,7 +168,10 @@ static int json_flatten_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (root) {
             for (size_t i = 0; i < st->n_fields; i++) {
                 const cJSON *val = tf_json_path_resolve(root, st->fields[i].path);
-                set_flattened_value(ob, r, in->n_cols + i, st->fields[i].type, val);
+                if (set_flattened_value(ob, r, in->n_cols + i, st->fields[i].type, val) != TF_OK) {
+                    cJSON_Delete(root);
+                    goto fail;
+                }
             }
             cJSON_Delete(root);
         }
@@ -176,6 +181,10 @@ static int json_flatten_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (ob->n_rows > 0) *out = ob;
     else tf_batch_free(ob);
     return TF_OK;
+
+fail:
+    tf_batch_free(ob);
+    return TF_ERROR;
 }
 
 static int json_flatten_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
@@ -216,6 +225,10 @@ static int parse_field_spec(const char *spec, char **path, char **name, tf_type 
         free(copy);
         return 0;
     }
+    if (tf_json_path_validate(copy) != TF_OK) {
+        free(copy);
+        return 0;
+    }
     *path = strdup(copy);
     *name = strdup(first + 1);
     *type = parsed;
@@ -237,6 +250,7 @@ static int init_field_from_json(const cJSON *item, json_flatten_field *field) {
     if (!cJSON_IsString(path_j) || !cJSON_IsString(name_j) ||
         path_j->valuestring[0] == '\0' || name_j->valuestring[0] == '\0' ||
         type == TF_TYPE_NULL) return 0;
+    if (tf_json_path_validate(path_j->valuestring) != TF_OK) return 0;
     field->path = strdup(path_j->valuestring);
     field->name = strdup(name_j->valuestring);
     field->type = type;

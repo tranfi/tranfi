@@ -25,9 +25,12 @@ static int hash_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
-    tf_batch_set_schema(ob, in->n_cols, "_hash", TF_TYPE_INT64);
+    const char *extra_names[] = {"_hash"};
+    const tf_type extra_types[] = {TF_TYPE_INT64};
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     /* Resolve column indices */
     size_t n_keys;
@@ -46,7 +49,11 @@ static int hash_process(tf_step *self, tf_batch *in, tf_batch **out,
     }
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_copy_row(ob, r, in, r);
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            free(col_indices);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         /* Compute hash */
         uint32_t h = 5381;
         char val_buf[64];
@@ -75,7 +82,11 @@ static int hash_process(tf_step *self, tf_batch *in, tf_batch **out,
             for (const unsigned char *p = (const unsigned char *)val; *p; p++)
                 h = ((h << 5) + h) ^ *p;
         }
-        tf_batch_set_int64(ob, r, in->n_cols, (int64_t)h);
+        if (tf_batch_set_int64(ob, r, in->n_cols, (int64_t)h) != TF_OK) {
+            free(col_indices);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = r + 1;
     }
 
@@ -88,12 +99,18 @@ static int hash_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     (void)self; (void)side; *out = NULL; return TF_OK;
 }
 
-static void hash_destroy(tf_step *self) {
-    hash_state *st = self->state;
+static void hash_state_free(hash_state *st) {
     if (st) {
-        for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
-        free(st->cols); free(st);
+        if (st->cols) {
+            for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
+        }
+        free(st->cols);
+        free(st);
     }
+}
+
+static void hash_destroy(tf_step *self) {
+    hash_state_free(self ? self->state : NULL);
     free(self);
 }
 
@@ -103,21 +120,33 @@ tf_step *tf_hash_create(const cJSON *args) {
 
     if (args) {
         cJSON *columns = cJSON_GetObjectItemCaseSensitive(args, "columns");
-        if (columns && cJSON_IsArray(columns)) {
+        if (columns) {
+            if (!cJSON_IsArray(columns)) {
+                tf_set_last_error("hash: columns must be an array");
+                hash_state_free(st);
+                return NULL;
+            }
             int n = cJSON_GetArraySize(columns);
             if (n > 0) {
                 st->cols = calloc(n, sizeof(char *));
-                st->n_cols = n;
+                if (!st->cols) { hash_state_free(st); return NULL; }
+                st->n_cols = (size_t)n;
                 for (int i = 0; i < n; i++) {
                     cJSON *item = cJSON_GetArrayItem(columns, i);
-                    if (cJSON_IsString(item)) st->cols[i] = strdup(item->valuestring);
+                    if (!cJSON_IsString(item) || !item->valuestring || !item->valuestring[0]) {
+                        tf_set_last_error("hash: column names must be non-empty strings");
+                        hash_state_free(st);
+                        return NULL;
+                    }
+                    st->cols[i] = strdup(item->valuestring);
+                    if (!st->cols[i]) { hash_state_free(st); return NULL; }
                 }
             }
         }
     }
 
     tf_step *step = calloc(1, sizeof(tf_step));
-    if (!step) { hash_destroy(&(tf_step){.state = st}); return NULL; }
+    if (!step) { hash_state_free(st); return NULL; }
     step->process = hash_process;
     step->flush = hash_flush;
     step->destroy = hash_destroy;

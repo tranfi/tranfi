@@ -62,16 +62,27 @@ static void append_count(char *buf, size_t buf_size, int *first,
 
 static int schema_infer_init(schema_infer_state *st, const tf_batch *in) {
     if (st->initialized) return TF_OK;
-    st->initialized = 1;
-    st->n_cols = in ? in->n_cols : 0;
-    if (st->n_cols == 0) return TF_OK;
-    st->cols = calloc(st->n_cols, sizeof(schema_infer_col));
-    if (!st->cols) return TF_ERROR;
-    for (size_t c = 0; c < st->n_cols; c++) {
-        const char *name = in->col_names[c] ? in->col_names[c] : "";
-        st->cols[c].name = strdup(name);
-        if (!st->cols[c].name) return TF_ERROR;
+    size_t n_cols = in ? in->n_cols : 0;
+    if (n_cols == 0) {
+        st->initialized = 1;
+        return TF_OK;
     }
+
+    schema_infer_col *cols = calloc(n_cols, sizeof(schema_infer_col));
+    if (!cols) return TF_ERROR;
+    for (size_t c = 0; c < n_cols; c++) {
+        const char *name = in->col_names[c] ? in->col_names[c] : "";
+        cols[c].name = strdup(name);
+        if (!cols[c].name) {
+            for (size_t i = 0; i < c; i++) free(cols[i].name);
+            free(cols);
+            return TF_ERROR;
+        }
+    }
+
+    st->cols = cols;
+    st->n_cols = n_cols;
+    st->initialized = 1;
     return TF_OK;
 }
 
@@ -150,7 +161,10 @@ static int schema_infer_flush(tf_step *self, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(10, st->n_cols ? st->n_cols : 1);
     if (!ob) return TF_ERROR;
-    if (schema_infer_set_output_schema(ob) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    int rc = TF_ERROR;
+#define SCHEMA_INFER_WRITE(expr) do { if ((expr) != TF_OK) goto done; } while (0)
+
+    SCHEMA_INFER_WRITE(schema_infer_set_output_schema(ob));
 
     static const char *type_names[] = {"bool", "int", "float", "string", "date", "timestamp"};
     for (size_t c = 0; c < st->n_cols; c++) {
@@ -174,21 +188,27 @@ static int schema_infer_flush(tf_step *self, tf_batch **out,
         if (st->schema_changed) append_token(warning, sizeof(warning), &first_warn, "schema_changed");
         if (st->rows_sampled == 0) append_token(warning, sizeof(warning), &first_warn, "no_rows_sampled");
 
-        tf_batch_set_string(ob, c, 0, col->name ? col->name : "");
-        tf_batch_set_string(ob, c, 1, inferred);
-        tf_batch_set_bool(ob, c, 2, col->missing > 0);
-        tf_batch_set_bool(ob, c, 3, col->missing == 0 && st->rows_sampled > 0);
-        tf_batch_set_int64(ob, c, 4, (int64_t)st->rows_seen);
-        tf_batch_set_int64(ob, c, 5, (int64_t)st->rows_sampled);
-        tf_batch_set_int64(ob, c, 6, (int64_t)col->missing);
-        tf_batch_set_int64(ob, c, 7, (int64_t)non_missing);
-        tf_batch_set_string(ob, c, 8, observed);
-        tf_batch_set_string(ob, c, 9, warning);
-        ob->n_rows++;
+        SCHEMA_INFER_WRITE(tf_batch_set_string(ob, c, 0, col->name ? col->name : ""));
+        SCHEMA_INFER_WRITE(tf_batch_set_string(ob, c, 1, inferred));
+        SCHEMA_INFER_WRITE(tf_batch_set_bool(ob, c, 2, col->missing > 0));
+        SCHEMA_INFER_WRITE(tf_batch_set_bool(ob, c, 3, col->missing == 0 && st->rows_sampled > 0));
+        SCHEMA_INFER_WRITE(tf_batch_set_int64(ob, c, 4, (int64_t)st->rows_seen));
+        SCHEMA_INFER_WRITE(tf_batch_set_int64(ob, c, 5, (int64_t)st->rows_sampled));
+        SCHEMA_INFER_WRITE(tf_batch_set_int64(ob, c, 6, (int64_t)col->missing));
+        SCHEMA_INFER_WRITE(tf_batch_set_int64(ob, c, 7, (int64_t)non_missing));
+        SCHEMA_INFER_WRITE(tf_batch_set_string(ob, c, 8, observed));
+        SCHEMA_INFER_WRITE(tf_batch_set_string(ob, c, 9, warning));
+        ob->n_rows = c + 1;
     }
 
     *out = ob;
-    return TF_OK;
+    ob = NULL;
+    rc = TF_OK;
+
+done:
+    if (ob) tf_batch_free(ob);
+#undef SCHEMA_INFER_WRITE
+    return rc;
 }
 
 static void schema_infer_destroy(tf_step *self) {
@@ -205,14 +225,14 @@ static void schema_infer_destroy(tf_step *self) {
 static int parse_rows_arg(const cJSON *args, size_t *rows) {
     *rows = SCHEMA_INFER_DEFAULT_ROWS;
     if (!args) return TF_OK;
-    cJSON *rows_j = cJSON_GetObjectItemCaseSensitive(args, "rows");
-    if (!rows_j) return TF_OK;
-    if (!cJSON_IsNumber(rows_j) || rows_j->valuedouble <= 0) {
-        tf_set_last_error("schema-infer: rows must be positive");
+    int has_rows = tf_json_get_size_arg(args, "rows",
+                                        1, TF_MAX_COUNT_ARG,
+                                        rows, "schema-infer");
+    if (has_rows < 0) {
         return TF_ERROR;
     }
-    *rows = (size_t)rows_j->valuedouble;
-    return *rows > 0 ? TF_OK : TF_ERROR;
+    if (has_rows == 0) *rows = SCHEMA_INFER_DEFAULT_ROWS;
+    return TF_OK;
 }
 
 tf_step *tf_schema_infer_create(const cJSON *args) {

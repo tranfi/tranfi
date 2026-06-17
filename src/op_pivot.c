@@ -8,6 +8,7 @@
  */
 
 #include "internal.h"
+#include "spill.h"
 #include "date_utils.h"
 #include "cJSON.h"
 #include <stdlib.h>
@@ -47,18 +48,10 @@ typedef struct {
     size_t  cap;
 } pivot_map;
 
-typedef union {
-    uint8_t b;
-    int64_t i64;
-    double f64;
-    int32_t date;
-    char *str;
-} pivot_spill_cell;
-
 typedef struct {
     uint64_t ordinal;
     uint8_t *nulls;
-    pivot_spill_cell *cells;
+    tf_owned_cell_value *cells;
 } pivot_spill_row;
 
 typedef struct {
@@ -78,6 +71,7 @@ typedef struct {
     int        use_spill;
 
     char      *spill_dir;
+    tf_spill_session *spill;
     size_t     spill_memory_bytes;
     size_t     configured_run_rows;
     size_t     run_rows;
@@ -135,12 +129,8 @@ typedef struct {
 static int pivot_resolve_name(pivot_state *st, const char *name,
                               tf_side_channels *side);
 
-static void pivot_write_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
+static int pivot_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
 static pivot_agg parse_pivot_agg(const char *s) {
@@ -156,16 +146,31 @@ static pivot_agg parse_pivot_agg(const char *s) {
 
 static int pivot_accum_init(pivot_accum *a, size_t n) {
     memset(a, 0, sizeof(*a));
-    a->n = n;
     if (n == 0) return TF_OK;
-    a->sums = calloc(n, sizeof(double));
-    a->mins = malloc(n * sizeof(double));
-    a->maxs = malloc(n * sizeof(double));
-    a->counts = calloc(n, sizeof(size_t));
-    a->has_first = calloc(n, sizeof(int));
-    a->firsts = calloc(n, sizeof(double));
-    if (!a->sums || !a->mins || !a->maxs || !a->counts || !a->has_first || !a->firsts)
+
+    double *sums = tf_callocarray_checked(n, sizeof(double));
+    double *mins = tf_mallocarray_checked(n, sizeof(double));
+    double *maxs = tf_mallocarray_checked(n, sizeof(double));
+    size_t *counts = tf_callocarray_checked(n, sizeof(size_t));
+    int *has_first = tf_callocarray_checked(n, sizeof(int));
+    double *firsts = tf_callocarray_checked(n, sizeof(double));
+    if (!sums || !mins || !maxs || !counts || !has_first || !firsts) {
+        free(sums);
+        free(mins);
+        free(maxs);
+        free(counts);
+        free(has_first);
+        free(firsts);
         return TF_ERROR;
+    }
+
+    a->sums = sums;
+    a->mins = mins;
+    a->maxs = maxs;
+    a->counts = counts;
+    a->has_first = has_first;
+    a->firsts = firsts;
+    a->n = n;
     for (size_t i = 0; i < n; i++) {
         a->mins[i] = DBL_MAX;
         a->maxs[i] = -DBL_MAX;
@@ -222,12 +227,17 @@ static int add_unique_name(pivot_state *st, const char *name, tf_side_channels *
         char msg[256];
         snprintf(msg, sizeof(msg), "pivot: max_categories=%zu exceeded while tracking category '%s'",
                  st->max_categories, name ? name : "");
-        pivot_write_error(side, msg);
+        if (pivot_write_error(side, msg) != TF_OK) return -1;
         return -1;
     }
     if (st->n_names >= st->names_cap) {
-        size_t new_cap = st->names_cap ? st->names_cap * 2 : 32;
-        char **tmp = realloc(st->unique_names, new_cap * sizeof(char *));
+        size_t need = 0;
+        size_t new_cap = 0;
+        if (tf_size_add(st->n_names, 1, &need) != TF_OK ||
+            tf_size_grow_pow2(st->names_cap, need, 32, &new_cap) != TF_OK) {
+            return -1;
+        }
+        char **tmp = tf_reallocarray_checked(st->unique_names, new_cap, sizeof(char *));
         if (!tmp) return -1;
         st->unique_names = tmp;
         st->names_cap = new_cap;
@@ -241,7 +251,7 @@ static int unknown_declared_category(pivot_state *st, const char *name, tf_side_
     char msg[256];
     snprintf(msg, sizeof(msg), "pivot: unknown category '%s' for column '%s'",
              name ? name : "", st->name_column ? st->name_column : "");
-    pivot_write_error(side, msg);
+    if (pivot_write_error(side, msg) != TF_OK) return TF_ERROR;
     return TF_ERROR;
 }
 
@@ -294,9 +304,21 @@ static char *build_pivot_key(const tf_batch *b, size_t row,
                     break;
             }
         }
-        while (buf_len + val_len + 2 >= buf_cap) {
-            if (buf_cap > SIZE_MAX / 2) { free(buf); return NULL; }
-            buf_cap *= 2;
+        size_t need = 0;
+        if (tf_size_add(buf_len, val_len, &need) != TF_OK ||
+            tf_size_add(need, 2, &need) != TF_OK) {
+            free(buf);
+            return NULL;
+        }
+        if (need >= buf_cap) {
+            size_t new_cap = 0;
+            size_t min_cap = 0;
+            if (tf_size_add(need, 1, &min_cap) != TF_OK ||
+                tf_size_grow_pow2(buf_cap, min_cap, 256, &new_cap) != TF_OK) {
+                free(buf);
+                return NULL;
+            }
+            buf_cap = new_cap;
             char *tmp = realloc(buf, buf_cap);
             if (!tmp) { free(buf); return NULL; }
             buf = tmp;
@@ -314,21 +336,53 @@ static int find_or_add_pivot_group(pivot_map *map, const char *key,
         if (strcmp(map->keys[i], key) == 0) return (int)i;
     }
     if (map->count >= map->cap) {
-        size_t new_cap = map->cap ? map->cap * 2 : 64;
-        char **keys = realloc(map->keys, new_cap * sizeof(char *));
-        size_t *pass_rows = realloc(map->pass_rows, new_cap * sizeof(size_t));
-        pivot_accum *accums = realloc(map->accums, new_cap * sizeof(pivot_accum));
-        if (!keys || !pass_rows || !accums) return -1;
+        size_t need = 0;
+        size_t new_cap = 0;
+        if (tf_size_add(map->count, 1, &need) != TF_OK ||
+            tf_size_grow_pow2(map->cap, need, 64, &new_cap) != TF_OK) {
+            return -1;
+        }
+        size_t keys_bytes = 0;
+        size_t pass_rows_bytes = 0;
+        size_t accums_bytes = 0;
+        if (map->count > 0 &&
+            (tf_size_mul(map->count, sizeof(char *), &keys_bytes) != TF_OK ||
+             tf_size_mul(map->count, sizeof(size_t), &pass_rows_bytes) != TF_OK ||
+             tf_size_mul(map->count, sizeof(pivot_accum), &accums_bytes) != TF_OK)) {
+            return -1;
+        }
+        char **keys = tf_mallocarray_checked(new_cap, sizeof(char *));
+        size_t *pass_rows = tf_mallocarray_checked(new_cap, sizeof(size_t));
+        pivot_accum *accums = tf_mallocarray_checked(new_cap, sizeof(pivot_accum));
+        if (!keys || !pass_rows || !accums) {
+            free(keys);
+            free(pass_rows);
+            free(accums);
+            return -1;
+        }
+        if (map->count > 0) {
+            memcpy(keys, map->keys, keys_bytes);
+            memcpy(pass_rows, map->pass_rows, pass_rows_bytes);
+            memcpy(accums, map->accums, accums_bytes);
+        }
+        free(map->keys);
+        free(map->pass_rows);
+        free(map->accums);
         map->keys = keys;
         map->pass_rows = pass_rows;
         map->accums = accums;
         map->cap = new_cap;
     }
-    size_t idx = map->count++;
+    size_t idx = map->count;
     map->keys[idx] = strdup(key);
     if (!map->keys[idx]) return -1;
     map->pass_rows[idx] = src_row;
-    if (pivot_accum_init(&map->accums[idx], n_names) != TF_OK) return -1;
+    if (pivot_accum_init(&map->accums[idx], n_names) != TF_OK) {
+        free(map->keys[idx]);
+        map->keys[idx] = NULL;
+        return -1;
+    }
+    map->count = idx + 1;
     return (int)idx;
 }
 
@@ -378,23 +432,6 @@ static const char *get_name_str(const tf_batch *b, size_t row, int col, char *bu
     }
 }
 
-static void copy_cell(tf_batch *dst, size_t dr, size_t dc,
-                      const tf_batch *src, size_t sr, int sc) {
-    if (tf_batch_is_null(src, sr, (size_t)sc)) {
-        tf_batch_set_null(dst, dr, dc);
-        return;
-    }
-    switch (src->col_types[sc]) {
-        case TF_TYPE_BOOL:      tf_batch_set_bool(dst, dr, dc, tf_batch_get_bool(src, sr, (size_t)sc)); break;
-        case TF_TYPE_INT64:     tf_batch_set_int64(dst, dr, dc, tf_batch_get_int64(src, sr, (size_t)sc)); break;
-        case TF_TYPE_FLOAT64:   tf_batch_set_float64(dst, dr, dc, tf_batch_get_float64(src, sr, (size_t)sc)); break;
-        case TF_TYPE_STRING:    tf_batch_set_string(dst, dr, dc, tf_batch_get_string(src, sr, (size_t)sc)); break;
-        case TF_TYPE_DATE:      tf_batch_set_date(dst, dr, dc, tf_batch_get_date(src, sr, (size_t)sc)); break;
-        case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(dst, dr, dc, tf_batch_get_timestamp(src, sr, (size_t)sc)); break;
-        default: tf_batch_set_null(dst, dr, dc); break;
-    }
-}
-
 static int pivot_set_output_schema_from_source(const pivot_state *st, tf_batch *ob,
                                                const tf_batch *src,
                                                const int *pt_cols, size_t n_pt) {
@@ -418,24 +455,26 @@ static int pivot_emit_row(const pivot_state *st, tf_batch *ob, size_t out_row,
     if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) return TF_ERROR;
     for (size_t k = 0; k < n_pt; k++) {
         int sc = pt_cols ? pt_cols[k] : (int)k;
-        copy_cell(ob, out_row, k, pt_src, pt_row, sc);
+        if (tf_batch_copy_cell_index(ob, out_row, k, pt_src, pt_row, sc) != TF_OK) return TF_ERROR;
     }
     for (size_t k = 0; k < st->n_names; k++) {
         size_t oc = n_pt + k;
         if (a->counts[k] == 0) {
-            tf_batch_set_null(ob, out_row, oc);
+            if (tf_batch_set_null(ob, out_row, oc) != TF_OK) return TF_ERROR;
             continue;
         }
         double v = 0.0;
         switch (st->agg) {
             case PIVOT_FIRST: v = a->firsts[k]; break;
             case PIVOT_SUM:   v = a->sums[k]; break;
-            case PIVOT_COUNT: tf_batch_set_int64(ob, out_row, oc, (int64_t)a->counts[k]); continue;
+            case PIVOT_COUNT:
+                if (tf_batch_set_int64(ob, out_row, oc, (int64_t)a->counts[k]) != TF_OK) return TF_ERROR;
+                continue;
             case PIVOT_AVG:   v = a->sums[k] / (double)a->counts[k]; break;
             case PIVOT_MIN:   v = a->mins[k]; break;
             case PIVOT_MAX:   v = a->maxs[k]; break;
         }
-        tf_batch_set_float64(ob, out_row, oc, v);
+        if (tf_batch_set_float64(ob, out_row, oc, v) != TF_OK) return TF_ERROR;
     }
     ob->n_rows = out_row + 1;
     return TF_OK;
@@ -458,10 +497,16 @@ static int pivot_set_output_schema_from_arrays(const pivot_state *st, tf_batch *
 
 static int pivot_key_append(char **buf, size_t *buf_cap, size_t *buf_len,
                             const char *data, size_t data_len) {
-    while (*buf_len + data_len + 1 >= *buf_cap) {
-        if (*buf_cap > SIZE_MAX / 2) return TF_ERROR;
-        size_t new_cap = *buf_cap * 2;
-        char *tmp = realloc(*buf, new_cap);
+    size_t need = 0;
+    size_t min_cap = 0;
+    if (tf_size_add(*buf_len, data_len, &need) != TF_OK ||
+        tf_size_add(need, 1, &min_cap) != TF_OK) {
+        return TF_ERROR;
+    }
+    if (min_cap >= *buf_cap) {
+        size_t new_cap = 0;
+        if (tf_size_grow_pow2(*buf_cap, min_cap, 256, &new_cap) != TF_OK) return TF_ERROR;
+        char *tmp = tf_reallocarray_checked(*buf, new_cap, sizeof(char));
         if (!tmp) return TF_ERROR;
         *buf = tmp;
         *buf_cap = new_cap;
@@ -487,12 +532,9 @@ static int pivot_key_append_size(char **buf, size_t *buf_cap, size_t *buf_len,
 
 static int pivot_ensure_ordinals(uint64_t **ord, size_t *cap, size_t need) {
     if (*cap >= need) return TF_OK;
-    size_t new_cap = *cap ? *cap * 2 : 64;
-    while (new_cap < need) {
-        if (new_cap > SIZE_MAX / 2) return TF_ERROR;
-        new_cap *= 2;
-    }
-    uint64_t *tmp = realloc(*ord, new_cap * sizeof(uint64_t));
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(*cap, need, 64, &new_cap) != TF_OK) return TF_ERROR;
+    uint64_t *tmp = tf_reallocarray_checked(*ord, new_cap, sizeof(uint64_t));
     if (!tmp) return TF_ERROR;
     *ord = tmp;
     *cap = new_cap;
@@ -560,9 +602,15 @@ static void pivot_spill_row_clear(pivot_spill_row *row, const tf_type *types, si
 
 static int pivot_spill_row_init(pivot_spill_row *row, size_t n_cols) {
     row->ordinal = 0;
-    row->nulls = calloc(n_cols ? n_cols : 1, sizeof(uint8_t));
-    row->cells = calloc(n_cols ? n_cols : 1, sizeof(pivot_spill_cell));
-    if (!row->nulls || !row->cells) return TF_ERROR;
+    row->nulls = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(uint8_t));
+    row->cells = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(*row->cells));
+    if (!row->nulls || !row->cells) {
+        free(row->nulls);
+        free(row->cells);
+        row->nulls = NULL;
+        row->cells = NULL;
+        return TF_ERROR;
+    }
     for (size_t c = 0; c < n_cols; c++) row->nulls[c] = 1;
     return TF_OK;
 }
@@ -594,7 +642,7 @@ static int pivot_reader_advance(pivot_state *st, pivot_run_reader *reader, int o
     tf_type *tmp_types = NULL;
     const tf_type *types = NULL;
     if (output_reader) {
-        tmp_types = calloc(n_cols ? n_cols : 1, sizeof(tf_type));
+        tmp_types = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(tf_type));
         if (!tmp_types) return -1;
         for (size_t c = 0; c < n_cols; c++) tmp_types[c] = pivot_output_col_type(st, c);
         types = tmp_types;
@@ -639,7 +687,7 @@ static void pivot_close_readers(pivot_state *st, int output_readers) {
     tf_type *tmp_types = NULL;
     const tf_type *types = NULL;
     if (output_readers) {
-        tmp_types = calloc(n_cols ? n_cols : 1, sizeof(tf_type));
+        tmp_types = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(tf_type));
         if (tmp_types) for (size_t c = 0; c < n_cols; c++) tmp_types[c] = pivot_output_col_type(st, c);
         types = tmp_types;
     } else {
@@ -669,23 +717,15 @@ static void pivot_remove_paths(char ***paths, size_t *n, size_t *cap) {
     *cap = 0;
 }
 
-static char *pivot_make_run_path(pivot_state *st, int output_run) {
-    size_t dir_len = strlen(st->spill_dir);
-    size_t cap = dir_len + 128;
-    char *path = malloc(cap);
-    if (!path) return NULL;
-    snprintf(path, cap, "%s%stranfi-pivot-%s-%ld-%zu.bin",
-             st->spill_dir,
-             (dir_len > 0 && st->spill_dir[dir_len - 1] == '/') ? "" : "/",
-             output_run ? "out" : "key",
-             (long)getpid(), output_run ? st->out_run_seq++ : st->run_seq++);
-    return path;
-}
-
 static int pivot_append_path(char ***paths, size_t *n, size_t *cap, char *path) {
     if (*n == *cap) {
-        size_t new_cap = *cap ? *cap * 2 : 8;
-        char **tmp = realloc(*paths, new_cap * sizeof(char *));
+        size_t need = 0;
+        size_t new_cap = 0;
+        if (tf_size_add(*n, 1, &need) != TF_OK ||
+            tf_size_grow_pow2(*cap, need, 8, &new_cap) != TF_OK) {
+            return TF_ERROR;
+        }
+        char **tmp = tf_reallocarray_checked(*paths, new_cap, sizeof(char *));
         if (!tmp) return TF_ERROR;
         *paths = tmp;
         *cap = new_cap;
@@ -811,35 +851,25 @@ static int pivot_compare_spill_key_rows(const pivot_state *st, const pivot_spill
     return (a->ordinal > b->ordinal) - (a->ordinal < b->ordinal);
 }
 
-static const pivot_state *g_pivot_sort_state;
-static int pivot_compare_key_indices(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    return pivot_compare_batch_key_rows(g_pivot_sort_state, ra, rb);
-}
+typedef struct {
+    const pivot_state *st;
+    int output_run;
+} pivot_sort_ctx;
 
-static const pivot_state *g_pivot_output_sort_state;
-static int pivot_compare_output_indices(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    uint64_t oa = g_pivot_output_sort_state->out_ordinals[ra];
-    uint64_t ob = g_pivot_output_sort_state->out_ordinals[rb];
+static int pivot_compare_indices(const void *ctx, size_t ra, size_t rb) {
+    const pivot_sort_ctx *sort = (const pivot_sort_ctx *)ctx;
+    if (!sort->output_run) return pivot_compare_batch_key_rows(sort->st, ra, rb);
+    uint64_t oa = sort->st->out_ordinals[ra];
+    uint64_t ob = sort->st->out_ordinals[rb];
     return (oa > ob) - (oa < ob);
 }
 
 static size_t *pivot_sorted_indices(size_t n, int output_run, const pivot_state *st) {
-    size_t *idx = malloc((n ? n : 1) * sizeof(size_t));
+    size_t *idx = tf_mallocarray_checked(n ? n : 1, sizeof(size_t));
     if (!idx) return NULL;
     for (size_t i = 0; i < n; i++) idx[i] = i;
-    if (output_run) {
-        g_pivot_output_sort_state = st;
-        qsort(idx, n, sizeof(size_t), pivot_compare_output_indices);
-        g_pivot_output_sort_state = NULL;
-    } else {
-        g_pivot_sort_state = st;
-        qsort(idx, n, sizeof(size_t), pivot_compare_key_indices);
-        g_pivot_sort_state = NULL;
-    }
+    pivot_sort_ctx ctx = { .st = st, .output_run = output_run };
+    tf_sort_indices(idx, n, pivot_compare_indices, &ctx);
     return idx;
 }
 
@@ -899,8 +929,8 @@ static size_t pivot_estimated_spill_row_bytes(const pivot_state *st) {
 static int pivot_init_spill_schema(pivot_state *st, const tf_batch *in, tf_side_channels *side) {
     if (st->has_schema) return TF_OK;
     st->n_schema_cols = in->n_cols;
-    st->schema_names = calloc(in->n_cols ? in->n_cols : 1, sizeof(char *));
-    st->schema_types = calloc(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
+    st->schema_names = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(char *));
+    st->schema_types = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
     if (!st->schema_names || !st->schema_types) return TF_ERROR;
     for (size_t c = 0; c < in->n_cols; c++) {
         st->schema_names[c] = strdup(in->col_names[c] ? in->col_names[c] : "");
@@ -913,7 +943,7 @@ static int pivot_init_spill_schema(pivot_state *st, const tf_batch *in, tf_side_
         pivot_write_error(side, "pivot spill: name_column or value_column not found");
         return TF_ERROR;
     }
-    st->pt_cols = malloc(in->n_cols * sizeof(int));
+    st->pt_cols = tf_mallocarray_checked(in->n_cols, sizeof(int));
     if (!st->pt_cols) return TF_ERROR;
     st->n_pt = 0;
     for (size_t c = 0; c < in->n_cols; c++) {
@@ -937,16 +967,9 @@ static int pivot_init_spill_schema(pivot_state *st, const tf_batch *in, tf_side_
 
 static int pivot_write_batch_run(pivot_state *st, tf_batch *batch, const uint64_t *ordinals,
                                  size_t *indices, size_t n, int output_run) {
-    char *path = pivot_make_run_path(st, output_run);
-    if (!path) return TF_ERROR;
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "pivot spill: cannot create '%s': %s", path, strerror(errno));
-        tf_set_last_error(msg);
-        free(path);
-        return TF_ERROR;
-    }
+    char *path = NULL;
+    FILE *f = tf_spill_open_run_file(st->spill, output_run ? "pivot-out" : "pivot-key", &path);
+    if (!f) return TF_ERROR;
     for (size_t i = 0; i < n; i++) {
         size_t r = indices[i];
         uint64_t ordinal = ordinals[r];
@@ -1019,7 +1042,7 @@ static int pivot_open_readers(pivot_state *st, int output_readers) {
     pivot_run_reader **readers = output_readers ? &st->out_readers : &st->readers;
     size_t *n_readers = output_readers ? &st->n_out_readers : &st->n_readers;
     if (n_paths == 0) return TF_OK;
-    *readers = calloc(n_paths, sizeof(pivot_run_reader));
+    *readers = tf_callocarray_checked(n_paths, sizeof(pivot_run_reader));
     if (!*readers) return TF_ERROR;
     *n_readers = n_paths;
     size_t n_cols = pivot_reader_cols(st, output_readers);
@@ -1131,18 +1154,12 @@ static int pivot_copy_spill_pt_values(tf_batch *dst, const pivot_state *st, cons
     for (size_t k = 0; k < st->n_pt; k++) {
         int ci = st->pt_cols[k];
         if (ci < 0 || row->nulls[(size_t)ci]) {
-            tf_batch_set_null(dst, 0, k);
-            continue;
-        }
-        size_t c = (size_t)ci;
-        switch (dst->col_types[k]) {
-            case TF_TYPE_BOOL: tf_batch_set_bool(dst, 0, k, row->cells[c].b != 0); break;
-            case TF_TYPE_INT64: tf_batch_set_int64(dst, 0, k, row->cells[c].i64); break;
-            case TF_TYPE_FLOAT64: tf_batch_set_float64(dst, 0, k, row->cells[c].f64); break;
-            case TF_TYPE_STRING: tf_batch_set_string(dst, 0, k, row->cells[c].str ? row->cells[c].str : ""); break;
-            case TF_TYPE_DATE: tf_batch_set_date(dst, 0, k, row->cells[c].date); break;
-            case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(dst, 0, k, row->cells[c].i64); break;
-            default: tf_batch_set_null(dst, 0, k); break;
+            if (tf_batch_set_null(dst, 0, k) != TF_OK) return TF_ERROR;
+        } else {
+            size_t c = (size_t)ci;
+            if (tf_batch_set_owned_cell_value(dst, 0, k, dst->col_types[k],
+                                              0, &row->cells[c]) != TF_OK)
+                return TF_ERROR;
         }
     }
     dst->n_rows = 1;
@@ -1153,20 +1170,9 @@ static int pivot_spill_row_to_batch(const pivot_state *st, tf_batch *out, size_t
                                     const pivot_spill_row *row) {
     if (tf_batch_ensure_capacity(out, dst_row + 1) != TF_OK) return TF_ERROR;
     for (size_t c = 0; c < out->n_cols; c++) {
-        if (row->nulls[c]) {
-            tf_batch_set_null(out, dst_row, c);
-            continue;
-        }
-        tf_type type = pivot_output_col_type(st, c);
-        switch (type) {
-            case TF_TYPE_BOOL: tf_batch_set_bool(out, dst_row, c, row->cells[c].b != 0); break;
-            case TF_TYPE_INT64: tf_batch_set_int64(out, dst_row, c, row->cells[c].i64); break;
-            case TF_TYPE_FLOAT64: tf_batch_set_float64(out, dst_row, c, row->cells[c].f64); break;
-            case TF_TYPE_STRING: tf_batch_set_string(out, dst_row, c, row->cells[c].str); break;
-            case TF_TYPE_DATE: tf_batch_set_date(out, dst_row, c, row->cells[c].date); break;
-            case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(out, dst_row, c, row->cells[c].i64); break;
-            default: tf_batch_set_null(out, dst_row, c); break;
-        }
+        if (tf_batch_set_owned_cell_value(out, dst_row, c, pivot_output_col_type(st, c),
+                                          row->nulls[c], &row->cells[c]) != TF_OK)
+            return TF_ERROR;
     }
     return TF_OK;
 }
@@ -1185,8 +1191,15 @@ static int pivot_append_spill_group(pivot_state *st, const tf_batch *pt_batch,
 static int pivot_finish_spill_group(pivot_state *st, char **current_key, tf_batch **current_pt,
                                     pivot_accum *accum, uint64_t first_ordinal) {
     if (!*current_key || !*current_pt) return TF_OK;
-    st->spill_key_bytes += strlen(*current_key) + 1;
-    int rc = pivot_append_spill_group(st, *current_pt, accum, first_ordinal);
+    size_t key_bytes_delta = 0;
+    size_t new_spill_key_bytes = 0;
+    int rc = TF_ERROR;
+    if (tf_size_add(strlen(*current_key), 1, &key_bytes_delta) == TF_OK &&
+        tf_size_add(st->spill_key_bytes, key_bytes_delta,
+                    &new_spill_key_bytes) == TF_OK) {
+        st->spill_key_bytes = new_spill_key_bytes;
+        rc = pivot_append_spill_group(st, *current_pt, accum, first_ordinal);
+    }
     pivot_accum_free(accum);
     memset(accum, 0, sizeof(*accum));
     free(*current_key);
@@ -1282,6 +1295,8 @@ static int pivot_begin_output_merge(pivot_state *st) {
     if (st->out_buf) { tf_batch_free(st->out_buf); st->out_buf = NULL; }
     free(st->out_ordinals); st->out_ordinals = NULL; st->out_ordinal_cap = 0;
     if (st->n_out_runs == 0) {
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->output_merge_done = 1;
         return TF_OK;
     }
@@ -1308,6 +1323,8 @@ static int pivot_output_next_batch(pivot_state *st, tf_batch **out) {
         tf_batch_free(ob);
         pivot_close_readers(st, 1);
         pivot_remove_paths(&st->out_run_paths, &st->n_out_runs, &st->cap_out_runs);
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->output_merge_done = 1;
         return TF_OK;
     }
@@ -1386,7 +1403,7 @@ static int pivot_prepare_sorted(pivot_state *st, const tf_batch *in,
         pivot_write_error(side, "pivot: name_column or value_column not found");
         return TF_ERROR;
     }
-    st->pt_cols = malloc(in->n_cols * sizeof(int));
+    st->pt_cols = tf_mallocarray_checked(in->n_cols, sizeof(int));
     if (!st->pt_cols) return TF_ERROR;
     st->n_pt = 0;
     for (size_t c = 0; c < in->n_cols; c++) {
@@ -1412,8 +1429,9 @@ static int pivot_start_sorted_group(pivot_state *st, char *key,
     pivot_accum_reset(&st->current_accum);
     st->current_pt->n_rows = 0;
     if (tf_batch_ensure_capacity(st->current_pt, 1) != TF_OK) return TF_ERROR;
-    for (size_t k = 0; k < st->n_pt; k++)
-        copy_cell(st->current_pt, 0, k, in, row, st->pt_cols[k]);
+    for (size_t k = 0; k < st->n_pt; k++) {
+        if (tf_batch_copy_cell_index(st->current_pt, 0, k, in, row, st->pt_cols[k]) != TF_OK) return TF_ERROR;
+    }
     st->current_pt->n_rows = 1;
     st->have_current = 1;
     return TF_OK;
@@ -1480,8 +1498,10 @@ static int pivot_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (!st->has_schema) {
         st->buf = tf_batch_create(in->n_cols, in->n_rows > 0 ? in->n_rows : 16);
         if (!st->buf) return TF_ERROR;
-        for (size_t c = 0; c < in->n_cols; c++)
-            tf_batch_set_schema(st->buf, c, in->col_names[c], in->col_types[c]);
+        for (size_t c = 0; c < in->n_cols; c++) {
+            if (tf_batch_set_schema(st->buf, c, in->col_names[c], in->col_types[c]) != TF_OK)
+                return TF_ERROR;
+        }
         st->has_schema = 1;
     }
 
@@ -1536,7 +1556,7 @@ static int pivot_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     int val_ci = tf_batch_col_index(buf, st->value_column);
     if (name_ci < 0 || val_ci < 0) return TF_OK;
 
-    int *pt_cols = malloc(buf->n_cols * sizeof(int));
+    int *pt_cols = tf_mallocarray_checked(buf->n_cols, sizeof(int));
     if (!pt_cols) return TF_ERROR;
     size_t n_pt = 0;
     for (size_t c = 0; c < buf->n_cols; c++) {
@@ -1586,6 +1606,10 @@ static int pivot_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 
 static void pivot_state_free(pivot_state *st) {
     if (!st) return;
+    if (st->has_schema) {
+        pivot_close_readers(st, 0);
+        pivot_close_readers(st, 1);
+    }
     free(st->name_column);
     free(st->value_column);
     if (st->buf) tf_batch_free(st->buf);
@@ -1596,10 +1620,6 @@ static void pivot_state_free(pivot_state *st) {
     if (st->current_pt) tf_batch_free(st->current_pt);
     free(st->current_key);
     pivot_accum_free(&st->current_accum);
-    if (st->has_schema) {
-        pivot_close_readers(st, 0);
-        pivot_close_readers(st, 1);
-    }
     pivot_remove_paths(&st->run_paths, &st->n_runs, &st->cap_runs);
     pivot_remove_paths(&st->out_run_paths, &st->n_out_runs, &st->cap_out_runs);
     for (size_t i = 0; i < st->n_schema_cols; i++) free(st->schema_names ? st->schema_names[i] : NULL);
@@ -1607,6 +1627,7 @@ static void pivot_state_free(pivot_state *st) {
     free(st->schema_types);
     free(st->buf_ordinals);
     free(st->out_ordinals);
+    tf_spill_cleanup(st->spill);
     free(st->spill_dir);
     free(st);
 }
@@ -1619,16 +1640,7 @@ static void pivot_destroy(tf_step *self) {
 }
 
 static int parse_positive_size(const cJSON *args, const char *name, size_t *out) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(args, name);
-    if (!item) return 0;
-    if (!cJSON_IsNumber(item) || item->valuedouble <= 0) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "pivot: %s must be positive", name);
-        tf_set_last_error(msg);
-        return -1;
-    }
-    *out = (size_t)item->valuedouble;
-    return 1;
+    return tf_json_get_size_arg(args, name, 1, TF_MAX_COUNT_ARG, out, "pivot");
 }
 
 static int load_declared_categories(pivot_state *st, const cJSON *args) {
@@ -1685,14 +1697,26 @@ tf_step *tf_pivot_create(const cJSON *args) {
         st->use_spill = 1;
         st->spill_dir = strdup(spill_dir_j->valuestring);
         if (!st->spill_dir) { pivot_state_free(st); return NULL; }
-        if (parse_positive_size(args, "spill_memory_bytes", &st->spill_memory_bytes) < 0 ||
-            parse_positive_size(args, "spill_run_rows", &st->configured_run_rows) < 0 ||
-            parse_positive_size(args, "spill_output_rows", &st->output_batch_rows) < 0) {
+        if (tf_spill_session_create(st->spill_dir, &st->spill) != TF_OK) { pivot_state_free(st); return NULL; }
+        size_t parsed_size = 0;
+        int has_spill_memory = tf_json_get_size_arg(args, "spill_memory_bytes",
+                                                    1, TF_MAX_SPILL_MEMORY_BYTES,
+                                                    &parsed_size, "pivot");
+        if (has_spill_memory < 0) { pivot_state_free(st); return NULL; }
+        if (has_spill_memory > 0) st->spill_memory_bytes = parsed_size;
+        int has_spill_rows = tf_json_get_size_arg(args, "spill_run_rows",
+                                                  1, TF_MAX_SPILL_RUN_ROWS,
+                                                  &parsed_size, "pivot");
+        if (has_spill_rows < 0) { pivot_state_free(st); return NULL; }
+        if (has_spill_rows > 0) st->configured_run_rows = parsed_size;
+        int has_output_rows = tf_json_get_size_arg(args, "spill_output_rows",
+                                                   1, TF_MAX_SPILL_OUTPUT_ROWS,
+                                                   &parsed_size, "pivot");
+        if (has_output_rows < 0) {
             pivot_state_free(st);
             return NULL;
         }
-        if (st->output_batch_rows == 0 || st->output_batch_rows == SIZE_MAX)
-            st->output_batch_rows = PIVOT_DEFAULT_OUTPUT_ROWS;
+        if (has_output_rows > 0) st->output_batch_rows = parsed_size;
     }
 
     cJSON *sorted_j = cJSON_GetObjectItemCaseSensitive(args, "sorted");

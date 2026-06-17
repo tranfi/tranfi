@@ -17,6 +17,7 @@ typedef struct {
 } rename_state;
 
 static const char *find_rename(rename_state *st, const char *name) {
+    if (!name) return "";
     for (size_t i = 0; i < st->n_mappings; i++) {
         if (strcmp(st->old_names[i], name) == 0)
             return st->new_names[i];
@@ -28,6 +29,7 @@ static int rename_process(tf_step *self, tf_batch *in, tf_batch **out,
                           tf_side_channels *side) {
     (void)side;
     rename_state *st = self->state;
+    *out = NULL;
 
     /* Create output batch with renamed columns */
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
@@ -35,40 +37,17 @@ static int rename_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     for (size_t i = 0; i < in->n_cols; i++) {
         const char *new_name = find_rename(st, in->col_names[i]);
-        tf_batch_set_schema(ob, i, new_name, in->col_types[i]);
+        if (tf_batch_set_schema(ob, i, new_name, in->col_types[i]) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     /* Copy all rows */
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_ensure_capacity(ob, r + 1);
-        for (size_t c = 0; c < in->n_cols; c++) {
-            if (tf_batch_is_null(in, r, c)) {
-                tf_batch_set_null(ob, r, c);
-                continue;
-            }
-            switch (in->col_types[c]) {
-                case TF_TYPE_BOOL:
-                    tf_batch_set_bool(ob, r, c, tf_batch_get_bool(in, r, c));
-                    break;
-                case TF_TYPE_INT64:
-                    tf_batch_set_int64(ob, r, c, tf_batch_get_int64(in, r, c));
-                    break;
-                case TF_TYPE_FLOAT64:
-                    tf_batch_set_float64(ob, r, c, tf_batch_get_float64(in, r, c));
-                    break;
-                case TF_TYPE_STRING:
-                    tf_batch_set_string(ob, r, c, tf_batch_get_string(in, r, c));
-                    break;
-                case TF_TYPE_DATE:
-                    tf_batch_set_date(ob, r, c, tf_batch_get_date(in, r, c));
-                    break;
-                case TF_TYPE_TIMESTAMP:
-                    tf_batch_set_timestamp(ob, r, c, tf_batch_get_timestamp(in, r, c));
-                    break;
-                default:
-                    tf_batch_set_null(ob, r, c);
-                    break;
-            }
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
         }
         ob->n_rows = r + 1;
     }
@@ -83,17 +62,19 @@ static int rename_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     return TF_OK;
 }
 
-static void rename_destroy(tf_step *self) {
-    rename_state *st = self->state;
-    if (st) {
-        for (size_t i = 0; i < st->n_mappings; i++) {
-            free(st->old_names[i]);
-            free(st->new_names[i]);
-        }
-        free(st->old_names);
-        free(st->new_names);
-        free(st);
+static void rename_state_free(rename_state *st) {
+    if (!st) return;
+    for (size_t i = 0; i < st->n_mappings; i++) {
+        if (st->old_names) free(st->old_names[i]);
+        if (st->new_names) free(st->new_names[i]);
     }
+    free(st->old_names);
+    free(st->new_names);
+    free(st);
+}
+
+static void rename_destroy(tf_step *self) {
+    rename_state_free(self ? self->state : NULL);
     free(self);
 }
 
@@ -108,8 +89,8 @@ tf_step *tf_rename_create(const cJSON *args) {
     rename_state *st = calloc(1, sizeof(rename_state));
     if (!st) return NULL;
     st->n_mappings = (size_t)n;
-    st->old_names = malloc(n * sizeof(char *));
-    st->new_names = malloc(n * sizeof(char *));
+    st->old_names = calloc((size_t)n, sizeof(char *));
+    st->new_names = calloc((size_t)n, sizeof(char *));
     if (!st->old_names || !st->new_names) {
         free(st->old_names);
         free(st->new_names);
@@ -120,14 +101,20 @@ tf_step *tf_rename_create(const cJSON *args) {
     int i = 0;
     cJSON *item;
     cJSON_ArrayForEach(item, mapping) {
-        st->old_names[i] = strdup(item->string);
-        st->new_names[i] = strdup(cJSON_IsString(item) ? item->valuestring : item->string);
+        const char *old_name = item->string ? item->string : "";
+        const char *new_name = cJSON_IsString(item) ? item->valuestring : old_name;
+        st->old_names[i] = strdup(old_name);
+        st->new_names[i] = strdup(new_name ? new_name : "");
+        if (!st->old_names[i] || !st->new_names[i]) {
+            rename_state_free(st);
+            return NULL;
+        }
         i++;
     }
 
     tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) {
-        rename_destroy(&(tf_step){.state = st});
+        rename_state_free(st);
         return NULL;
     }
     step->process = rename_process;

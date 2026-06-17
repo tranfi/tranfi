@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include <regex.h>
 
+#define TF_SELECTOR_MAX_DEPTH 256
+
 static char *selector_strdup_range(const char *start, size_t len) {
     char *out = malloc(len + 1);
     if (!out) return NULL;
@@ -334,8 +336,14 @@ static int selector_append_name_item(char ***items, size_t *n_items, size_t *cap
     }
 
     if (*n_items == *cap) {
-        size_t next = *cap ? *cap * 2 : 4;
-        char **grown = realloc(*items, next * sizeof(char *));
+        size_t needed = 0;
+        size_t next = 0;
+        if (tf_size_add(*n_items, 1, &needed) != TF_OK ||
+            tf_size_grow_pow2(*cap, needed, 4, &next) != TF_OK) {
+            free(trimmed);
+            return TF_ERROR;
+        }
+        char **grown = tf_reallocarray_checked(*items, next, sizeof(char *));
         if (!grown) {
             free(trimmed);
             return TF_ERROR;
@@ -422,8 +430,9 @@ typedef struct {
 static int selector_result_init(selector_result *r, size_t n_cols) {
     r->n_cols = n_cols;
     r->n_order = 0;
-    r->order = malloc((n_cols ? n_cols : 1) * sizeof(int));
-    r->included = calloc(n_cols ? n_cols : 1, sizeof(int));
+    size_t alloc_cols = n_cols ? n_cols : 1;
+    r->order = tf_mallocarray_checked(alloc_cols, sizeof(int));
+    r->included = tf_callocarray_checked(alloc_cols, sizeof(int));
     if (!r->order || !r->included) {
         free(r->order);
         free(r->included);
@@ -615,9 +624,16 @@ static void selector_expr_skip_ws(selector_expr_parser *p) {
     while (p->pos < p->len && isspace((unsigned char)p->s[p->pos])) p->pos++;
 }
 
-static int selector_expr_parse_or(selector_expr_parser *p, selector_result *out);
+static int selector_expr_parse_or(selector_expr_parser *p, selector_result *out, unsigned depth);
 
-static int selector_expr_parse_primary(selector_expr_parser *p, selector_result *out) {
+static int selector_expr_depth_exceeded(selector_expr_parser *p, unsigned depth) {
+    if (depth <= TF_SELECTOR_MAX_DEPTH) return 0;
+    selector_set_error(p->error, "selector nesting too deep", NULL);
+    return 1;
+}
+
+static int selector_expr_parse_primary(selector_expr_parser *p, selector_result *out, unsigned depth) {
+    if (selector_expr_depth_exceeded(p, depth)) return TF_ERROR;
     selector_expr_skip_ws(p);
     if (p->pos >= p->len) {
         selector_set_error(p->error, "expected selector expression", NULL);
@@ -627,7 +643,7 @@ static int selector_expr_parse_primary(selector_expr_parser *p, selector_result 
     if (p->s[p->pos] == '(') {
         p->pos++;
         selector_result inner;
-        if (selector_expr_parse_or(p, &inner) != TF_OK) return TF_ERROR;
+        if (selector_expr_parse_or(p, &inner, depth + 1) != TF_OK) return TF_ERROR;
         selector_expr_skip_ws(p);
         if (p->pos >= p->len || p->s[p->pos] != ')') {
             selector_result_free(&inner);
@@ -677,12 +693,13 @@ static int selector_expr_parse_primary(selector_expr_parser *p, selector_result 
     return rc;
 }
 
-static int selector_expr_parse_unary(selector_expr_parser *p, selector_result *out) {
+static int selector_expr_parse_unary(selector_expr_parser *p, selector_result *out, unsigned depth) {
+    if (selector_expr_depth_exceeded(p, depth)) return TF_ERROR;
     selector_expr_skip_ws(p);
     if (p->pos < p->len && (p->s[p->pos] == '!' || p->s[p->pos] == '-')) {
         p->pos++;
         selector_result child;
-        if (selector_expr_parse_unary(p, &child) != TF_OK) return TF_ERROR;
+        if (selector_expr_parse_unary(p, &child, depth + 1) != TF_OK) return TF_ERROR;
         selector_result comp;
         if (selector_result_complement(&child, &comp) != TF_OK) {
             selector_result_free(&child);
@@ -693,18 +710,18 @@ static int selector_expr_parse_unary(selector_expr_parser *p, selector_result *o
         *out = comp;
         return TF_OK;
     }
-    return selector_expr_parse_primary(p, out);
+    return selector_expr_parse_primary(p, out, depth);
 }
 
-static int selector_expr_parse_and(selector_expr_parser *p, selector_result *out) {
+static int selector_expr_parse_and(selector_expr_parser *p, selector_result *out, unsigned depth) {
     selector_result left;
-    if (selector_expr_parse_unary(p, &left) != TF_OK) return TF_ERROR;
+    if (selector_expr_parse_unary(p, &left, depth) != TF_OK) return TF_ERROR;
     for (;;) {
         selector_expr_skip_ws(p);
         if (p->pos >= p->len || p->s[p->pos] != '&') break;
         p->pos++;
         selector_result right;
-        if (selector_expr_parse_unary(p, &right) != TF_OK) {
+        if (selector_expr_parse_unary(p, &right, depth) != TF_OK) {
             selector_result_free(&left);
             return TF_ERROR;
         }
@@ -723,15 +740,15 @@ static int selector_expr_parse_and(selector_expr_parser *p, selector_result *out
     return TF_OK;
 }
 
-static int selector_expr_parse_or(selector_expr_parser *p, selector_result *out) {
+static int selector_expr_parse_or(selector_expr_parser *p, selector_result *out, unsigned depth) {
     selector_result left;
-    if (selector_expr_parse_and(p, &left) != TF_OK) return TF_ERROR;
+    if (selector_expr_parse_and(p, &left, depth) != TF_OK) return TF_ERROR;
     for (;;) {
         selector_expr_skip_ws(p);
         if (p->pos >= p->len || p->s[p->pos] != '|') break;
         p->pos++;
         selector_result right;
-        if (selector_expr_parse_and(p, &right) != TF_OK) {
+        if (selector_expr_parse_and(p, &right, depth) != TF_OK) {
             selector_result_free(&left);
             return TF_ERROR;
         }
@@ -763,7 +780,7 @@ static int selector_eval_boolean_algebra(const char *raw,
         .n_cols = n_cols,
         .error = error,
     };
-    if (selector_expr_parse_or(&p, out) != TF_OK) return TF_ERROR;
+    if (selector_expr_parse_or(&p, out, 0) != TF_OK) return TF_ERROR;
     selector_expr_skip_ws(&p);
     if (p.pos != p.len) {
         selector_result_free(out);
@@ -784,8 +801,9 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
         return TF_ERROR;
     }
 
-    int *included = calloc(n_cols ? n_cols : 1, sizeof(int));
-    int *order = malloc((n_cols ? n_cols : 1) * sizeof(int));
+    size_t alloc_cols = n_cols ? n_cols : 1;
+    int *included = tf_callocarray_checked(alloc_cols, sizeof(int));
+    int *order = tf_mallocarray_checked(alloc_cols, sizeof(int));
     if (!included || !order) {
         free(included); free(order);
         selector_set_error(error, "selector out of memory", NULL);
@@ -937,7 +955,7 @@ int tf_column_selectors_resolve(char **selectors, size_t n_selectors,
         return TF_ERROR;
     }
 
-    int *out = malloc(final_n * sizeof(int));
+    int *out = tf_mallocarray_checked(final_n, sizeof(int));
     if (!out) {
         free(included); free(order);
         selector_set_error(error, "selector out of memory", NULL);
@@ -969,7 +987,7 @@ int tf_column_selectors_resolve_json(const cJSON *selectors,
         selector_set_error(error, "selector list is empty", NULL);
         return TF_ERROR;
     }
-    char **items = calloc((size_t)n, sizeof(char *));
+    char **items = tf_callocarray_checked((size_t)n, sizeof(char *));
     if (!items) {
         selector_set_error(error, "selector out of memory", NULL);
         return TF_ERROR;

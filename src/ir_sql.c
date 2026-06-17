@@ -121,7 +121,7 @@ static int expr_to_sql(const tf_expr *e, strbuf *sb) {
       return 0;
 
     case EXPR_LIT_FLOAT:
-      sb_appendf(sb, "%g", e->lit_float);
+      sb_appendf(sb, TF_FLOAT64_ROUNDTRIP_FORMAT, e->lit_float);
       return 0;
 
     case EXPR_LIT_STR:
@@ -713,21 +713,21 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
       sb_init(&tmp);
       sql_quote_ident(&tmp, column);
       sb_init(&expr);
-      sb_appendf(&expr, "GREATEST(%g, LEAST(%g, %s))", min_v->valuedouble, max_v->valuedouble, tmp.data);
+      sb_appendf(&expr, "GREATEST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", LEAST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", %s))", min_v->valuedouble, max_v->valuedouble, tmp.data);
       sb_free(&tmp);
     } else if (min_v) {
       strbuf tmp;
       sb_init(&tmp);
       sql_quote_ident(&tmp, column);
       sb_init(&expr);
-      sb_appendf(&expr, "GREATEST(%g, %s)", min_v->valuedouble, tmp.data);
+      sb_appendf(&expr, "GREATEST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", %s)", min_v->valuedouble, tmp.data);
       sb_free(&tmp);
     } else if (max_v) {
       strbuf tmp;
       sb_init(&tmp);
       sql_quote_ident(&tmp, column);
       sb_init(&expr);
-      sb_appendf(&expr, "LEAST(%g, %s)", max_v->valuedouble, tmp.data);
+      sb_appendf(&expr, "LEAST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", %s)", max_v->valuedouble, tmp.data);
       sb_free(&tmp);
     }
     strbuf qcol;
@@ -1118,18 +1118,18 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
       cJSON *b = cJSON_GetArrayItem(boundaries, i);
       double val = b->valuedouble;
       if (i == 0) {
-        sb_appendf(&expr, " WHEN %s < %g THEN '<%g'", qcol.data, val, val);
+        sb_appendf(&expr, " WHEN %s < " TF_FLOAT64_ROUNDTRIP_FORMAT " THEN '<" TF_FLOAT64_ROUNDTRIP_FORMAT "'", qcol.data, val, val);
       }
       if (i > 0) {
         cJSON *prev_b = cJSON_GetArrayItem(boundaries, i - 1);
-        sb_appendf(&expr, " WHEN %s >= %g AND %s < %g THEN '%g-%g'",
+        sb_appendf(&expr, " WHEN %s >= " TF_FLOAT64_ROUNDTRIP_FORMAT " AND %s < " TF_FLOAT64_ROUNDTRIP_FORMAT " THEN '" TF_FLOAT64_ROUNDTRIP_FORMAT "-" TF_FLOAT64_ROUNDTRIP_FORMAT "'",
                    qcol.data, prev_b->valuedouble, qcol.data, val,
                    prev_b->valuedouble, val);
       }
     }
     if (n > 0) {
       cJSON *last = cJSON_GetArrayItem(boundaries, n - 1);
-      sb_appendf(&expr, " WHEN %s >= %g THEN '%g+'", qcol.data, last->valuedouble, last->valuedouble);
+      sb_appendf(&expr, " WHEN %s >= " TF_FLOAT64_ROUNDTRIP_FORMAT " THEN '" TF_FLOAT64_ROUNDTRIP_FORMAT "+'", qcol.data, last->valuedouble, last->valuedouble);
     }
     sb_append(&expr, " END");
     strbuf bin_col;

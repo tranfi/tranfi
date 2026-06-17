@@ -29,17 +29,11 @@ static int source_name_process(tf_step *self, tf_batch *in, tf_batch **out,
         return TF_ERROR;
     }
 
-    size_t out_cols = in->n_cols + 1;
-    tf_batch *ob = tf_batch_create(out_cols, in->n_rows > 0 ? in->n_rows : 1);
+    const char *extra_names[1] = {st->result};
+    tf_type extra_types[1] = {TF_TYPE_STRING};
+    tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
-    if (tf_batch_set_schema(ob, in->n_cols, st->result, TF_TYPE_STRING) != TF_OK) {
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
         tf_batch_free(ob);
         return TF_ERROR;
     }
@@ -52,8 +46,14 @@ static int source_name_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        tf_batch_set_string(ob, r, in->n_cols, value);
-        ob->n_rows = r + 1;
+        if (tf_batch_set_string(ob, r, in->n_cols, value) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     if (ob->n_rows > 0) {

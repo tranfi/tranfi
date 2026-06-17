@@ -44,21 +44,21 @@ typedef struct {
     int              replace;
 } across_state;
 
-static void across_write_error(tf_side_channels *side, const char *msg,
-                               const char *column, const char *fn) {
-    if (!side || !side->errors) return;
+static int across_write_error(tf_side_channels *side, const char *msg,
+                              const char *column, const char *fn) {
+    if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
-    if (!obj) return;
+    if (!obj) return TF_ERROR;
     cJSON_AddStringToObject(obj, "op", "across");
     cJSON_AddStringToObject(obj, "error", msg ? msg : "across error");
     if (column) cJSON_AddStringToObject(obj, "column", column);
     if (fn) cJSON_AddStringToObject(obj, "function", fn);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
-    if (!line) return;
-    tf_buffer_write_str(side->errors, line);
-    tf_buffer_write_str(side->errors, "\n");
+    if (!line) return TF_ERROR;
+    int rc = tf_buffer_write_line(side->errors, line);
     free(line);
+    return rc;
 }
 
 static int across_fn_from_name(const char *name, across_fn_kind *out) {
@@ -95,26 +95,9 @@ static tf_type across_output_type(across_fn_kind fn, tf_type input) {
     return TF_TYPE_FLOAT64;
 }
 
-static void across_copy_cell(tf_batch *out, size_t out_row, size_t out_col,
-                             const tf_batch *in, size_t in_row, size_t in_col) {
-    if (tf_batch_is_null(in, in_row, in_col)) {
-        tf_batch_set_null(out, out_row, out_col);
-        return;
-    }
-    switch (in->col_types[in_col]) {
-        case TF_TYPE_BOOL: tf_batch_set_bool(out, out_row, out_col, tf_batch_get_bool(in, in_row, in_col)); break;
-        case TF_TYPE_INT64: tf_batch_set_int64(out, out_row, out_col, tf_batch_get_int64(in, in_row, in_col)); break;
-        case TF_TYPE_FLOAT64: tf_batch_set_float64(out, out_row, out_col, tf_batch_get_float64(in, in_row, in_col)); break;
-        case TF_TYPE_STRING: tf_batch_set_string(out, out_row, out_col, tf_batch_get_string(in, in_row, in_col)); break;
-        case TF_TYPE_DATE: tf_batch_set_date(out, out_row, out_col, tf_batch_get_date(in, in_row, in_col)); break;
-        case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(out, out_row, out_col, tf_batch_get_timestamp(in, in_row, in_col)); break;
-        default: tf_batch_set_null(out, out_row, out_col); break;
-    }
-}
-
-static void across_set_string_transform(tf_batch *out, size_t row, size_t col,
-                                        across_fn_kind fn, const char *s) {
-    if (!s) { tf_batch_set_null(out, row, col); return; }
+static int across_set_string_transform(tf_batch *out, size_t row, size_t col,
+                                       across_fn_kind fn, const char *s) {
+    if (!s) return tf_batch_set_null(out, row, col);
     const char *start = s;
     size_t len = strlen(s);
     if (fn == ACROSS_FN_TRIM) {
@@ -122,8 +105,10 @@ static void across_set_string_transform(tf_batch *out, size_t row, size_t col,
         len = strlen(start);
         while (len > 0 && isspace((unsigned char)start[len - 1])) len--;
     }
-    char *buf = malloc(len + 1);
-    if (!buf) { tf_batch_set_null(out, row, col); return; }
+    size_t cap = 0;
+    if (tf_size_add(len, 1, &cap) != TF_OK) return TF_ERROR;
+    char *buf = tf_mallocarray_checked(cap, sizeof(char));
+    if (!buf) return TF_ERROR;
     for (size_t i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)start[i];
         if (fn == ACROSS_FN_LOWER) buf[i] = (char)tolower(ch);
@@ -131,8 +116,9 @@ static void across_set_string_transform(tf_batch *out, size_t row, size_t col,
         else buf[i] = (char)ch;
     }
     buf[len] = '\0';
-    tf_batch_set_string(out, row, col, buf);
+    int rc = tf_batch_set_string(out, row, col, buf);
     free(buf);
+    return rc;
 }
 
 static int across_get_numeric(const tf_batch *in, size_t row, size_t col, double *out) {
@@ -153,55 +139,52 @@ static int across_double_to_i64(double v, int64_t *out) {
     return TF_OK;
 }
 
-static void across_apply_cell(tf_batch *out, size_t out_row, size_t out_col,
-                              const tf_batch *in, size_t in_row, size_t in_col,
-                              across_fn_kind fn) {
-    if (tf_batch_is_null(in, in_row, in_col)) {
-        tf_batch_set_null(out, out_row, out_col);
-        return;
-    }
+static int across_apply_cell(tf_batch *out, size_t out_row, size_t out_col,
+                             const tf_batch *in, size_t in_row, size_t in_col,
+                             across_fn_kind fn) {
+    if (tf_batch_is_null(in, in_row, in_col)) return tf_batch_set_null(out, out_row, out_col);
     if (across_fn_is_string(fn)) {
-        across_set_string_transform(out, out_row, out_col, fn, tf_batch_get_string(in, in_row, in_col));
-        return;
+        return across_set_string_transform(out, out_row, out_col, fn,
+                                           tf_batch_get_string(in, in_row, in_col));
     }
 
     if (fn == ACROSS_FN_ABS && in->col_types[in_col] == TF_TYPE_INT64) {
         int64_t v = tf_batch_get_int64(in, in_row, in_col);
-        if (v == INT64_MIN) { tf_batch_set_null(out, out_row, out_col); return; }
-        tf_batch_set_int64(out, out_row, out_col, v < 0 ? -v : v);
-        return;
+        if (v == INT64_MIN) return tf_batch_set_null(out, out_row, out_col);
+        return tf_batch_set_int64(out, out_row, out_col, v < 0 ? -v : v);
     }
 
     double v = 0.0;
-    if (across_get_numeric(in, in_row, in_col, &v) != TF_OK) {
-        tf_batch_set_null(out, out_row, out_col);
-        return;
-    }
+    if (across_get_numeric(in, in_row, in_col, &v) != TF_OK) return tf_batch_set_null(out, out_row, out_col);
 
     if (fn == ACROSS_FN_ABS) {
-        tf_batch_set_float64(out, out_row, out_col, fabs(v));
+        return tf_batch_set_float64(out, out_row, out_col, fabs(v));
     } else if (fn == ACROSS_FN_ROUND || fn == ACROSS_FN_FLOOR || fn == ACROSS_FN_CEIL) {
         double rv = fn == ACROSS_FN_ROUND ? round(v) : (fn == ACROSS_FN_FLOOR ? floor(v) : ceil(v));
         int64_t iv = 0;
-        if (across_double_to_i64(rv, &iv) != TF_OK) tf_batch_set_null(out, out_row, out_col);
-        else tf_batch_set_int64(out, out_row, out_col, iv);
+        if (across_double_to_i64(rv, &iv) != TF_OK) return tf_batch_set_null(out, out_row, out_col);
+        return tf_batch_set_int64(out, out_row, out_col, iv);
     } else if (fn == ACROSS_FN_SQRT) {
-        if (v < 0.0) tf_batch_set_null(out, out_row, out_col);
-        else tf_batch_set_float64(out, out_row, out_col, sqrt(v));
+        if (v < 0.0) return tf_batch_set_null(out, out_row, out_col);
+        return tf_batch_set_float64(out, out_row, out_col, sqrt(v));
     } else if (fn == ACROSS_FN_LOG) {
-        if (v <= 0.0) tf_batch_set_null(out, out_row, out_col);
-        else tf_batch_set_float64(out, out_row, out_col, log(v));
+        if (v <= 0.0) return tf_batch_set_null(out, out_row, out_col);
+        return tf_batch_set_float64(out, out_row, out_col, log(v));
     } else if (fn == ACROSS_FN_EXP) {
         double ev = exp(v);
-        if (!isfinite(ev)) tf_batch_set_null(out, out_row, out_col);
-        else tf_batch_set_float64(out, out_row, out_col, ev);
-    } else {
-        tf_batch_set_null(out, out_row, out_col);
+        if (!isfinite(ev)) return tf_batch_set_null(out, out_row, out_col);
+        return tf_batch_set_float64(out, out_row, out_col, ev);
     }
+    return tf_batch_set_null(out, out_row, out_col);
 }
 
 static int token_matches(const char *p, const char *tok) {
     return strncmp(p, tok, strlen(tok)) == 0;
+}
+
+static int across_add_len(size_t *len, size_t add) {
+    if (!len) return TF_ERROR;
+    return tf_size_add(*len, add, len);
 }
 
 static char *across_format_name(const char *tmpl, const char *col, const char *fn) {
@@ -210,13 +193,26 @@ static char *across_format_name(const char *tmpl, const char *col, const char *f
     if (!fn) fn = "";
     size_t len = 0;
     for (const char *p = tmpl; *p;) {
-        if (token_matches(p, "{.col}")) { len += strlen(col); p += 6; }
-        else if (token_matches(p, "{col}")) { len += strlen(col); p += 5; }
-        else if (token_matches(p, "{.fn}")) { len += strlen(fn); p += 5; }
-        else if (token_matches(p, "{fn}")) { len += strlen(fn); p += 4; }
-        else { len++; p++; }
+        if (token_matches(p, "{.col}")) {
+            if (across_add_len(&len, strlen(col)) != TF_OK) return NULL;
+            p += 6;
+        } else if (token_matches(p, "{col}")) {
+            if (across_add_len(&len, strlen(col)) != TF_OK) return NULL;
+            p += 5;
+        } else if (token_matches(p, "{.fn}")) {
+            if (across_add_len(&len, strlen(fn)) != TF_OK) return NULL;
+            p += 5;
+        } else if (token_matches(p, "{fn}")) {
+            if (across_add_len(&len, strlen(fn)) != TF_OK) return NULL;
+            p += 4;
+        } else {
+            if (across_add_len(&len, 1) != TF_OK) return NULL;
+            p++;
+        }
     }
-    char *out = malloc(len + 1);
+    size_t alloc_len = 0;
+    if (tf_size_add(len, 1, &alloc_len) != TF_OK) return NULL;
+    char *out = tf_mallocarray_checked(alloc_len, sizeof(char));
     if (!out) return NULL;
     char *w = out;
     for (const char *p = tmpl; *p;) {
@@ -244,39 +240,49 @@ static int across_process(tf_step *self, tf_batch *in, tf_batch **out,
     across_state *st = self->state;
     *out = NULL;
 
+    int rc = TF_ERROR;
     int *indices = NULL;
     size_t n_indices = 0;
     char *selector_error = NULL;
+    int *selected_pos = NULL;
+    tf_type *out_types = NULL;
+    char **append_names = NULL;
+    size_t *append_src = NULL;
+    size_t *append_fn = NULL;
+    tf_batch *ob = NULL;
+    size_t n_appended = 0;
+    size_t out_n_cols = 0;
+
     if (tf_column_selectors_resolve(st->selectors, st->n_selectors,
                                     in->col_names, in->col_types, in->n_cols,
                                     &indices, &n_indices, &selector_error) != TF_OK) {
-        across_write_error(side, selector_error ? selector_error : "selector resolution failed", NULL, NULL);
-        free(selector_error);
-        return TF_ERROR;
+        if (across_write_error(side, selector_error ? selector_error : "selector resolution failed", NULL, NULL) != TF_OK)
+            goto done;
+        goto done;
     }
 
-    int *selected_pos = malloc((in->n_cols ? in->n_cols : 1) * sizeof(int));
-    if (!selected_pos) { free(indices); return TF_ERROR; }
-    for (size_t i = 0; i < in->n_cols; i++) selected_pos[i] = -1;
-    for (size_t i = 0; i < n_indices; i++) selected_pos[indices[i]] = (int)i;
+    size_t selected_pos_count = in->n_cols ? in->n_cols : 1;
+    selected_pos = tf_mallocarray_checked(selected_pos_count, sizeof(int));
+    if (!selected_pos) goto done;
+    for (size_t i = 0; i < selected_pos_count; i++) selected_pos[i] = -1;
+    for (size_t i = 0; i < n_indices; i++) {
+        if (indices[i] < 0 || (size_t)indices[i] >= in->n_cols) goto done;
+        selected_pos[indices[i]] = (int)i;
+    }
 
     if (st->replace && st->n_fns != 1) {
-        across_write_error(side, "replace=true requires exactly one function", NULL, NULL);
-        free(selected_pos); free(indices);
-        return TF_ERROR;
+        if (across_write_error(side, "replace=true requires exactly one function", NULL, NULL) != TF_OK)
+            goto done;
+        goto done;
     }
 
-    size_t n_appended = st->replace ? 0 : n_indices * st->n_fns;
-    size_t out_n_cols = in->n_cols + n_appended;
-    tf_type *out_types = calloc(out_n_cols ? out_n_cols : 1, sizeof(tf_type));
-    char **append_names = n_appended ? calloc(n_appended, sizeof(char *)) : NULL;
-    size_t *append_src = n_appended ? calloc(n_appended, sizeof(size_t)) : NULL;
-    size_t *append_fn = n_appended ? calloc(n_appended, sizeof(size_t)) : NULL;
-    if (!out_types || (n_appended && (!append_names || !append_src || !append_fn))) {
-        free(out_types); free(append_names); free(append_src); free(append_fn);
-        free(selected_pos); free(indices);
-        return TF_ERROR;
-    }
+    if (!st->replace && tf_size_mul(n_indices, st->n_fns, &n_appended) != TF_OK) goto done;
+    if (tf_size_add(in->n_cols, n_appended, &out_n_cols) != TF_OK) goto done;
+    out_types = tf_callocarray_checked(out_n_cols ? out_n_cols : 1, sizeof(tf_type));
+    append_names = n_appended ? tf_callocarray_checked(n_appended, sizeof(char *)) : NULL;
+    append_src = n_appended ? tf_callocarray_checked(n_appended, sizeof(size_t)) : NULL;
+    append_fn = n_appended ? tf_callocarray_checked(n_appended, sizeof(size_t)) : NULL;
+    if (!out_types || (n_appended && (!append_names || !append_src || !append_fn))) goto done;
 
     for (size_t c = 0; c < in->n_cols; c++) out_types[c] = in->col_types[c];
     if (st->replace) {
@@ -284,10 +290,10 @@ static int across_process(tf_step *self, tf_batch *in, tf_batch **out,
             size_t ci = (size_t)indices[i];
             tf_type t = across_output_type(st->fns[0], in->col_types[ci]);
             if (t == TF_TYPE_NULL) {
-                across_write_error(side, "function is incompatible with column type", in->col_names[ci], st->fn_names[0]);
-                free(out_types); free(append_names); free(append_src); free(append_fn);
-                free(selected_pos); free(indices);
-                return TF_ERROR;
+                if (across_write_error(side, "function is incompatible with column type",
+                                       in->col_names[ci], st->fn_names[0]) != TF_OK)
+                    goto done;
+                goto done;
             }
             out_types[ci] = t;
         }
@@ -298,54 +304,63 @@ static int across_process(tf_step *self, tf_batch *in, tf_batch **out,
             for (size_t f = 0; f < st->n_fns; f++) {
                 tf_type t = across_output_type(st->fns[f], in->col_types[ci]);
                 if (t == TF_TYPE_NULL) {
-                    across_write_error(side, "function is incompatible with column type", in->col_names[ci], st->fn_names[f]);
-                    for (size_t k = 0; k < a; k++) free(append_names[k]);
-                    free(out_types); free(append_names); free(append_src); free(append_fn);
-                    free(selected_pos); free(indices);
-                    return TF_ERROR;
+                    if (across_write_error(side, "function is incompatible with column type",
+                                           in->col_names[ci], st->fn_names[f]) != TF_OK)
+                        goto done;
+                    goto done;
                 }
                 append_src[a] = ci;
                 append_fn[a] = f;
                 append_names[a] = across_format_name(st->names_template, in->col_names[ci], st->fn_names[f]);
-                if (!append_names[a]) {
-                    for (size_t k = 0; k < a; k++) free(append_names[k]);
-                    free(out_types); free(append_names); free(append_src); free(append_fn);
-                    free(selected_pos); free(indices);
-                    return TF_ERROR;
-                }
+                if (!append_names[a]) goto done;
                 out_types[in->n_cols + a] = t;
                 a++;
             }
         }
     }
 
-    tf_batch *ob = tf_batch_create(out_n_cols, in->n_rows > 0 ? in->n_rows : 1);
-    if (!ob) {
-        for (size_t k = 0; k < n_appended; k++) free(append_names[k]);
-        free(out_types); free(append_names); free(append_src); free(append_fn);
-        free(selected_pos); free(indices);
-        return TF_ERROR;
+    ob = tf_batch_create(out_n_cols, in->n_rows > 0 ? in->n_rows : 1);
+    if (!ob) goto done;
+    for (size_t c = 0; c < in->n_cols; c++) {
+        if (tf_batch_set_schema(ob, c, in->col_names[c], out_types[c]) != TF_OK) goto done;
     }
-    for (size_t c = 0; c < in->n_cols; c++) tf_batch_set_schema(ob, c, in->col_names[c], out_types[c]);
-    for (size_t a = 0; a < n_appended; a++) tf_batch_set_schema(ob, in->n_cols + a, append_names[a], out_types[in->n_cols + a]);
+    for (size_t a = 0; a < n_appended; a++) {
+        if (tf_batch_set_schema(ob, in->n_cols + a, append_names[a], out_types[in->n_cols + a]) != TF_OK) goto done;
+    }
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_ensure_capacity(ob, r + 1);
+        size_t need_rows = 0;
+        if (tf_size_add(r, 1, &need_rows) != TF_OK ||
+            tf_batch_ensure_capacity(ob, need_rows) != TF_OK)
+            goto done;
         for (size_t c = 0; c < in->n_cols; c++) {
-            if (st->replace && selected_pos[c] >= 0) across_apply_cell(ob, r, c, in, r, c, st->fns[0]);
-            else across_copy_cell(ob, r, c, in, r, c);
+            int write_rc = (st->replace && selected_pos[c] >= 0)
+                ? across_apply_cell(ob, r, c, in, r, c, st->fns[0])
+                : tf_batch_copy_cell(ob, r, c, in, r, c);
+            if (write_rc != TF_OK) goto done;
         }
         for (size_t a = 0; a < n_appended; a++) {
-            across_apply_cell(ob, r, in->n_cols + a, in, r, append_src[a], st->fns[append_fn[a]]);
+            if (across_apply_cell(ob, r, in->n_cols + a, in, r, append_src[a], st->fns[append_fn[a]]) != TF_OK)
+                goto done;
         }
-        ob->n_rows = r + 1;
+        if (tf_batch_expose_row(ob, r) != TF_OK) goto done;
     }
 
-    for (size_t k = 0; k < n_appended; k++) free(append_names[k]);
-    free(out_types); free(append_names); free(append_src); free(append_fn);
-    free(selected_pos); free(indices);
     *out = ob;
-    return TF_OK;
+    ob = NULL;
+    rc = TF_OK;
+
+done:
+    if (ob) tf_batch_free(ob);
+    for (size_t k = 0; k < n_appended; k++) free(append_names ? append_names[k] : NULL);
+    free(out_types);
+    free(append_names);
+    free(append_src);
+    free(append_fn);
+    free(selected_pos);
+    free(indices);
+    free(selector_error);
+    return rc;
 }
 
 static int across_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
@@ -370,7 +385,7 @@ static int parse_string_array(const cJSON *arr, char ***out_items, size_t *out_n
     if (!cJSON_IsArray(arr)) return TF_ERROR;
     int n = cJSON_GetArraySize((cJSON *)arr);
     if (n <= 0) return TF_ERROR;
-    char **items = calloc((size_t)n, sizeof(char *));
+    char **items = tf_callocarray_checked((size_t)n, sizeof(char *));
     if (!items) return TF_ERROR;
     for (int i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem((cJSON *)arr, i);
@@ -405,8 +420,8 @@ tf_step *tf_across_create(const cJSON *args) {
     cJSON *fn = cJSON_GetObjectItemCaseSensitive(args, "fn");
     if (functions) {
         if (cJSON_IsString(functions)) {
-            st->fn_names = calloc(1, sizeof(char *));
-            st->fns = calloc(1, sizeof(across_fn_kind));
+            st->fn_names = tf_callocarray_checked(1, sizeof(char *));
+            st->fns = tf_callocarray_checked(1, sizeof(across_fn_kind));
             if (!st->fn_names || !st->fns) goto fail;
             st->fn_names[0] = strdup(functions->valuestring);
             st->n_fns = 1;
@@ -414,8 +429,8 @@ tf_step *tf_across_create(const cJSON *args) {
             goto fail;
         }
     } else if (cJSON_IsString(fn)) {
-        st->fn_names = calloc(1, sizeof(char *));
-        st->fns = calloc(1, sizeof(across_fn_kind));
+        st->fn_names = tf_callocarray_checked(1, sizeof(char *));
+        st->fns = tf_callocarray_checked(1, sizeof(across_fn_kind));
         if (!st->fn_names || !st->fns) goto fail;
         st->fn_names[0] = strdup(fn->valuestring);
         st->n_fns = 1;
@@ -424,7 +439,7 @@ tf_step *tf_across_create(const cJSON *args) {
     }
 
     if (!st->fns) {
-        st->fns = calloc(st->n_fns, sizeof(across_fn_kind));
+        st->fns = tf_callocarray_checked(st->n_fns, sizeof(across_fn_kind));
         if (!st->fns) goto fail;
     }
     for (size_t i = 0; i < st->n_fns; i++) {

@@ -26,15 +26,24 @@ enum {
     TF_FINISH_PHASE_DONE = 4
 };
 
-static char *g_last_error = NULL;
+#define TF_LAST_ERROR_CAP 1024
+
+#if defined(_MSC_VER)
+static __declspec(thread) char g_last_error[TF_LAST_ERROR_CAP];
+#else
+static _Thread_local char g_last_error[TF_LAST_ERROR_CAP];
+#endif
 
 void tf_set_last_error(const char *msg) {
-    free(g_last_error);
-    g_last_error = msg ? strdup(msg) : NULL;
+    if (!msg || !*msg) {
+        g_last_error[0] = '\0';
+        return;
+    }
+    snprintf(g_last_error, sizeof(g_last_error), "%s", msg);
 }
 
 const char *tf_last_error(void) {
-    return g_last_error;
+    return g_last_error[0] ? g_last_error : NULL;
 }
 
 static void pipeline_set_error(tf_pipeline *p, const char *fallback) {
@@ -117,15 +126,6 @@ static int node_has_spill_dir(const tf_ir_node *node) {
     return cJSON_IsString(spill) && spill->valuestring && spill->valuestring[0];
 }
 
-
-static int node_op_is_filtering_join(const tf_ir_node *node) {
-    if (!node || !node->op) return 0;
-    if (strcmp(node->op, "semi-join") == 0 || strcmp(node->op, "anti-join") == 0) return 1;
-    if (strcmp(node->op, "join") != 0 || !node->args) return 0;
-    cJSON *how = cJSON_GetObjectItemCaseSensitive(node->args, "how");
-    return cJSON_IsString(how) && how->valuestring &&
-           (strcmp(how->valuestring, "semi") == 0 || strcmp(how->valuestring, "anti") == 0);
-}
 
 static int node_op_is_join_spillable(const tf_ir_node *node) {
     if (!node || !node->op) return 0;
@@ -350,33 +350,17 @@ static tf_pipeline *assemble_pipeline(tf_decoder *decoder, tf_step **steps,
     return p;
 }
 
-tf_pipeline *tf_pipeline_create(const char *plan_json, size_t len) {
-    if (!plan_json || len == 0) {
-        tf_set_last_error("empty plan");
-        return NULL;
-    }
-
+static tf_pipeline *pipeline_create_from_owned_ir(tf_ir_plan *ir, const tf_host_policy *policy) {
     char *error = NULL;
 
-    /* 1. Parse JSON → IR */
-    tf_ir_plan *ir = tf_ir_from_json(plan_json, len, &error);
-    if (!ir) {
-        tf_set_last_error(error ? error : "failed to parse plan");
-        free(error);
-        return NULL;
-    }
-
-    /* 2. Validate */
-    if (tf_ir_validate(ir) != TF_OK) {
+    if (tf_ir_validate_with_host_policy(ir, policy) != TF_OK) {
         tf_set_last_error(ir->error ? ir->error : "validation failed");
         tf_ir_plan_free(ir);
         return NULL;
     }
 
-    /* 3. Schema inference (best-effort, non-fatal) */
     tf_ir_infer_schema(ir);
 
-    /* 4. Build per-step stats metadata and compile to native target */
     tf_step_run_stats *step_stats = NULL;
     size_t n_step_stats = 0;
     if (build_step_stats_from_plan(ir, &step_stats, &n_step_stats) != TF_OK) {
@@ -398,9 +382,42 @@ tf_pipeline *tf_pipeline_create(const char *plan_json, size_t len) {
     }
 
     tf_ir_plan_free(ir);
-
-    /* 5. Assemble pipeline */
     return assemble_pipeline(decoder, steps, n_steps, step_stats, n_step_stats, encoder);
+}
+
+tf_pipeline *tf_pipeline_create_with_host_policy(const char *plan_json, size_t len,
+                                                 const tf_host_policy *policy) {
+    if (!plan_json || len == 0) {
+        tf_set_last_error("empty plan");
+        return NULL;
+    }
+
+    char *error = NULL;
+    tf_ir_plan *ir = tf_ir_from_json(plan_json, len, &error);
+    if (!ir) {
+        tf_set_last_error(error ? error : "failed to parse plan");
+        free(error);
+        return NULL;
+    }
+    return pipeline_create_from_owned_ir(ir, policy);
+}
+
+tf_pipeline *tf_pipeline_create(const char *plan_json, size_t len) {
+    return tf_pipeline_create_with_host_policy(plan_json, len, NULL);
+}
+
+tf_pipeline *tf_pipeline_create_from_ir_with_host_policy(const tf_ir_plan *plan,
+                                                                 const tf_host_policy *policy) {
+    if (!plan) {
+        tf_set_last_error("NULL IR plan");
+        return NULL;
+    }
+    tf_ir_plan *copy = tf_ir_plan_clone(plan);
+    if (!copy) {
+        tf_set_last_error("out of memory");
+        return NULL;
+    }
+    return pipeline_create_from_owned_ir(copy, policy);
 }
 
 tf_pipeline *tf_pipeline_create_from_ir(const tf_ir_plan *plan) {
@@ -441,6 +458,9 @@ char *tf_ir_plan_to_json(const tf_ir_plan *plan) {
 }
 int tf_ir_plan_validate(tf_ir_plan *plan) {
     return tf_ir_validate(plan);
+}
+int tf_ir_plan_validate_with_host_policy(tf_ir_plan *plan, const tf_host_policy *policy) {
+    return tf_ir_validate_with_host_policy(plan, policy);
 }
 int tf_ir_plan_infer_schema(tf_ir_plan *plan) {
     return tf_ir_infer_schema(plan);
@@ -1009,12 +1029,13 @@ char *tf_ir_plan_to_sql(const tf_ir_plan *plan, char **error) {
     return tf_ir_to_sql(plan, error);
 }
 
-char *tf_compile_dsl(const char *dsl, size_t len, char **error) {
+char *tf_compile_dsl_with_host_policy(const char *dsl, size_t len,
+                                      const tf_host_policy *policy, char **error) {
     if (error) *error = NULL;
     tf_ir_plan *plan = tf_dsl_parse(dsl, len, error);
     if (!plan) return NULL;
 
-    if (tf_ir_validate(plan) != TF_OK) {
+    if (tf_ir_validate_with_host_policy(plan, policy) != TF_OK) {
         if (error) *error = strdup(plan->error ? plan->error : "validation failed");
         tf_ir_plan_destroy(plan);
         return NULL;
@@ -1024,6 +1045,10 @@ char *tf_compile_dsl(const char *dsl, size_t len, char **error) {
     char *json = tf_ir_plan_to_json(plan);
     tf_ir_plan_destroy(plan);
     return json;
+}
+
+char *tf_compile_dsl(const char *dsl, size_t len, char **error) {
+    return tf_compile_dsl_with_host_policy(dsl, len, NULL, error);
 }
 
 void tf_string_free(char *s) {

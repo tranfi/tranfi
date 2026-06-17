@@ -328,6 +328,32 @@ async function createTranfi() {
     return result
   }
 
+  function hostPolicyOptions(options) {
+    options = options || {}
+    return {
+      allowFs: options.allowFs === undefined ? Boolean(options.spillDir) : Boolean(options.allowFs),
+      allowSpill: Boolean(options.spillDir),
+      allowRulesFile: Boolean(options.allowRulesFile),
+      workspaceRoot: options.workspaceRoot
+    }
+  }
+
+  function planUsesHostPaths(planJson) {
+    try {
+      var plan = JSON.parse(planJson)
+      var steps = Array.isArray(plan.steps) ? plan.steps : []
+      return steps.some(function(step) {
+        var args = step && step.args
+        if (!args || typeof args !== 'object') return false
+        return ['file', 'rules_file', 'rulesFile', 'spill_dir', 'spillDir'].some(function(key) {
+          return typeof args[key] === 'string' && args[key].length > 0
+        })
+      })
+    } catch (_) {
+      return false
+    }
+  }
+
   return {
     /** Raw WASM module (for advanced use) */
     _wasm: wasm,
@@ -371,10 +397,26 @@ async function createTranfi() {
     },
 
     /** Create a native pipeline (push/pull streaming) */
-    createPipeline(planJson) {
+    createPipeline(planJson, options) {
+      options = options || {}
       var s = allocString(planJson)
-      var handle = wasm.ccall('wasm_pipeline_create', 'number', ['number', 'number'], [s.ptr, s.len])
+      var root = options.workspaceRoot ? allocString(String(options.workspaceRoot)) : { ptr: 0 }
+      var hasPolicyCreate = typeof wasm._wasm_pipeline_create_with_policy === 'function'
+      var needsPolicyCreate = options.allowFs || options.allowSpill || options.allowRulesFile || root.ptr || planUsesHostPaths(planJson)
+      var handle = -1
+      if (hasPolicyCreate) {
+        handle = wasm.ccall('wasm_pipeline_create_with_policy', 'number',
+          ['number', 'number', 'number', 'number', 'number', 'number'],
+          [s.ptr, s.len, options.allowFs ? 1 : 0, options.allowSpill ? 1 : 0,
+            options.allowRulesFile ? 1 : 0, root.ptr])
+      } else if (!needsPolicyCreate) {
+        handle = wasm.ccall('wasm_pipeline_create', 'number', ['number', 'number'], [s.ptr, s.len])
+      }
       wasm._free(s.ptr)
+      if (root.ptr) wasm._free(root.ptr)
+      if (!hasPolicyCreate && needsPolicyCreate) {
+        throw new Error('Failed to create pipeline: WASM host policy export unavailable for this plan; rebuild tranfi_core.js')
+      }
       if (handle < 0) {
         var err = wasm.ccall('wasm_pipeline_error', 'string', ['number'], [handle])
         throw new Error('Failed to create pipeline: ' + (err || 'unknown error'))
@@ -486,7 +528,7 @@ async function createTranfi() {
 
       var planJson = this.compileDsl(dsl)
       planJson = prepareNativePlan(planJson, { allowBlocking: allowBlocking, memory: options.memory, spillDir: options.spillDir })
-      var handle = this.createPipeline(planJson)
+      var handle = this.createPipeline(planJson, hostPolicyOptions(options))
       var outputChunks = []
       var self = this
       function drainMain() {
@@ -531,7 +573,7 @@ async function createTranfi() {
       var allowBlocking = options.allowBlocking === true
       var planJson = this.compileDsl(dsl)
       planJson = prepareNativePlan(planJson, { allowBlocking: allowBlocking, memory: options.memory, spillDir: options.spillDir })
-      var handle = this.createPipeline(planJson)
+      var handle = this.createPipeline(planJson, hostPolicyOptions(options))
       try {
         var buf = toBytes(data || '')
         for (var i = 0; i < buf.length; i += chunkSize) {

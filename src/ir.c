@@ -11,8 +11,10 @@
 
 void tf_schema_free(tf_schema *s) {
     if (!s) return;
-    for (size_t i = 0; i < s->n_cols; i++) {
-        free(s->col_names[i]);
+    if (s->col_names) {
+        for (size_t i = 0; i < s->n_cols; i++) {
+            free(s->col_names[i]);
+        }
     }
     free(s->col_names);
     free(s->col_types);
@@ -23,19 +25,32 @@ void tf_schema_free(tf_schema *s) {
 }
 
 void tf_schema_copy(tf_schema *dst, const tf_schema *src) {
+    if (!dst) return;
+    dst->known = false;
+    dst->n_cols = 0;
+    dst->col_names = NULL;
+    dst->col_types = NULL;
+    if (!src) return;
+
     dst->known = src->known;
     dst->n_cols = src->n_cols;
-    if (src->n_cols == 0 || !src->known) {
-        dst->col_names = NULL;
-        dst->col_types = NULL;
-        return;
-    }
+    if (src->n_cols == 0 || !src->known) return;
+
     dst->col_names = calloc(src->n_cols, sizeof(char *));
     dst->col_types = calloc(src->n_cols, sizeof(tf_type));
+    if (!dst->col_names || !dst->col_types) {
+        tf_schema_free(dst);
+        return;
+    }
     for (size_t i = 0; i < src->n_cols; i++) {
-        dst->col_names[i] = strdup(src->col_names[i]);
+        dst->col_names[i] = strdup(src->col_names[i] ? src->col_names[i] : "");
+        if (!dst->col_names[i]) {
+            tf_schema_free(dst);
+            return;
+        }
         dst->col_types[i] = src->col_types[i];
     }
+    dst->known = true;
 }
 
 /* ---- IR node helpers ---- */
@@ -59,6 +74,7 @@ tf_ir_plan *tf_ir_plan_create(void) {
 }
 
 int tf_ir_plan_add_node(tf_ir_plan *plan, const char *op, cJSON *args) {
+    if (!plan || !op) return -1;
     if (plan->n_nodes >= plan->capacity) {
         size_t new_cap = plan->capacity * 2;
         tf_ir_node *new_nodes = realloc(plan->nodes, new_cap * sizeof(tf_ir_node));
@@ -69,10 +85,18 @@ int tf_ir_plan_add_node(tf_ir_plan *plan, const char *op, cJSON *args) {
         plan->capacity = new_cap;
     }
 
+    char *op_copy = strdup(op);
+    cJSON *args_copy = args ? cJSON_Duplicate(args, 1) : cJSON_CreateObject();
+    if (!op_copy || !args_copy) {
+        free(op_copy);
+        if (args_copy) cJSON_Delete(args_copy);
+        return -1;
+    }
+
     tf_ir_node *node = &plan->nodes[plan->n_nodes];
     memset(node, 0, sizeof(tf_ir_node));
-    node->op = strdup(op);
-    node->args = args ? cJSON_Duplicate(args, 1) : cJSON_CreateObject();
+    node->op = op_copy;
+    node->args = args_copy;
     node->index = plan->n_nodes;
 
     plan->n_nodes++;

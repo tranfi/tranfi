@@ -38,10 +38,16 @@ static int grep_process(tf_step *self, tf_batch *in, tf_batch **out,
             /* Don't free — caller owns it, but we need to copy */
             tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
             if (!ob) return TF_ERROR;
-            for (size_t c = 0; c < in->n_cols; c++)
-                tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
-            for (size_t r = 0; r < in->n_rows; r++)
-                tf_batch_copy_row(ob, r, in, r);
+            if (tf_batch_clone_schema(ob, in) != TF_OK) {
+                tf_batch_free(ob);
+                return TF_ERROR;
+            }
+            for (size_t r = 0; r < in->n_rows; r++) {
+                if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
+            }
             ob->n_rows = in->n_rows;
             *out = ob;
         }
@@ -51,8 +57,10 @@ static int grep_process(tf_step *self, tf_batch *in, tf_batch **out,
     /* Create output batch with same schema */
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     size_t out_row = 0;
     for (size_t r = 0; r < in->n_rows; r++) {
@@ -77,7 +85,10 @@ static int grep_process(tf_step *self, tf_batch *in, tf_batch **out,
             return TF_ERROR;
         }
 
-        tf_batch_copy_row(ob, out_row, in, r);
+        if (tf_batch_copy_row(ob, out_row, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         out_row++;
     }
     ob->n_rows = out_row;
@@ -88,9 +99,12 @@ static int grep_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (side && side->stats) {
         char stats_buf[128];
         snprintf(stats_buf, sizeof(stats_buf),
-                 "{\"op\":\"grep\",\"rows_in\":%zu,\"rows_out\":%zu}\n",
+                 "{\"op\":\"grep\",\"rows_in\":%zu,\"rows_out\":%zu}",
                  in->n_rows, out_row);
-        tf_buffer_write_str(side->stats, stats_buf);
+        if (tf_buffer_write_line(side->stats, stats_buf) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     if (out_row > 0) {

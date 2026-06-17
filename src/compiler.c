@@ -3,7 +3,7 @@
  *
  * Iterates IR nodes, looks up each op in the registry,
  * and calls create_native() to build live decoder/steps/encoder structs.
- * Replaces the constructor dispatch loop that was in plan.c.
+ * This is the single native construction path for JSON IR plans.
  */
 
 #include "ir.h"

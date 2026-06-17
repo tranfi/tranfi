@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdint.h>
 
 typedef enum {
     STEP_RUNNING_SUM,
@@ -59,70 +60,107 @@ static int step_process(tf_step *self, tf_batch *in, tf_batch **out,
     step_state *st = self->state;
     *out = NULL;
 
+    const char *extra_names[1] = {st->result};
+    tf_type extra_types[1] = {TF_TYPE_FLOAT64};
     tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
-    tf_batch_set_schema(ob, in->n_cols, st->result, TF_TYPE_FLOAT64);
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     int ci = tf_batch_col_index(in, st->column);
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_copy_row(ob, r, in, r);
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
 
         if (ci < 0 || tf_batch_is_null(in, r, ci)) {
-            tf_batch_set_null(ob, r, in->n_cols);
+            if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             ob->n_rows = r + 1;
             continue;
         }
 
         double val = get_numeric(in, r, ci);
         double result = 0;
+        double next_running_sum = st->running_sum;
+        double next_running_min = st->running_min;
+        double next_running_max = st->running_max;
+        size_t next_running_count = st->running_count;
+        double next_prev_val = st->prev_val;
+        int next_has_prev = st->has_prev;
+        int write_null = 0;
 
         switch (st->func) {
             case STEP_RUNNING_SUM:
-                st->running_sum += val;
-                result = st->running_sum;
+                next_running_sum += val;
+                result = next_running_sum;
                 break;
             case STEP_RUNNING_AVG:
-                st->running_sum += val;
-                st->running_count++;
-                result = st->running_sum / st->running_count;
+                if (next_running_count == SIZE_MAX) { tf_batch_free(ob); return TF_ERROR; }
+                next_running_sum += val;
+                next_running_count++;
+                result = next_running_sum / next_running_count;
                 break;
             case STEP_RUNNING_MIN:
-                if (st->running_count == 0 || val < st->running_min)
-                    st->running_min = val;
-                st->running_count++;
-                result = st->running_min;
+                if (next_running_count == SIZE_MAX) { tf_batch_free(ob); return TF_ERROR; }
+                if (next_running_count == 0 || val < next_running_min)
+                    next_running_min = val;
+                next_running_count++;
+                result = next_running_min;
                 break;
             case STEP_RUNNING_MAX:
-                if (st->running_count == 0 || val > st->running_max)
-                    st->running_max = val;
-                st->running_count++;
-                result = st->running_max;
+                if (next_running_count == SIZE_MAX) { tf_batch_free(ob); return TF_ERROR; }
+                if (next_running_count == 0 || val > next_running_max)
+                    next_running_max = val;
+                next_running_count++;
+                result = next_running_max;
                 break;
             case STEP_RUNNING_COUNT:
-                st->running_count++;
-                result = (double)st->running_count;
+                if (next_running_count == SIZE_MAX) { tf_batch_free(ob); return TF_ERROR; }
+                next_running_count++;
+                result = (double)next_running_count;
                 break;
             case STEP_DELTA:
                 if (st->has_prev) result = val - st->prev_val;
-                else { tf_batch_set_null(ob, r, in->n_cols); st->prev_val = val; st->has_prev = 1; ob->n_rows = r + 1; continue; }
-                st->prev_val = val;
+                else write_null = 1;
+                next_prev_val = val;
+                next_has_prev = 1;
                 break;
             case STEP_LAG:
                 if (st->has_prev) result = st->prev_val;
-                else { tf_batch_set_null(ob, r, in->n_cols); st->prev_val = val; st->has_prev = 1; ob->n_rows = r + 1; continue; }
-                st->prev_val = val;
+                else write_null = 1;
+                next_prev_val = val;
+                next_has_prev = 1;
                 break;
             case STEP_RATIO:
                 if (st->has_prev && st->prev_val != 0) result = val / st->prev_val;
-                else { tf_batch_set_null(ob, r, in->n_cols); st->prev_val = val; st->has_prev = 1; ob->n_rows = r + 1; continue; }
-                st->prev_val = val;
+                else write_null = 1;
+                next_prev_val = val;
+                next_has_prev = 1;
                 break;
         }
 
-        tf_batch_set_float64(ob, r, in->n_cols, result);
+        if (write_null) {
+            if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            st->prev_val = next_prev_val;
+            st->has_prev = next_has_prev;
+            ob->n_rows = r + 1;
+            continue;
+        }
+
+        if (tf_batch_set_float64(ob, r, in->n_cols, result) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        st->running_sum = next_running_sum;
+        st->running_min = next_running_min;
+        st->running_max = next_running_max;
+        st->running_count = next_running_count;
+        st->prev_val = next_prev_val;
+        st->has_prev = next_has_prev;
         ob->n_rows = r + 1;
     }
 

@@ -569,98 +569,102 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 
     tf_batch *ob = tf_batch_create(n_stat_cols, st->n_cols);
     if (!ob) return TF_ERROR;
+    int rc = TF_ERROR;
+#define STATS_WRITE(expr) do { if ((expr) != TF_OK) goto done; } while (0)
 
     /* Set schema */
     size_t ci = 0;
-    tf_batch_set_schema(ob, ci++, "column", TF_TYPE_STRING);
-    if (st->want_count)         tf_batch_set_schema(ob, ci++, "count", TF_TYPE_INT64);
-    if (st->want_missing)       tf_batch_set_schema(ob, ci++, "missing", TF_TYPE_INT64);
-    if (st->want_complete_rate) tf_batch_set_schema(ob, ci++, "complete_rate", TF_TYPE_FLOAT64);
-    if (st->want_sum)           tf_batch_set_schema(ob, ci++, "sum", TF_TYPE_FLOAT64);
-    if (st->want_avg)      tf_batch_set_schema(ob, ci++, "avg", TF_TYPE_FLOAT64);
-    if (st->want_min)      tf_batch_set_schema(ob, ci++, "min", TF_TYPE_FLOAT64);
-    if (st->want_max)      tf_batch_set_schema(ob, ci++, "max", TF_TYPE_FLOAT64);
-    if (st->want_var)      tf_batch_set_schema(ob, ci++, "var", TF_TYPE_FLOAT64);
-    if (st->want_stddev)   tf_batch_set_schema(ob, ci++, "stddev", TF_TYPE_FLOAT64);
-    if (st->want_median)   tf_batch_set_schema(ob, ci++, "median", TF_TYPE_FLOAT64);
-    if (st->want_p25)      tf_batch_set_schema(ob, ci++, "p25", TF_TYPE_FLOAT64);
-    if (st->want_p75)      tf_batch_set_schema(ob, ci++, "p75", TF_TYPE_FLOAT64);
-    if (st->want_skewness) tf_batch_set_schema(ob, ci++, "skewness", TF_TYPE_FLOAT64);
-    if (st->want_kurtosis) tf_batch_set_schema(ob, ci++, "kurtosis", TF_TYPE_FLOAT64);
-    if (st->want_distinct) tf_batch_set_schema(ob, ci++, "distinct", TF_TYPE_INT64);
-    if (st->want_hist)     tf_batch_set_schema(ob, ci++, "hist", TF_TYPE_STRING);
-    if (st->want_sample)   tf_batch_set_schema(ob, ci++, "sample", TF_TYPE_STRING);
+    STATS_WRITE(tf_batch_set_schema(ob, ci++, "column", TF_TYPE_STRING));
+    if (st->want_count)         STATS_WRITE(tf_batch_set_schema(ob, ci++, "count", TF_TYPE_INT64));
+    if (st->want_missing)       STATS_WRITE(tf_batch_set_schema(ob, ci++, "missing", TF_TYPE_INT64));
+    if (st->want_complete_rate) STATS_WRITE(tf_batch_set_schema(ob, ci++, "complete_rate", TF_TYPE_FLOAT64));
+    if (st->want_sum)           STATS_WRITE(tf_batch_set_schema(ob, ci++, "sum", TF_TYPE_FLOAT64));
+    if (st->want_avg)      STATS_WRITE(tf_batch_set_schema(ob, ci++, "avg", TF_TYPE_FLOAT64));
+    if (st->want_min)      STATS_WRITE(tf_batch_set_schema(ob, ci++, "min", TF_TYPE_FLOAT64));
+    if (st->want_max)      STATS_WRITE(tf_batch_set_schema(ob, ci++, "max", TF_TYPE_FLOAT64));
+    if (st->want_var)      STATS_WRITE(tf_batch_set_schema(ob, ci++, "var", TF_TYPE_FLOAT64));
+    if (st->want_stddev)   STATS_WRITE(tf_batch_set_schema(ob, ci++, "stddev", TF_TYPE_FLOAT64));
+    if (st->want_median)   STATS_WRITE(tf_batch_set_schema(ob, ci++, "median", TF_TYPE_FLOAT64));
+    if (st->want_p25)      STATS_WRITE(tf_batch_set_schema(ob, ci++, "p25", TF_TYPE_FLOAT64));
+    if (st->want_p75)      STATS_WRITE(tf_batch_set_schema(ob, ci++, "p75", TF_TYPE_FLOAT64));
+    if (st->want_skewness) STATS_WRITE(tf_batch_set_schema(ob, ci++, "skewness", TF_TYPE_FLOAT64));
+    if (st->want_kurtosis) STATS_WRITE(tf_batch_set_schema(ob, ci++, "kurtosis", TF_TYPE_FLOAT64));
+    if (st->want_distinct) STATS_WRITE(tf_batch_set_schema(ob, ci++, "distinct", TF_TYPE_INT64));
+    if (st->want_hist)     STATS_WRITE(tf_batch_set_schema(ob, ci++, "hist", TF_TYPE_STRING));
+    if (st->want_sample)   STATS_WRITE(tf_batch_set_schema(ob, ci++, "sample", TF_TYPE_STRING));
 
     /* One row per input column */
     for (size_t c = 0; c < st->n_cols; c++) {
-        tf_batch_ensure_capacity(ob, c + 1);
+        STATS_WRITE(tf_batch_ensure_capacity(ob, c + 1));
         ci = 0;
-        tf_batch_set_string(ob, c, ci++, st->col_names[c]);
+        STATS_WRITE(tf_batch_set_string(ob, c, ci++, st->col_names[c]));
 
         col_accum *a = &st->accums[c];
 
         if (st->want_count) {
-            tf_batch_set_int64(ob, c, ci++, (int64_t)a->count);
+            STATS_WRITE(tf_batch_set_int64(ob, c, ci++, (int64_t)a->count));
         }
         if (st->want_missing) {
             size_t missing = a->total >= a->count ? a->total - a->count : 0;
-            tf_batch_set_int64(ob, c, ci++, (int64_t)missing);
+            STATS_WRITE(tf_batch_set_int64(ob, c, ci++, (int64_t)missing));
         }
         if (st->want_complete_rate) {
-            if (a->total > 0)
-                tf_batch_set_float64(ob, c, ci, (double)a->count / (double)a->total);
-            else tf_batch_set_null(ob, c, ci);
+            if (a->total > 0) {
+                STATS_WRITE(tf_batch_set_float64(ob, c, ci, (double)a->count / (double)a->total));
+            } else {
+                STATS_WRITE(tf_batch_set_null(ob, c, ci));
+            }
             ci++;
         }
         if (st->want_sum) {
-            if (a->has_numeric) tf_batch_set_float64(ob, c, ci, a->sum);
-            else tf_batch_set_null(ob, c, ci);
+            if (a->has_numeric) STATS_WRITE(tf_batch_set_float64(ob, c, ci, a->sum));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_avg) {
             if (a->has_numeric && a->count > 0)
-                tf_batch_set_float64(ob, c, ci, a->sum / (double)a->count);
-            else tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_float64(ob, c, ci, a->sum / (double)a->count));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_min) {
-            if (a->has_numeric && a->count > 0) tf_batch_set_float64(ob, c, ci, a->min);
-            else tf_batch_set_null(ob, c, ci);
+            if (a->has_numeric && a->count > 0) STATS_WRITE(tf_batch_set_float64(ob, c, ci, a->min));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_max) {
-            if (a->has_numeric && a->count > 0) tf_batch_set_float64(ob, c, ci, a->max);
-            else tf_batch_set_null(ob, c, ci);
+            if (a->has_numeric && a->count > 0) STATS_WRITE(tf_batch_set_float64(ob, c, ci, a->max));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_var) {
             if (a->has_numeric && a->count > 1)
-                tf_batch_set_float64(ob, c, ci, a->wf_m2 / (double)(a->count - 1));
-            else tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_float64(ob, c, ci, a->wf_m2 / (double)(a->count - 1)));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_stddev) {
             if (a->has_numeric && a->count > 1)
-                tf_batch_set_float64(ob, c, ci, sqrt(a->wf_m2 / (double)(a->count - 1)));
-            else tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_float64(ob, c, ci, sqrt(a->wf_m2 / (double)(a->count - 1))));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_median) {
             if (a->has_numeric && a->count > 0)
-                tf_batch_set_float64(ob, c, ci, p2_value(&a->p2_median));
-            else tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_float64(ob, c, ci, p2_value(&a->p2_median)));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_p25) {
             if (a->has_numeric && a->count > 0)
-                tf_batch_set_float64(ob, c, ci, p2_value(&a->p2_p25));
-            else tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_float64(ob, c, ci, p2_value(&a->p2_p25)));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_p75) {
             if (a->has_numeric && a->count > 0)
-                tf_batch_set_float64(ob, c, ci, p2_value(&a->p2_p75));
-            else tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_float64(ob, c, ci, p2_value(&a->p2_p75)));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_skewness) {
@@ -669,11 +673,11 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
                 double vr = m2 - m1 * m1;
                 if (vr > 1e-15) {
                     double sk = (m3 - 3.0*m1*vr - m1*m1*m1) / pow(vr, 1.5);
-                    tf_batch_set_float64(ob, c, ci, sk);
+                    STATS_WRITE(tf_batch_set_float64(ob, c, ci, sk));
                 } else {
-                    tf_batch_set_float64(ob, c, ci, 0.0);
+                    STATS_WRITE(tf_batch_set_float64(ob, c, ci, 0.0));
                 }
-            } else tf_batch_set_null(ob, c, ci);
+            } else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_kurtosis) {
@@ -684,17 +688,17 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
                 if (vr > 1e-15) {
                     double kt = (m4 - 4.0*m1*m3 + 6.0*m1*m1*m2
                                  - 3.0*m1*m1*m1*m1) / (vr*vr) - 3.0;
-                    tf_batch_set_float64(ob, c, ci, kt);
+                    STATS_WRITE(tf_batch_set_float64(ob, c, ci, kt));
                 } else {
-                    tf_batch_set_float64(ob, c, ci, 0.0);
+                    STATS_WRITE(tf_batch_set_float64(ob, c, ci, 0.0));
                 }
-            } else tf_batch_set_null(ob, c, ci);
+            } else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_distinct) {
             if (a->hll && a->count > 0)
-                tf_batch_set_int64(ob, c, ci, (int64_t)round(hll_estimate(a->hll)));
-            else tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_int64(ob, c, ci, (int64_t)round(hll_estimate(a->hll))));
+            else STATS_WRITE(tf_batch_set_null(ob, c, ci));
             ci++;
         }
         if (st->want_hist) {
@@ -707,9 +711,9 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
                     if (b > 0) buf[pos++] = ',';
                     pos += snprintf(buf + pos, sizeof(buf) - pos, "%zu", a->hist->counts[b]);
                 }
-                tf_batch_set_string(ob, c, ci, buf);
+                STATS_WRITE(tf_batch_set_string(ob, c, ci, buf));
             } else {
-                tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_null(ob, c, ci));
             }
             ci++;
         }
@@ -723,9 +727,9 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
                     pos += snprintf(buf + pos, sizeof(buf) - pos,
                                     "%.6g", a->reservoir->values[s]);
                 }
-                tf_batch_set_string(ob, c, ci, buf);
+                STATS_WRITE(tf_batch_set_string(ob, c, ci, buf));
             } else {
-                tf_batch_set_null(ob, c, ci);
+                STATS_WRITE(tf_batch_set_null(ob, c, ci));
             }
             ci++;
         }
@@ -733,7 +737,13 @@ static int stats_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     }
 
     *out = ob;
-    return TF_OK;
+    ob = NULL;
+    rc = TF_OK;
+
+done:
+    if (ob) tf_batch_free(ob);
+#undef STATS_WRITE
+    return rc;
 }
 
 static void stats_destroy(tf_step *self) {

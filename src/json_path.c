@@ -13,6 +13,51 @@
 #include <string.h>
 
 #define TF_JSON_PATH_MAX_INDEX 2147483647
+#define TF_JSON_PATH_MAX_DEPTH 256
+
+static int json_path_depth_fail(void) {
+    tf_set_last_error("json path nesting too deep");
+    return TF_ERROR;
+}
+
+int tf_json_path_validate(const char *path) {
+    if (!path) return TF_ERROR;
+    if (path[0] == '\0') return TF_OK;
+
+    size_t depth = 0;
+    if (path[0] == '/') {
+        for (const char *p = path; *p; p++) {
+            if (*p == '/' && ++depth > TF_JSON_PATH_MAX_DEPTH) return json_path_depth_fail();
+        }
+        return TF_OK;
+    }
+
+    const char *p = path;
+    if (*p == '$') p++;
+    while (*p) {
+        if (*p == '.') {
+            p++;
+            if (++depth > TF_JSON_PATH_MAX_DEPTH) return json_path_depth_fail();
+            while (*p && *p != '.' && *p != '[') p++;
+            continue;
+        }
+        if (*p == '[') {
+            if (++depth > TF_JSON_PATH_MAX_DEPTH) return json_path_depth_fail();
+            p++;
+            if (*p == '\'' || *p == '"') {
+                char quote = *p++;
+                while (*p && *p != quote) p++;
+                if (*p == quote) p++;
+            }
+            while (*p && *p != ']') p++;
+            if (*p == ']') p++;
+            continue;
+        }
+        if (++depth > TF_JSON_PATH_MAX_DEPTH) return json_path_depth_fail();
+        while (*p && *p != '.' && *p != '[') p++;
+    }
+    return TF_OK;
+}
 
 static char *dup_range(const char *start, size_t len) {
     char *s = malloc(len + 1);
@@ -68,7 +113,12 @@ static const cJSON *resolve_json_pointer(const cJSON *root, const char *path) {
 
     const cJSON *cur = root;
     const char *p = path;
+    size_t depth = 0;
     while (*p == '/') {
+        if (++depth > TF_JSON_PATH_MAX_DEPTH) {
+            tf_set_last_error("json path nesting too deep");
+            return NULL;
+        }
         p++;
         const char *start = p;
         while (*p && *p != '/') p++;
@@ -89,7 +139,12 @@ static const cJSON *resolve_simple_path(const cJSON *root, const char *path) {
     if (*p == '$') p++;
     if (*p == '\0') return cur;
 
+    size_t depth = 0;
     while (*p) {
+        if (++depth > TF_JSON_PATH_MAX_DEPTH) {
+            tf_set_last_error("json path nesting too deep");
+            return NULL;
+        }
         if (*p == '.') {
             p++;
             if (*p == '\0' || *p == '.' || *p == '[') return NULL;

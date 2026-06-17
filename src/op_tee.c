@@ -35,6 +35,7 @@ typedef struct {
     size_t   row_index;
     size_t   emitted;
     int      include_row;
+    tf_audit_options audit_opts;
 } tee_state;
 
 static int parse_channel(const char *s, int *out, const char **name_out) {
@@ -66,24 +67,41 @@ static tf_buffer *tee_side_buffer(tf_side_channels *side, int channel) {
     }
 }
 
-static cJSON *tee_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL:
-            return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64:
-            return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64:
-            return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING:
-            return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE:
-            return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP:
-            return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default:
-            return cJSON_CreateNull();
+static int tee_audit_column_allowed(const tee_state *st, const char *name) {
+    if (!st || st->audit_opts.n_columns == 0) return 1;
+    for (size_t i = 0; i < st->audit_opts.n_columns; i++) {
+        if (st->audit_opts.columns[i] && strcmp(st->audit_opts.columns[i], name ? name : "") == 0)
+            return 1;
     }
+    return 0;
+}
+
+static cJSON *tee_selected_row_to_json(const tee_state *st, const tf_batch *in, size_t row) {
+    cJSON *data = cJSON_CreateObject();
+    if (!data) return NULL;
+    for (size_t i = 0; i < st->n_indices; i++) {
+        int ci = st->indices[i];
+        if (ci < 0 || (size_t)ci >= in->n_cols) continue;
+        const char *name = in->col_names[ci] ? in->col_names[ci] : "";
+        if (!tee_audit_column_allowed(st, name)) continue;
+        cJSON *value = tf_audit_cell_to_json(in, row, (size_t)ci, &st->audit_opts);
+        if (!value) { cJSON_Delete(data); return NULL; }
+        cJSON_AddItemToObject(data, name, value);
+    }
+    if (st->audit_opts.max_bytes > 0) {
+        char *printed = cJSON_PrintUnformatted(data);
+        if (!printed) { cJSON_Delete(data); return NULL; }
+        size_t n = strlen(printed);
+        free(printed);
+        if (n > st->audit_opts.max_bytes) {
+            cJSON_Delete(data);
+            data = cJSON_CreateObject();
+            if (!data) return NULL;
+            cJSON_AddBoolToObject(data, "_audit_truncated", 1);
+            cJSON_AddNumberToObject(data, "max_bytes", (double)st->audit_opts.max_bytes);
+        }
+    }
+    return data;
 }
 
 static int tee_resolve_columns(tee_state *st, const tf_batch *in) {
@@ -130,16 +148,11 @@ static int tee_emit_row(tee_state *st, const tf_batch *in, size_t row,
     if (st->expr_text && st->expr_text[0]) cJSON_AddStringToObject(obj, "expr", st->expr_text);
     if (st->include_row) cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
 
-    cJSON *data = cJSON_CreateObject();
-    if (!data) { cJSON_Delete(obj); return TF_ERROR; }
-    for (size_t i = 0; i < st->n_indices; i++) {
-        int ci = st->indices[i];
-        if (ci < 0 || (size_t)ci >= in->n_cols) continue;
-        cJSON *value = tee_cell_to_json(in, row, (size_t)ci);
-        if (!value) { cJSON_Delete(obj); return TF_ERROR; }
-        cJSON_AddItemToObject(data, in->col_names[ci] ? in->col_names[ci] : "", value);
+    if (st->audit_opts.include_row) {
+        cJSON *data = tee_selected_row_to_json(st, in, row);
+        if (!data) { cJSON_Delete(obj); return TF_ERROR; }
+        cJSON_AddItemToObject(obj, "data", data);
     }
-    cJSON_AddItemToObject(obj, "data", data);
 
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
@@ -148,14 +161,6 @@ static int tee_emit_row(tee_state *st, const tf_batch *in, size_t row,
     if (rc == TF_OK) rc = tf_buffer_write_str(buf, "\n");
     free(line);
     return rc;
-}
-
-static int tee_copy_schema(tf_batch *dst, const tf_batch *src) {
-    for (size_t c = 0; c < src->n_cols; c++) {
-        if (tf_batch_set_schema(dst, c, src->col_names[c], src->col_types[c]) != TF_OK)
-            return TF_ERROR;
-    }
-    return TF_OK;
 }
 
 static int tee_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -167,7 +172,7 @@ static int tee_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    if (tee_copy_schema(ob, in) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    if (tf_batch_clone_schema(ob, in) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
 
     for (size_t r = 0; r < in->n_rows; r++) {
         st->row_index++;
@@ -201,6 +206,7 @@ static void tee_state_free(tee_state *st) {
     free(st->expr_text);
     free(st->name);
     free(st->channel_name);
+    tf_audit_options_free(&st->audit_opts);
     for (size_t i = 0; i < st->n_selectors; i++) free(st->selectors[i]);
     free(st->selectors);
     free(st->indices);
@@ -244,6 +250,7 @@ tf_step *tf_tee_create(const cJSON *args) {
     st->limit = 1000;
     st->every = 1;
     st->include_row = 1;
+    tf_audit_options_init(&st->audit_opts, 1);
 
     cJSON *expr_json = cJSON_GetObjectItemCaseSensitive(args, "expr");
     if (cJSON_IsString(expr_json) && expr_json->valuestring[0]) {
@@ -269,22 +276,25 @@ tf_step *tf_tee_create(const cJSON *args) {
     cJSON *limit_json = cJSON_GetObjectItemCaseSensitive(args, "limit");
     if (!limit_json) limit_json = cJSON_GetObjectItemCaseSensitive(args, "max_rows");
     if (limit_json) {
-        if (!cJSON_IsNumber(limit_json) || limit_json->valuedouble <= 0) {
-            tf_set_last_error("tee: limit must be a positive integer");
+        size_t parsed_limit = 0;
+        if (tf_json_get_size_arg_any(args, "limit", "max_rows",
+                                     1, TF_MAX_AUDIT_RECORDS,
+                                     &parsed_limit, "tee") < 0) {
             tee_state_free(st);
             return NULL;
         }
-        st->limit = (size_t)limit_json->valuedouble;
+        st->limit = parsed_limit;
     }
 
     cJSON *every_json = cJSON_GetObjectItemCaseSensitive(args, "every");
     if (every_json) {
-        if (!cJSON_IsNumber(every_json) || every_json->valuedouble <= 0) {
-            tf_set_last_error("tee: every must be a positive integer");
+        size_t parsed_every = 0;
+        if (tf_json_get_size_arg(args, "every", 1, TF_MAX_COUNT_ARG,
+                                 &parsed_every, "tee") < 0) {
             tee_state_free(st);
             return NULL;
         }
-        st->every = (size_t)every_json->valuedouble;
+        st->every = parsed_every;
     }
 
     cJSON *include_json = cJSON_GetObjectItemCaseSensitive(args, "include_row");
@@ -293,6 +303,11 @@ tf_step *tf_tee_create(const cJSON *args) {
 
     cJSON *columns_json = cJSON_GetObjectItemCaseSensitive(args, "columns");
     if (tee_copy_columns_arg(st, columns_json) != TF_OK) {
+        tee_state_free(st);
+        return NULL;
+    }
+
+    if (tf_audit_options_parse(&st->audit_opts, args, "tee") != TF_OK) {
         tee_state_free(st);
         return NULL;
     }

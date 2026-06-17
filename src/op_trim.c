@@ -16,14 +16,13 @@ typedef struct {
     size_t  n_cols;
 } trim_state;
 
-static const char *trim_str(const char *s, char *buf, size_t buf_sz) {
+static void trim_bounds(const char *s, const char **start, size_t *len_out) {
+    if (!s) s = "";
     while (*s && isspace((unsigned char)*s)) s++;
     size_t len = strlen(s);
     while (len > 0 && isspace((unsigned char)s[len - 1])) len--;
-    if (len >= buf_sz) len = buf_sz - 1;
-    memcpy(buf, s, len);
-    buf[len] = '\0';
-    return buf;
+    *start = s;
+    *len_out = len;
 }
 
 static int trim_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -34,11 +33,16 @@ static int trim_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_copy_row(ob, r, in, r);
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = r + 1;
     }
 
@@ -54,11 +58,16 @@ static int trim_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
         }
         if (!target) continue;
-        char buf[4096];
         for (size_t r = 0; r < ob->n_rows; r++) {
             if (tf_batch_is_null(ob, r, c)) continue;
             const char *val = tf_batch_get_string(ob, r, c);
-            tf_batch_set_string(ob, r, c, trim_str(val, buf, sizeof(buf)));
+            const char *trimmed = NULL;
+            size_t trimmed_len = 0;
+            trim_bounds(val, &trimmed, &trimmed_len);
+            if (tf_batch_set_string_len(ob, r, c, trimmed, trimmed_len) != TF_OK) {
+                tf_batch_free(ob);
+                return TF_ERROR;
+            }
         }
     }
 
@@ -70,13 +79,18 @@ static int trim_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     (void)self; (void)side; *out = NULL; return TF_OK;
 }
 
-static void trim_destroy(tf_step *self) {
-    trim_state *st = self->state;
+static void trim_state_free(trim_state *st) {
     if (st) {
-        for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
+        if (st->cols) {
+            for (size_t i = 0; i < st->n_cols; i++) free(st->cols[i]);
+        }
         free(st->cols);
         free(st);
     }
+}
+
+static void trim_destroy(tf_step *self) {
+    trim_state_free(self ? self->state : NULL);
     free(self);
 }
 
@@ -86,21 +100,33 @@ tf_step *tf_trim_create(const cJSON *args) {
 
     if (args) {
         cJSON *columns = cJSON_GetObjectItemCaseSensitive(args, "columns");
-        if (columns && cJSON_IsArray(columns)) {
+        if (columns) {
+            if (!cJSON_IsArray(columns)) {
+                tf_set_last_error("trim: columns must be an array");
+                trim_state_free(st);
+                return NULL;
+            }
             int n = cJSON_GetArraySize(columns);
             if (n > 0) {
                 st->cols = calloc(n, sizeof(char *));
-                st->n_cols = n;
+                if (!st->cols) { trim_state_free(st); return NULL; }
+                st->n_cols = (size_t)n;
                 for (int i = 0; i < n; i++) {
                     cJSON *item = cJSON_GetArrayItem(columns, i);
-                    if (cJSON_IsString(item)) st->cols[i] = strdup(item->valuestring);
+                    if (!cJSON_IsString(item) || !item->valuestring || !item->valuestring[0]) {
+                        tf_set_last_error("trim: column names must be non-empty strings");
+                        trim_state_free(st);
+                        return NULL;
+                    }
+                    st->cols[i] = strdup(item->valuestring);
+                    if (!st->cols[i]) { trim_state_free(st); return NULL; }
                 }
             }
         }
     }
 
     tf_step *step = calloc(1, sizeof(tf_step));
-    if (!step) { free(st); return NULL; }
+    if (!step) { trim_state_free(st); return NULL; }
     step->process = trim_process;
     step->flush = trim_flush;
     step->destroy = trim_destroy;

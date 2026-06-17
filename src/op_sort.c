@@ -7,6 +7,7 @@
  */
 
 #include "internal.h"
+#include "spill.h"
 #include "cJSON.h"
 
 #include <errno.h>
@@ -26,13 +27,7 @@ typedef struct {
     int   desc;
 } sort_col;
 
-typedef union {
-    uint8_t b;
-    int64_t i64;
-    double f64;
-    int32_t date;
-    char *str;
-} sort_cell;
+typedef tf_owned_cell_value sort_cell;
 
 typedef struct {
     uint8_t *nulls;
@@ -60,6 +55,7 @@ typedef struct {
 
     int       use_spill;
     char     *spill_dir;
+    tf_spill_session *spill;
     size_t    spill_memory_bytes;
     size_t    configured_run_rows;
     size_t    run_rows;
@@ -79,42 +75,6 @@ typedef struct {
     int       merge_started;
     int       merge_done;
 } sort_state;
-
-/* Copy a row from src batch to dst batch. */
-static int copy_row(tf_batch *dst, size_t dst_row,
-                    const tf_batch *src, size_t src_row) {
-    if (tf_batch_ensure_capacity(dst, dst_row + 1) != TF_OK) return TF_ERROR;
-    for (size_t c = 0; c < src->n_cols; c++) {
-        if (tf_batch_is_null(src, src_row, c)) {
-            tf_batch_set_null(dst, dst_row, c);
-            continue;
-        }
-        switch (src->col_types[c]) {
-            case TF_TYPE_BOOL:
-                tf_batch_set_bool(dst, dst_row, c, tf_batch_get_bool(src, src_row, c));
-                break;
-            case TF_TYPE_INT64:
-                tf_batch_set_int64(dst, dst_row, c, tf_batch_get_int64(src, src_row, c));
-                break;
-            case TF_TYPE_FLOAT64:
-                tf_batch_set_float64(dst, dst_row, c, tf_batch_get_float64(src, src_row, c));
-                break;
-            case TF_TYPE_STRING:
-                tf_batch_set_string(dst, dst_row, c, tf_batch_get_string(src, src_row, c));
-                break;
-            case TF_TYPE_DATE:
-                tf_batch_set_date(dst, dst_row, c, tf_batch_get_date(src, src_row, c));
-                break;
-            case TF_TYPE_TIMESTAMP:
-                tf_batch_set_timestamp(dst, dst_row, c, tf_batch_get_timestamp(src, src_row, c));
-                break;
-            default:
-                tf_batch_set_null(dst, dst_row, c);
-                break;
-        }
-    }
-    return TF_OK;
-}
 
 static tf_batch *create_buffer_from_schema(const sort_state *st, size_t capacity) {
     tf_batch *b = tf_batch_create(st->n_schema_cols, capacity ? capacity : 16);
@@ -148,11 +108,19 @@ static size_t sort_estimated_row_bytes(const sort_state *st) {
 static int resolve_sort_columns(sort_state *st) {
     free(st->col_indices);
     free(st->col_desc);
-    st->col_indices = calloc(st->n_cols ? st->n_cols : 1, sizeof(int));
-    st->col_desc = calloc(st->n_cols ? st->n_cols : 1, sizeof(int));
+    st->col_indices = tf_callocarray_checked(st->n_cols ? st->n_cols : 1, sizeof(int));
+    st->col_desc = tf_callocarray_checked(st->n_cols ? st->n_cols : 1, sizeof(int));
     if (!st->col_indices || !st->col_desc) return TF_ERROR;
     for (size_t k = 0; k < st->n_cols; k++) {
-        st->col_indices[k] = tf_batch_col_index(st->buf, st->cols[k].name);
+        int idx = tf_batch_col_index(st->buf, st->cols[k].name);
+        if (idx < 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "sort: column '%s' not found",
+                     st->cols[k].name ? st->cols[k].name : "");
+            tf_set_last_error(msg);
+            return TF_ERROR;
+        }
+        st->col_indices[k] = idx;
         st->col_desc[k] = st->cols[k].desc;
     }
     return TF_OK;
@@ -162,8 +130,8 @@ static int init_schema(sort_state *st, const tf_batch *in) {
     if (st->has_schema) return TF_OK;
 
     st->n_schema_cols = in->n_cols;
-    st->schema_names = calloc(in->n_cols ? in->n_cols : 1, sizeof(char *));
-    st->schema_types = calloc(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
+    st->schema_names = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(char *));
+    st->schema_types = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
     if (!st->schema_names || !st->schema_types) return TF_ERROR;
     for (size_t c = 0; c < in->n_cols; c++) {
         st->schema_names[c] = strdup(in->col_names[c] ? in->col_names[c] : "");
@@ -191,7 +159,6 @@ static int init_schema(sort_state *st, const tf_batch *in) {
     return resolve_sort_columns(st);
 }
 
-/* Comparator context for qsort. */
 typedef struct {
     const tf_batch *batch;
     int            *col_indices;
@@ -199,16 +166,11 @@ typedef struct {
     size_t          n_sort_cols;
 } sort_ctx;
 
-static sort_ctx *g_sort_ctx;
+static int sort_compare_rows(const sort_ctx *ctx, size_t ra, size_t rb) {
+    const tf_batch *batch = ctx->batch;
 
-static int compare_rows(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    const tf_batch *batch = g_sort_ctx->batch;
-
-    for (size_t k = 0; k < g_sort_ctx->n_sort_cols; k++) {
-        int ci = g_sort_ctx->col_indices[k];
-        if (ci < 0) continue;
+    for (size_t k = 0; k < ctx->n_sort_cols; k++) {
+        int ci = ctx->col_indices[k];
 
         int null_a = tf_batch_is_null(batch, ra, ci);
         int null_b = tf_batch_is_null(batch, rb, ci);
@@ -256,14 +218,18 @@ static int compare_rows(const void *a, const void *b) {
                 break;
         }
 
-        if (cmp != 0) return g_sort_ctx->col_desc[k] ? -cmp : cmp;
+        if (cmp != 0) return ctx->col_desc[k] ? -cmp : cmp;
     }
     return 0;
 }
 
+static int sort_compare_index(const void *ctx, size_t ra, size_t rb) {
+    return sort_compare_rows((const sort_ctx *)ctx, ra, rb);
+}
+
 static size_t *sort_batch_indices(const sort_state *st, const tf_batch *batch) {
     size_t n = batch->n_rows;
-    size_t *indices = malloc((n ? n : 1) * sizeof(size_t));
+    size_t *indices = tf_mallocarray_checked(n ? n : 1, sizeof(size_t));
     if (!indices) return NULL;
     for (size_t i = 0; i < n; i++) indices[i] = i;
     sort_ctx ctx = {
@@ -272,9 +238,7 @@ static size_t *sort_batch_indices(const sort_state *st, const tf_batch *batch) {
         .col_desc = st->col_desc,
         .n_sort_cols = st->n_cols,
     };
-    g_sort_ctx = &ctx;
-    qsort(indices, n, sizeof(size_t), compare_rows);
-    g_sort_ctx = NULL;
+    tf_sort_indices(indices, n, sort_compare_index, &ctx);
     return indices;
 }
 
@@ -323,22 +287,15 @@ static int write_cell(FILE *f, const tf_batch *b, size_t r, size_t c) {
     }
 }
 
-static char *make_run_path(sort_state *st) {
-    size_t dir_len = strlen(st->spill_dir);
-    size_t cap = dir_len + 96;
-    char *path = malloc(cap);
-    if (!path) return NULL;
-    snprintf(path, cap, "%s%stranfi-sort-%ld-%zu.bin",
-             st->spill_dir,
-             (dir_len > 0 && st->spill_dir[dir_len - 1] == '/') ? "" : "/",
-             (long)getpid(), st->run_seq++);
-    return path;
-}
-
 static int append_run_path(sort_state *st, char *path) {
     if (st->n_runs == st->cap_runs) {
-        size_t new_cap = st->cap_runs ? st->cap_runs * 2 : 8;
-        char **tmp = realloc(st->run_paths, new_cap * sizeof(char *));
+        size_t need = 0;
+        size_t new_cap = 0;
+        if (tf_size_add(st->n_runs, 1, &need) != TF_OK ||
+            tf_size_grow_pow2(st->cap_runs, need, 8, &new_cap) != TF_OK) {
+            return TF_ERROR;
+        }
+        char **tmp = tf_reallocarray_checked(st->run_paths, new_cap, sizeof(char *));
         if (!tmp) return TF_ERROR;
         st->run_paths = tmp;
         st->cap_runs = new_cap;
@@ -354,14 +311,9 @@ static int write_spill_run(sort_state *st) {
     size_t *indices = sort_batch_indices(st, st->buf);
     if (!indices) return TF_ERROR;
 
-    char *path = make_run_path(st);
-    if (!path) { free(indices); return TF_ERROR; }
-    FILE *f = fopen(path, "wb");
+    char *path = NULL;
+    FILE *f = tf_spill_open_run_file(st->spill, "sort", &path);
     if (!f) {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "sort spill: cannot create '%s': %s", path, strerror(errno));
-        tf_set_last_error(msg);
-        free(path);
         free(indices);
         return TF_ERROR;
     }
@@ -413,9 +365,15 @@ static void spill_row_clear(sort_spill_row *row, const tf_type *types, size_t n_
 }
 
 static int spill_row_init(sort_spill_row *row, size_t n_cols) {
-    row->nulls = calloc(n_cols ? n_cols : 1, sizeof(uint8_t));
-    row->cells = calloc(n_cols ? n_cols : 1, sizeof(sort_cell));
-    if (!row->nulls || !row->cells) return TF_ERROR;
+    row->nulls = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(uint8_t));
+    row->cells = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(sort_cell));
+    if (!row->nulls || !row->cells) {
+        free(row->nulls);
+        free(row->cells);
+        row->nulls = NULL;
+        row->cells = NULL;
+        return TF_ERROR;
+    }
     for (size_t c = 0; c < n_cols; c++) row->nulls[c] = 1;
     return TF_OK;
 }
@@ -562,32 +520,9 @@ static int spill_row_to_batch(const sort_state *st, tf_batch *out,
                               size_t dst_row, const sort_spill_row *row) {
     if (tf_batch_ensure_capacity(out, dst_row + 1) != TF_OK) return TF_ERROR;
     for (size_t c = 0; c < st->n_schema_cols; c++) {
-        if (row->nulls[c]) {
-            tf_batch_set_null(out, dst_row, c);
-            continue;
-        }
-        switch (st->schema_types[c]) {
-            case TF_TYPE_BOOL:
-                tf_batch_set_bool(out, dst_row, c, row->cells[c].b != 0);
-                break;
-            case TF_TYPE_INT64:
-                tf_batch_set_int64(out, dst_row, c, row->cells[c].i64);
-                break;
-            case TF_TYPE_FLOAT64:
-                tf_batch_set_float64(out, dst_row, c, row->cells[c].f64);
-                break;
-            case TF_TYPE_STRING:
-                tf_batch_set_string(out, dst_row, c, row->cells[c].str);
-                break;
-            case TF_TYPE_DATE:
-                tf_batch_set_date(out, dst_row, c, row->cells[c].date);
-                break;
-            case TF_TYPE_TIMESTAMP:
-                tf_batch_set_timestamp(out, dst_row, c, row->cells[c].i64);
-                break;
-            default:
-                tf_batch_set_null(out, dst_row, c);
-                break;
+        if (tf_batch_set_owned_cell_value(out, dst_row, c, st->schema_types[c],
+                                          row->nulls[c], &row->cells[c]) != TF_OK) {
+            return TF_ERROR;
         }
     }
     return TF_OK;
@@ -632,7 +567,7 @@ static int begin_merge(sort_state *st) {
         return TF_OK;
     }
 
-    st->readers = calloc(st->n_runs, sizeof(sort_run_reader));
+    st->readers = tf_callocarray_checked(st->n_runs, sizeof(sort_run_reader));
     if (!st->readers) return TF_ERROR;
     st->n_readers = st->n_runs;
     for (size_t i = 0; i < st->n_runs; i++) {
@@ -690,6 +625,8 @@ static int spill_next_batch(sort_state *st, tf_batch **out) {
         tf_batch_free(ob);
         close_readers(st);
         remove_run_files(st);
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->merge_done = 1;
         return TF_OK;
     }
@@ -709,7 +646,7 @@ static int sort_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (init_schema(st, in) != TF_OK) return TF_ERROR;
     for (size_t r = 0; r < in->n_rows; r++) {
         size_t dst_row = st->buf->n_rows;
-        if (copy_row(st->buf, dst_row, in, r) != TF_OK) return TF_ERROR;
+        if (tf_batch_copy_row(st->buf, dst_row, in, r) != TF_OK) return TF_ERROR;
         st->buf->n_rows = dst_row + 1;
         if (st->use_spill && st->buf->n_rows >= st->run_rows) {
             if (write_spill_run(st) != TF_OK) return TF_ERROR;
@@ -730,7 +667,7 @@ static int sort_flush_in_memory(tf_step *self, tf_batch **out) {
     tf_batch *ob = create_buffer_from_schema(st, n);
     if (!ob) { free(indices); return TF_ERROR; }
     for (size_t i = 0; i < n; i++) {
-        if (copy_row(ob, i, st->buf, indices[i]) != TF_OK) {
+        if (tf_batch_copy_row(ob, i, st->buf, indices[i]) != TF_OK) {
             free(indices);
             tf_batch_free(ob);
             return TF_ERROR;
@@ -785,6 +722,7 @@ static void sort_state_free(sort_state *st) {
     free(st->cols);
     free(st->col_indices);
     free(st->col_desc);
+    tf_spill_cleanup(st->spill);
     free(st->spill_dir);
     free(st);
 }
@@ -792,13 +730,6 @@ static void sort_state_free(sort_state *st) {
 static void sort_destroy(tf_step *self) {
     if (self) sort_state_free(self->state);
     free(self);
-}
-
-static size_t json_size_arg(const cJSON *args, const char *name) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(args, name);
-    if (!cJSON_IsNumber(item) || item->valuedouble <= 0.0) return 0;
-    if (item->valuedouble > (double)SIZE_MAX) return SIZE_MAX;
-    return (size_t)item->valuedouble;
 }
 
 tf_step *tf_sort_create(const cJSON *args) {
@@ -811,7 +742,7 @@ tf_step *tf_sort_create(const cJSON *args) {
 
     sort_state *st = calloc(1, sizeof(sort_state));
     if (!st) return NULL;
-    st->cols = calloc((size_t)n, sizeof(sort_col));
+    st->cols = tf_callocarray_checked((size_t)n, sizeof(sort_col));
     if (!st->cols) { free(st); return NULL; }
     st->n_cols = (size_t)n;
     st->output_batch_rows = SORT_DEFAULT_OUTPUT_ROWS;
@@ -820,7 +751,8 @@ tf_step *tf_sort_create(const cJSON *args) {
         cJSON *item = cJSON_GetArrayItem(columns, i);
         cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
         cJSON *desc_j = cJSON_GetObjectItemCaseSensitive(item, "desc");
-        if (!cJSON_IsString(name_j)) {
+        if (!cJSON_IsString(name_j) || !name_j->valuestring || name_j->valuestring[0] == '\0') {
+            tf_set_last_error("sort: column names must be non-empty strings");
             sort_state_free(st);
             return NULL;
         }
@@ -840,13 +772,26 @@ tf_step *tf_sort_create(const cJSON *args) {
             sort_state_free(st);
             return NULL;
         }
-        st->spill_memory_bytes = json_size_arg(args, "spill_memory_bytes");
-        st->configured_run_rows = json_size_arg(args, "spill_run_rows");
-        st->output_batch_rows = json_size_arg(args, "spill_output_rows");
-        if (st->output_batch_rows == 0 || st->output_batch_rows == SIZE_MAX)
-            st->output_batch_rows = SORT_DEFAULT_OUTPUT_ROWS;
-        if (st->configured_run_rows == SIZE_MAX) st->configured_run_rows = 0;
-        if (st->spill_memory_bytes == SIZE_MAX) st->spill_memory_bytes = 0;
+        if (tf_spill_session_create(st->spill_dir, &st->spill) != TF_OK) {
+            sort_state_free(st);
+            return NULL;
+        }
+        size_t parsed_size = 0;
+        int has_spill_memory = tf_json_get_size_arg(args, "spill_memory_bytes",
+                                                    1, TF_MAX_SPILL_MEMORY_BYTES,
+                                                    &parsed_size, "sort");
+        if (has_spill_memory < 0) { sort_state_free(st); return NULL; }
+        if (has_spill_memory > 0) st->spill_memory_bytes = parsed_size;
+        int has_spill_rows = tf_json_get_size_arg(args, "spill_run_rows",
+                                                  1, TF_MAX_SPILL_RUN_ROWS,
+                                                  &parsed_size, "sort");
+        if (has_spill_rows < 0) { sort_state_free(st); return NULL; }
+        if (has_spill_rows > 0) st->configured_run_rows = parsed_size;
+        int has_output_rows = tf_json_get_size_arg(args, "spill_output_rows",
+                                                   1, TF_MAX_SPILL_OUTPUT_ROWS,
+                                                   &parsed_size, "sort");
+        if (has_output_rows < 0) { sort_state_free(st); return NULL; }
+        if (has_output_rows > 0) st->output_batch_rows = parsed_size;
     }
 
     tf_step *step = calloc(1, sizeof(tf_step));

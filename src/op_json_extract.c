@@ -70,70 +70,46 @@ static int parse_bool_string(const char *s, int *out) {
     return 0;
 }
 
-static void set_extracted_value(tf_batch *ob, size_t row, size_t col,
-                                tf_type type, const cJSON *val) {
+static int set_extracted_value(tf_batch *ob, size_t row, size_t col,
+                               tf_type type, const cJSON *val) {
     if (!val || cJSON_IsNull(val)) {
-        tf_batch_set_null(ob, row, col);
-        return;
+        return tf_batch_set_null(ob, row, col);
     }
 
     switch (type) {
         case TF_TYPE_STRING: {
             if (cJSON_IsString(val)) {
-                tf_batch_set_string(ob, row, col, val->valuestring ? val->valuestring : "");
-            } else {
-                char *printed = cJSON_PrintUnformatted((cJSON *)val);
-                if (printed) {
-                    tf_batch_set_string(ob, row, col, printed);
-                    free(printed);
-                } else {
-                    tf_batch_set_null(ob, row, col);
-                }
+                return tf_batch_set_string(ob, row, col, val->valuestring ? val->valuestring : "");
             }
-            break;
+            char *printed = cJSON_PrintUnformatted((cJSON *)val);
+            if (!printed) return tf_batch_set_null(ob, row, col);
+            int rc = tf_batch_set_string(ob, row, col, printed);
+            free(printed);
+            return rc;
         }
         case TF_TYPE_INT64: {
             int64_t out = 0;
-            if (cJSON_IsNumber(val)) {
-                tf_batch_set_int64(ob, row, col, (int64_t)val->valuedouble);
-            } else if (cJSON_IsBool(val)) {
-                tf_batch_set_int64(ob, row, col, cJSON_IsTrue(val) ? 1 : 0);
-            } else if (cJSON_IsString(val) && parse_strict_int64(val->valuestring, &out)) {
-                tf_batch_set_int64(ob, row, col, out);
-            } else {
-                tf_batch_set_null(ob, row, col);
-            }
-            break;
+            if (cJSON_IsNumber(val)) return tf_batch_set_int64(ob, row, col, (int64_t)val->valuedouble);
+            if (cJSON_IsBool(val)) return tf_batch_set_int64(ob, row, col, cJSON_IsTrue(val) ? 1 : 0);
+            if (cJSON_IsString(val) && parse_strict_int64(val->valuestring, &out)) return tf_batch_set_int64(ob, row, col, out);
+            return tf_batch_set_null(ob, row, col);
         }
         case TF_TYPE_FLOAT64: {
             double out = 0.0;
-            if (cJSON_IsNumber(val)) {
-                tf_batch_set_float64(ob, row, col, val->valuedouble);
-            } else if (cJSON_IsBool(val)) {
-                tf_batch_set_float64(ob, row, col, cJSON_IsTrue(val) ? 1.0 : 0.0);
-            } else if (cJSON_IsString(val) && parse_strict_double(val->valuestring, &out)) {
-                tf_batch_set_float64(ob, row, col, out);
-            } else {
-                tf_batch_set_null(ob, row, col);
-            }
-            break;
+            if (cJSON_IsNumber(val)) return tf_batch_set_float64(ob, row, col, val->valuedouble);
+            if (cJSON_IsBool(val)) return tf_batch_set_float64(ob, row, col, cJSON_IsTrue(val) ? 1.0 : 0.0);
+            if (cJSON_IsString(val) && parse_strict_double(val->valuestring, &out)) return tf_batch_set_float64(ob, row, col, out);
+            return tf_batch_set_null(ob, row, col);
         }
         case TF_TYPE_BOOL: {
             int out = 0;
-            if (cJSON_IsBool(val)) {
-                tf_batch_set_bool(ob, row, col, cJSON_IsTrue(val));
-            } else if (cJSON_IsNumber(val)) {
-                tf_batch_set_bool(ob, row, col, val->valuedouble != 0.0);
-            } else if (cJSON_IsString(val) && parse_bool_string(val->valuestring, &out)) {
-                tf_batch_set_bool(ob, row, col, out != 0);
-            } else {
-                tf_batch_set_null(ob, row, col);
-            }
-            break;
+            if (cJSON_IsBool(val)) return tf_batch_set_bool(ob, row, col, cJSON_IsTrue(val));
+            if (cJSON_IsNumber(val)) return tf_batch_set_bool(ob, row, col, val->valuedouble != 0.0);
+            if (cJSON_IsString(val) && parse_bool_string(val->valuestring, &out)) return tf_batch_set_bool(ob, row, col, out != 0);
+            return tf_batch_set_null(ob, row, col);
         }
         default:
-            tf_batch_set_null(ob, row, col);
-            break;
+            return tf_batch_set_null(ob, row, col);
     }
 }
 
@@ -146,12 +122,9 @@ static int json_extract_process(tf_step *self, tf_batch *in, tf_batch **out,
     tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
 
-    for (size_t c = 0; c < in->n_cols; c++)
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    if (tf_batch_set_schema(ob, in->n_cols, st->result, st->type) != TF_OK) {
+    const char *extra_names[] = {st->result};
+    const tf_type extra_types[] = {st->type};
+    if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
         tf_batch_free(ob);
         return TF_ERROR;
     }
@@ -164,7 +137,10 @@ static int json_extract_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        tf_batch_set_null(ob, r, in->n_cols);
+        if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
 
         if (can_parse && !tf_batch_is_null(in, r, (size_t)ci)) {
             const char *json = tf_batch_get_string(in, r, (size_t)ci);
@@ -172,8 +148,12 @@ static int json_extract_process(tf_step *self, tf_batch *in, tf_batch **out,
                 cJSON *root = cJSON_Parse(json);
                 if (root) {
                     const cJSON *val = tf_json_path_resolve(root, st->path);
-                    set_extracted_value(ob, r, in->n_cols, st->type, val);
+                    int rc = set_extracted_value(ob, r, in->n_cols, st->type, val);
                     cJSON_Delete(root);
+                    if (rc != TF_OK) {
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
                 }
             }
         }
@@ -211,6 +191,7 @@ tf_step *tf_json_extract_create(const cJSON *args) {
     cJSON *result_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (!cJSON_IsString(path_j) || !cJSON_IsString(result_j) || result_j->valuestring[0] == '\0')
         return NULL;
+    if (tf_json_path_validate(path_j->valuestring) != TF_OK) return NULL;
 
     cJSON *column_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     const char *column = cJSON_IsString(column_j) && column_j->valuestring[0] != '\0'

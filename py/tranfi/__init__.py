@@ -46,8 +46,10 @@ class codec:
     @staticmethod
     def csv(delimiter=',', header=True, batch_size=1024, encode=False, repair=False,
             nulls=None, quoted_nulls=True, mode=None, strict=False, max_error_bytes=4096,
-            max_record_bytes=64 * 1024 * 1024, comment=None, trim_ws=True,
-            skip_empty_rows=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None):
+            max_record_bytes=64 * 1024 * 1024, max_columns=8192, comment=None, trim_ws=True,
+            skip_empty_rows=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None,
+            audit_include_row=None, audit_columns=None, audit_redact=None,
+            audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """CSV codec. Use encode=True for encoding (output), False for decoding (input)."""
         args = {}
         if delimiter != ',':
@@ -67,10 +69,24 @@ class codec:
                 args['max_error_bytes'] = int(max_error_bytes)
             if max_record_bytes != 64 * 1024 * 1024:
                 args['max_record_bytes'] = int(max_record_bytes)
+            if max_columns != 8192:
+                args['max_columns'] = int(max_columns)
             if audit:
                 args['audit'] = True
             if audit_limit is not None:
                 args['audit_limit'] = int(audit_limit)
+            if audit_include_row is not None:
+                args['audit_include_row'] = bool(audit_include_row)
+            if audit_columns is not None:
+                args['audit_columns'] = audit_columns
+            if audit_redact is not None:
+                args['audit_redact'] = audit_redact
+            if audit_hash_columns is not None:
+                args['audit_hash_columns'] = audit_hash_columns
+            if audit_max_bytes is not None:
+                args['audit_max_bytes'] = int(audit_max_bytes)
+            if audit_max_cell_bytes is not None:
+                args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
             if nulls is not None:
                 args['nulls'] = nulls
             if quoted_nulls is not True:
@@ -93,15 +109,20 @@ class codec:
     @staticmethod
     def csv_decode(delimiter=',', header=True, batch_size=1024, nulls=None, quoted_nulls=True,
                    mode=None, strict=False, max_error_bytes=4096,
-                   max_record_bytes=64 * 1024 * 1024, comment=None, trim_ws=True,
-                   skip_empty_rows=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None):
+                   max_record_bytes=64 * 1024 * 1024, max_columns=8192, comment=None, trim_ws=True,
+                   skip_empty_rows=False, skip=0, n_max=None, max_rows=None, audit=False, audit_limit=None,
+                   audit_include_row=None, audit_columns=None, audit_redact=None,
+                   audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """CSV decoder."""
         return codec.csv(delimiter=delimiter, header=header, batch_size=batch_size,
                          encode=False, nulls=nulls, quoted_nulls=quoted_nulls,
                          mode=mode, strict=strict, max_error_bytes=max_error_bytes,
-                         max_record_bytes=max_record_bytes, comment=comment,
+                         max_record_bytes=max_record_bytes, max_columns=max_columns, comment=comment,
                          trim_ws=trim_ws, skip_empty_rows=skip_empty_rows, skip=skip,
-                         n_max=n_max, max_rows=max_rows, audit=audit, audit_limit=audit_limit)
+                         n_max=n_max, max_rows=max_rows, audit=audit, audit_limit=audit_limit,
+                         audit_include_row=audit_include_row, audit_columns=audit_columns,
+                         audit_redact=audit_redact, audit_hash_columns=audit_hash_columns,
+                         audit_max_bytes=audit_max_bytes, audit_max_cell_bytes=audit_max_cell_bytes)
 
     @staticmethod
     def csv_encode(delimiter=','):
@@ -112,7 +133,8 @@ class codec:
         return {'op': 'codec.csv.encode', 'args': args}
 
     @staticmethod
-    def jsonl(batch_size=1024, encode=False, on_error='skip', max_error_bytes=4096):
+    def jsonl(batch_size=1024, encode=False, on_error='skip', max_error_bytes=4096,
+              max_record_bytes=64 * 1024 * 1024):
         """JSON Lines codec."""
         args = {}
         if batch_size != 1024:
@@ -123,13 +145,17 @@ class codec:
                 args['on_error'] = on_error
             if max_error_bytes != 4096:
                 args['max_error_bytes'] = max_error_bytes
+            if max_record_bytes != 64 * 1024 * 1024:
+                args['max_record_bytes'] = int(max_record_bytes)
         return {'op': op, 'args': args}
 
     @staticmethod
-    def jsonl_decode(batch_size=1024, on_error='skip', max_error_bytes=4096):
+    def jsonl_decode(batch_size=1024, on_error='skip', max_error_bytes=4096,
+                     max_record_bytes=64 * 1024 * 1024):
         """JSON Lines decoder."""
         return codec.jsonl(batch_size=batch_size, encode=False,
-                           on_error=on_error, max_error_bytes=max_error_bytes)
+                           on_error=on_error, max_error_bytes=max_error_bytes,
+                           max_record_bytes=max_record_bytes)
 
     @staticmethod
     def jsonl_encode():
@@ -137,18 +163,27 @@ class codec:
         return {'op': 'codec.jsonl.encode', 'args': {}}
 
     @staticmethod
-    def text(batch_size=1024, encode=False):
+    def text(batch_size=1024, encode=False, max_error_bytes=4096,
+             max_record_bytes=64 * 1024 * 1024):
         """Text line codec."""
         args = {}
         if batch_size != 1024:
             args['batch_size'] = batch_size
         op = 'codec.text.encode' if encode else 'codec.text.decode'
+        if not encode:
+            if max_error_bytes != 4096:
+                args['max_error_bytes'] = int(max_error_bytes)
+            if max_record_bytes != 64 * 1024 * 1024:
+                args['max_record_bytes'] = int(max_record_bytes)
         return {'op': op, 'args': args}
 
     @staticmethod
-    def text_decode(batch_size=1024):
+    def text_decode(batch_size=1024, max_error_bytes=4096,
+                    max_record_bytes=64 * 1024 * 1024):
         """Text line decoder."""
-        return codec.text(batch_size=batch_size, encode=False)
+        return codec.text(batch_size=batch_size, encode=False,
+                          max_error_bytes=max_error_bytes,
+                          max_record_bytes=max_record_bytes)
 
     @staticmethod
     def text_encode():
@@ -170,13 +205,27 @@ class ops:
     """Transform step constructors."""
 
     @staticmethod
-    def filter(expression, audit=False, audit_limit=None):
+    def filter(expression, audit=False, audit_limit=None, audit_include_row=None,
+               audit_columns=None, audit_redact=None, audit_hash_columns=None,
+               audit_max_bytes=None, audit_max_cell_bytes=None):
         """Filter rows by expression. Set audit=True to record bounded dropped-row audit entries."""
         args = {'expr': expression}
         if audit:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = audit_limit
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'filter', 'args': args}
 
     @staticmethod
@@ -295,7 +344,9 @@ class ops:
     @staticmethod
     def validate(expression=None, audit=False, audit_limit=None, max_failures=None,
                  max_failure_rate=None, warn_failure_rate=None, name=None,
-                 message=None, rules=None, rules_file=None):
+                 message=None, rules=None, rules_file=None, audit_include_row=None,
+                 audit_columns=None, audit_redact=None, audit_hash_columns=None,
+                 audit_max_bytes=None, audit_max_cell_bytes=None):
         """Add _valid bool column from one expression or a row-local rule set."""
         args = {}
         if rules_file is not None:
@@ -310,6 +361,18 @@ class ops:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = int(audit_limit)
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         if max_failures is not None:
             args['max_failures'] = int(max_failures)
         if max_failure_rate is not None:
@@ -324,7 +387,10 @@ class ops:
 
     @staticmethod
     def assert_(expression=None, action='fail', name='assert', message='', result='_assert', audit=False,
-                audit_limit=None, aggregate=None, op=None, value=None, column=None):
+                audit_limit=None, aggregate=None, op=None, value=None, column=None,
+                tolerance=None, rel=None, audit_include_row=None, audit_columns=None,
+                audit_redact=None, audit_hash_columns=None, audit_max_bytes=None,
+                audit_max_cell_bytes=None):
         """Assert a row-local rule or a finish-time streaming aggregate rule."""
         args = {'action': action}
         if aggregate is not None:
@@ -337,7 +403,13 @@ class ops:
             args['value'] = float(value)
             if column is not None:
                 args['column'] = column
+            if tolerance is not None:
+                args['tolerance'] = float(tolerance)
+            if rel is not None:
+                args['rel'] = bool(rel)
         elif expression is not None:
+            if tolerance is not None or rel is not None:
+                raise ValueError('assert tolerance and rel require aggregate')
             args['expr'] = expression
         else:
             raise ValueError('assert_ requires expression or aggregate')
@@ -351,22 +423,51 @@ class ops:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = audit_limit
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'assert', 'args': args}
 
     @staticmethod
-    def quarantine(expression, name=None, message=None):
+    def quarantine(expression, name=None, message=None, audit_include_row=None,
+                   audit_columns=None, audit_redact=None, audit_hash_columns=None,
+                   audit_max_bytes=None, audit_max_cell_bytes=None):
         """Route rows matching expression to errors and drop them from main output."""
         args = {'expr': expression}
         if name is not None:
             args['name'] = name
         if message:
             args['message'] = message
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'quarantine', 'args': args}
 
     @staticmethod
     def schema(columns=None, required=None, non_null=None, nullable=None, values=None,
                min=None, max=None, regex=None, mode='fail', name='schema',
-               message='', result='_schema', audit=False, audit_limit=None):
+               message='', result='_schema', audit=False, audit_limit=None,
+               max_regex_pattern_bytes=None, max_regex_cell_bytes=None,
+               audit_include_row=None, audit_columns=None, audit_redact=None,
+               audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """Validate a row-local column contract. mode: fail, warn, filter, quarantine, annotate."""
         args = {'mode': mode, 'action': mode}
         if columns is not None:
@@ -395,6 +496,22 @@ class ops:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = audit_limit
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
+        if max_regex_pattern_bytes is not None:
+            args['max_regex_pattern_bytes'] = max_regex_pattern_bytes
+        if max_regex_cell_bytes is not None:
+            args['max_regex_cell_bytes'] = max_regex_cell_bytes
         return {'op': 'schema', 'args': args}
 
     @staticmethod
@@ -406,7 +523,9 @@ class ops:
         return {'op': 'schema-infer', 'args': args}
 
     @staticmethod
-    def tee(expr=None, channel='samples', columns=None, limit=1000, every=1, name='tee', include_row=True):
+    def tee(expr=None, channel='samples', columns=None, limit=1000, every=1, name='tee', include_row=True,
+            audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None,
+            audit_max_bytes=None, audit_max_cell_bytes=None):
         """Copy bounded row snapshots to a side channel while preserving main rows."""
         args = {
             'channel': channel,
@@ -419,6 +538,18 @@ class ops:
             args['expr'] = expr
         if columns is not None:
             args['columns'] = columns
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'tee', 'args': args}
 
     @staticmethod
@@ -430,23 +561,51 @@ class ops:
         return {'op': 'trim', 'args': args}
 
     @staticmethod
-    def fill_null(audit=False, audit_limit=None, **mapping):
+    def fill_null(audit=False, audit_limit=None, audit_include_row=None,
+                  audit_columns=None, audit_redact=None, audit_hash_columns=None,
+                  audit_max_bytes=None, audit_max_cell_bytes=None, **mapping):
         """Replace nulls with defaults. Example: tf.ops.fill_null(age='0', city='unknown')"""
         args = {'mapping': mapping}
         if audit:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = int(audit_limit)
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'fill-null', 'args': args}
 
     @staticmethod
-    def cast(audit=False, audit_limit=None, **mapping):
+    def cast(audit=False, audit_limit=None, audit_include_row=None,
+             audit_columns=None, audit_redact=None, audit_hash_columns=None,
+             audit_max_bytes=None, audit_max_cell_bytes=None, **mapping):
         """Type conversion. Example: tf.ops.cast(age='int', score='float')"""
         args = {'mapping': mapping}
         if audit:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = int(audit_limit)
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'cast', 'args': args}
 
     @staticmethod
@@ -460,7 +619,9 @@ class ops:
         return {'op': 'clip', 'args': args}
 
     @staticmethod
-    def replace(column, pattern, replacement, regex=False, audit=False, audit_limit=None):
+    def replace(column, pattern, replacement, regex=False, audit=False, audit_limit=None,
+                audit_include_row=None, audit_columns=None, audit_redact=None,
+                audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """String find/replace. Example: tf.ops.replace('name', 'foo', 'bar', regex=True)"""
         args = {'column': column, 'pattern': pattern, 'replacement': replacement}
         if regex:
@@ -469,6 +630,18 @@ class ops:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = int(audit_limit)
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'replace', 'args': args}
 
     @staticmethod
@@ -480,9 +653,40 @@ class ops:
         return {'op': 'hash', 'args': args}
 
     @staticmethod
-    def bin(column, boundaries):
-        """Discretize into bins. Example: tf.ops.bin('age', [18, 30, 50])"""
-        return {'op': 'bin', 'args': {'column': column, 'boundaries': boundaries}}
+    def bin(column, boundaries, missing=None, on_type_error=None):
+        """Discretize into bins. missing: error/null/ignore; on_type_error: fail/null."""
+        args = {'column': column, 'boundaries': boundaries}
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
+        return {'op': 'bin', 'args': args}
+
+    @staticmethod
+    def ewma(column, alpha, result=None, missing=None, on_type_error=None):
+        """Exponentially weighted moving average."""
+        args = {'column': column, 'alpha': alpha}
+        if result is not None:
+            args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
+        return {'op': 'ewma', 'args': args}
+
+    @staticmethod
+    def anomaly(column, threshold=3.0, result=None, missing=None, on_type_error=None):
+        """Streaming z-score anomaly flag."""
+        args = {'column': column}
+        if threshold is not None:
+            args['threshold'] = threshold
+        if result is not None:
+            args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
+        return {'op': 'anomaly', 'args': args}
 
     @staticmethod
     def fill_down(columns=None):
@@ -501,43 +705,63 @@ class ops:
         return {'op': 'step', 'args': args}
 
     @staticmethod
-    def window(column, size, func, result=None):
-        """Sliding window aggregation. Example: tf.ops.window('price', 3, 'avg', 'price_ma3')"""
+    def window(column, size, func, result=None, missing=None, on_type_error=None):
+        """Sliding window aggregation. missing: error/null/ignore; on_type_error: fail/null."""
         args = {'column': column, 'size': size, 'func': func}
         if result is not None:
             args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'window', 'args': args}
 
     @staticmethod
-    def rolling_sum(column, size, result=None):
-        """Trailing fixed-window sum. Example: tf.ops.rolling_sum('price', 3, 'price_sum3')"""
+    def rolling_sum(column, size, result=None, missing=None, on_type_error=None):
+        """Trailing fixed-window numeric sum."""
         args = {'column': column, 'size': size}
         if result is not None:
             args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'rolling-sum', 'args': args}
 
     @staticmethod
-    def rolling_mean(column, size, result=None):
-        """Trailing fixed-window mean. Example: tf.ops.rolling_mean('price', 3, 'price_ma3')"""
+    def rolling_mean(column, size, result=None, missing=None, on_type_error=None):
+        """Trailing fixed-window numeric mean."""
         args = {'column': column, 'size': size}
         if result is not None:
             args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'rolling-mean', 'args': args}
 
     @staticmethod
-    def rolling_min(column, size, result=None):
-        """Trailing fixed-window minimum. Example: tf.ops.rolling_min('price', 3, 'price_min3')"""
+    def rolling_min(column, size, result=None, missing=None, on_type_error=None):
+        """Trailing fixed-window numeric min."""
         args = {'column': column, 'size': size}
         if result is not None:
             args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'rolling-min', 'args': args}
 
     @staticmethod
-    def rolling_max(column, size, result=None):
-        """Trailing fixed-window maximum. Example: tf.ops.rolling_max('price', 3, 'price_max3')"""
+    def rolling_max(column, size, result=None, missing=None, on_type_error=None):
+        """Trailing fixed-window numeric max."""
         args = {'column': column, 'size': size}
         if result is not None:
             args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'rolling-max', 'args': args}
 
     @staticmethod
@@ -561,11 +785,21 @@ class ops:
         return {'op': 'rolling-all', 'args': args}
 
     @staticmethod
-    def explode(column, delimiter=','):
+    def explode(column, delimiter=',', max_tokens_per_row=None,
+                max_output_rows_per_input_row=None, max_output_rows_per_batch=None,
+                max_token_bytes=None):
         """Split delimited string into multiple rows. Example: tf.ops.explode('tags', ',')"""
         args = {'column': column}
         if delimiter != ',':
             args['delimiter'] = delimiter
+        if max_tokens_per_row is not None:
+            args['max_tokens_per_row'] = max_tokens_per_row
+        if max_output_rows_per_input_row is not None:
+            args['max_output_rows_per_input_row'] = max_output_rows_per_input_row
+        if max_output_rows_per_batch is not None:
+            args['max_output_rows_per_batch'] = max_output_rows_per_batch
+        if max_token_bytes is not None:
+            args['max_token_bytes'] = max_token_bytes
         return {'op': 'explode', 'args': args}
 
     @staticmethod
@@ -577,9 +811,14 @@ class ops:
         return {'op': 'split', 'args': args}
 
     @staticmethod
-    def unpivot(columns):
+    def unpivot(columns, max_output_rows_per_input_row=None, max_output_rows_per_batch=None):
         """Wide to long. Example: tf.ops.unpivot(['jan', 'feb', 'mar'])"""
-        return {'op': 'unpivot', 'args': {'columns': columns}}
+        args = {'columns': columns}
+        if max_output_rows_per_input_row is not None:
+            args['max_output_rows_per_input_row'] = max_output_rows_per_input_row
+        if max_output_rows_per_batch is not None:
+            args['max_output_rows_per_batch'] = max_output_rows_per_batch
+        return {'op': 'unpivot', 'args': args}
 
     @staticmethod
     def pivot(name_column, value_column, agg=None, categories=None, max_categories=None, sorted=False):
@@ -596,7 +835,19 @@ class ops:
         return {'op': 'pivot', 'args': args}
 
     @staticmethod
-    def normalize(columns, method='minmax', audit=False, audit_limit=None):
+    def interpolate(column, method='linear', missing=None, on_type_error=None):
+        """Interpolate nulls in a numeric column. Example: tf.ops.interpolate('score', 'linear')"""
+        args = {'column': column, 'method': method}
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
+        return {'op': 'interpolate', 'args': args}
+
+    @staticmethod
+    def normalize(columns, method='minmax', audit=False, audit_limit=None, missing=None, on_type_error=None,
+                  audit_include_row=None, audit_columns=None, audit_redact=None,
+                  audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """Normalize numeric columns with minmax or zscore. Example: tf.ops.normalize(['score'])"""
         if isinstance(columns, str):
             cols = [c.strip() for c in columns.split(',') if c.strip()]
@@ -607,7 +858,33 @@ class ops:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = int(audit_limit)
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'normalize', 'args': args}
+
+    @staticmethod
+    def acf(column, lags=20, missing=None, on_type_error=None):
+        """Compute autocorrelation for a numeric column. Example: tf.ops.acf('score', lags=10)"""
+        args = {'column': column, 'lags': lags}
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
+        return {'op': 'acf', 'args': args}
 
     @staticmethod
     def top(n, column, desc=True):
@@ -649,9 +926,12 @@ class ops:
         return {'op': 'slice-max', 'args': {'n': n, 'column': column, 'desc': True, 'with_ties': False}}
 
     @staticmethod
-    def sample(n):
-        """Reservoir sampling. Example: tf.ops.sample(100)"""
-        return {'op': 'sample', 'args': {'n': n}}
+    def sample(n, seed=0):
+        """Reservoir sampling. Use seed='random' for non-deterministic sampling."""
+        args = {'n': n}
+        if seed != 0:
+            args['seed'] = seed
+        return {'op': 'sample', 'args': args}
 
     @staticmethod
     def group_agg(group_by, aggs, max_groups=None, sorted=False, max_state_bytes=None):
@@ -667,7 +947,9 @@ class ops:
 
     @staticmethod
     def frequency(columns=None, max_values=None, overflow=None, other=None, max_state_bytes=None,
-                  audit=False, audit_limit=None):
+                  audit=False, audit_limit=None, audit_include_row=None, audit_columns=None,
+                  audit_redact=None, audit_hash_columns=None, audit_max_bytes=None,
+                  audit_max_cell_bytes=None):
         """Value counts. Example: tf.ops.frequency(['city'], max_values=10000, overflow='other')"""
         args = {}
         if columns is not None:
@@ -684,6 +966,18 @@ class ops:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = int(audit_limit)
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'frequency', 'args': args}
 
     @staticmethod
@@ -719,11 +1013,15 @@ class ops:
         return {'op': 'label-encode', 'args': args}
 
     @staticmethod
-    def datetime(column, extract=None):
+    def datetime(column, extract=None, missing=None, on_type_error=None):
         """Extract date components. Example: tf.ops.datetime('date', ['year', 'month', 'day'])"""
         args = {'column': column}
         if extract is not None:
             args['extract'] = extract
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'datetime', 'args': args}
 
     @staticmethod
@@ -781,7 +1079,10 @@ class ops:
         return {'op': 'json-filter', 'args': args}
 
     @staticmethod
-    def json_schema(schema, column='_line', mode='annotate', result='_valid', audit=False, audit_limit=None):
+    def json_schema(schema, column='_line', mode='annotate', result='_valid', audit=False,
+                    audit_limit=None, audit_include_row=None, audit_columns=None,
+                    audit_redact=None, audit_hash_columns=None, audit_max_bytes=None,
+                    audit_max_cell_bytes=None):
         """Validate each JSON text cell against a supported JSON Schema subset."""
         args = {
             'column': column,
@@ -793,6 +1094,18 @@ class ops:
             args['audit'] = True
         if audit_limit is not None:
             args['audit_limit'] = audit_limit
+        if audit_include_row is not None:
+            args['audit_include_row'] = bool(audit_include_row)
+        if audit_columns is not None:
+            args['audit_columns'] = audit_columns
+        if audit_redact is not None:
+            args['audit_redact'] = audit_redact
+        if audit_hash_columns is not None:
+            args['audit_hash_columns'] = audit_hash_columns
+        if audit_max_bytes is not None:
+            args['audit_max_bytes'] = int(audit_max_bytes)
+        if audit_max_cell_bytes is not None:
+            args['audit_max_cell_bytes'] = int(audit_max_cell_bytes)
         return {'op': 'json-schema', 'args': args}
 
     @staticmethod
@@ -1035,11 +1348,15 @@ class ops:
         return {'op': 'rleid', 'args': args}
 
     @staticmethod
-    def date_trunc(column, trunc, result=None):
+    def date_trunc(column, trunc, result=None, missing=None, on_type_error=None):
         """Truncate date/timestamp to granularity. Example: tf.ops.date_trunc('ts', 'month')"""
         args = {'column': column, 'trunc': trunc}
         if result is not None:
             args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'date-trunc', 'args': args}
 
 

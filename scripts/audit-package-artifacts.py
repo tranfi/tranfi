@@ -62,6 +62,9 @@ NPM_REQUIRED = {
     'csrc/tranfi.h',
     'csrc/codec_csv.c',
     'csrc/pipeline.c',
+    'csrc/spill.c',
+    'csrc/spill.h',
+    'csrc/size_utils.c',
     'app/index.html',
 }
 NPM_REQUIRED_PREFIXES = ('app/assets/',)
@@ -82,6 +85,9 @@ PY_SDIST_REQUIRED = {
     'csrc/tranfi.h',
     'csrc/codec_csv.c',
     'csrc/pipeline.c',
+    'csrc/spill.c',
+    'csrc/spill.h',
+    'csrc/size_utils.c',
 }
 
 
@@ -153,6 +159,94 @@ def audit(kind: str, paths: set[str], required: set[str], prefixes: tuple[str, .
     return errors
 
 
+def audit_repo_hardening() -> list[str]:
+    cmake = Path('CMakeLists.txt')
+    if not cmake.exists():
+        return ['repo: missing CMakeLists.txt for hardening audit']
+    text = cmake.read_text(encoding='utf-8')
+    required = [
+        '_POSIX_C_SOURCE=200809L',
+        'Werror=implicit-function-declaration',
+        'Wformat',
+        'Werror=format-security',
+        'fno-common',
+        'fstack-protector-strong',
+        '_FORTIFY_SOURCE=3',
+        '-fPIE',
+        '-pie',
+    ]
+    return [f'repo: CMakeLists.txt missing hardening token: {token}' for token in required if token not in text]
+
+
+def audit_repo_license() -> list[str]:
+    errors: list[str] = []
+    required_files = [
+        Path('LICENSE'),
+        Path('NOTICE'),
+        Path('README.md'),
+        Path('py/pyproject.toml'),
+        Path('py/NOTICE'),
+        Path('js/package.json'),
+        Path('js/NOTICE'),
+    ]
+    for path in required_files:
+        if not path.exists():
+            errors.append(f'repo: missing license/notice file: {path}')
+    if errors:
+        return errors
+
+    readme = Path('README.md').read_text(encoding='utf-8')
+    if 'Apache-2.0' not in readme:
+        errors.append('repo: README.md license section must mention Apache-2.0')
+    if '\nMIT\n' in readme or 'License\n\nMIT' in readme:
+        errors.append('repo: README.md still contains MIT license text')
+
+    pyproject = Path('py/pyproject.toml').read_text(encoding='utf-8')
+    if 'Apache-2.0' not in pyproject:
+        errors.append('repo: py/pyproject.toml must declare Apache-2.0')
+
+    package_json = json.loads(Path('js/package.json').read_text(encoding='utf-8'))
+    if package_json.get('license') != 'Apache-2.0':
+        errors.append('repo: js/package.json license must be Apache-2.0')
+
+    for path in [Path('NOTICE'), Path('py/NOTICE'), Path('js/NOTICE')]:
+        body = path.read_text(encoding='utf-8')
+        if 'Apache License, Version 2.0' not in body and 'Apache-2.0' not in body:
+            errors.append(f'repo: {path} must mention Apache-2.0 / Apache License, Version 2.0')
+        if 'cJSON 1.7.19' not in body:
+            errors.append(f'repo: {path} must include cJSON 1.7.19 attribution')
+    return errors
+
+
+def audit_dependency_governance() -> list[str]:
+    errors: list[str] = []
+    provenance_path = Path('third_party/cjson.json')
+    if not provenance_path.exists():
+        return ['repo: missing third_party/cjson.json provenance file']
+    provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
+    if provenance.get('version') != '1.7.19':
+        errors.append('repo: cJSON provenance version must be 1.7.19')
+    header = Path('src/cJSON.h').read_text(encoding='utf-8')
+    if '#define CJSON_VERSION_PATCH 19' not in header:
+        errors.append('repo: vendored cJSON.h must be version 1.7.19')
+    source = Path('src/cJSON.c').read_text(encoding='utf-8')
+    if 'static CJSON_THREAD_LOCAL error global_error' not in source:
+        errors.append('repo: cJSON thread-local parse-error patch is missing')
+    if Path('src/cJSON_Utils.c').exists() or Path('src/cJSON_Utils.h').exists():
+        errors.append('repo: cJSON_Utils must not be vendored/compiled')
+    sbom_path = Path('build/tranfi-sbom.spdx.json')
+    if not sbom_path.exists():
+        errors.append('repo: missing generated SBOM build/tranfi-sbom.spdx.json')
+    else:
+        sbom = json.loads(sbom_path.read_text(encoding='utf-8'))
+        packages = {pkg.get('name'): pkg for pkg in sbom.get('packages', [])}
+        if packages.get('cJSON', {}).get('versionInfo') != '1.7.19':
+            errors.append('repo: generated SBOM must include cJSON 1.7.19')
+        if packages.get('tranfi', {}).get('licenseDeclared') != 'Apache-2.0':
+            errors.append('repo: generated SBOM must declare tranfi Apache-2.0')
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--npm-json', action='append', default=[], help='npm pack --dry-run --json output file')
@@ -161,6 +255,9 @@ def main() -> int:
 
     errors: list[str] = []
     summaries: list[str] = []
+    errors.extend(audit_repo_hardening())
+    errors.extend(audit_repo_license())
+    errors.extend(audit_dependency_governance())
 
     for item in args.npm_json:
         path = expand_one(item)

@@ -2,18 +2,61 @@ cmake_minimum_required(VERSION 3.16)
 project(tranfi C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+function(tranfi_apply_c_common target)
+    target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(${target} PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Werror=implicit-function-declaration
+            -Werror=incompatible-pointer-types
+            -Wformat
+            -Werror=format-security
+            -Werror=unused-result
+            -fno-common
+            $<$<CONFIG:Release>:-fstack-protector-strong>
+        )
+        if(NOT EMSCRIPTEN)
+            target_compile_definitions(${target} PRIVATE $<$<CONFIG:Release>:_FORTIFY_SOURCE=3>)
+        endif()
+    endif()
+endfunction()
+
+function(tranfi_apply_executable_hardening target)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang" AND NOT EMSCRIPTEN)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-fPIE>)
+        target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-pie>)
+    endif()
+endfunction()
+
+set(TRANFI_SANITIZER "address,undefined" CACHE STRING "Debug sanitizer set: address,undefined, thread, or none")
+
+function(tranfi_apply_debug_sanitizer target)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT EMSCRIPTEN AND NOT TRANFI_SANITIZER STREQUAL "" AND NOT TRANFI_SANITIZER STREQUAL "none")
+        target_compile_options(${target} PRIVATE -fsanitize=${TRANFI_SANITIZER} -fno-omit-frame-pointer -g -O0)
+        target_link_options(${target} PRIVATE -fsanitize=${TRANFI_SANITIZER})
+        if(TRANFI_SANITIZER STREQUAL "thread")
+            target_compile_options(${target} PRIVATE -fPIE)
+            target_link_options(${target} PRIVATE -pie)
+        endif()
+    endif()
+endfunction()
 
 # Core sources
 set(CORE_SOURCES
     src/cJSON.c
     src/arena.c
     src/buffer.c
+    src/size_utils.c
     src/batch.c
     src/pipeline.c
-    src/plan.c
     src/expr.c
     src/selector.c
     src/memory_estimate.c
+    src/spill.c
     src/json_path.c
     src/codec_csv.c
     src/codec_jsonl.c
@@ -99,25 +142,20 @@ set_target_properties(tranfi_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(tranfi SHARED ${CORE_SOURCES})
 target_include_directories(tranfi PUBLIC src)
 
-# Compiler warnings and POSIX features (for strdup)
-target_compile_definitions(tranfi_core PRIVATE _POSIX_C_SOURCE=200809L)
-target_compile_definitions(tranfi PRIVATE _POSIX_C_SOURCE=200809L)
-target_compile_options(tranfi_core PRIVATE -Wall -Wextra -Wpedantic)
-target_compile_options(tranfi PRIVATE -Wall -Wextra -Wpedantic)
+# Compiler warnings, POSIX features, and native hardening.
+tranfi_apply_c_common(tranfi_core)
+tranfi_apply_c_common(tranfi)
 
-# Debug build: ASan + UBSan for catching memory bugs and undefined behavior
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(tranfi_core PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0)
-    target_link_options(tranfi_core PRIVATE -fsanitize=address,undefined)
-    target_compile_options(tranfi PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0)
-    target_link_options(tranfi PRIVATE -fsanitize=address,undefined)
-endif()
+# Debug build: configurable sanitizer. Default remains ASan + UBSan.
+tranfi_apply_debug_sanitizer(tranfi_core)
+tranfi_apply_debug_sanitizer(tranfi)
 
 # WASM (Emscripten)
 if(EMSCRIPTEN)
     add_executable(tranfi_wasm src/wasm_api.c)
     target_link_libraries(tranfi_wasm tranfi_core)
     target_include_directories(tranfi_wasm PRIVATE src)
+    tranfi_apply_c_common(tranfi_wasm)
     set_target_properties(tranfi_wasm PROPERTIES
         OUTPUT_NAME "tranfi_core"
         SUFFIX ".js"
@@ -140,50 +178,60 @@ target_link_libraries(tranfi m)
 add_executable(tranfi_cli src/main.c)
 target_link_libraries(tranfi_cli tranfi_core)
 target_include_directories(tranfi_cli PRIVATE src)
-target_compile_definitions(tranfi_cli PRIVATE _POSIX_C_SOURCE=200809L)
-target_compile_options(tranfi_cli PRIVATE -Wall -Wextra -Wpedantic)
+tranfi_apply_c_common(tranfi_cli)
+tranfi_apply_executable_hardening(tranfi_cli)
 set_target_properties(tranfi_cli PROPERTIES OUTPUT_NAME "tranfi")
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(tranfi_cli PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0)
-    target_link_options(tranfi_cli PRIVATE -fsanitize=address,undefined)
-endif()
+tranfi_apply_debug_sanitizer(tranfi_cli)
 
 # Tests
 option(BUILD_TESTING "Build tests" OFF)
 if(BUILD_TESTING)
     enable_testing()
+    find_package(Threads REQUIRED)
     add_executable(test_core test/test_core.c)
-    target_link_libraries(test_core tranfi_core)
+    target_link_libraries(test_core tranfi_core Threads::Threads)
     target_include_directories(test_core PRIVATE src)
     # Never disable asserts in test binary
-    target_compile_definitions(test_core PRIVATE $<$<CONFIG:Release>:NDEBUG=0>)
+    tranfi_apply_c_common(test_core)
     target_compile_options(test_core PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        target_compile_options(test_core PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0)
-        target_link_options(test_core PRIVATE -fsanitize=address,undefined)
-    endif()
+    tranfi_apply_executable_hardening(test_core)
+    tranfi_apply_debug_sanitizer(test_core)
     add_test(NAME core_tests COMMAND test_core)
 
     add_executable(test_memory test/test_memory.c)
     target_link_libraries(test_memory tranfi_core)
     target_include_directories(test_memory PRIVATE src)
-    target_compile_definitions(test_memory PRIVATE _POSIX_C_SOURCE=200809L $<$<CONFIG:Release>:NDEBUG=0>)
+    tranfi_apply_c_common(test_memory)
     target_compile_options(test_memory PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        target_compile_options(test_memory PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0)
-        target_link_options(test_memory PRIVATE -fsanitize=address,undefined)
-    endif()
+    tranfi_apply_executable_hardening(test_memory)
+    tranfi_apply_debug_sanitizer(test_memory)
     add_test(NAME memory_tests COMMAND test_memory)
     add_test(NAME cli_memory_policy COMMAND bash ${CMAKE_SOURCE_DIR}/test/test_cli_memory_policy.sh $<TARGET_FILE:tranfi_cli>)
+
+    add_executable(test_oom test/test_oom.c)
+    target_link_libraries(test_oom tranfi_core)
+    target_include_directories(test_oom PRIVATE src)
+    tranfi_apply_c_common(test_oom)
+    target_compile_options(test_oom PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
+    tranfi_apply_executable_hardening(test_oom)
+    tranfi_apply_debug_sanitizer(test_oom)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang" AND NOT EMSCRIPTEN)
+        target_link_options(test_oom PRIVATE
+            -Wl,--wrap=malloc
+            -Wl,--wrap=calloc
+            -Wl,--wrap=realloc
+            -Wl,--wrap=strdup
+            -Wl,--wrap=strndup
+        )
+    endif()
+    add_test(NAME oom_tests COMMAND test_oom)
 endif()
 
 # Benchmark
 add_executable(bench bench/bench.c)
 target_link_libraries(bench tranfi_core)
 target_include_directories(bench PRIVATE src)
-target_compile_definitions(bench PRIVATE _POSIX_C_SOURCE=200809L)
-target_compile_options(bench PRIVATE -Wall -Wextra -Wpedantic -O2)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(bench PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0)
-    target_link_options(bench PRIVATE -fsanitize=address,undefined)
-endif()
+tranfi_apply_c_common(bench)
+target_compile_options(bench PRIVATE -O2)
+tranfi_apply_executable_hardening(bench)
+tranfi_apply_debug_sanitizer(bench)

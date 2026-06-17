@@ -21,38 +21,8 @@ typedef struct {
     size_t   audit_limit;
     size_t   audit_emitted;
     int      audit;
+    tf_audit_options audit_opts;
 } filter_state;
-
-static cJSON *filter_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL:
-            return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64:
-            return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64:
-            return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING:
-            return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE:
-            return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP:
-            return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default:
-            return cJSON_CreateNull();
-    }
-}
-
-static cJSON *filter_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = filter_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
-    }
-    return obj;
-}
 
 static int filter_emit_drop_audit(filter_state *st, const tf_batch *b, size_t row,
                                   tf_side_channels *side, const char *reason) {
@@ -66,13 +36,12 @@ static int filter_emit_drop_audit(filter_state *st, const tf_batch *b, size_t ro
     cJSON_AddStringToObject(obj, "channel", "audit");
     cJSON_AddStringToObject(obj, "expr", st->expr_text ? st->expr_text : "");
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    cJSON *data = filter_row_to_json(b, row);
+    cJSON *data = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (data) cJSON_AddItemToObject(obj, "data", data);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->stats, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    int rc = tf_buffer_write_line(side->stats, line);
     free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
@@ -86,8 +55,9 @@ static int filter_process(tf_step *self, tf_batch *in, tf_batch **out,
     /* Create output batch with same schema */
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t i = 0; i < in->n_cols; i++) {
-        tf_batch_set_schema(ob, i, in->col_names[i], in->col_types[i]);
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
 
     /* Filter rows */
@@ -105,40 +75,9 @@ static int filter_process(tf_step *self, tf_batch *in, tf_batch **out,
             continue;
         }
 
-        if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) {
+        if (tf_batch_copy_row(ob, out_row, in, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
-        }
-
-        /* Copy row */
-        for (size_t c = 0; c < in->n_cols; c++) {
-            if (tf_batch_is_null(in, r, c)) {
-                tf_batch_set_null(ob, out_row, c);
-                continue;
-            }
-            switch (in->col_types[c]) {
-                case TF_TYPE_BOOL:
-                    tf_batch_set_bool(ob, out_row, c, tf_batch_get_bool(in, r, c));
-                    break;
-                case TF_TYPE_INT64:
-                    tf_batch_set_int64(ob, out_row, c, tf_batch_get_int64(in, r, c));
-                    break;
-                case TF_TYPE_FLOAT64:
-                    tf_batch_set_float64(ob, out_row, c, tf_batch_get_float64(in, r, c));
-                    break;
-                case TF_TYPE_STRING:
-                    tf_batch_set_string(ob, out_row, c, tf_batch_get_string(in, r, c));
-                    break;
-                case TF_TYPE_DATE:
-                    tf_batch_set_date(ob, out_row, c, tf_batch_get_date(in, r, c));
-                    break;
-                case TF_TYPE_TIMESTAMP:
-                    tf_batch_set_timestamp(ob, out_row, c, tf_batch_get_timestamp(in, r, c));
-                    break;
-                default:
-                    tf_batch_set_null(ob, out_row, c);
-                    break;
-            }
         }
         out_row++;
     }
@@ -151,9 +90,12 @@ static int filter_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (side && side->stats) {
         char stats_buf[128];
         snprintf(stats_buf, sizeof(stats_buf),
-                 "{\"op\":\"filter\",\"rows_in\":%zu,\"rows_out\":%zu}\n",
+                 "{\"op\":\"filter\",\"rows_in\":%zu,\"rows_out\":%zu}",
                  in->n_rows, out_row);
-        tf_buffer_write_str(side->stats, stats_buf);
+        if (tf_buffer_write_line(side->stats, stats_buf) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     if (out_row > 0) {
@@ -175,6 +117,7 @@ static void filter_destroy(tf_step *self) {
     if (st) {
         tf_expr_free(st->expr);
         free(st->expr_text);
+        tf_audit_options_free(&st->audit_opts);
         free(st);
     }
     free(self);
@@ -193,24 +136,35 @@ tf_step *tf_filter_create(const cJSON *args) {
     st->expr = expr;
     st->expr_text = strdup(expr_json->valuestring);
     st->audit_limit = 1000;
+    tf_audit_options_init(&st->audit_opts, 1);
     cJSON *audit_json = cJSON_GetObjectItemCaseSensitive(args, "audit");
     st->audit = cJSON_IsTrue(audit_json) ? 1 : 0;
     cJSON *audit_limit_json = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
     if (!audit_limit_json) audit_limit_json = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
     if (audit_limit_json) {
-        if (!cJSON_IsNumber(audit_limit_json) || audit_limit_json->valuedouble <= 0) {
+        size_t parsed_limit = 0;
+        if (tf_json_get_size_arg_any(args, "audit_limit", "auditLimit",
+                                     1, TF_MAX_AUDIT_RECORDS,
+                                     &parsed_limit, "filter") < 0) {
             tf_expr_free(expr);
             free(st->expr_text);
+            tf_audit_options_free(&st->audit_opts);
             free(st);
-            tf_set_last_error("filter: audit_limit must be a positive integer");
             return NULL;
         }
-        st->audit_limit = (size_t)audit_limit_json->valuedouble;
+        st->audit_limit = parsed_limit;
     }
-    if (!st->expr_text) { tf_expr_free(expr); free(st); return NULL; }
+    if (tf_audit_options_parse(&st->audit_opts, args, "filter") != TF_OK) {
+        tf_expr_free(expr);
+        free(st->expr_text);
+        tf_audit_options_free(&st->audit_opts);
+        free(st);
+        return NULL;
+    }
+    if (!st->expr_text) { tf_expr_free(expr); tf_audit_options_free(&st->audit_opts); free(st); return NULL; }
 
     tf_step *step = calloc(1, sizeof(tf_step));
-    if (!step) { tf_expr_free(expr); free(st); return NULL; }
+    if (!step) { tf_expr_free(expr); free(st->expr_text); tf_audit_options_free(&st->audit_opts); free(st); return NULL; }
     step->process = filter_process;
     step->flush = filter_flush;
     step->destroy = filter_destroy;

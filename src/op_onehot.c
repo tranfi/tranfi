@@ -43,30 +43,33 @@ static const char *OTHER_CATEGORY = "__other__";
 
 static size_t onehot_retained_state_bytes(const onehot_state *st);
 
-static void onehot_write_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
+static int onehot_expose_row(tf_batch *ob, size_t row) {
+    size_t next_rows = 0;
+    if (tf_size_add(row, 1, &next_rows) != TF_OK) return TF_ERROR;
+    ob->n_rows = next_rows;
+    return TF_OK;
 }
 
-static void onehot_unknown_error(const onehot_state *st, const char *val,
-                                 tf_side_channels *side) {
+static int onehot_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
+}
+
+static int onehot_unknown_error(const onehot_state *st, const char *val,
+                                tf_side_channels *side) {
     char msg[256];
     snprintf(msg, sizeof(msg),
              "onehot: unknown category '%s' for column '%s'",
              val ? val : "", st->column ? st->column : "");
-    onehot_write_error(side, msg);
+    return onehot_write_error(side, msg);
 }
 
-static void onehot_limit_error(const onehot_state *st, const char *val,
-                               tf_side_channels *side) {
+static int onehot_limit_error(const onehot_state *st, const char *val,
+                              tf_side_channels *side) {
     char msg[256];
     snprintf(msg, sizeof(msg),
              "onehot: max_categories=%zu exceeded while tracking category '%s'",
              st->max_categories, val ? val : "");
-    onehot_write_error(side, msg);
+    return onehot_write_error(side, msg);
 }
 
 static int onehot_check_state_bytes(onehot_state *st, tf_side_channels *side) {
@@ -77,7 +80,7 @@ static int onehot_check_state_bytes(onehot_state *st, tf_side_channels *side) {
     snprintf(msg, sizeof(msg),
              "onehot: max_state_bytes=%zu exceeded while tracking categories (%zu bytes retained)",
              st->max_state_bytes, retained);
-    onehot_write_error(side, msg);
+    if (onehot_write_error(side, msg) != TF_OK) return TF_ERROR;
     return TF_ERROR;
 }
 
@@ -108,18 +111,41 @@ static int add_category(onehot_state *st, const char *val) {
     int existing = find_category(st, val);
     if (existing >= 0) return existing;
     if (st->n_cats >= st->cap) {
-        size_t newcap = st->cap ? st->cap * 2 : 16;
-        onehot_category *tmp = realloc(st->cats, newcap * sizeof(onehot_category));
+        size_t min_cap = 0, newcap = 0;
+        if (tf_size_add(st->n_cats, 1, &min_cap) != TF_OK ||
+            tf_size_grow_pow2(st->cap, min_cap, 16, &newcap) != TF_OK) {
+            return -1;
+        }
+        onehot_category *tmp = tf_reallocarray_checked(st->cats, newcap,
+                                                       sizeof(onehot_category));
         if (!tmp) return -1;
         st->cats = tmp;
         st->cap = newcap;
     }
     char *value = strdup(val);
     if (!value) return -1;
-    char namebuf[512];
-    snprintf(namebuf, sizeof(namebuf), "%s_%s", st->column, val);
-    char *col_name = strdup(namebuf);
-    if (!col_name) { free(value); return -1; }
+    size_t column_len = 0, value_len = 0, name_len = 0, name_cap = 0;
+    if (tf_string_length_bounded(st->column, TF_MAX_COLUMN_NAME_BYTES,
+                                 &column_len, "onehot", "column") != TF_OK ||
+        tf_string_length_bounded(val, TF_MAX_COLUMN_NAME_BYTES,
+                                 &value_len, "onehot", "category value") != TF_OK ||
+        tf_size_add(column_len, 1, &name_len) != TF_OK ||
+        tf_size_add(name_len, value_len, &name_len) != TF_OK ||
+        tf_check_byte_limit(name_len, TF_MAX_COLUMN_NAME_BYTES,
+                            "onehot", "generated column name") != TF_OK ||
+        tf_size_add(name_len, 1, &name_cap) != TF_OK) {
+        free(value);
+        return -1;
+    }
+    char *col_name = tf_mallocarray_checked(name_cap, sizeof(char));
+    if (!col_name) {
+        free(value);
+        return -1;
+    }
+    memcpy(col_name, st->column, column_len);
+    col_name[column_len] = '_';
+    memcpy(col_name + column_len + 1, val, value_len);
+    col_name[name_len] = '\0';
     st->cats[st->n_cats].value = value;
     st->cats[st->n_cats].col_name = col_name;
     st->n_cats++;
@@ -130,7 +156,7 @@ static int resolve_other(onehot_state *st, int *idx, tf_side_channels *side) {
     int other = find_category(st, OTHER_CATEGORY);
     if (other >= 0) { *idx = other; return 0; }
     if (st->max_categories > 0 && st->n_cats >= st->max_categories) {
-        onehot_limit_error(st, OTHER_CATEGORY, side);
+        if (onehot_limit_error(st, OTHER_CATEGORY, side) != TF_OK) return -1;
         return -1;
     }
     other = add_category(st, OTHER_CATEGORY);
@@ -149,7 +175,7 @@ static int resolve_unknown(onehot_state *st, const char *val, int *idx,
         case TF_CAT_UNKNOWN_OTHER:
             return resolve_other(st, idx, side);
         case TF_CAT_UNKNOWN_ERROR:
-            onehot_unknown_error(st, val, side);
+            if (onehot_unknown_error(st, val, side) != TF_OK) return -1;
             return -1;
         case TF_CAT_UNKNOWN_ADD:
         default:
@@ -182,7 +208,7 @@ static int resolve_category(onehot_state *st, const char *val, int *idx,
     if (st->max_categories > 0 && st->n_cats >= st->max_categories) {
         int rc = resolve_unknown(st, val, idx, side);
         if (rc == 0) return 0;
-        onehot_limit_error(st, val, side);
+        if (onehot_limit_error(st, val, side) != TF_OK) return -1;
         return -1;
     }
 
@@ -199,7 +225,8 @@ static int onehot_process(tf_step *self, tf_batch *in, tf_batch **out,
     *out = NULL;
 
     int ci = tf_batch_col_index(in, st->column);
-    int *matches = malloc((in->n_rows ? in->n_rows : 1) * sizeof(int));
+    size_t match_count = in->n_rows ? in->n_rows : 1;
+    int *matches = tf_mallocarray_checked(match_count, sizeof(int));
     if (!matches) return TF_ERROR;
     for (size_t r = 0; r < in->n_rows; r++) matches[r] = -1;
 
@@ -215,56 +242,47 @@ static int onehot_process(tf_step *self, tf_batch *in, tf_batch **out,
     }
 
     size_t input_cols = (st->drop && ci >= 0 && in->n_cols > 0) ? in->n_cols - 1 : in->n_cols;
-    size_t out_cols = input_cols + st->n_cats;
+    size_t out_cols = 0;
+    if (tf_size_add(input_cols, st->n_cats, &out_cols) != TF_OK) {
+        free(matches);
+        return TF_ERROR;
+    }
     tf_batch *ob = tf_batch_create(out_cols, in->n_rows);
     if (!ob) { free(matches); return TF_ERROR; }
 
     size_t oc = 0;
     for (size_t c = 0; c < in->n_cols; c++) {
         if (st->drop && ci >= 0 && c == (size_t)ci) continue;
-        tf_batch_set_schema(ob, oc, in->col_names[c], in->col_types[c]);
+        if (tf_batch_set_schema(ob, oc, in->col_names[c], in->col_types[c]) != TF_OK) goto fail;
         oc++;
     }
     for (size_t i = 0; i < st->n_cats; i++) {
-        tf_batch_set_schema(ob, oc + i, st->cats[i].col_name, TF_TYPE_INT64);
+        if (tf_batch_set_schema(ob, oc + i, st->cats[i].col_name, TF_TYPE_INT64) != TF_OK) goto fail;
     }
 
     for (size_t r = 0; r < in->n_rows; r++) {
         oc = 0;
         for (size_t c = 0; c < in->n_cols; c++) {
             if (st->drop && ci >= 0 && c == (size_t)ci) continue;
-            if (tf_batch_is_null(in, r, c)) {
-                tf_batch_set_null(ob, r, oc);
-            } else {
-                switch (in->col_types[c]) {
-                    case TF_TYPE_STRING:
-                        tf_batch_set_string(ob, r, oc, tf_batch_get_string(in, r, c)); break;
-                    case TF_TYPE_INT64:
-                        tf_batch_set_int64(ob, r, oc, tf_batch_get_int64(in, r, c)); break;
-                    case TF_TYPE_FLOAT64:
-                        tf_batch_set_float64(ob, r, oc, tf_batch_get_float64(in, r, c)); break;
-                    case TF_TYPE_BOOL:
-                        tf_batch_set_bool(ob, r, oc, tf_batch_get_bool(in, r, c)); break;
-                    case TF_TYPE_DATE:
-                        tf_batch_set_date(ob, r, oc, tf_batch_get_date(in, r, c)); break;
-                    case TF_TYPE_TIMESTAMP:
-                        tf_batch_set_timestamp(ob, r, oc, tf_batch_get_timestamp(in, r, c)); break;
-                    default: tf_batch_set_null(ob, r, oc); break;
-                }
-            }
+            if (tf_batch_copy_cell(ob, r, oc, in, r, c) != TF_OK) goto fail;
             oc++;
         }
 
         int match = matches[r];
         for (size_t i = 0; i < st->n_cats; i++) {
-            tf_batch_set_int64(ob, r, oc + i, (int)i == match ? 1 : 0);
+            if (tf_batch_set_int64(ob, r, oc + i, (int)i == match ? 1 : 0) != TF_OK) goto fail;
         }
-        ob->n_rows = r + 1;
+        if (onehot_expose_row(ob, r) != TF_OK) goto fail;
     }
 
     free(matches);
     *out = ob;
     return TF_OK;
+
+fail:
+    free(matches);
+    tf_batch_free(ob);
+    return TF_ERROR;
 }
 
 static int onehot_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
@@ -364,25 +382,18 @@ tf_step *tf_onehot_create(const cJSON *args) {
     cJSON *drop_j = cJSON_GetObjectItemCaseSensitive(args, "drop");
     st->drop = cJSON_IsBool(drop_j) && cJSON_IsTrue(drop_j) ? 1 : 0;
 
-    cJSON *max_j = cJSON_GetObjectItemCaseSensitive(args, "max_categories");
-    if (max_j) {
-        if (!cJSON_IsNumber(max_j) || max_j->valuedouble <= 0) {
-            tf_set_last_error("onehot: max_categories must be positive");
-            onehot_state_free(st);
-            return NULL;
-        }
-        st->max_categories = (size_t)max_j->valuedouble;
-    }
+    size_t parsed_size = 0;
+    int has_max_categories = tf_json_get_size_arg(args, "max_categories",
+                                                  1, TF_MAX_COUNT_ARG,
+                                                  &parsed_size, "onehot");
+    if (has_max_categories < 0) { onehot_state_free(st); return NULL; }
+    if (has_max_categories > 0) st->max_categories = parsed_size;
 
-    cJSON *max_state_j = cJSON_GetObjectItemCaseSensitive(args, "max_state_bytes");
-    if (max_state_j) {
-        if (!cJSON_IsNumber(max_state_j) || max_state_j->valuedouble <= 0) {
-            tf_set_last_error("onehot: max_state_bytes must be positive");
-            onehot_state_free(st);
-            return NULL;
-        }
-        st->max_state_bytes = (size_t)max_state_j->valuedouble;
-    }
+    int has_max_state = tf_json_get_size_arg(args, "max_state_bytes",
+                                             1, TF_MAX_STATE_BYTES,
+                                             &parsed_size, "onehot");
+    if (has_max_state < 0) { onehot_state_free(st); return NULL; }
+    if (has_max_state > 0) st->max_state_bytes = parsed_size;
 
     int unknown_specified = 0;
     if (parse_unknown_policy(args, &st->unknown, &unknown_specified) != 0) {

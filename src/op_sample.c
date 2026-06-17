@@ -1,11 +1,12 @@
 /*
- * op_sample.c — Reservoir sampling (Algorithm R). Bounded memory.
+ * op_sample.c -- Reservoir sampling (Algorithm R). Bounded memory.
  *
- * Config: {"n": 100}
+ * Config: {"n": 100, "seed": 123} or {"n": 100, "seed": "random"}
  */
 
 #include "internal.h"
 #include "cJSON.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -15,8 +16,32 @@ typedef struct {
     tf_batch *buf;
     size_t    seen;       /* total rows seen */
     int       has_schema;
-    unsigned  seed;
+    uint64_t  rng;
 } sample_state;
+
+static uint64_t sample_random_seed(void) {
+    uintptr_t stack_marker = 0;
+    uintptr_t stack_addr = (uintptr_t)&stack_marker;
+    return ((uint64_t)time(NULL) << 32) ^ (uint64_t)clock() ^ (uint64_t)stack_addr;
+}
+
+static uint64_t sample_next_u64(sample_state *st) {
+    st->rng += UINT64_C(0x9E3779B97F4A7C15);
+    uint64_t z = st->rng;
+    z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+    return z ^ (z >> 31);
+}
+
+static size_t sample_bounded(sample_state *st, size_t bound) {
+    if (bound <= 1) return 0;
+    uint64_t b = (uint64_t)bound;
+    uint64_t threshold = (uint64_t)(-b) % b;
+    for (;;) {
+        uint64_t r = sample_next_u64(st);
+        if (r >= threshold) return (size_t)(r % b);
+    }
+}
 
 static int sample_process(tf_step *self, tf_batch *in, tf_batch **out,
                           tf_side_channels *side) {
@@ -27,22 +52,22 @@ static int sample_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (!st->has_schema) {
         st->buf = tf_batch_create(in->n_cols, st->n);
         if (!st->buf) return TF_ERROR;
-        for (size_t c = 0; c < in->n_cols; c++)
-            tf_batch_set_schema(st->buf, c, in->col_names[c], in->col_types[c]);
+        if (tf_batch_clone_schema(st->buf, in) != TF_OK) return TF_ERROR;
         st->has_schema = 1;
     }
 
     for (size_t r = 0; r < in->n_rows; r++) {
+        if (st->seen == SIZE_MAX) {
+            tf_set_last_error("sample: row count overflow");
+            return TF_ERROR;
+        }
         if (st->seen < st->n) {
-            /* Fill reservoir */
-            tf_batch_copy_row(st->buf, st->seen, in, r);
+            if (tf_batch_copy_row(st->buf, st->seen, in, r) != TF_OK) return TF_ERROR;
             st->buf->n_rows = st->seen + 1;
         } else {
-            /* Replace with probability n/seen */
-            size_t j = (size_t)(rand_r(&st->seed) % (st->seen + 1));
-            if (j < st->n) {
-                tf_batch_copy_row(st->buf, j, in, r);
-            }
+            size_t j = sample_bounded(st, st->seen + 1);
+            if (j < st->n && tf_batch_copy_row(st->buf, j, in, r) != TF_OK)
+                return TF_ERROR;
         }
         st->seen++;
     }
@@ -57,14 +82,18 @@ static int sample_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 
     if (!st->buf || st->buf->n_rows == 0) return TF_OK;
 
-    /* Copy buffer to output */
     size_t n = st->buf->n_rows;
     tf_batch *ob = tf_batch_create(st->buf->n_cols, n);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < st->buf->n_cols; c++)
-        tf_batch_set_schema(ob, c, st->buf->col_names[c], st->buf->col_types[c]);
+    if (tf_batch_clone_schema(ob, st->buf) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
     for (size_t i = 0; i < n; i++) {
-        tf_batch_copy_row(ob, i, st->buf, i);
+        if (tf_batch_copy_row(ob, i, st->buf, i) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         ob->n_rows = i + 1;
     }
 
@@ -83,13 +112,38 @@ static void sample_destroy(tf_step *self) {
 
 tf_step *tf_sample_create(const cJSON *args) {
     if (!args) return NULL;
-    cJSON *n_json = cJSON_GetObjectItemCaseSensitive(args, "n");
-    if (!cJSON_IsNumber(n_json) || n_json->valueint <= 0) return NULL;
+    size_t n = 0;
+    int has_n = tf_json_get_size_arg(args, "n", 1, TF_MAX_OUTPUT_ROWS_PER_BATCH, &n, "sample");
+    if (has_n <= 0) return NULL;
 
     sample_state *st = calloc(1, sizeof(sample_state));
     if (!st) return NULL;
-    st->n = (size_t)n_json->valueint;
-    st->seed = (unsigned)time(NULL);
+    st->n = n;
+    st->rng = 0;
+
+    cJSON *seed_json = cJSON_GetObjectItemCaseSensitive(args, "seed");
+    if (seed_json) {
+        if (cJSON_IsString(seed_json)) {
+            if (strcmp(seed_json->valuestring, "random") != 0) {
+                tf_set_last_error("sample: seed must be an integer or 'random'");
+                free(st);
+                return NULL;
+            }
+            st->rng = sample_random_seed();
+        } else if (cJSON_IsNumber(seed_json) && seed_json->valuedouble >= 0.0) {
+            size_t parsed = 0;
+            if (tf_json_size_value(seed_json, "seed", 0, TF_MAX_SAFE_SIZE_ARG,
+                                   &parsed, "sample") < 0) {
+                free(st);
+                return NULL;
+            }
+            st->rng = (uint64_t)parsed;
+        } else {
+            tf_set_last_error("sample: seed must be an integer or 'random'");
+            free(st);
+            return NULL;
+        }
+    }
 
     tf_step *step = calloc(1, sizeof(tf_step));
     if (!step) { free(st); return NULL; }

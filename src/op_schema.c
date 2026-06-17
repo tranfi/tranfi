@@ -105,6 +105,9 @@ typedef struct {
     size_t regex_failures;
     size_t schema_failures;
     int audit;
+    tf_audit_options audit_opts;
+    size_t max_regex_pattern_bytes;
+    size_t max_regex_cell_bytes;
     int checked_schema;
     int selectors_expanded;
     int schema_ok;
@@ -209,10 +212,13 @@ static void schema_record_failure(schema_state *st, const char *rule) {
 static schema_rule *ensure_rule(schema_state *st, const char *column) {
     schema_rule *existing = find_rule(st, column);
     if (existing) return existing;
-    schema_rule *nr = realloc(st->rules, (st->n_rules + 1) * sizeof(schema_rule));
+    size_t next = 0;
+    if (tf_size_add(st->n_rules, 1, &next) != TF_OK) return NULL;
+    schema_rule *nr = tf_reallocarray_checked(st->rules, next, sizeof(schema_rule));
     if (!nr) return NULL;
     st->rules = nr;
-    schema_rule *r = &st->rules[st->n_rules++];
+    schema_rule *r = &st->rules[st->n_rules];
+    st->n_rules = next;
     memset(r, 0, sizeof(*r));
     r->column = strdup(column);
     r->expected_type = SCHEMA_EXPECT_ANY;
@@ -225,7 +231,9 @@ static schema_rule *ensure_rule(schema_state *st, const char *column) {
 }
 
 static int add_value(schema_rule *r, const char *value) {
-    char **nv = realloc(r->values, (r->n_values + 1) * sizeof(char *));
+    size_t next = 0;
+    if (tf_size_add(r->n_values, 1, &next) != TF_OK) return TF_ERROR;
+    char **nv = tf_reallocarray_checked(r->values, next, sizeof(char *));
     if (!nv) return TF_ERROR;
     r->values = nv;
     r->values[r->n_values] = strdup(value ? value : "");
@@ -259,7 +267,16 @@ static int rule_set_expected_type(schema_rule *r, const char *type_s) {
     return TF_OK;
 }
 
-static int rule_set_regex_pattern(schema_rule *r, const char *pattern, int compile_now) {
+static int schema_regex_pattern_within_cap(const schema_state *st, const char *pattern) {
+    size_t len = strlen(pattern ? pattern : "");
+    return len <= st->max_regex_pattern_bytes;
+}
+
+static int rule_set_regex_pattern(schema_state *st, schema_rule *r, const char *pattern, int compile_now) {
+    if (!schema_regex_pattern_within_cap(st, pattern)) {
+        tf_set_last_error("schema: regex pattern exceeds max_regex_pattern_bytes");
+        return TF_ERROR;
+    }
     char *copy = strdup(pattern ? pattern : "");
     if (!copy) return TF_ERROR;
     if (r->compiled_regex) {
@@ -278,12 +295,15 @@ static int rule_set_regex_pattern(schema_rule *r, const char *pattern, int compi
 
 static schema_selector_rule *add_selector_rule_items(schema_state *st, char **items, size_t n_items) {
     if (!items || n_items == 0) return NULL;
-    schema_selector_rule *nr = realloc(st->selector_rules, (st->n_selector_rules + 1) * sizeof(schema_selector_rule));
+    size_t next = 0;
+    if (tf_size_add(st->n_selector_rules, 1, &next) != TF_OK) return NULL;
+    schema_selector_rule *nr = tf_reallocarray_checked(st->selector_rules, next, sizeof(schema_selector_rule));
     if (!nr) return NULL;
     st->selector_rules = nr;
-    schema_selector_rule *sr = &st->selector_rules[st->n_selector_rules++];
+    schema_selector_rule *sr = &st->selector_rules[st->n_selector_rules];
+    st->n_selector_rules = next;
     memset(sr, 0, sizeof(*sr));
-    sr->selectors = calloc(n_items, sizeof(char *));
+    sr->selectors = tf_callocarray_checked(n_items, sizeof(char *));
     if (!sr->selectors) return NULL;
     sr->n_selectors = n_items;
     sr->expected_type = SCHEMA_EXPECT_ANY;
@@ -304,7 +324,7 @@ static schema_selector_rule *add_selector_rule_json_array(schema_state *st, cons
     if (!arr || !cJSON_IsArray(arr)) return NULL;
     int n = cJSON_GetArraySize(arr);
     if (n <= 0) return NULL;
-    char **items = calloc((size_t)n, sizeof(char *));
+    char **items = tf_callocarray_checked((size_t)n, sizeof(char *));
     if (!items) return NULL;
     for (int i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(arr, i);
@@ -329,7 +349,9 @@ static int selector_rule_set_expected_type(schema_selector_rule *sr, const char 
 }
 
 static int selector_rule_add_value(schema_selector_rule *sr, const char *value) {
-    char **nv = realloc(sr->values, (sr->n_values + 1) * sizeof(char *));
+    size_t next = 0;
+    if (tf_size_add(sr->n_values, 1, &next) != TF_OK) return TF_ERROR;
+    char **nv = tf_reallocarray_checked(sr->values, next, sizeof(char *));
     if (!nv) return TF_ERROR;
     sr->values = nv;
     sr->values[sr->n_values] = strdup(value ? value : "");
@@ -360,7 +382,11 @@ static int parse_string_list_into_selector_rule(schema_selector_rule *sr, const 
     return TF_OK;
 }
 
-static int selector_rule_set_regex_pattern(schema_selector_rule *sr, const char *pattern) {
+static int selector_rule_set_regex_pattern(schema_state *st, schema_selector_rule *sr, const char *pattern) {
+    if (!schema_regex_pattern_within_cap(st, pattern)) {
+        tf_set_last_error("schema: regex pattern exceeds max_regex_pattern_bytes");
+        return TF_ERROR;
+    }
     char *copy = strdup(pattern ? pattern : "");
     if (!copy) return TF_ERROR;
     free(sr->regex_pattern);
@@ -435,8 +461,8 @@ static int parse_columns(schema_state *st, const cJSON *columns) {
             }
             if (cJSON_IsString(regex_j)) {
                 if (sr) {
-                    if (selector_rule_set_regex_pattern(sr, regex_j->valuestring) != TF_OK) return TF_ERROR;
-                } else if (rule_set_regex_pattern(r, regex_j->valuestring, 0) != TF_OK) {
+                    if (selector_rule_set_regex_pattern(st, sr, regex_j->valuestring) != TF_OK) return TF_ERROR;
+                } else if (rule_set_regex_pattern(st, r, regex_j->valuestring, 0) != TF_OK) {
                     return TF_ERROR;
                 }
             }
@@ -532,39 +558,15 @@ static int parse_regex_map(schema_state *st, const cJSON *obj) {
             if (!sr) return TF_ERROR;
             sr->required_set = 1;
             sr->required = 1;
-            if (selector_rule_set_regex_pattern(sr, entry->valuestring) != TF_OK) return TF_ERROR;
+            if (selector_rule_set_regex_pattern(st, sr, entry->valuestring) != TF_OK) return TF_ERROR;
         } else {
             schema_rule *r = ensure_rule(st, entry->string);
             if (!r) return TF_ERROR;
             r->required = 1;
-            if (rule_set_regex_pattern(r, entry->valuestring, 0) != TF_OK) return TF_ERROR;
+            if (rule_set_regex_pattern(st, r, entry->valuestring, 0) != TF_OK) return TF_ERROR;
         }
     }
     return TF_OK;
-}
-
-static cJSON *batch_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default: return cJSON_CreateNull();
-    }
-}
-
-static cJSON *batch_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = batch_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
-    }
-    return obj;
 }
 
 static int cell_to_string(const tf_batch *b, size_t row, size_t col, char *buf, size_t buf_size) {
@@ -610,13 +612,13 @@ static int cell_to_number(const tf_batch *b, size_t row, size_t col, double *out
     }
 }
 
-static void emit_failure(schema_state *st, const char *rule, const char *column,
-                         const char *expected, const char *actual,
-                         const tf_batch *b, size_t row, tf_side_channels *side,
-                         int include_row) {
-    if (!side || !side->errors) return;
+static int emit_failure(schema_state *st, const char *rule, const char *column,
+                        const char *expected, const char *actual,
+                        const tf_batch *b, size_t row, tf_side_channels *side,
+                        int include_row) {
+    if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
-    if (!obj) return;
+    if (!obj) return TF_ERROR;
     cJSON_AddStringToObject(obj, "type", "schema_failure");
     cJSON_AddStringToObject(obj, "op", "schema");
     cJSON_AddStringToObject(obj, "action", schema_action_name(st->action));
@@ -625,20 +627,24 @@ static void emit_failure(schema_state *st, const char *rule, const char *column,
     cJSON_AddStringToObject(obj, "rule", rule ? rule : "schema");
     if (column) cJSON_AddStringToObject(obj, "column", column);
     if (expected) cJSON_AddStringToObject(obj, "expected", expected);
-    if (actual) cJSON_AddStringToObject(obj, "actual", actual);
+    if (actual) {
+        char actual_buf[256];
+        cJSON_AddStringToObject(obj, "actual",
+                                tf_audit_format_string_for_column(&st->audit_opts, column, actual,
+                                                                  actual_buf, sizeof(actual_buf)));
+    }
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
     if (row > 0) cJSON_AddNumberToObject(obj, "row", (double)row);
     if (include_row && b) {
-        cJSON *row_obj = batch_row_to_json(b, row - 1);
+        cJSON *row_obj = tf_audit_row_to_json(b, row - 1, &st->audit_opts);
         if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     }
     char *line = cJSON_PrintUnformatted(obj);
-    if (line) {
-        tf_buffer_write_str(side->errors, line);
-        tf_buffer_write_str(side->errors, "\n");
-        free(line);
-    }
     cJSON_Delete(obj);
+    if (!line) return TF_ERROR;
+    int rc = tf_buffer_write_line(side->errors, line);
+    free(line);
+    return rc;
 }
 
 static int emit_schema_audit(schema_state *st, const char *rule, const char *column,
@@ -657,16 +663,20 @@ static int emit_schema_audit(schema_state *st, const char *rule, const char *col
     cJSON_AddStringToObject(obj, "rule", rule ? rule : "schema");
     if (column) cJSON_AddStringToObject(obj, "column", column);
     if (expected) cJSON_AddStringToObject(obj, "expected", expected);
-    if (actual) cJSON_AddStringToObject(obj, "actual", actual);
+    if (actual) {
+        char actual_buf[256];
+        cJSON_AddStringToObject(obj, "actual",
+                                tf_audit_format_string_for_column(&st->audit_opts, column, actual,
+                                                                  actual_buf, sizeof(actual_buf)));
+    }
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    cJSON *row_obj = batch_row_to_json(b, row);
+    cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->stats, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    int rc = tf_buffer_write_line(side->stats, line);
     free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
@@ -675,7 +685,8 @@ static int emit_schema_audit(schema_state *st, const char *rule, const char *col
 static int handle_schema_level_failure(schema_state *st, const char *rule, const char *column,
                                        const char *expected, const char *actual,
                                        tf_side_channels *side) {
-    emit_failure(st, rule, column, expected, actual, NULL, 0, side, 0);
+    if (emit_failure(st, rule, column, expected, actual, NULL, 0, side, 0) != TF_OK)
+        return TF_ERROR;
     if (st->action == SCHEMA_FAIL || st->action == SCHEMA_FILTER || st->action == SCHEMA_QUARANTINE) {
         char msg[512];
         snprintf(msg, sizeof(msg), "schema failed: %s column '%s' expected %s got %s",
@@ -686,7 +697,7 @@ static int handle_schema_level_failure(schema_state *st, const char *rule, const
     return TF_OK;
 }
 
-static int apply_selector_rule_to_rule(schema_rule *r, const schema_selector_rule *sr) {
+static int apply_selector_rule_to_rule(schema_state *st, schema_rule *r, const schema_selector_rule *sr) {
     if (sr->type_set) {
         char *name = strdup(sr->expected_type_name ? sr->expected_type_name : "any");
         if (!name) return TF_ERROR;
@@ -703,7 +714,7 @@ static int apply_selector_rule_to_rule(schema_rule *r, const schema_selector_rul
     if (sr->has_min) { r->has_min = 1; r->min_value = sr->min_value; }
     if (sr->has_max) { r->has_max = 1; r->max_value = sr->max_value; }
     if (sr->has_regex) {
-        if (rule_set_regex_pattern(r, sr->regex_pattern, 1) != TF_OK) return TF_ERROR;
+        if (rule_set_regex_pattern(st, r, sr->regex_pattern, 1) != TF_OK) return TF_ERROR;
     }
     return TF_OK;
 }
@@ -721,11 +732,13 @@ static int expand_schema_selectors(schema_state *st, const tf_batch *in, tf_side
                                         &indices, &n_indices, &error) != TF_OK) {
             char msg[512];
             snprintf(msg, sizeof(msg), "schema selector failed: %s", error ? error : "invalid selector");
-            emit_failure(st, "selector", NULL, "matching columns", error ? error : "invalid selector",
-                         NULL, 0, side, 0);
+            int err_rc = emit_failure(st, "selector", NULL, "matching columns",
+                                      error ? error : "invalid selector",
+                                      NULL, 0, side, 0);
             schema_record_failure(st, "schema");
             tf_set_last_error(msg);
             free(error);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         for (size_t j = 0; j < n_indices; j++) {
@@ -733,7 +746,7 @@ static int expand_schema_selectors(schema_state *st, const tf_batch *in, tf_side
             if (idx < 0 || (size_t)idx >= in->n_cols) { free(indices); return TF_ERROR; }
             schema_rule *r = ensure_rule(st, in->col_names[(size_t)idx]);
             if (!r) { free(indices); return TF_ERROR; }
-            if (apply_selector_rule_to_rule(r, sr) != TF_OK) { free(indices); return TF_ERROR; }
+            if (apply_selector_rule_to_rule(st, r, sr) != TF_OK) { free(indices); return TF_ERROR; }
         }
         free(indices);
     }
@@ -781,9 +794,11 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *failed_column = r->column;
             *expected = "non-null";
             snprintf(actual, actual_size, "null");
-            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE)
-                emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
-                             st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
             return 0;
         }
         return 1;
@@ -796,9 +811,11 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *failed_column = r->column;
             *expected = "numeric";
             cell_to_string(in, row, col, actual, actual_size);
-            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE)
-                emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
-                             st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
             return 0;
         }
         if (r->has_min && val < r->min_value) {
@@ -808,9 +825,11 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *failed_column = r->column;
             *expected = expbuf;
             snprintf(actual, actual_size, "%.17g", val);
-            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE)
-                emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
-                             st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
             return 0;
         }
         if (r->has_max && val > r->max_value) {
@@ -820,9 +839,11 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *failed_column = r->column;
             *expected = expbuf;
             snprintf(actual, actual_size, "%.17g", val);
-            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE)
-                emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
-                             st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
             return 0;
         }
     }
@@ -839,9 +860,11 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *failed_column = r->column;
             *expected = "allowed value";
             snprintf(actual, actual_size, "%s", valbuf);
-            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE)
-                emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
-                             st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
             return 0;
         }
     }
@@ -852,36 +875,41 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *failed_column = r->column;
             *expected = "string";
             snprintf(actual, actual_size, "%s", type_name(in->col_types[col]));
-            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE)
-                emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
-                             st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
             return 0;
         }
         const char *s = tf_batch_get_string(in, row, col);
+        if (s && strlen(s) > st->max_regex_cell_bytes) {
+            *failed_rule = "regex";
+            *failed_column = r->column;
+            *expected = "regex cell within max_regex_cell_bytes";
+            snprintf(actual, actual_size, "cell exceeds %zu bytes", st->max_regex_cell_bytes);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
+            return 0;
+        }
         if (!s || regexec(&r->regex, s, 0, NULL, 0) != 0) {
             *failed_rule = "regex";
             *failed_column = r->column;
             *expected = r->regex_pattern;
             snprintf(actual, actual_size, "%s", s ? s : "");
-            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE)
-                emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
-                             st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE);
+            if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                                 st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
+                    return -1;
+            }
             return 0;
         }
     }
 
     return 1;
-}
-
-static int copy_schema(tf_batch *dst, const tf_batch *src, size_t extra_cols, const char *result) {
-    for (size_t c = 0; c < src->n_cols; c++) {
-        if (tf_batch_set_schema(dst, c, src->col_names[c], src->col_types[c]) != TF_OK) return TF_ERROR;
-    }
-    if (extra_cols > 0) {
-        if (tf_batch_set_schema(dst, src->n_cols, result && result[0] ? result : "_schema", TF_TYPE_BOOL) != TF_OK)
-            return TF_ERROR;
-    }
-    return TF_OK;
 }
 
 static int schema_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -891,9 +919,18 @@ static int schema_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (check_schema_once(st, in, side) != TF_OK) return TF_ERROR;
 
     size_t extra = st->action == SCHEMA_ANNOTATE ? 1u : 0u;
-    tf_batch *ob = tf_batch_create(in->n_cols + extra, in->n_rows > 0 ? in->n_rows : 1);
+    size_t out_cols = 0;
+    if (tf_size_add(in->n_cols, extra, &out_cols) != TF_OK) return TF_ERROR;
+    tf_batch *ob = tf_batch_create(out_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    if (copy_schema(ob, in, extra, st->result) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    if (extra) {
+        const char *names[] = {st->result && st->result[0] ? st->result : "_schema"};
+        const tf_type types[] = {TF_TYPE_BOOL};
+        if (tf_batch_clone_with_extra_cols(ob, in, names, types, 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    } else if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
 
     size_t out_row = 0;
     for (size_t r = 0; r < in->n_rows; r++) {
@@ -910,7 +947,13 @@ static int schema_process(tf_step *self, tf_batch *in, tf_batch **out,
                 const char *column = NULL;
                 const char *expected = NULL;
                 char actual[256] = {0};
-                if (!row_rule_ok(st, &st->rules[i], in, r, side, &rule, &column, &expected, actual, sizeof(actual))) {
+                int rule_ok = row_rule_ok(st, &st->rules[i], in, r, side,
+                                          &rule, &column, &expected, actual, sizeof(actual));
+                if (rule_ok < 0) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
+                if (!rule_ok) {
                     schema_record_failure(st, rule);
                     if (ok) {
                         failed_rule = rule;
@@ -927,7 +970,12 @@ static int schema_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (!ok) {
             st->failed_rows++;
             if (st->action == SCHEMA_FAIL) {
-                if (!failed_rule) emit_failure(st, "schema", NULL, "valid schema", "invalid schema", in, st->row_index, side, 1);
+                if (!failed_rule &&
+                    emit_failure(st, "schema", NULL, "valid schema", "invalid schema",
+                                 in, st->row_index, side, 1) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
                 char msg[512];
                 snprintf(msg, sizeof(msg), "schema failed at row %zu%s%s",
                          st->row_index,
@@ -955,7 +1003,11 @@ static int schema_process(tf_step *self, tf_batch *in, tf_batch **out,
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (st->action == SCHEMA_ANNOTATE) tf_batch_set_bool(ob, out_row, in->n_cols, ok ? true : false);
+        if (st->action == SCHEMA_ANNOTATE &&
+            tf_batch_set_bool(ob, out_row, in->n_cols, ok ? true : false) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
         out_row++;
     }
 
@@ -974,20 +1026,22 @@ static int schema_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 static int schema_append_stats(tf_step *self, tf_buffer *out) {
     if (!self || !self->state || !out) return TF_ERROR;
     schema_state *st = self->state;
-    char buf[512];
+    char buf[768];
     snprintf(buf, sizeof(buf),
              ",\"checked_rows\":%zu,\"passed_rows\":%zu,\"failed_rows\":%zu,"
              "\"violation_count\":%zu,\"audit_emitted\":%zu,"
              "\"required_failures\":%zu,\"type_failures\":%zu,"
              "\"nullable_failures\":%zu,\"values_failures\":%zu,"
              "\"min_failures\":%zu,\"max_failures\":%zu,"
-             "\"regex_failures\":%zu,\"schema_failures\":%zu",
+             "\"regex_failures\":%zu,\"schema_failures\":%zu,"
+             "\"max_regex_pattern_bytes\":%zu,\"max_regex_cell_bytes\":%zu",
              st->checked_rows, st->passed_rows, st->failed_rows,
              st->violation_count, st->audit_emitted,
              st->required_failures, st->type_failures,
              st->nullable_failures, st->values_failures,
              st->min_failures, st->max_failures,
-             st->regex_failures, st->schema_failures);
+             st->regex_failures, st->schema_failures,
+             st->max_regex_pattern_bytes, st->max_regex_cell_bytes);
     return tf_buffer_write_str(out, buf);
 }
 
@@ -1016,6 +1070,7 @@ static void schema_state_free(schema_state *st) {
     free(st->name);
     free(st->message);
     free(st->result);
+    tf_audit_options_free(&st->audit_opts);
     free(st);
 }
 
@@ -1032,18 +1087,39 @@ tf_step *tf_schema_create(const cJSON *args) {
     st->schema_ok = 1;
     st->action = SCHEMA_FAIL;
     st->audit_limit = 1000;
+    tf_audit_options_init(&st->audit_opts, 1);
+    st->max_regex_pattern_bytes = TF_MAX_REGEX_PATTERN_BYTES;
+    st->max_regex_cell_bytes = TF_MAX_REGEX_CELL_BYTES;
+
+    if (tf_json_get_size_arg(args, "max_regex_pattern_bytes", 1, TF_MAX_RECORD_BYTES,
+                             &st->max_regex_pattern_bytes, "schema") < 0 ||
+        tf_json_get_size_arg(args, "maxRegexPatternBytes", 1, TF_MAX_RECORD_BYTES,
+                             &st->max_regex_pattern_bytes, "schema") < 0 ||
+        tf_json_get_size_arg(args, "max_regex_cell_bytes", 1, TF_MAX_RECORD_BYTES,
+                             &st->max_regex_cell_bytes, "schema") < 0 ||
+        tf_json_get_size_arg(args, "maxRegexCellBytes", 1, TF_MAX_RECORD_BYTES,
+                             &st->max_regex_cell_bytes, "schema") < 0) {
+        schema_state_free(st);
+        return NULL;
+    }
 
     cJSON *audit_j = cJSON_GetObjectItemCaseSensitive(args, "audit");
     st->audit = cJSON_IsTrue(audit_j) ? 1 : 0;
     cJSON *audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
     if (!audit_limit_j) audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
     if (audit_limit_j) {
-        if (!cJSON_IsNumber(audit_limit_j) || audit_limit_j->valuedouble <= 0) {
-            tf_set_last_error("schema: audit_limit must be a positive integer");
+        size_t parsed_limit = 0;
+        if (tf_json_get_size_arg_any(args, "audit_limit", "auditLimit",
+                                     1, TF_MAX_AUDIT_RECORDS,
+                                     &parsed_limit, "schema") < 0) {
             schema_state_free(st);
             return NULL;
         }
-        st->audit_limit = (size_t)audit_limit_j->valuedouble;
+        st->audit_limit = parsed_limit;
+    }
+    if (tf_audit_options_parse(&st->audit_opts, args, "schema") != TF_OK) {
+        schema_state_free(st);
+        return NULL;
     }
 
     cJSON *mode_j = cJSON_GetObjectItemCaseSensitive(args, "mode");
@@ -1063,6 +1139,7 @@ tf_step *tf_schema_create(const cJSON *args) {
     st->result = strdup(cJSON_IsString(result_j) && result_j->valuestring[0] ? result_j->valuestring : "_schema");
     if (!st->name || !st->message || !st->result) { schema_state_free(st); return NULL; }
 
+    tf_set_last_error(NULL);
     if (parse_columns(st, cJSON_GetObjectItemCaseSensitive(args, "columns")) != TF_OK ||
         parse_string_array_rules(st, cJSON_GetObjectItemCaseSensitive(args, "required"), 1, -1) != TF_OK ||
         parse_string_array_rules(st, cJSON_GetObjectItemCaseSensitive(args, "non_null"), 1, 0) != TF_OK ||
@@ -1071,7 +1148,8 @@ tf_step *tf_schema_create(const cJSON *args) {
         parse_number_map(st, cJSON_GetObjectItemCaseSensitive(args, "min"), 1) != TF_OK ||
         parse_number_map(st, cJSON_GetObjectItemCaseSensitive(args, "max"), 0) != TF_OK ||
         parse_regex_map(st, cJSON_GetObjectItemCaseSensitive(args, "regex")) != TF_OK) {
-        tf_set_last_error("schema: invalid schema arguments");
+        if (!tf_last_error() || !tf_last_error()[0])
+            tf_set_last_error("schema: invalid schema arguments");
         schema_state_free(st);
         return NULL;
     }

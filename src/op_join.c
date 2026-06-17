@@ -12,6 +12,7 @@
  */
 
 #include "internal.h"
+#include "spill.h"
 #include "date_utils.h"
 #include "cJSON.h"
 #include <stdlib.h>
@@ -42,13 +43,7 @@ typedef struct {
     size_t       row_ref_capacity;
 } join_hash_map;
 
-typedef union {
-    uint8_t b;
-    int64_t i64;
-    double f64;
-    int32_t date;
-    char *str;
-} join_key_data;
+typedef tf_owned_cell_value join_key_data;
 
 typedef struct {
     int valid;
@@ -88,6 +83,7 @@ typedef struct {
 
     int         use_spill;            /* exact external semi/anti filtering join */
     char       *spill_dir;
+    tf_spill_session *spill;
     size_t      spill_memory_bytes;
     size_t      configured_run_rows;
     size_t      run_rows;
@@ -200,28 +196,24 @@ static int join_check_unsorted_state_bytes(const join_state *st,
 static int join_reserve_output_row(join_state *st, tf_side_channels *side);
 static size_t join_spill_retained_state_bytes(const join_state *st);
 
-static void join_write_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
+static int join_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
-static void join_limit_error_context(tf_side_channels *side, const char *field,
-                                     size_t limit, size_t actual,
-                                     const char *context) {
+static int join_limit_error_context(tf_side_channels *side, const char *field,
+                                    size_t limit, size_t actual,
+                                    const char *context) {
     char msg[224];
     snprintf(msg, sizeof(msg),
              "join: %s=%zu exceeded %s (%zu)",
              field, limit, context, actual);
-    join_write_error(side, msg);
+    return join_write_error(side, msg);
 }
 
-static void join_limit_error(tf_side_channels *side, const char *field,
-                             size_t limit, size_t actual) {
-    join_limit_error_context(side, field, limit, actual,
-                             "while loading lookup side");
+static int join_limit_error(tf_side_channels *side, const char *field,
+                            size_t limit, size_t actual) {
+    return join_limit_error_context(side, field, limit, actual,
+                                    "while loading lookup side");
 }
 
 /* FNV-1a hash */
@@ -233,11 +225,13 @@ static uint64_t fnv1a(const char *s) {
 
 static int map_init(join_hash_map *m, size_t hint) {
     size_t n = 64;
-    while (n < hint * 2) {
+    size_t target = 0;
+    if (tf_size_mul(hint, 2, &target) != TF_OK) return -1;
+    while (n < target) {
         if (n > (SIZE_MAX / 2)) return -1;
         n *= 2;
     }
-    m->buckets = calloc(n, sizeof(join_bucket));
+    m->buckets = tf_callocarray_checked(n, sizeof(join_bucket));
     if (!m->buckets) return -1;
     m->n_buckets = n;
     m->count = 0;
@@ -267,12 +261,20 @@ static int map_insert(join_state *st, join_hash_map *m,
             }
             if (b->n_rows >= b->rows_cap) {
                 size_t old_cap = b->rows_cap;
-                size_t new_cap = b->rows_cap ? b->rows_cap * 2 : 4;
-                size_t *tmp = realloc(b->rows, new_cap * sizeof(size_t));
+                size_t need = 0;
+                size_t new_cap = 0;
+                size_t new_row_ref_capacity = 0;
+                if (tf_size_add(b->n_rows, 1, &need) != TF_OK ||
+                    tf_size_grow_pow2(b->rows_cap, need, 4, &new_cap) != TF_OK ||
+                    tf_size_add(m->row_ref_capacity, new_cap - old_cap,
+                                &new_row_ref_capacity) != TF_OK) {
+                    return -1;
+                }
+                size_t *tmp = tf_reallocarray_checked(b->rows, new_cap, sizeof(size_t));
                 if (!tmp) return -1;
                 b->rows = tmp;
                 b->rows_cap = new_cap;
-                m->row_ref_capacity += new_cap - old_cap;
+                m->row_ref_capacity = new_row_ref_capacity;
             }
             b->rows[b->n_rows++] = row;
             return 0;
@@ -287,21 +289,40 @@ static int map_insert(join_state *st, join_hash_map *m,
 
     /* New key */
     join_bucket *b = &m->buckets[idx];
-    b->key = strdup(key);
-    if (!b->key) return -1;
-    if (st->how >= 2) {
-        b->rows = NULL;
-        b->rows_cap = 0;
-        b->n_rows = 0;
-    } else {
-        b->rows = malloc(4 * sizeof(size_t));
-        if (!b->rows) { free(b->key); b->key = NULL; return -1; }
-        b->rows_cap = 4;
-        b->rows[0] = row;
-        b->n_rows = 1;
+    char *key_copy = strdup(key);
+    if (!key_copy) return -1;
+    size_t key_bytes_delta = 0;
+    size_t new_key_bytes = 0;
+    if (tf_size_add(strlen(key_copy), 1, &key_bytes_delta) != TF_OK ||
+        tf_size_add(m->key_bytes, key_bytes_delta, &new_key_bytes) != TF_OK) {
+        free(key_copy);
+        return -1;
     }
-    m->key_bytes += strlen(b->key) + 1;
-    m->row_ref_capacity += b->rows_cap;
+    size_t *rows = NULL;
+    size_t rows_cap = 0;
+    size_t n_rows = 0;
+    size_t new_row_ref_capacity = m->row_ref_capacity;
+    if (st->how >= 2) {
+        rows = NULL;
+        rows_cap = 0;
+        n_rows = 0;
+    } else {
+        if (tf_size_add(m->row_ref_capacity, 4, &new_row_ref_capacity) != TF_OK) {
+            free(key_copy);
+            return -1;
+        }
+        rows = tf_mallocarray_checked(4, sizeof(size_t));
+        if (!rows) { free(key_copy); return -1; }
+        rows_cap = 4;
+        rows[0] = row;
+        n_rows = 1;
+    }
+    b->key = key_copy;
+    b->rows = rows;
+    b->rows_cap = rows_cap;
+    b->n_rows = n_rows;
+    m->key_bytes = new_key_bytes;
+    m->row_ref_capacity = new_row_ref_capacity;
     m->count++;
     return 0;
 }
@@ -376,24 +397,6 @@ static char *format_join_key(const tf_batch *b, size_t row, int col) {
         default:
             snprintf(buf, sizeof(buf), "U:%d", (int)type);
             return strdup(buf);
-    }
-}
-
-/* Copy a cell from src batch to dst batch (different column index) */
-static void copy_cell(tf_batch *dst, size_t dr, size_t dc,
-                      const tf_batch *src, size_t sr, int sc) {
-    if (tf_batch_is_null(src, sr, sc)) {
-        tf_batch_set_null(dst, dr, dc);
-        return;
-    }
-    switch (src->col_types[sc]) {
-        case TF_TYPE_BOOL:      tf_batch_set_bool(dst, dr, dc, tf_batch_get_bool(src, sr, sc)); break;
-        case TF_TYPE_INT64:     tf_batch_set_int64(dst, dr, dc, tf_batch_get_int64(src, sr, sc)); break;
-        case TF_TYPE_FLOAT64:   tf_batch_set_float64(dst, dr, dc, tf_batch_get_float64(src, sr, sc)); break;
-        case TF_TYPE_STRING:    tf_batch_set_string(dst, dr, dc, tf_batch_get_string(src, sr, sc)); break;
-        case TF_TYPE_DATE:      tf_batch_set_date(dst, dr, dc, tf_batch_get_date(src, sr, sc)); break;
-        case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(dst, dr, dc, tf_batch_get_timestamp(src, sr, sc)); break;
-        default: tf_batch_set_null(dst, dr, dc); break;
     }
 }
 
@@ -582,8 +585,8 @@ static void sorted_join_free_schema(join_state *st) {
 static int sorted_join_capture_schema(join_state *st, const tf_batch *b) {
     if (st->n_lookup_schema_cols > 0) return TF_OK;
     st->n_lookup_schema_cols = b->n_cols;
-    st->lookup_schema_names = calloc(b->n_cols ? b->n_cols : 1, sizeof(char *));
-    st->lookup_schema_types = calloc(b->n_cols ? b->n_cols : 1, sizeof(tf_type));
+    st->lookup_schema_names = tf_callocarray_checked(b->n_cols ? b->n_cols : 1, sizeof(char *));
+    st->lookup_schema_types = tf_callocarray_checked(b->n_cols ? b->n_cols : 1, sizeof(tf_type));
     if (!st->lookup_schema_names || !st->lookup_schema_types) return TF_ERROR;
     for (size_t c = 0; c < b->n_cols; c++) {
         st->lookup_schema_names[c] = strdup(b->col_names[c] ? b->col_names[c] : "");
@@ -595,7 +598,7 @@ static int sorted_join_capture_schema(join_state *st, const tf_batch *b) {
     st->lookup_key_type = b->col_types[st->lookup_join_col];
     st->have_lookup_key_type = 1;
     if (st->how < 2) {
-        st->lookup_out_cols = malloc((b->n_cols ? b->n_cols : 1) * sizeof(int));
+        st->lookup_out_cols = tf_mallocarray_checked(b->n_cols ? b->n_cols : 1, sizeof(int));
         if (!st->lookup_out_cols) return TF_ERROR;
         st->n_lookup_out = 0;
         for (size_t c = 0; c < b->n_cols; c++) {
@@ -877,7 +880,7 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
     if (dec->flush(dec, &flush_batches, &n_flush, NULL) != TF_OK) goto fail;
 
     total_batches = n_batches + n_flush;
-    all_batches = malloc((total_batches ? total_batches : 1) * sizeof(tf_batch *));
+    all_batches = tf_mallocarray_checked(total_batches ? total_batches : 1, sizeof(tf_batch *));
     if (!all_batches) goto fail;
     for (size_t i = 0; i < n_batches; i++) {
         all_batches[i] = batches[i];
@@ -955,8 +958,9 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
     tf_batch *first = all_batches[0];
     merged = tf_batch_create(first->n_cols, total_rows);
     if (!merged) goto fail;
-    for (size_t c = 0; c < first->n_cols; c++)
-        tf_batch_set_schema(merged, c, first->col_names[c], first->col_types[c]);
+    for (size_t c = 0; c < first->n_cols; c++) {
+        if (tf_batch_set_schema(merged, c, first->col_names[c], first->col_types[c]) != TF_OK) goto fail;
+    }
 
     size_t dst_row = 0;
     for (size_t b = 0; b < total_batches; b++) {
@@ -988,7 +992,7 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
     size_t n_lookup_out = 0;
     if (st->how < 2) {
         /* Determine output columns for mutating joins (all except join key). */
-        lookup_out_cols = malloc((merged->n_cols ? merged->n_cols : 1) * sizeof(int));
+        lookup_out_cols = tf_mallocarray_checked(merged->n_cols ? merged->n_cols : 1, sizeof(int));
         if (!lookup_out_cols) goto fail;
         for (size_t c = 0; c < merged->n_cols; c++) {
             if ((int)c != lookup_join_col)
@@ -1058,9 +1062,9 @@ static int join_reserve_output_row(join_state *st, tf_side_channels *side) {
 
 static int join_ensure_ordinals(uint64_t **ord, size_t *cap, size_t need) {
     if (*cap >= need) return TF_OK;
-    size_t new_cap = *cap ? *cap * 2 : 16;
-    while (new_cap < need) new_cap *= 2;
-    uint64_t *tmp = realloc(*ord, new_cap * sizeof(uint64_t));
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(*cap, need, 16, &new_cap) != TF_OK) return TF_ERROR;
+    uint64_t *tmp = tf_reallocarray_checked(*ord, new_cap, sizeof(uint64_t));
     if (!tmp) return TF_ERROR;
     *ord = tmp;
     *cap = new_cap;
@@ -1163,8 +1167,8 @@ static int join_spill_init_schema(join_state *st, const tf_batch *in, tf_side_ch
         return TF_ERROR;
     }
     st->spill_n_cols = in->n_cols;
-    st->spill_schema_names = calloc(in->n_cols ? in->n_cols : 1, sizeof(char *));
-    st->spill_schema_types = calloc(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
+    st->spill_schema_names = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(char *));
+    st->spill_schema_types = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
     if (!st->spill_schema_names || !st->spill_schema_types) return TF_ERROR;
     for (size_t c = 0; c < in->n_cols; c++) {
         st->spill_schema_names[c] = strdup(in->col_names[c] ? in->col_names[c] : "");
@@ -1224,44 +1228,38 @@ static int join_spill_compare_batch_key(const tf_batch *b, size_t ca, size_t cb,
     }
 }
 
-static const join_state *g_join_sort_state;
-static const tf_batch *g_join_sort_batch;
-static const uint64_t *g_join_sort_ordinals;
-static int g_join_sort_kind; /* 0=left by key, 1=lookup by key, 2=output by ordinal */
+typedef struct {
+    const join_state *st;
+    const tf_batch *batch;
+    const uint64_t *ordinals;
+    int kind; /* 0=left by key, 1=lookup by key, 2=output by ordinal */
+} join_spill_sort_ctx;
 
-static int join_spill_compare_indices(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    if (g_join_sort_kind == 2) {
-        uint64_t oa = g_join_sort_ordinals[ra], ob = g_join_sort_ordinals[rb];
+static int join_spill_compare_indices(const void *ctx, size_t ra, size_t rb) {
+    const join_spill_sort_ctx *sort = (const join_spill_sort_ctx *)ctx;
+    if (sort->kind == 2) {
+        uint64_t oa = sort->ordinals[ra], ob = sort->ordinals[rb];
         return (oa > ob) - (oa < ob);
     }
     size_t col;
-    if (g_join_sort_kind == 1)
-        col = (g_join_sort_state->how < 2) ? (size_t)g_join_sort_state->spill_lookup_join_col : 0u;
+    if (sort->kind == 1)
+        col = (sort->st->how < 2) ? (size_t)sort->st->spill_lookup_join_col : 0u;
     else
-        col = (size_t)g_join_sort_state->spill_left_join_col;
-    int cmp = join_spill_compare_batch_key(g_join_sort_batch, col, col, ra, rb);
+        col = (size_t)sort->st->spill_left_join_col;
+    int cmp = join_spill_compare_batch_key(sort->batch, col, col, ra, rb);
     if (cmp != 0) return cmp;
-    uint64_t oa = g_join_sort_ordinals[ra], ob = g_join_sort_ordinals[rb];
+    uint64_t oa = sort->ordinals[ra], ob = sort->ordinals[rb];
     return (oa > ob) - (oa < ob);
 }
 
 static size_t *join_spill_sorted_indices(const join_state *st, const tf_batch *b,
                                          const uint64_t *ordinals, int kind) {
     size_t n = b ? b->n_rows : 0;
-    size_t *idx = malloc((n ? n : 1) * sizeof(size_t));
+    size_t *idx = tf_mallocarray_checked(n ? n : 1, sizeof(size_t));
     if (!idx) return NULL;
     for (size_t i = 0; i < n; i++) idx[i] = i;
-    g_join_sort_state = st;
-    g_join_sort_batch = b;
-    g_join_sort_ordinals = ordinals;
-    g_join_sort_kind = kind;
-    qsort(idx, n, sizeof(size_t), join_spill_compare_indices);
-    g_join_sort_state = NULL;
-    g_join_sort_batch = NULL;
-    g_join_sort_ordinals = NULL;
-    g_join_sort_kind = 0;
+    join_spill_sort_ctx ctx = { .st = st, .batch = b, .ordinals = ordinals, .kind = kind };
+    tf_sort_indices(idx, n, join_spill_compare_indices, &ctx);
     return idx;
 }
 
@@ -1293,26 +1291,15 @@ static int join_spill_write_cell(FILE *f, const tf_batch *b, size_t r, size_t c)
     }
 }
 
-static char *join_spill_make_run_path(join_state *st, const char *kind) {
-    size_t dir_len = strlen(st->spill_dir);
-    size_t cap = dir_len + 128;
-    char *path = malloc(cap);
-    if (!path) return NULL;
-    size_t seq;
-    if (strcmp(kind, "left") == 0) seq = st->spill_left_run_seq++;
-    else if (strcmp(kind, "lookup") == 0) seq = st->spill_lookup_run_seq++;
-    else seq = st->spill_out_run_seq++;
-    snprintf(path, cap, "%s%stranfi-join-%s-%ld-%zu.bin",
-             st->spill_dir,
-             (dir_len > 0 && st->spill_dir[dir_len - 1] == '/') ? "" : "/",
-             kind, (long)getpid(), seq);
-    return path;
-}
-
 static int join_spill_append_path(char ***paths, size_t *n, size_t *cap, char *path) {
     if (*n == *cap) {
-        size_t new_cap = *cap ? *cap * 2 : 8;
-        char **tmp = realloc(*paths, new_cap * sizeof(char *));
+        size_t need = 0;
+        size_t new_cap = 0;
+        if (tf_size_add(*n, 1, &need) != TF_OK ||
+            tf_size_grow_pow2(*cap, need, 8, &new_cap) != TF_OK) {
+            return TF_ERROR;
+        }
+        char **tmp = tf_reallocarray_checked(*paths, new_cap, sizeof(char *));
         if (!tmp) return TF_ERROR;
         *paths = tmp;
         *cap = new_cap;
@@ -1324,16 +1311,11 @@ static int join_spill_append_path(char ***paths, size_t *n, size_t *cap, char *p
 static int join_spill_write_run(join_state *st, tf_batch *batch, const uint64_t *ordinals,
                                 const size_t *indices, size_t n, const char *kind) {
     if (n == 0) return TF_OK;
-    char *path = join_spill_make_run_path(st, kind);
-    if (!path) return TF_ERROR;
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "join spill: cannot create '%s': %s", path, strerror(errno));
-        tf_set_last_error(msg);
-        free(path);
-        return TF_ERROR;
-    }
+    char label[48];
+    snprintf(label, sizeof(label), "join-%s", kind ? kind : "run");
+    char *path = NULL;
+    FILE *f = tf_spill_open_run_file(st->spill, label, &path);
+    if (!f) return TF_ERROR;
     for (size_t i = 0; i < n; i++) {
         size_t r = indices[i];
         uint64_t ordinal = ordinals[r];
@@ -1428,9 +1410,15 @@ static void join_spill_row_clear(join_spill_row *row, const tf_type *types, size
 
 static int join_spill_row_init(join_spill_row *row, size_t n_cols) {
     row->ordinal = 0;
-    row->nulls = calloc(n_cols ? n_cols : 1, sizeof(uint8_t));
-    row->cells = calloc(n_cols ? n_cols : 1, sizeof(join_key_data));
-    if (!row->nulls || !row->cells) return TF_ERROR;
+    row->nulls = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(uint8_t));
+    row->cells = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(join_key_data));
+    if (!row->nulls || !row->cells) {
+        free(row->nulls);
+        free(row->cells);
+        row->nulls = NULL;
+        row->cells = NULL;
+        return TF_ERROR;
+    }
     for (size_t c = 0; c < n_cols; c++) row->nulls[c] = 1;
     return TF_OK;
 }
@@ -1559,7 +1547,7 @@ static int join_spill_open_readers(join_state *st, int kind) {
         readers = &st->spill_out_readers; n_readers = &st->spill_n_out_readers;
     }
     if (n_paths == 0) return TF_OK;
-    *readers = calloc(n_paths, sizeof(join_spill_reader));
+    *readers = tf_callocarray_checked(n_paths, sizeof(join_spill_reader));
     if (!*readers) return TF_ERROR;
     *n_readers = n_paths;
     size_t n_cols = 0;
@@ -1656,9 +1644,14 @@ static int join_spill_best_output_reader(const join_state *st) {
 }
 
 static int join_spill_append_key_bytes(char **buf, size_t *len, size_t *cap, const void *src, size_t n) {
-    if (*len + n + 1 > *cap) {
-        size_t new_cap = *cap ? *cap : 64;
-        while (*len + n + 1 > new_cap) new_cap *= 2;
+    size_t need = 0;
+    if (tf_size_add(*len, n, &need) != TF_OK ||
+        tf_size_add(need, 1, &need) != TF_OK) {
+        return TF_ERROR;
+    }
+    if (need > *cap) {
+        size_t new_cap = 0;
+        if (tf_size_grow_pow2(*cap, need, 64, &new_cap) != TF_OK) return TF_ERROR;
         char *tmp = realloc(*buf, new_cap);
         if (!tmp) return TF_ERROR;
         *buf = tmp;
@@ -1740,11 +1733,19 @@ static int join_spill_count_lookup_key(join_state *st, const join_spill_row *row
             free(key);
             return TF_ERROR;
         }
+        size_t key_bytes_delta = 0;
+        size_t new_spill_lookup_key_bytes = 0;
+        if (tf_size_add(strlen(key), 1, &key_bytes_delta) != TF_OK ||
+            tf_size_add(st->spill_lookup_key_bytes, key_bytes_delta,
+                        &new_spill_lookup_key_bytes) != TF_OK) {
+            free(key);
+            return TF_ERROR;
+        }
         free(st->spill_last_lookup_key);
         st->spill_last_lookup_key = key;
         key = NULL;
         st->spill_lookup_keys++;
-        st->spill_lookup_key_bytes += strlen(st->spill_last_lookup_key) + 1;
+        st->spill_lookup_key_bytes = new_spill_lookup_key_bytes;
     }
     free(key);
     return TF_OK;
@@ -1753,20 +1754,9 @@ static int join_spill_count_lookup_key(join_state *st, const join_spill_row *row
 static int join_spill_set_batch_cell(tf_batch *out, size_t dst_row, size_t dst_col,
                                      const join_spill_row *row, size_t src_col,
                                      const tf_type *types) {
-    if (row->nulls[src_col]) {
-        tf_batch_set_null(out, dst_row, dst_col);
-        return TF_OK;
-    }
-    switch (types[src_col]) {
-        case TF_TYPE_BOOL: tf_batch_set_bool(out, dst_row, dst_col, row->cells[src_col].b != 0); break;
-        case TF_TYPE_INT64: tf_batch_set_int64(out, dst_row, dst_col, row->cells[src_col].i64); break;
-        case TF_TYPE_FLOAT64: tf_batch_set_float64(out, dst_row, dst_col, row->cells[src_col].f64); break;
-        case TF_TYPE_STRING: tf_batch_set_string(out, dst_row, dst_col, row->cells[src_col].str); break;
-        case TF_TYPE_DATE: tf_batch_set_date(out, dst_row, dst_col, row->cells[src_col].date); break;
-        case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(out, dst_row, dst_col, row->cells[src_col].i64); break;
-        default: tf_batch_set_null(out, dst_row, dst_col); break;
-    }
-    return TF_OK;
+    tf_type type = types[src_col];
+    return tf_batch_set_owned_cell_value(out, dst_row, dst_col, type,
+                                         row->nulls[src_col], &row->cells[src_col]);
 }
 
 static int join_spill_row_to_batch_typed(tf_batch *out, size_t dst_row,
@@ -1789,8 +1779,11 @@ static int join_spill_append_selected_row(join_state *st, const join_spill_row *
                                           tf_side_channels *side) {
     if (!join_reserve_output_row(st, side)) return TF_ERROR;
     size_t dst = st->spill_out_buf->n_rows;
+    if (join_ensure_ordinals(&st->spill_out_ordinals,
+                             &st->spill_out_ordinal_cap, dst + 1) != TF_OK) {
+        return TF_ERROR;
+    }
     if (join_spill_row_to_batch(st, st->spill_out_buf, dst, row) != TF_OK) return TF_ERROR;
-    if (join_ensure_ordinals(&st->spill_out_ordinals, &st->spill_out_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
     st->spill_out_ordinals[dst] = row->ordinal;
     st->spill_out_buf->n_rows = dst + 1;
     st->spill_kept_rows++;
@@ -1821,8 +1814,8 @@ static int join_spill_capture_lookup_schema(join_state *st, const tf_batch *batc
 
     st->spill_lookup_n_cols = batch->n_cols;
     st->spill_lookup_join_col = lookup_ci;
-    st->spill_lookup_schema_names = calloc(batch->n_cols ? batch->n_cols : 1, sizeof(char *));
-    st->spill_lookup_schema_types = calloc(batch->n_cols ? batch->n_cols : 1, sizeof(tf_type));
+    st->spill_lookup_schema_names = tf_callocarray_checked(batch->n_cols ? batch->n_cols : 1, sizeof(char *));
+    st->spill_lookup_schema_types = tf_callocarray_checked(batch->n_cols ? batch->n_cols : 1, sizeof(tf_type));
     if (!st->spill_lookup_schema_names || !st->spill_lookup_schema_types) return TF_ERROR;
     for (size_t c = 0; c < batch->n_cols; c++) {
         st->spill_lookup_schema_names[c] = strdup(batch->col_names[c] ? batch->col_names[c] : "");
@@ -1833,7 +1826,7 @@ static int join_spill_capture_lookup_schema(join_state *st, const tf_batch *batc
     st->lookup_key_type = batch->col_types[lookup_ci];
     st->have_lookup_key_type = 1;
 
-    st->lookup_out_cols = malloc((batch->n_cols ? batch->n_cols : 1) * sizeof(int));
+    st->lookup_out_cols = tf_mallocarray_checked(batch->n_cols ? batch->n_cols : 1, sizeof(int));
     if (!st->lookup_out_cols) return TF_ERROR;
     st->n_lookup_out = 0;
     for (size_t c = 0; c < batch->n_cols; c++) {
@@ -1841,8 +1834,8 @@ static int join_spill_capture_lookup_schema(join_state *st, const tf_batch *batc
     }
 
     st->spill_output_n_cols = st->spill_n_cols + st->n_lookup_out;
-    st->spill_output_schema_names = calloc(st->spill_output_n_cols ? st->spill_output_n_cols : 1, sizeof(char *));
-    st->spill_output_schema_types = calloc(st->spill_output_n_cols ? st->spill_output_n_cols : 1, sizeof(tf_type));
+    st->spill_output_schema_names = tf_callocarray_checked(st->spill_output_n_cols ? st->spill_output_n_cols : 1, sizeof(char *));
+    st->spill_output_schema_types = tf_callocarray_checked(st->spill_output_n_cols ? st->spill_output_n_cols : 1, sizeof(tf_type));
     if (!st->spill_output_schema_names || !st->spill_output_schema_types) return TF_ERROR;
     for (size_t c = 0; c < st->spill_n_cols; c++) {
         st->spill_output_schema_names[c] = strdup(st->spill_schema_names[c] ? st->spill_schema_names[c] : "");
@@ -1892,7 +1885,7 @@ static int join_spill_process_lookup_batch(join_state *st, const tf_batch *batch
         if (st->how < 2) {
             if (tf_batch_copy_row(st->spill_lookup_buf, dst, batch, r) != TF_OK) return TF_ERROR;
         } else {
-            copy_cell(st->spill_lookup_buf, dst, 0, batch, r, lookup_ci);
+            if (tf_batch_copy_cell_index(st->spill_lookup_buf, dst, 0, batch, r, lookup_ci) != TF_OK) return TF_ERROR;
         }
         if (join_ensure_ordinals(&st->spill_lookup_ordinals, &st->spill_lookup_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
         st->spill_lookup_ordinals[dst] = st->spill_next_lookup_ordinal++;
@@ -2005,6 +1998,11 @@ static int join_spill_append_joined_row(join_state *st, const join_spill_row *le
     if (!join_reserve_output_row(st, side)) return TF_ERROR;
     size_t dst = st->spill_out_buf->n_rows;
     if (tf_batch_ensure_capacity(st->spill_out_buf, dst + 1) != TF_OK) return TF_ERROR;
+    if (join_ensure_ordinals(&st->spill_out_ordinals, &st->spill_out_ordinal_cap, dst + 1) != TF_OK)
+        return TF_ERROR;
+    uint64_t output_ordinal = 0;
+    if (join_spill_output_ordinal(st, left->ordinal, lookup_run ? match_idx : 0, &output_ordinal, side) != TF_OK)
+        return TF_ERROR;
 
     for (size_t c = 0; c < st->spill_n_cols; c++) {
         if (join_spill_set_batch_cell(st->spill_out_buf, dst, c, left, c,
@@ -2014,21 +2012,19 @@ static int join_spill_append_joined_row(join_state *st, const join_spill_row *le
         for (size_t k = 0; k < st->n_lookup_out; k++) {
             size_t src = (size_t)st->lookup_out_cols[k];
             if (tf_batch_is_null(lookup_run, match_idx, src)) {
-                tf_batch_set_null(st->spill_out_buf, dst, st->spill_n_cols + k);
+                if (tf_batch_set_null(st->spill_out_buf, dst, st->spill_n_cols + k) != TF_OK) return TF_ERROR;
             } else {
-                copy_cell(st->spill_out_buf, dst, st->spill_n_cols + k,
-                          lookup_run, match_idx, (int)src);
+                if (tf_batch_copy_cell_index(st->spill_out_buf, dst, st->spill_n_cols + k,
+                                             lookup_run, match_idx, (int)src) != TF_OK) return TF_ERROR;
             }
         }
     } else {
-        for (size_t k = 0; k < st->n_lookup_out; k++)
-            tf_batch_set_null(st->spill_out_buf, dst, st->spill_n_cols + k);
+        for (size_t k = 0; k < st->n_lookup_out; k++) {
+            if (tf_batch_set_null(st->spill_out_buf, dst, st->spill_n_cols + k) != TF_OK) return TF_ERROR;
+        }
     }
 
-    if (join_ensure_ordinals(&st->spill_out_ordinals, &st->spill_out_ordinal_cap, dst + 1) != TF_OK)
-        return TF_ERROR;
-    if (join_spill_output_ordinal(st, left->ordinal, lookup_run ? match_idx : 0, &st->spill_out_ordinals[dst], side) != TF_OK)
-        return TF_ERROR;
+    st->spill_out_ordinals[dst] = output_ordinal;
     st->spill_out_buf->n_rows = dst + 1;
     st->spill_kept_rows++;
     if (st->spill_out_buf->n_rows >= st->run_rows) return join_spill_write_output_run(st);
@@ -2239,6 +2235,8 @@ static int join_spill_begin_output_merge(join_state *st) {
     if (st->spill_out_buf) { tf_batch_free(st->spill_out_buf); st->spill_out_buf = NULL; }
     free(st->spill_out_ordinals); st->spill_out_ordinals = NULL; st->spill_out_ordinal_cap = 0;
     if (st->spill_n_out_runs == 0) {
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->spill_output_merge_done = 1;
         return TF_OK;
     }
@@ -2272,6 +2270,8 @@ static int join_spill_output_next_batch(join_state *st, tf_batch **out, tf_side_
         tf_batch_free(ob);
         join_spill_close_readers(st, 2);
         join_spill_remove_paths(&st->spill_out_run_paths, &st->spill_n_out_runs, &st->spill_cap_out_runs);
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->spill_output_merge_done = 1;
         return TF_OK;
     }
@@ -2386,27 +2386,32 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
             if (keep) {
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
                 if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                for (size_t c = 0; c < in->n_cols; c++)
-                    copy_cell(ob, out_row, c, in, r, (int)c);
+                for (size_t c = 0; c < in->n_cols; c++) {
+                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                }
                 ob->n_rows = ++out_row;
             }
         } else if (has_match) {
             for (size_t m = 0; m < st->right_run->n_rows; m++) {
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
                 if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                for (size_t c = 0; c < in->n_cols; c++)
-                    copy_cell(ob, out_row, c, in, r, (int)c);
-                for (size_t k = 0; k < st->n_lookup_out; k++)
-                    copy_cell(ob, out_row, in->n_cols + k, st->right_run, m, st->lookup_out_cols[k]);
+                for (size_t c = 0; c < in->n_cols; c++) {
+                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                }
+                for (size_t k = 0; k < st->n_lookup_out; k++) {
+                    if (tf_batch_copy_cell_index(ob, out_row, in->n_cols + k, st->right_run, m, st->lookup_out_cols[k]) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                }
                 ob->n_rows = ++out_row;
             }
         } else if (st->how == 1) {
             if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
             if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            for (size_t c = 0; c < in->n_cols; c++)
-                copy_cell(ob, out_row, c, in, r, (int)c);
-            for (size_t k = 0; k < st->n_lookup_out; k++)
-                tf_batch_set_null(ob, out_row, in->n_cols + k);
+            for (size_t c = 0; c < in->n_cols; c++) {
+                if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            }
+            for (size_t k = 0; k < st->n_lookup_out; k++) {
+                if (tf_batch_set_null(ob, out_row, in->n_cols + k) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            }
             ob->n_rows = ++out_row;
         }
     }
@@ -2447,14 +2452,21 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
     if (!ob) return TF_ERROR;
 
     /* Set schema: main columns, plus lookup columns for mutating joins. */
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    for (size_t c = 0; c < in->n_cols; c++) {
+        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+    }
     if (st->how < 2) {
         for (size_t k = 0; k < st->n_lookup_out; k++) {
             int lc = st->lookup_out_cols[k];
-            tf_batch_set_schema(ob, in->n_cols + k,
-                                st->lookup->col_names[lc],
-                                st->lookup->col_types[lc]);
+            if (tf_batch_set_schema(ob, in->n_cols + k,
+                                    st->lookup->col_names[lc],
+                                    st->lookup->col_types[lc]) != TF_OK) {
+                tf_batch_free(ob);
+                return TF_ERROR;
+            }
         }
     }
 
@@ -2471,8 +2483,9 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
             if (keep) {
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
                 if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-                for (size_t c = 0; c < in->n_cols; c++)
-                    copy_cell(ob, out_row, c, in, r, (int)c);
+                for (size_t c = 0; c < in->n_cols; c++) {
+                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                }
                 ob->n_rows = ++out_row;
             }
         } else if (bucket) {
@@ -2489,21 +2502,25 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
                 if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
                 if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
                 /* Copy main columns */
-                for (size_t c = 0; c < in->n_cols; c++)
-                    copy_cell(ob, out_row, c, in, r, (int)c);
+                for (size_t c = 0; c < in->n_cols; c++) {
+                    if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                }
                 /* Copy lookup columns */
-                for (size_t k = 0; k < st->n_lookup_out; k++)
-                    copy_cell(ob, out_row, in->n_cols + k, st->lookup, lr, st->lookup_out_cols[k]);
+                for (size_t k = 0; k < st->n_lookup_out; k++) {
+                    if (tf_batch_copy_cell_index(ob, out_row, in->n_cols + k, st->lookup, lr, st->lookup_out_cols[k]) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+                }
                 ob->n_rows = ++out_row;
             }
         } else if (st->how == 1) {
             /* Left join: emit main + nulls */
             if (!join_reserve_output_row(st, side)) { tf_batch_free(ob); return TF_ERROR; }
             if (tf_batch_ensure_capacity(ob, out_row + 1) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
-            for (size_t c = 0; c < in->n_cols; c++)
-                copy_cell(ob, out_row, c, in, r, (int)c);
-            for (size_t k = 0; k < st->n_lookup_out; k++)
-                tf_batch_set_null(ob, out_row, in->n_cols + k);
+            for (size_t c = 0; c < in->n_cols; c++) {
+                if (tf_batch_copy_cell_index(ob, out_row, c, in, r, (int)c) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            }
+            for (size_t k = 0; k < st->n_lookup_out; k++) {
+                if (tf_batch_set_null(ob, out_row, in->n_cols + k) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+            }
             ob->n_rows = ++out_row;
         }
         /* Inner join + no match: skip */
@@ -2590,8 +2607,10 @@ static int join_check_unsorted_state_bytes(const join_state *st,
     if (!st || st->max_state_bytes == 0) return TF_OK;
     size_t retained = join_unsorted_retained_state_bytes(map, lookup, n_lookup_out);
     if (retained <= st->max_state_bytes) return TF_OK;
-    join_limit_error_context(side, "max_state_bytes", st->max_state_bytes, retained,
-                             "while tracking lookup state");
+    if (join_limit_error_context(side, "max_state_bytes", st->max_state_bytes, retained,
+                                 "while tracking lookup state") != TF_OK) {
+        return TF_ERROR;
+    }
     return TF_ERROR;
 }
 
@@ -2706,6 +2725,7 @@ static void join_state_free(join_state *st) {
     free(st->spill_output_schema_names);
     free(st->spill_output_schema_types);
     free(st->spill_last_lookup_key);
+    tf_spill_cleanup(st->spill);
     free(st->spill_dir);
     free(st);
 }
@@ -2719,16 +2739,7 @@ static void join_destroy(tf_step *self) {
 
 static int parse_positive_size_arg(const cJSON *args, const char *name,
                                    size_t *out, const char *op_name) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(args, name);
-    if (!item) return 0;
-    if (!cJSON_IsNumber(item) || item->valuedouble <= 0) {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "%s: %s must be positive", op_name, name);
-        tf_set_last_error(msg);
-        return -1;
-    }
-    *out = (size_t)item->valuedouble;
-    return 1;
+    return tf_json_get_size_arg(args, name, 1, TF_MAX_COUNT_ARG, out, op_name);
 }
 
 tf_step *tf_join_create(const cJSON *args) {
@@ -2792,16 +2803,23 @@ tf_step *tf_join_create(const cJSON *args) {
         st->use_spill = 1;
         st->spill_dir = strdup(spill_dir_j->valuestring);
         if (!st->spill_dir) { join_state_free(st); return NULL; }
-        cJSON *spill_memory = cJSON_GetObjectItemCaseSensitive(args, "spill_memory_bytes");
-        if (cJSON_IsNumber(spill_memory) && spill_memory->valuedouble > 0)
-            st->spill_memory_bytes = (size_t)spill_memory->valuedouble;
-        cJSON *spill_rows = cJSON_GetObjectItemCaseSensitive(args, "spill_run_rows");
-        if (cJSON_IsNumber(spill_rows) && spill_rows->valuedouble > 0)
-            st->configured_run_rows = (size_t)spill_rows->valuedouble;
-        cJSON *spill_output = cJSON_GetObjectItemCaseSensitive(args, "spill_output_rows");
-        if (cJSON_IsNumber(spill_output) && spill_output->valuedouble > 0)
-            st->output_batch_rows = (size_t)spill_output->valuedouble;
-        if (st->output_batch_rows == 0) st->output_batch_rows = JOIN_DEFAULT_OUTPUT_ROWS;
+        if (tf_spill_session_create(st->spill_dir, &st->spill) != TF_OK) { join_state_free(st); return NULL; }
+        size_t parsed_size = 0;
+        int has_spill_memory = tf_json_get_size_arg(args, "spill_memory_bytes",
+                                                    1, TF_MAX_SPILL_MEMORY_BYTES,
+                                                    &parsed_size, "join");
+        if (has_spill_memory < 0) { join_state_free(st); return NULL; }
+        if (has_spill_memory > 0) st->spill_memory_bytes = parsed_size;
+        int has_spill_rows = tf_json_get_size_arg(args, "spill_run_rows",
+                                                  1, TF_MAX_SPILL_RUN_ROWS,
+                                                  &parsed_size, "join");
+        if (has_spill_rows < 0) { join_state_free(st); return NULL; }
+        if (has_spill_rows > 0) st->configured_run_rows = parsed_size;
+        int has_output_rows = tf_json_get_size_arg(args, "spill_output_rows",
+                                                   1, TF_MAX_SPILL_OUTPUT_ROWS,
+                                                   &parsed_size, "join");
+        if (has_output_rows < 0) { join_state_free(st); return NULL; }
+        if (has_output_rows > 0) st->output_batch_rows = parsed_size;
     }
 
     if (st->use_spill && st->sorted) {

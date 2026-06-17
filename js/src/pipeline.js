@@ -20,11 +20,68 @@ const CHAN_SAMPLES = 3
 
 const CHUNK_SIZE = 64 * 1024
 
+const HOSTED_AUDIT_PRIVACY_OPS = new Set([
+  'codec.csv.decode',
+  'filter',
+  'validate',
+  'assert',
+  'schema',
+  'json-schema',
+  'fill-null',
+  'replace',
+  'cast',
+  'normalize',
+  'frequency',
+  'tee',
+  'quarantine'
+])
+
+function applyHostedAuditDefaults(planJson) {
+  const plan = JSON.parse(planJson)
+  if (!plan || !Array.isArray(plan.steps)) return planJson
+  let changed = false
+  for (const step of plan.steps) {
+    if (!step || typeof step !== 'object' || !HOSTED_AUDIT_PRIVACY_OPS.has(step.op)) continue
+    if (!step.args || typeof step.args !== 'object' || Array.isArray(step.args)) step.args = {}
+    if (!Object.prototype.hasOwnProperty.call(step.args, 'audit_include_row')) {
+      step.args.audit_include_row = false
+      changed = true
+    }
+  }
+  return changed ? JSON.stringify(plan) : planJson
+}
+
 /**
  * Get the backend (native or WASM).
  * Returns an object with: createPipeline, push, finish, pull, free, version
  */
 let _backend = null
+
+function effectiveHostPolicy({ allowFs, allowRulesFile = false, workspaceRoot, spillDir, allowBlocking = true } = {}) {
+  return {
+    allowFs: allowFs === undefined ? Boolean(spillDir) : Boolean(allowFs),
+    allowSpill: Boolean(spillDir),
+    allowRulesFile: Boolean(allowRulesFile),
+    allowBlocking: Boolean(allowBlocking),
+    workspaceRoot
+  }
+}
+
+function planUsesHostPaths(planJson) {
+  try {
+    const plan = JSON.parse(planJson)
+    const steps = Array.isArray(plan.steps) ? plan.steps : []
+    return steps.some((step) => {
+      const args = step && step.args
+      if (!args || typeof args !== 'object') return false
+      return ['file', 'rules_file', 'rulesFile', 'spill_dir', 'spillDir'].some((key) =>
+        typeof args[key] === 'string' && args[key].length > 0
+      )
+    })
+  } catch (_) {
+    return false
+  }
+}
 
 async function getBackend() {
   if (_backend) return _backend
@@ -40,6 +97,7 @@ async function getBackend() {
   const wasm = await loadWasm()
 
   _backend = {
+    isWasm: true,
     compileDsl(dsl) {
       const len = wasm.lengthBytesUTF8(dsl)
       const ptr = wasm._malloc(len + 1)
@@ -54,12 +112,33 @@ async function getBackend() {
       wasm._free(resultPtr)
       return json
     },
-    createPipeline(planJson) {
+    createPipeline(planJson, options = {}) {
       const len = wasm.lengthBytesUTF8(planJson)
       const ptr = wasm._malloc(len + 1)
       wasm.stringToUTF8(planJson, ptr, len + 1)
-      const handle = wasm.ccall('wasm_pipeline_create', 'number', ['number', 'number'], [ptr, len])
+      let rootPtr = 0
+      if (options.workspaceRoot) {
+        const root = String(options.workspaceRoot)
+        const rootLen = wasm.lengthBytesUTF8(root)
+        rootPtr = wasm._malloc(rootLen + 1)
+        wasm.stringToUTF8(root, rootPtr, rootLen + 1)
+      }
+      const hasPolicyCreate = typeof wasm._wasm_pipeline_create_with_policy === 'function'
+      const needsPolicyCreate = options.allowFs || options.allowSpill || options.allowRulesFile || rootPtr || planUsesHostPaths(planJson)
+      let handle = -1
+      if (hasPolicyCreate) {
+        handle = wasm.ccall('wasm_pipeline_create_with_policy', 'number',
+          ['number', 'number', 'number', 'number', 'number', 'number'],
+          [ptr, len, options.allowFs ? 1 : 0, options.allowSpill ? 1 : 0,
+            options.allowRulesFile ? 1 : 0, rootPtr])
+      } else if (!needsPolicyCreate) {
+        handle = wasm.ccall('wasm_pipeline_create', 'number', ['number', 'number'], [ptr, len])
+      }
       wasm._free(ptr)
+      if (rootPtr) wasm._free(rootPtr)
+      if (!hasPolicyCreate && needsPolicyCreate) {
+        throw new Error('Failed to create pipeline: WASM host policy export unavailable for this plan; rebuild tranfi_core.js')
+      }
       if (handle < 0) {
         const err = wasm.ccall('wasm_pipeline_error', 'string', ['number'], [handle])
         throw new Error(`Failed to create pipeline: ${err || 'unknown error'}`)
@@ -415,7 +494,7 @@ class Pipeline {
     return JSON.stringify({ steps: this._steps })
   }
 
-  async run({ input, inputFile, inputFiles, inputStream, sourceColumn, onOutput, collectOutput = true, chunkSize = CHUNK_SIZE, allowBlocking = false, memory, spillDir, compression = 'auto' } = {}) {
+  async run({ input, inputFile, inputFiles, inputStream, sourceColumn, onOutput, collectOutput = true, chunkSize = CHUNK_SIZE, allowBlocking = false, memory, spillDir, allowFs, allowRulesFile = false, workspaceRoot, compression = 'auto', hostedAuditDefaults = false } = {}) {
     if (chunkSize <= 0) throw new Error('chunkSize must be positive')
     if (sourceColumn !== undefined && sourceColumn !== null && !hasInput(inputFile) && !hasInput(inputFiles)) {
       throw new Error('sourceColumn requires inputFile or inputFiles')
@@ -436,8 +515,9 @@ class Pipeline {
     }
     let planJson = await this._toPlanJson(backend)
     planJson = injectSourceNameStep(planJson, sourceColumn)
+    if (hostedAuditDefaults) planJson = applyHostedAuditDefaults(planJson)
     planJson = prepareNativePlan(planJson, { allowBlocking, memory, spillDir })
-    const handle = backend.createPipeline(planJson)
+    const handle = backend.createPipeline(planJson, effectiveHostPolicy({ allowFs, allowRulesFile, workspaceRoot, spillDir, allowBlocking: true }))
     const outputChunks = []
 
     try {
@@ -466,7 +546,7 @@ class Pipeline {
     }
   }
 
-  async *iterChunks({ input, inputFile, inputFiles, inputStream, sourceColumn, chunkSize = CHUNK_SIZE, allowBlocking = false, memory, spillDir, compression = 'auto' } = {}) {
+  async *iterChunks({ input, inputFile, inputFiles, inputStream, sourceColumn, chunkSize = CHUNK_SIZE, allowBlocking = false, memory, spillDir, allowFs, allowRulesFile = false, workspaceRoot, compression = 'auto' } = {}) {
     if (chunkSize <= 0) throw new Error('chunkSize must be positive')
     if (sourceColumn !== undefined && sourceColumn !== null && !hasInput(inputFile) && !hasInput(inputFiles)) {
       throw new Error('sourceColumn requires inputFile or inputFiles')
@@ -482,7 +562,7 @@ class Pipeline {
     let planJson = await this._toPlanJson(backend)
     planJson = injectSourceNameStep(planJson, sourceColumn)
     planJson = prepareNativePlan(planJson, { allowBlocking, memory, spillDir })
-    const handle = backend.createPipeline(planJson)
+    const handle = backend.createPipeline(planJson, effectiveHostPolicy({ allowFs, allowRulesFile, workspaceRoot, spillDir, allowBlocking: true }))
 
     try {
       for await (const item of iterInputChunks({ input, inputFile, inputFiles, inputStream, chunkSize, compression })) {

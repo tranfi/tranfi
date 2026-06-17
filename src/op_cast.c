@@ -22,6 +22,7 @@ typedef struct {
     size_t    audit_limit;
     size_t    audit_emitted;
     int       audit;
+    tf_audit_options audit_opts;
 } cast_state;
 
 static const char *cast_type_name(tf_type t) {
@@ -110,30 +111,6 @@ static int strict_timestamp_parse_ok(const char *s, const char **reason) {
     return 0;
 }
 
-static cJSON *cast_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (!b || col >= b->n_cols || row >= b->n_rows || tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default: return cJSON_CreateNull();
-    }
-}
-
-static cJSON *cast_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = cast_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
-    }
-    return obj;
-}
-
 static int emit_cast_audit(cast_state *st, const tf_batch *before_b, const tf_batch *after_b,
                            size_t row, size_t col, size_t row_no, tf_type src_t, tf_type dst_t,
                            const char *event, const char *reason, tf_side_channels *side) {
@@ -145,25 +122,30 @@ static int emit_cast_audit(cast_state *st, const tf_batch *before_b, const tf_ba
     cJSON_AddStringToObject(obj, "event", event ? event : "value_changed");
     cJSON_AddStringToObject(obj, "reason", reason ? reason : "type_cast");
     cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "column", before_b->col_names[col] ? before_b->col_names[col] : "");
+    const char *column_name = before_b->col_names[col] ? before_b->col_names[col] : "";
+    cJSON_AddStringToObject(obj, "column", column_name);
     cJSON_AddStringToObject(obj, "from_type", cast_type_name(src_t));
     cJSON_AddStringToObject(obj, "to_type", cast_type_name(dst_t));
     cJSON_AddStringToObject(obj, "expected", cast_type_name(dst_t));
-    if (src_t == TF_TYPE_STRING && !tf_batch_is_null(before_b, row, col))
-        cJSON_AddStringToObject(obj, "actual", tf_batch_get_string(before_b, row, col));
+    if (src_t == TF_TYPE_STRING && !tf_batch_is_null(before_b, row, col)) {
+        char actual_buf[256];
+        const char *actual = tf_audit_format_string_for_column(&st->audit_opts, column_name,
+                                                               tf_batch_get_string(before_b, row, col),
+                                                               actual_buf, sizeof(actual_buf));
+        cJSON_AddStringToObject(obj, "actual", actual ? actual : "");
+    }
     cJSON_AddStringToObject(obj, "action", "cast");
     cJSON_AddNumberToObject(obj, "row", (double)row_no);
-    cJSON *before = cast_cell_to_json(before_b, row, col);
+    cJSON *before = tf_audit_cell_to_json(before_b, row, col, &st->audit_opts);
     if (before) cJSON_AddItemToObject(obj, "before", before);
-    cJSON *after = cast_cell_to_json(after_b, row, col);
+    cJSON *after = tf_audit_cell_to_json(after_b, row, col, &st->audit_opts);
     if (after) cJSON_AddItemToObject(obj, "after", after);
-    cJSON *row_obj = cast_row_to_json(after_b, row);
+    cJSON *row_obj = tf_audit_row_to_json(after_b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->stats, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->stats, "\n");
+    int rc = tf_buffer_write_line(side->stats, line);
     free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
@@ -185,31 +167,25 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) { free(out_types); return TF_ERROR; }
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], out_types[c]);
+    for (size_t c = 0; c < in->n_cols; c++) {
+        if (tf_batch_set_schema(ob, c, in->col_names[c], out_types[c]) != TF_OK) goto fail;
+    }
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_ensure_capacity(ob, r + 1);
-        ob->n_rows = r + 1;
+        if (tf_batch_ensure_capacity(ob, r + 1) != TF_OK) goto fail;
+        ob->n_rows = r + 1; /* audit row serialization needs this row visible */
         for (size_t c = 0; c < in->n_cols; c++) {
             if (tf_batch_is_null(in, r, c)) {
-                tf_batch_set_null(ob, r, c);
+                if (tf_batch_set_null(ob, r, c) != TF_OK) goto fail;
                 continue;
             }
             tf_type src_t = in->col_types[c];
             tf_type dst_t = out_types[c];
             const char *failure_reason = NULL;
+            int write_rc = TF_OK;
 
             if (src_t == dst_t) {
-                switch (src_t) {
-                    case TF_TYPE_BOOL: tf_batch_set_bool(ob, r, c, tf_batch_get_bool(in, r, c)); break;
-                    case TF_TYPE_INT64: tf_batch_set_int64(ob, r, c, tf_batch_get_int64(in, r, c)); break;
-                    case TF_TYPE_FLOAT64: tf_batch_set_float64(ob, r, c, tf_batch_get_float64(in, r, c)); break;
-                    case TF_TYPE_STRING: tf_batch_set_string(ob, r, c, tf_batch_get_string(in, r, c)); break;
-                    case TF_TYPE_DATE: tf_batch_set_date(ob, r, c, tf_batch_get_date(in, r, c)); break;
-                    case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(ob, r, c, tf_batch_get_timestamp(in, r, c)); break;
-                    default: tf_batch_set_null(ob, r, c); break;
-                }
+                if (tf_batch_copy_cell(ob, r, c, in, r, c) != TF_OK) goto fail;
                 continue;
             }
 
@@ -217,63 +193,63 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
                 char buf[64];
                 switch (src_t) {
                     case TF_TYPE_INT64: snprintf(buf, sizeof(buf), "%lld", (long long)tf_batch_get_int64(in, r, c)); break;
-                    case TF_TYPE_FLOAT64: snprintf(buf, sizeof(buf), "%g", tf_batch_get_float64(in, r, c)); break;
+                    case TF_TYPE_FLOAT64:
+                        if (tf_format_float64(buf, sizeof(buf), tf_batch_get_float64(in, r, c)) != TF_OK) goto fail;
+                        break;
                     case TF_TYPE_BOOL: snprintf(buf, sizeof(buf), "%s", tf_batch_get_bool(in, r, c) ? "true" : "false"); break;
                     case TF_TYPE_DATE: tf_date_format(tf_batch_get_date(in, r, c), buf, sizeof(buf)); break;
                     case TF_TYPE_TIMESTAMP: tf_timestamp_format(tf_batch_get_timestamp(in, r, c), buf, sizeof(buf)); break;
                     default: buf[0] = '\0'; failure_reason = "unsupported_conversion"; break;
                 }
-                tf_batch_set_string(ob, r, c, buf);
+                write_rc = tf_batch_set_string(ob, r, c, buf);
             } else if (dst_t == TF_TYPE_INT64) {
                 int64_t v = 0;
                 if (src_t == TF_TYPE_FLOAT64) v = (int64_t)tf_batch_get_float64(in, r, c);
                 else if (src_t == TF_TYPE_STRING) {
                     const char *s = tf_batch_get_string(in, r, c);
-                    char *end;
-                    v = strtoll(s, &end, 10);
+                    v = strtoll(s ? s : "", NULL, 10);
                     strict_int_parse_ok(s, &failure_reason);
                 } else if (src_t == TF_TYPE_BOOL) v = tf_batch_get_bool(in, r, c) ? 1 : 0;
                 else if (src_t == TF_TYPE_TIMESTAMP) v = tf_batch_get_timestamp(in, r, c);
                 else failure_reason = "unsupported_conversion";
-                tf_batch_set_int64(ob, r, c, v);
+                write_rc = tf_batch_set_int64(ob, r, c, v);
             } else if (dst_t == TF_TYPE_FLOAT64) {
                 double v = 0;
                 if (src_t == TF_TYPE_INT64) v = (double)tf_batch_get_int64(in, r, c);
                 else if (src_t == TF_TYPE_STRING) {
                     const char *s = tf_batch_get_string(in, r, c);
-                    char *end;
-                    v = strtod(s, &end);
+                    v = strtod(s ? s : "", NULL);
                     strict_float_parse_ok(s, &failure_reason);
                 } else if (src_t == TF_TYPE_BOOL) v = tf_batch_get_bool(in, r, c) ? 1.0 : 0.0;
                 else failure_reason = "unsupported_conversion";
-                tf_batch_set_float64(ob, r, c, v);
+                write_rc = tf_batch_set_float64(ob, r, c, v);
             } else if (dst_t == TF_TYPE_BOOL) {
                 bool v = false;
                 if (src_t == TF_TYPE_INT64) v = tf_batch_get_int64(in, r, c) != 0;
                 else if (src_t == TF_TYPE_FLOAT64) v = tf_batch_get_float64(in, r, c) != 0.0;
                 else if (src_t == TF_TYPE_STRING) {
                     const char *s = tf_batch_get_string(in, r, c);
-                    v = strlen(s) > 0 && strcmp(s, "false") != 0;
-                    if (strcmp(s, "true") != 0 && strcmp(s, "false") != 0) failure_reason = "non_canonical_bool";
+                    v = s && strlen(s) > 0 && strcmp(s, "false") != 0;
+                    if (!s || (strcmp(s, "true") != 0 && strcmp(s, "false") != 0)) failure_reason = "non_canonical_bool";
                 } else failure_reason = "unsupported_conversion";
-                tf_batch_set_bool(ob, r, c, v);
+                write_rc = tf_batch_set_bool(ob, r, c, v);
             } else if (dst_t == TF_TYPE_DATE) {
                 int32_t v = 0;
                 if (src_t == TF_TYPE_STRING) {
                     const char *s = tf_batch_get_string(in, r, c);
                     int y, m, d;
-                    if (sscanf(s, "%d-%d-%d", &y, &m, &d) == 3)
+                    if (s && sscanf(s, "%d-%d-%d", &y, &m, &d) == 3)
                         v = tf_date_from_ymd(y, m, d);
                     strict_date_parse_ok(s, &failure_reason);
                 } else if (src_t == TF_TYPE_TIMESTAMP) {
                     v = (int32_t)(tf_batch_get_timestamp(in, r, c) / (86400LL * 1000000LL));
                 } else failure_reason = "unsupported_conversion";
-                tf_batch_set_date(ob, r, c, v);
+                write_rc = tf_batch_set_date(ob, r, c, v);
             } else if (dst_t == TF_TYPE_TIMESTAMP) {
                 int64_t v = 0;
                 if (src_t == TF_TYPE_STRING) {
                     const char *s = tf_batch_get_string(in, r, c);
-                    size_t slen = strlen(s);
+                    size_t slen = s ? strlen(s) : 0;
                     int32_t dv;
                     if (slen >= 19) {
                         int y, mo, d, h, mi, se;
@@ -294,20 +270,17 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
                 } else if (src_t == TF_TYPE_INT64) {
                     v = tf_batch_get_int64(in, r, c);
                 } else failure_reason = "unsupported_conversion";
-                tf_batch_set_timestamp(ob, r, c, v);
+                write_rc = tf_batch_set_timestamp(ob, r, c, v);
             } else {
                 failure_reason = dst_t == TF_TYPE_NULL ? "invalid_target_type" : "unsupported_conversion";
-                tf_batch_set_null(ob, r, c);
+                write_rc = tf_batch_set_null(ob, r, c);
             }
+            if (write_rc != TF_OK) goto fail;
 
             if (st->audit) {
                 const char *event = failure_reason ? "coercion_failed" : "value_changed";
                 const char *reason = failure_reason ? failure_reason : "type_cast";
-                if (emit_cast_audit(st, in, ob, r, c, row_base + r + 1, src_t, dst_t, event, reason, side) != TF_OK) {
-                    tf_batch_free(ob);
-                    free(out_types);
-                    return TF_ERROR;
-                }
+                if (emit_cast_audit(st, in, ob, r, c, row_base + r + 1, src_t, dst_t, event, reason, side) != TF_OK) goto fail;
             }
         }
     }
@@ -316,6 +289,11 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
     free(out_types);
     *out = ob;
     return TF_OK;
+
+fail:
+    tf_batch_free(ob);
+    free(out_types);
+    return TF_ERROR;
 }
 
 static int cast_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
@@ -324,6 +302,7 @@ static int cast_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 
 static void cast_state_free(cast_state *st) {
     if (!st) return;
+    tf_audit_options_free(&st->audit_opts);
     for (size_t i = 0; i < st->n; i++) free(st->col_names[i]);
     free(st->col_names);
     free(st->target_types);
@@ -343,6 +322,7 @@ tf_step *tf_cast_create(const cJSON *args) {
     int n = cJSON_GetArraySize(mapping);
     cast_state *st = calloc(1, sizeof(cast_state));
     if (!st) return NULL;
+    tf_audit_options_init(&st->audit_opts, 1);
     st->col_names = calloc((size_t)n, sizeof(char *));
     st->target_types = calloc((size_t)n, sizeof(tf_type));
     st->n = (size_t)n;
@@ -363,12 +343,19 @@ tf_step *tf_cast_create(const cJSON *args) {
     cJSON *audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "audit_limit");
     if (!audit_limit_j) audit_limit_j = cJSON_GetObjectItemCaseSensitive(args, "auditLimit");
     if (audit_limit_j) {
-        if (!cJSON_IsNumber(audit_limit_j) || audit_limit_j->valuedouble <= 0) {
-            tf_set_last_error("cast: audit_limit must be a positive integer");
+        size_t parsed_limit = 0;
+        if (tf_json_get_size_arg_any(args, "audit_limit", "auditLimit",
+                                     1, TF_MAX_AUDIT_RECORDS,
+                                     &parsed_limit, "cast") < 0) {
             cast_state_free(st);
             return NULL;
         }
-        st->audit_limit = (size_t)audit_limit_j->valuedouble;
+        st->audit_limit = parsed_limit;
+    }
+
+    if (tf_audit_options_parse(&st->audit_opts, args, "cast") != TF_OK) {
+        cast_state_free(st);
+        return NULL;
     }
 
     tf_step *step = calloc(1, sizeof(tf_step));

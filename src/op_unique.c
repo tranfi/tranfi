@@ -8,6 +8,7 @@
  */
 
 #include "internal.h"
+#include "spill.h"
 #include "cJSON.h"
 #include "date_utils.h"
 #include <errno.h>
@@ -21,13 +22,7 @@
 #define UNIQUE_DEFAULT_OUTPUT_ROWS 1024
 #define UNIQUE_MIN_RUN_ROWS 16
 
-typedef union {
-    uint8_t b;
-    int64_t i64;
-    double f64;
-    int32_t date;
-    char *str;
-} unique_cell;
+typedef tf_owned_cell_value unique_cell;
 
 typedef struct {
     uint64_t ordinal;
@@ -55,7 +50,7 @@ static int hs_init(hash_set *hs, size_t cap) {
     hs->cap = cap;
     hs->count = 0;
     hs->key_bytes = 0;
-    hs->keys = calloc(cap, sizeof(char *));
+    hs->keys = tf_callocarray_checked(cap, sizeof(char *));
     return hs->keys ? 0 : -1;
 }
 
@@ -67,8 +62,9 @@ static uint32_t hs_hash(const char *key) {
 }
 
 static int hs_grow(hash_set *hs) {
-    size_t new_cap = hs->cap * 2;
-    char **new_keys = calloc(new_cap, sizeof(char *));
+    size_t new_cap = 0;
+    if (tf_size_mul(hs->cap, 2, &new_cap) != TF_OK) return -1;
+    char **new_keys = tf_callocarray_checked(new_cap, sizeof(char *));
     if (!new_keys) return -1;
 
     for (size_t i = 0; i < hs->cap; i++) {
@@ -95,7 +91,13 @@ static int hs_contains(const hash_set *hs, const char *key) {
 }
 
 static int hs_insert(hash_set *hs, const char *key) {
-    if (hs->count * 4 >= hs->cap * 3) {
+    size_t load_count = 0;
+    size_t load_limit = 0;
+    if (tf_size_mul(hs->count, 4, &load_count) != TF_OK ||
+        tf_size_mul(hs->cap, 3, &load_limit) != TF_OK) {
+        return -1;
+    }
+    if (load_count >= load_limit) {
         if (hs_grow(hs) != 0) return -1;
     }
     uint32_t idx = hs_hash(key) % hs->cap;
@@ -103,15 +105,24 @@ static int hs_insert(hash_set *hs, const char *key) {
         if (strcmp(hs->keys[idx], key) == 0) return 0;
         idx = (idx + 1) % hs->cap;
     }
+    size_t key_bytes_delta = 0;
+    size_t new_key_bytes = 0;
+    if (tf_size_add(strlen(key), 1, &key_bytes_delta) != TF_OK ||
+        tf_size_add(hs->key_bytes, key_bytes_delta, &new_key_bytes) != TF_OK) {
+        return -1;
+    }
     hs->keys[idx] = strdup(key);
     if (!hs->keys[idx]) return -1;
-    hs->key_bytes += strlen(key) + 1;
+    hs->key_bytes = new_key_bytes;
     hs->count++;
     return 1;
 }
 
 static void hs_free(hash_set *hs) {
-    for (size_t i = 0; i < hs->cap; i++) free(hs->keys[i]);
+    if (!hs) return;
+    if (hs->keys) {
+        for (size_t i = 0; i < hs->cap; i++) free(hs->keys[i]);
+    }
     free(hs->keys);
     memset(hs, 0, sizeof(*hs));
 }
@@ -131,6 +142,7 @@ typedef struct {
     hash_set  seen;
 
     char     *spill_dir;
+    tf_spill_session *spill;
     size_t    spill_memory_bytes;
     size_t    configured_run_rows;
     size_t    run_rows;
@@ -179,33 +191,27 @@ typedef struct {
     size_t    spill_key_bytes;
 } unique_state;
 
-static size_t json_size_arg(const cJSON *args, const char *name) {
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(args, name);
-    if (!cJSON_IsNumber(item) || item->valuedouble <= 0.0) return 0;
-    if (item->valuedouble > (double)SIZE_MAX) return SIZE_MAX;
-    return (size_t)item->valuedouble;
+static int unique_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
 }
 
-static void unique_write_error(tf_side_channels *side, const char *msg) {
-    tf_set_last_error(msg);
-    if (side && side->errors) {
-        tf_buffer_write_str(side->errors, msg);
-        tf_buffer_write_str(side->errors, "\n");
-    }
-}
-
-static void unique_limit_error(unique_state *st, tf_side_channels *side) {
+static int unique_limit_error(unique_state *st, tf_side_channels *side) {
     char msg[160];
     snprintf(msg, sizeof(msg),
              "unique: max_keys=%zu exceeded while tracking distinct keys",
              st->max_keys);
-    unique_write_error(side, msg);
+    return unique_write_error(side, msg);
 }
 
 static int append_bytes(char **buf, size_t *len, size_t *cap, const void *src, size_t n) {
-    if (*len + n + 1 > *cap) {
-        size_t new_cap = *cap ? *cap : 128;
-        while (*len + n + 1 > new_cap) new_cap *= 2;
+    size_t need = 0;
+    if (tf_size_add(*len, n, &need) != TF_OK ||
+        tf_size_add(need, 1, &need) != TF_OK) {
+        return TF_ERROR;
+    }
+    if (need > *cap) {
+        size_t new_cap = 0;
+        if (tf_size_grow_pow2(*cap, need, 128, &new_cap) != TF_OK) return TF_ERROR;
         char *tmp = realloc(*buf, new_cap);
         if (!tmp) return TF_ERROR;
         *buf = tmp;
@@ -280,26 +286,6 @@ fail:
     return NULL;
 }
 
-static int copy_row(tf_batch *dst, size_t dst_row, const tf_batch *src, size_t src_row) {
-    if (tf_batch_ensure_capacity(dst, dst_row + 1) != TF_OK) return TF_ERROR;
-    for (size_t c = 0; c < src->n_cols; c++) {
-        if (tf_batch_is_null(src, src_row, c)) {
-            tf_batch_set_null(dst, dst_row, c);
-            continue;
-        }
-        switch (src->col_types[c]) {
-            case TF_TYPE_BOOL: tf_batch_set_bool(dst, dst_row, c, tf_batch_get_bool(src, src_row, c)); break;
-            case TF_TYPE_INT64: tf_batch_set_int64(dst, dst_row, c, tf_batch_get_int64(src, src_row, c)); break;
-            case TF_TYPE_FLOAT64: tf_batch_set_float64(dst, dst_row, c, tf_batch_get_float64(src, src_row, c)); break;
-            case TF_TYPE_STRING: tf_batch_set_string(dst, dst_row, c, tf_batch_get_string(src, src_row, c)); break;
-            case TF_TYPE_DATE: tf_batch_set_date(dst, dst_row, c, tf_batch_get_date(src, src_row, c)); break;
-            case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(dst, dst_row, c, tf_batch_get_timestamp(src, src_row, c)); break;
-            default: tf_batch_set_null(dst, dst_row, c); break;
-        }
-    }
-    return TF_OK;
-}
-
 static tf_batch *create_buffer_from_schema(const unique_state *st, size_t capacity) {
     tf_batch *b = tf_batch_create(st->n_schema_cols, capacity ? capacity : 16);
     if (!b) return NULL;
@@ -331,9 +317,9 @@ static size_t unique_estimated_row_bytes(const unique_state *st) {
 
 static int ensure_ordinals(uint64_t **ord, size_t *cap, size_t need) {
     if (*cap >= need) return TF_OK;
-    size_t new_cap = *cap ? *cap * 2 : 16;
-    while (new_cap < need) new_cap *= 2;
-    uint64_t *tmp = realloc(*ord, new_cap * sizeof(uint64_t));
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(*cap, need, 16, &new_cap) != TF_OK) return TF_ERROR;
+    uint64_t *tmp = tf_reallocarray_checked(*ord, new_cap, sizeof(uint64_t));
     if (!tmp) return TF_ERROR;
     *ord = tmp;
     *cap = new_cap;
@@ -343,8 +329,8 @@ static int ensure_ordinals(uint64_t **ord, size_t *cap, size_t need) {
 static int init_spill_schema(unique_state *st, const tf_batch *in) {
     if (st->has_schema) return TF_OK;
     st->n_schema_cols = in->n_cols;
-    st->schema_names = calloc(in->n_cols ? in->n_cols : 1, sizeof(char *));
-    st->schema_types = calloc(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
+    st->schema_names = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(char *));
+    st->schema_types = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
     if (!st->schema_names || !st->schema_types) return TF_ERROR;
     for (size_t c = 0; c < in->n_cols; c++) {
         st->schema_names[c] = strdup(in->col_names[c] ? in->col_names[c] : "");
@@ -354,12 +340,22 @@ static int init_spill_schema(unique_state *st, const tf_batch *in) {
 
     if (st->n_key_cols > 0) {
         st->n_keys = st->n_key_cols;
-        st->key_indices = calloc(st->n_keys ? st->n_keys : 1, sizeof(int));
+        st->key_indices = tf_callocarray_checked(st->n_keys ? st->n_keys : 1, sizeof(int));
         if (!st->key_indices) return TF_ERROR;
-        for (size_t k = 0; k < st->n_keys; k++) st->key_indices[k] = tf_batch_col_index(in, st->key_cols[k]);
+        for (size_t k = 0; k < st->n_keys; k++) {
+            int idx = tf_batch_col_index(in, st->key_cols[k]);
+            if (idx < 0) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "unique: column '%s' not found",
+                         st->key_cols[k] ? st->key_cols[k] : "");
+                tf_set_last_error(msg);
+                return TF_ERROR;
+            }
+            st->key_indices[k] = idx;
+        }
     } else {
         st->n_keys = in->n_cols;
-        st->key_indices = calloc(st->n_keys ? st->n_keys : 1, sizeof(int));
+        st->key_indices = tf_callocarray_checked(st->n_keys ? st->n_keys : 1, sizeof(int));
         if (!st->key_indices) return TF_ERROR;
         for (size_t k = 0; k < st->n_keys; k++) st->key_indices[k] = (int)k;
     }
@@ -421,35 +417,25 @@ static int compare_batch_key_rows(const unique_state *st, const tf_batch *batch,
     return (oa > ob) - (oa < ob);
 }
 
-static const unique_state *g_key_sort_state;
-static int compare_key_indices(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    return compare_batch_key_rows(g_key_sort_state, g_key_sort_state->buf, ra, rb);
-}
+typedef struct {
+    const unique_state *st;
+    int by_ordinal;
+} unique_sort_ctx;
 
-static const unique_state *g_ordinal_sort_state;
-static int compare_ordinal_indices(const void *a, const void *b) {
-    size_t ra = *(const size_t *)a;
-    size_t rb = *(const size_t *)b;
-    uint64_t oa = g_ordinal_sort_state->out_ordinals[ra];
-    uint64_t ob = g_ordinal_sort_state->out_ordinals[rb];
+static int unique_compare_indices(const void *ctx, size_t a, size_t b) {
+    const unique_sort_ctx *sort = (const unique_sort_ctx *)ctx;
+    if (!sort->by_ordinal) return compare_batch_key_rows(sort->st, sort->st->buf, a, b);
+    uint64_t oa = sort->st->out_ordinals[a];
+    uint64_t ob = sort->st->out_ordinals[b];
     return (oa > ob) - (oa < ob);
 }
 
 static size_t *sorted_indices(size_t n, int by_ordinal, const unique_state *st) {
-    size_t *idx = malloc((n ? n : 1) * sizeof(size_t));
+    size_t *idx = tf_mallocarray_checked(n ? n : 1, sizeof(size_t));
     if (!idx) return NULL;
     for (size_t i = 0; i < n; i++) idx[i] = i;
-    if (by_ordinal) {
-        g_ordinal_sort_state = st;
-        qsort(idx, n, sizeof(size_t), compare_ordinal_indices);
-        g_ordinal_sort_state = NULL;
-    } else {
-        g_key_sort_state = st;
-        qsort(idx, n, sizeof(size_t), compare_key_indices);
-        g_key_sort_state = NULL;
-    }
+    unique_sort_ctx ctx = { .st = st, .by_ordinal = by_ordinal };
+    tf_sort_indices(idx, n, unique_compare_indices, &ctx);
     return idx;
 }
 
@@ -481,23 +467,15 @@ static int write_cell(FILE *f, const tf_batch *b, size_t r, size_t c) {
     }
 }
 
-static char *make_run_path(unique_state *st, int output_run) {
-    size_t dir_len = strlen(st->spill_dir);
-    size_t cap = dir_len + 112;
-    char *path = malloc(cap);
-    if (!path) return NULL;
-    snprintf(path, cap, "%s%stranfi-unique-%s-%ld-%zu.bin",
-             st->spill_dir,
-             (dir_len > 0 && st->spill_dir[dir_len - 1] == '/') ? "" : "/",
-             output_run ? "out" : "key",
-             (long)getpid(), output_run ? st->out_run_seq++ : st->run_seq++);
-    return path;
-}
-
 static int append_path(char ***paths, size_t *n, size_t *cap, char *path) {
     if (*n == *cap) {
-        size_t new_cap = *cap ? *cap * 2 : 8;
-        char **tmp = realloc(*paths, new_cap * sizeof(char *));
+        size_t need = 0;
+        size_t new_cap = 0;
+        if (tf_size_add(*n, 1, &need) != TF_OK ||
+            tf_size_grow_pow2(*cap, need, 8, &new_cap) != TF_OK) {
+            return TF_ERROR;
+        }
+        char **tmp = tf_reallocarray_checked(*paths, new_cap, sizeof(char *));
         if (!tmp) return TF_ERROR;
         *paths = tmp;
         *cap = new_cap;
@@ -508,16 +486,9 @@ static int append_path(char ***paths, size_t *n, size_t *cap, char *path) {
 
 static int write_batch_run(unique_state *st, tf_batch *batch, const uint64_t *ordinals,
                            size_t *indices, size_t n, int output_run) {
-    char *path = make_run_path(st, output_run);
-    if (!path) return TF_ERROR;
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "unique spill: cannot create '%s': %s", path, strerror(errno));
-        tf_set_last_error(msg);
-        free(path);
-        return TF_ERROR;
-    }
+    char *path = NULL;
+    FILE *f = tf_spill_open_run_file(st->spill, output_run ? "unique-out" : "unique-key", &path);
+    if (!f) return TF_ERROR;
     for (size_t i = 0; i < n; i++) {
         size_t r = indices[i];
         uint64_t ordinal = ordinals[r];
@@ -595,9 +566,15 @@ static void spill_row_clear(unique_spill_row *row, const tf_type *types, size_t 
 
 static int spill_row_init(unique_spill_row *row, size_t n_cols) {
     row->ordinal = 0;
-    row->nulls = calloc(n_cols ? n_cols : 1, sizeof(uint8_t));
-    row->cells = calloc(n_cols ? n_cols : 1, sizeof(unique_cell));
-    if (!row->nulls || !row->cells) return TF_ERROR;
+    row->nulls = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(uint8_t));
+    row->cells = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(unique_cell));
+    if (!row->nulls || !row->cells) {
+        free(row->nulls);
+        free(row->cells);
+        row->nulls = NULL;
+        row->cells = NULL;
+        return TF_ERROR;
+    }
     for (size_t c = 0; c < n_cols; c++) row->nulls[c] = 1;
     return TF_OK;
 }
@@ -739,21 +716,13 @@ fail:
     return NULL;
 }
 
-static int spill_row_to_batch(const unique_state *st, tf_batch *out, size_t dst_row, const unique_spill_row *row) {
+static int spill_row_to_batch(const unique_state *st, tf_batch *out,
+                              size_t dst_row, const unique_spill_row *row) {
     if (tf_batch_ensure_capacity(out, dst_row + 1) != TF_OK) return TF_ERROR;
     for (size_t c = 0; c < st->n_schema_cols; c++) {
-        if (row->nulls[c]) {
-            tf_batch_set_null(out, dst_row, c);
-            continue;
-        }
-        switch (st->schema_types[c]) {
-            case TF_TYPE_BOOL: tf_batch_set_bool(out, dst_row, c, row->cells[c].b != 0); break;
-            case TF_TYPE_INT64: tf_batch_set_int64(out, dst_row, c, row->cells[c].i64); break;
-            case TF_TYPE_FLOAT64: tf_batch_set_float64(out, dst_row, c, row->cells[c].f64); break;
-            case TF_TYPE_STRING: tf_batch_set_string(out, dst_row, c, row->cells[c].str); break;
-            case TF_TYPE_DATE: tf_batch_set_date(out, dst_row, c, row->cells[c].date); break;
-            case TF_TYPE_TIMESTAMP: tf_batch_set_timestamp(out, dst_row, c, row->cells[c].i64); break;
-            default: tf_batch_set_null(out, dst_row, c); break;
+        if (tf_batch_set_owned_cell_value(out, dst_row, c, st->schema_types[c],
+                                          row->nulls[c], &row->cells[c]) != TF_OK) {
+            return TF_ERROR;
         }
     }
     return TF_OK;
@@ -792,7 +761,7 @@ static int open_readers(unique_state *st, int output_readers) {
     unique_run_reader **readers = output_readers ? &st->out_readers : &st->readers;
     size_t *n_readers = output_readers ? &st->n_out_readers : &st->n_readers;
     if (n_paths == 0) return TF_OK;
-    *readers = calloc(n_paths, sizeof(unique_run_reader));
+    *readers = tf_callocarray_checked(n_paths, sizeof(unique_run_reader));
     if (!*readers) return TF_ERROR;
     *n_readers = n_paths;
     for (size_t i = 0; i < n_paths; i++) {
@@ -832,8 +801,8 @@ static int best_ordinal_reader(const unique_state *st) {
 
 static int append_selected_row(unique_state *st, const unique_spill_row *row) {
     size_t dst = st->out_buf->n_rows;
-    if (spill_row_to_batch(st, st->out_buf, dst, row) != TF_OK) return TF_ERROR;
     if (ensure_ordinals(&st->out_ordinals, &st->out_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
+    if (spill_row_to_batch(st, st->out_buf, dst, row) != TF_OK) return TF_ERROR;
     st->out_ordinals[dst] = row->ordinal;
     st->out_buf->n_rows = dst + 1;
     st->spill_distinct_rows++;
@@ -856,9 +825,17 @@ static int produce_output_runs(unique_state *st) {
         if (!key) return TF_ERROR;
         int keep = !st->last_spill_key || strcmp(st->last_spill_key, key) != 0;
         if (keep) {
+            size_t key_bytes_delta = 0;
+            size_t new_spill_key_bytes = 0;
+            if (tf_size_add(strlen(key), 1, &key_bytes_delta) != TF_OK ||
+                tf_size_add(st->spill_key_bytes, key_bytes_delta,
+                            &new_spill_key_bytes) != TF_OK) {
+                free(key);
+                return TF_ERROR;
+            }
             free(st->last_spill_key);
             st->last_spill_key = key;
-            st->spill_key_bytes += strlen(key) + 1;
+            st->spill_key_bytes = new_spill_key_bytes;
             key = NULL;
             if (append_selected_row(st, &reader->row) != TF_OK) { free(key); return TF_ERROR; }
         }
@@ -879,6 +856,8 @@ static int begin_output_merge(unique_state *st) {
     if (st->out_buf) { tf_batch_free(st->out_buf); st->out_buf = NULL; }
     free(st->out_ordinals); st->out_ordinals = NULL; st->out_ordinal_cap = 0;
     if (st->n_out_runs == 0) {
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->output_merge_done = 1;
         return TF_OK;
     }
@@ -906,6 +885,8 @@ static int output_next_batch(unique_state *st, tf_batch **out) {
         tf_batch_free(ob);
         close_readers(st, 1);
         remove_paths(&st->out_run_paths, &st->n_out_runs, &st->cap_out_runs);
+        tf_spill_cleanup(st->spill);
+        st->spill = NULL;
         st->output_merge_done = 1;
         return TF_OK;
     }
@@ -941,7 +922,7 @@ static int unique_check_state_bytes(unique_state *st, tf_side_channels *side) {
     snprintf(msg, sizeof(msg),
              "unique: max_state_bytes=%zu exceeded while tracking distinct keys (%zu bytes retained)",
              st->max_state_bytes, retained);
-    unique_write_error(side, msg);
+    if (unique_write_error(side, msg) != TF_OK) return -1;
     return -1;
 }
 
@@ -949,8 +930,8 @@ static int unique_process_spill(unique_state *st, tf_batch *in) {
     if (init_spill_schema(st, in) != TF_OK) return TF_ERROR;
     for (size_t r = 0; r < in->n_rows; r++) {
         size_t dst = st->buf->n_rows;
-        if (copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         if (ensure_ordinals(&st->buf_ordinals, &st->buf_ordinal_cap, dst + 1) != TF_OK) return TF_ERROR;
+        if (tf_batch_copy_row(st->buf, dst, in, r) != TF_OK) return TF_ERROR;
         st->buf_ordinals[dst] = st->next_ordinal++;
         st->buf->n_rows = dst + 1;
         if (st->buf->n_rows >= st->run_rows && write_key_run(st) != TF_OK) return TF_ERROR;
@@ -968,19 +949,30 @@ static int unique_process(tf_step *self, tf_batch *in, tf_batch **out, tf_side_c
     int *col_indices;
     if (st->n_key_cols > 0) {
         n_keys = st->n_key_cols;
-        col_indices = malloc(n_keys * sizeof(int));
+        col_indices = tf_mallocarray_checked(n_keys, sizeof(int));
         if (!col_indices) return TF_ERROR;
-        for (size_t k = 0; k < n_keys; k++) col_indices[k] = tf_batch_col_index(in, st->key_cols[k]);
+        for (size_t k = 0; k < n_keys; k++) {
+            int idx = tf_batch_col_index(in, st->key_cols[k]);
+            if (idx < 0) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "unique: column '%s' not found",
+                         st->key_cols[k] ? st->key_cols[k] : "");
+                tf_set_last_error(msg);
+                free(col_indices);
+                return TF_ERROR;
+            }
+            col_indices[k] = idx;
+        }
     } else {
         n_keys = in->n_cols;
-        col_indices = malloc(n_keys * sizeof(int));
+        col_indices = tf_mallocarray_checked(n_keys, sizeof(int));
         if (!col_indices) return TF_ERROR;
         for (size_t k = 0; k < n_keys; k++) col_indices[k] = (int)k;
     }
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) { free(col_indices); return TF_ERROR; }
-    for (size_t c = 0; c < in->n_cols; c++) tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    if (tf_batch_clone_schema(ob, in) != TF_OK) { free(col_indices); tf_batch_free(ob); return TF_ERROR; }
 
     size_t out_row = 0;
     for (size_t r = 0; r < in->n_rows; r++) {
@@ -998,7 +990,12 @@ static int unique_process(tf_step *self, tf_batch *in, tf_batch **out, tf_side_c
             }
         } else {
             if (!hs_contains(&st->seen, key) && st->max_keys > 0 && st->seen.count >= st->max_keys) {
-                unique_limit_error(st, side);
+                if (unique_limit_error(st, side) != TF_OK) {
+                    free(key);
+                    free(col_indices);
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
                 free(key);
                 free(col_indices);
                 tf_batch_free(ob);
@@ -1016,7 +1013,7 @@ static int unique_process(tf_step *self, tf_batch *in, tf_batch **out, tf_side_c
         }
         free(key);
         if (!emit_row) continue;
-        if (copy_row(ob, out_row, in, r) != TF_OK) { free(col_indices); tf_batch_free(ob); return TF_ERROR; }
+        if (tf_batch_copy_row(ob, out_row, in, r) != TF_OK) { free(col_indices); tf_batch_free(ob); return TF_ERROR; }
         out_row++;
     }
     ob->n_rows = out_row;
@@ -1069,7 +1066,9 @@ static int unique_append_stats(tf_step *self, tf_buffer *out) {
 
 static void unique_state_free(unique_state *st) {
     if (!st) return;
-    for (size_t i = 0; i < st->n_key_cols; i++) free(st->key_cols[i]);
+    if (st->key_cols) {
+        for (size_t i = 0; i < st->n_key_cols; i++) free(st->key_cols[i]);
+    }
     free(st->key_cols);
     free(st->prev_key);
     free(st->last_spill_key);
@@ -1086,6 +1085,7 @@ static void unique_state_free(unique_state *st) {
     free(st->schema_names);
     free(st->schema_types);
     free(st->key_indices);
+    tf_spill_cleanup(st->spill);
     free(st->spill_dir);
     free(st);
 }
@@ -1104,45 +1104,63 @@ tf_step *tf_unique_create(const cJSON *args) {
         cJSON *sorted = cJSON_GetObjectItemCaseSensitive(args, "sorted");
         st->sorted = cJSON_IsBool(sorted) && cJSON_IsTrue(sorted);
 
-        cJSON *max_keys = cJSON_GetObjectItemCaseSensitive(args, "max_keys");
-        if (cJSON_IsNumber(max_keys) && max_keys->valuedouble > 0) st->max_keys = (size_t)max_keys->valuedouble;
+        size_t parsed_size = 0;
+        int has_max_keys = tf_json_get_size_arg(args, "max_keys",
+                                                1, TF_MAX_COUNT_ARG,
+                                                &parsed_size, "unique");
+        if (has_max_keys < 0) { unique_state_free(st); return NULL; }
+        if (has_max_keys > 0) st->max_keys = parsed_size;
 
-        cJSON *max_state_bytes = cJSON_GetObjectItemCaseSensitive(args, "max_state_bytes");
-        if (max_state_bytes) {
-            if (!cJSON_IsNumber(max_state_bytes) || max_state_bytes->valuedouble <= 0) {
-                tf_set_last_error("unique: max_state_bytes must be positive");
-                unique_state_free(st);
-                return NULL;
-            }
-            st->max_state_bytes = (size_t)max_state_bytes->valuedouble;
-        }
+        int has_max_state = tf_json_get_size_arg(args, "max_state_bytes",
+                                                 1, TF_MAX_STATE_BYTES,
+                                                 &parsed_size, "unique");
+        if (has_max_state < 0) { unique_state_free(st); return NULL; }
+        if (has_max_state > 0) st->max_state_bytes = parsed_size;
 
         cJSON *spill_dir_j = cJSON_GetObjectItemCaseSensitive(args, "spill_dir");
         if (cJSON_IsString(spill_dir_j) && spill_dir_j->valuestring && spill_dir_j->valuestring[0]) {
             st->use_spill = 1;
             st->spill_dir = strdup(spill_dir_j->valuestring);
             if (!st->spill_dir) { unique_state_free(st); return NULL; }
-            st->spill_memory_bytes = json_size_arg(args, "spill_memory_bytes");
-            st->configured_run_rows = json_size_arg(args, "spill_run_rows");
-            st->output_batch_rows = json_size_arg(args, "spill_output_rows");
-            if (st->output_batch_rows == 0 || st->output_batch_rows == SIZE_MAX) st->output_batch_rows = UNIQUE_DEFAULT_OUTPUT_ROWS;
-            if (st->configured_run_rows == SIZE_MAX) st->configured_run_rows = 0;
-            if (st->spill_memory_bytes == SIZE_MAX) st->spill_memory_bytes = 0;
+            if (tf_spill_session_create(st->spill_dir, &st->spill) != TF_OK) { unique_state_free(st); return NULL; }
+            int has_spill_memory = tf_json_get_size_arg(args, "spill_memory_bytes",
+                                                        1, TF_MAX_SPILL_MEMORY_BYTES,
+                                                        &parsed_size, "unique");
+            if (has_spill_memory < 0) { unique_state_free(st); return NULL; }
+            if (has_spill_memory > 0) st->spill_memory_bytes = parsed_size;
+            int has_spill_rows = tf_json_get_size_arg(args, "spill_run_rows",
+                                                      1, TF_MAX_SPILL_RUN_ROWS,
+                                                      &parsed_size, "unique");
+            if (has_spill_rows < 0) { unique_state_free(st); return NULL; }
+            if (has_spill_rows > 0) st->configured_run_rows = parsed_size;
+            int has_output_rows = tf_json_get_size_arg(args, "spill_output_rows",
+                                                       1, TF_MAX_SPILL_OUTPUT_ROWS,
+                                                       &parsed_size, "unique");
+            if (has_output_rows < 0) { unique_state_free(st); return NULL; }
+            if (has_output_rows > 0) st->output_batch_rows = parsed_size;
         }
 
         cJSON *columns = cJSON_GetObjectItemCaseSensitive(args, "columns");
-        if (columns && cJSON_IsArray(columns)) {
+        if (columns) {
+            if (!cJSON_IsArray(columns)) {
+                tf_set_last_error("unique: columns must be an array");
+                unique_state_free(st);
+                return NULL;
+            }
             int n = cJSON_GetArraySize(columns);
             if (n > 0) {
-                st->key_cols = calloc((size_t)n, sizeof(char *));
+                st->key_cols = tf_callocarray_checked((size_t)n, sizeof(char *));
                 if (!st->key_cols) { unique_state_free(st); return NULL; }
                 st->n_key_cols = (size_t)n;
                 for (int i = 0; i < n; i++) {
                     cJSON *item = cJSON_GetArrayItem(columns, i);
-                    if (cJSON_IsString(item)) {
-                        st->key_cols[i] = strdup(item->valuestring);
-                        if (!st->key_cols[i]) { unique_state_free(st); return NULL; }
+                    if (!cJSON_IsString(item) || !item->valuestring || item->valuestring[0] == '\0') {
+                        tf_set_last_error("unique: column names must be non-empty strings");
+                        unique_state_free(st);
+                        return NULL;
                     }
+                    st->key_cols[i] = strdup(item->valuestring);
+                    if (!st->key_cols[i]) { unique_state_free(st); return NULL; }
                 }
             }
         }

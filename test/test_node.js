@@ -205,6 +205,38 @@ await test('cast audit side channel', async () => {
   assert(result.statsText.includes('"actual":"bad"'), 'cast audit should include actual value')
 })
 
+
+function makeWideCsv(nCols) {
+  const header = Array.from({ length: nCols }, (_, i) => `col${i}`).join(',')
+  const row = Array.from({ length: nCols }, (_, i) => `v${i}`).join(',')
+  return `${header}\n${row}\n`
+}
+
+await test('csv wide columns and maxColumns', async () => {
+  const step = codec.csv({ maxColumns: 3 })
+  assert(step.args.max_columns === 3, 'helper should expose max_columns')
+
+  const result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    codec.csvEncode(),
+  ]).run({ input: makeWideCsv(300), chunkSize: 17 })
+  assert(result.outputText.includes('col255'), 'should preserve column 255')
+  assert(result.outputText.includes('col299'), 'should preserve column 299')
+  assert(result.outputText.includes('v255'), 'should preserve value 255')
+  assert(result.outputText.includes('v299'), 'should preserve value 299')
+
+  await assertRejects(
+    () => pipeline([codec.csv({ maxColumns: 3 }), codec.csvEncode()]).run({ input: 'a,b,c,d\n1,2,3,4\n', chunkSize: 2 }),
+    /csv record exceeds max_columns/
+  )
+
+  const longName = 'a'.repeat(4097)
+  await assertRejects(
+    () => pipeline([codec.csv(), codec.csvEncode()]).run({ input: `${longName}\n1\n`, chunkSize: 11 }),
+    /column name/
+  )
+})
+
 await test('csv repair diagnostics', async () => {
   const p = pipeline([
     codec.csv({ batchSize: 2, repair: true, maxErrorBytes: 5, audit: true, auditLimit: 1 }),
@@ -521,6 +553,27 @@ await test('jsonl malformed records', async () => {
     () => pipeline([codec.jsonl({ onError: 'fail' }), codec.csvEncode()])
       .run({ input: '{"name":"Alice","age":30}\nnot json\n' }),
     /jsonl decode failed at line 2/
+  )
+})
+
+await test('jsonl max record bytes', async () => {
+  const step = codec.jsonlDecode({ maxRecordBytes: 16, maxErrorBytes: 6 })
+  assert(step.args.max_record_bytes === 16, 'helper should expose max_record_bytes')
+  assert(step.args.max_error_bytes === 6, 'helper should expose max_error_bytes')
+
+  const p = pipeline([
+    codec.jsonl({ maxRecordBytes: 16, maxErrorBytes: 6 }),
+    codec.csvEncode(),
+  ])
+  await assertRejects(
+    () => p.run({ input: '{"id":1}\n{"name":"abcdefghijklmnop"}', chunkSize: 7 }),
+    /jsonl record exceeds max_record_bytes/
+  )
+
+  const longName = 'a'.repeat(4097)
+  await assertRejects(
+    () => pipeline([codec.jsonl(), codec.csvEncode()]).run({ input: `{"${longName}":1}\n`, chunkSize: 13 }),
+    /column name/
   )
 })
 
@@ -1734,11 +1787,19 @@ await test('validate rules', async () => {
   }))
   const fileStep = ops.validate(null, { rulesFile: rulesPath })
   assert(fileStep.args.rules_file === rulesPath, 'validate helper should pass rulesFile')
+  await assertRejects(
+    () => pipeline([
+      codec.csv({ batchSize: 1 }),
+      fileStep,
+      codec.csvEncode(),
+    ]).run({ input: 'name,age\nAlice,30\nBob,-1\nCara,20\n' }),
+    /allow_fs=false/
+  )
   const fileResult = await pipeline([
     codec.csv({ batchSize: 1 }),
     fileStep,
     codec.csvEncode(),
-  ]).run({ input: 'name,age\nAlice,30\nBob,-1\nCara,20\n' })
+  ]).run({ input: 'name,age\nAlice,30\nBob,-1\nCara,20\n', allowFs: true, allowRulesFile: true })
   assert(fileResult.outputText.includes('Alice,30,true'), 'validate rulesFile should keep passing row')
   assert(fileResult.outputText.includes('Bob,-1,false'), 'validate rulesFile should mark failed row')
   assert(fileResult.statsText.includes('"suite":"quality_file"'), 'validate rulesFile should use suite name')
@@ -1850,10 +1911,14 @@ await test('assert actions', async () => {
     action: 'warn',
     name: 'sales_total',
     message: 'too low',
+    tolerance: 1e-9,
+    rel: false,
   })
   assert(aggregateHelper.args.aggregate === 'sum:amount', 'aggregate assert helper should set aggregate')
   assert(aggregateHelper.args.op === '>=', 'aggregate assert helper should set comparison')
   assert(aggregateHelper.args.value === 100, 'aggregate assert helper should set value')
+  assert(aggregateHelper.args.tolerance === 1e-9, 'aggregate assert helper should set tolerance')
+  assert(aggregateHelper.args.rel === false, 'aggregate assert helper should set rel')
 
   const amountData = 'name,amount\nA,30\nB,20\n'
   const aggregateWarn = await pipeline([
@@ -1884,6 +1949,30 @@ await test('assert actions', async () => {
     ]).run({ input: amountData }),
     /assert aggregate failed/
   )
+  const largeAmountData = 'amount\n1000000000000000\n'
+  const relativePass = await pipeline([
+    codec.csv(),
+    ops.assert(null, { aggregate: 'sum:amount', op: '==', value: 1000000000000100, action: 'fail' }),
+    codec.csvEncode(),
+  ]).run({ input: largeAmountData })
+  assert(relativePass.statsText.includes('"aggregate_passed":true'), 'relative aggregate equality should pass')
+  assert(relativePass.statsText.includes('"relative_tolerance":true'), 'relative aggregate equality should report relative tolerance')
+  assert(relativePass.errors.length === 0, 'relative aggregate equality should not warn')
+
+  const absoluteWarn = await pipeline([
+    codec.csv(),
+    ops.assert(null, { aggregate: 'sum:amount', op: '==', value: 1000000000000100, tolerance: 1e-12, rel: false, action: 'warn' }),
+    codec.csvEncode(),
+  ]).run({ input: largeAmountData })
+  assert(absoluteWarn.errors.toString('utf-8').includes('aggregate_assert_failed'), 'absolute aggregate equality should warn')
+  assert(absoluteWarn.statsText.includes('"relative_tolerance":false'), 'absolute aggregate equality should report rel=false')
+
+  const whitespaceValue = await pipeline([
+    codec.csv(),
+    { op: 'assert', args: { aggregate: 'sum:amount', op: '==', value: '50 ', action: 'fail' } },
+    codec.csvEncode(),
+  ]).run({ input: amountData })
+  assert(whitespaceValue.statsText.includes('"aggregate_passed":true'), 'string aggregate threshold with trailing whitespace should parse')
 })
 
 
@@ -2034,6 +2123,363 @@ await test('schema selectors', async () => {
 })
 
 
+await test('schema regex budgets', async () => {
+  const step = ops.schema({
+    regex: { code: '^[A-Z]+$' },
+    maxRegexPatternBytes: 32,
+    maxRegexCellBytes: 3,
+    mode: 'warn',
+  })
+  assert(step.args.max_regex_pattern_bytes === 32, 'schema helper should pass maxRegexPatternBytes')
+  assert(step.args.max_regex_cell_bytes === 3, 'schema helper should pass maxRegexCellBytes')
+
+  const result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    step,
+    codec.csvEncode(),
+  ]).run({ input: 'code\nAA\nTOOLONG\n' })
+  assert(result.outputText.includes('AA'), 'schema regex budget should keep passing row in warn mode')
+  assert(result.outputText.includes('TOOLONG'), 'schema regex budget should keep failing row in warn mode')
+  const errors = result.errors.toString('utf-8')
+  assert(errors.includes('schema_failure'), 'over-cap regex cell should emit schema failure')
+  assert(errors.includes('"rule":"regex"'), 'over-cap regex cell should count as regex failure')
+  assert(errors.includes('regex cell within max_regex_cell_bytes'), 'over-cap regex cell should report expected cap')
+  assert(errors.includes('cell exceeds 3 bytes'), 'over-cap regex cell should report actual cap failure')
+  assert(result.statsText.includes('"checked_rows":2'), 'schema regex budget stats should count rows')
+  assert(result.statsText.includes('"passed_rows":1'), 'schema regex budget stats should count passing row')
+  assert(result.statsText.includes('"failed_rows":1'), 'schema regex budget stats should count failing row')
+  assert(result.statsText.includes('"regex_failures":1'), 'schema regex budget stats should count regex failures')
+  assert(result.statsText.includes('"max_regex_pattern_bytes":32'), 'schema regex budget stats should report pattern cap')
+  assert(result.statsText.includes('"max_regex_cell_bytes":3'), 'schema regex budget stats should report cell cap')
+
+  await assertRejects(
+    () => pipeline([
+      codec.csv(),
+      ops.schema({ regex: { code: '^[A-Z]+$' }, maxRegexPatternBytes: 3, mode: 'warn' }),
+      codec.csvEncode(),
+    ]).run({ input: 'code\nAA\n' }),
+    /max_regex_pattern_bytes/
+  )
+
+  await assertRejects(
+    () => pipeline([
+      codec.csv(),
+      ops.schema({ regex: { 'ends_with(code)': '^[A-Z]+$' }, maxRegexPatternBytes: 3, mode: 'warn' }),
+      codec.csvEncode(),
+    ]).run({ input: 'code\nAA\n' }),
+    /max_regex_pattern_bytes/
+  )
+})
+
+
+await test('schema audit privacy controls', async () => {
+  const data = 'name,ssn,age\nAliciaSecret,111-22-3333,200\n'
+  const step = ops.schema({
+    values: { ssn: ['OK'] },
+    mode: 'filter',
+    audit: true,
+    auditLimit: 1,
+    auditIncludeRow: true,
+    auditColumns: ['ssn'],
+    auditRedact: ['ssn'],
+    auditHashColumns: ['name'],
+    auditMaxBytes: 1024,
+    auditMaxCellBytes: 3,
+  })
+  assert(step.args.audit_include_row === true, 'schema helper should pass auditIncludeRow')
+  assert(step.args.audit_columns[0] === 'ssn', 'schema helper should pass auditColumns')
+  assert(step.args.audit_redact[0] === 'ssn', 'schema helper should pass auditRedact')
+  assert(step.args.audit_hash_columns[0] === 'name', 'schema helper should pass auditHashColumns')
+  assert(step.args.audit_max_bytes === 1024, 'schema helper should pass auditMaxBytes')
+  assert(step.args.audit_max_cell_bytes === 3, 'schema helper should pass auditMaxCellBytes')
+
+  let result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.schema({ max: { age: 120 }, mode: 'filter', audit: true, auditLimit: 1, auditIncludeRow: false }),
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('"type":"audit"'), 'schema audit should emit audit record')
+  assert(!result.statsText.includes('"data"'), 'auditIncludeRow=false should omit row payload')
+  assert(!result.statsText.includes('AliciaSecret'), 'auditIncludeRow=false should not leak name')
+  assert(!result.statsText.includes('111-22-3333'), 'auditIncludeRow=false should not leak ssn')
+
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.schema({ values: { ssn: ['OK'] }, mode: 'filter', audit: true, auditLimit: 1, auditColumns: ['ssn'], auditRedact: ['ssn'] }),
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('[REDACTED]'), 'auditRedact should redact selected column')
+  assert(!result.statsText.includes('111-22-3333'), 'auditRedact should not leak raw ssn')
+  assert(!result.statsText.includes('AliciaSecret'), 'auditColumns should limit row payload columns')
+
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.schema({ values: { ssn: ['OK'] }, mode: 'filter', audit: true, auditLimit: 1, auditHashColumns: ['ssn'] }),
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('fnv1a64:'), 'auditHashColumns should hash selected column')
+  assert(!result.statsText.includes('111-22-3333'), 'auditHashColumns should not leak raw ssn')
+
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.schema({ max: { age: 120 }, mode: 'filter', audit: true, auditLimit: 1, auditMaxCellBytes: 3 }),
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('Ali...'), 'auditMaxCellBytes should truncate string cells')
+  assert(result.statsText.includes('111...'), 'auditMaxCellBytes should truncate string cells')
+  assert(!result.statsText.includes('AliciaSecret'), 'auditMaxCellBytes should not leak full name')
+  assert(!result.statsText.includes('111-22-3333'), 'auditMaxCellBytes should not leak full ssn')
+
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.schema({ max: { age: 120 }, mode: 'filter', audit: true, auditLimit: 1, auditMaxBytes: 1 }),
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('_audit_truncated'), 'auditMaxBytes should replace oversized row payloads')
+  assert(!result.statsText.includes('AliciaSecret'), 'auditMaxBytes should not leak name')
+  assert(!result.statsText.includes('111-22-3333'), 'auditMaxBytes should not leak ssn')
+
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    ops.schema({ regex: { ssn: '^OK$' }, mode: 'warn', auditRedact: ['ssn'] }),
+    codec.csvEncode(),
+  ]).run({ input: data })
+  const errors = result.errors.toString('utf-8')
+  assert(errors.includes('schema_failure'), 'warn mode should emit schema failure')
+  assert(errors.includes('[REDACTED]'), 'auditRedact should redact error actual values')
+  assert(!errors.includes('111-22-3333'), 'auditRedact should not leak raw ssn in errors')
+})
+
+
+await test('audit privacy migrated producers', async () => {
+  const data = 'name,ssn,age\nAlice,111-22-3333,20\nBob,222-33-4444,40\n'
+
+  const filterStep = ops.filter(expr("col('age') > 30"), {
+    audit: true,
+    auditLimit: 1,
+    auditIncludeRow: false,
+    auditRedact: ['ssn'],
+    auditMaxCellBytes: 3,
+  })
+  assert(filterStep.args.audit_include_row === false, 'filter helper should pass auditIncludeRow')
+  assert(filterStep.args.audit_redact[0] === 'ssn', 'filter helper should pass auditRedact')
+  assert(filterStep.args.audit_max_cell_bytes === 3, 'filter helper should pass auditMaxCellBytes')
+  let result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    filterStep,
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('"op":"filter"'), 'filter audit should emit')
+  assert(!result.statsText.includes('"data"'), 'filter auditIncludeRow=false should omit data')
+  assert(!result.statsText.includes('Alice'), 'filter audit should not leak omitted row name')
+  assert(!result.statsText.includes('111-22-3333'), 'filter audit should not leak omitted ssn')
+
+  const validateStep = ops.validate(expr("col('age') > 30"), {
+    audit: true,
+    auditLimit: 1,
+    auditColumns: ['ssn'],
+    auditRedact: ['ssn'],
+  })
+  assert(validateStep.args.audit_columns[0] === 'ssn', 'validate helper should pass auditColumns')
+  assert(validateStep.args.audit_redact[0] === 'ssn', 'validate helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    validateStep,
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('"op":"validate"'), 'validate audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'validate audit should redact selected column')
+  assert(!result.statsText.includes('111-22-3333'), 'validate audit should not leak raw ssn')
+  assert(!result.statsText.includes('Alice'), 'validate auditColumns should limit payload')
+
+  const assertStep = ops.assert(expr("col('age') > 30"), {
+    action: 'warn',
+    auditColumns: ['ssn'],
+    auditHashColumns: ['ssn'],
+  })
+  assert(assertStep.args.audit_columns[0] === 'ssn', 'assert helper should pass auditColumns')
+  assert(assertStep.args.audit_hash_columns[0] === 'ssn', 'assert helper should pass auditHashColumns')
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    assertStep,
+    codec.csvEncode(),
+  ]).run({ input: data })
+  const errors = result.errors.toString('utf-8')
+  assert(errors.includes('assert_failure'), 'assert warning should emit failure record')
+  assert(errors.includes('fnv1a64:'), 'assert errors should hash selected column')
+  assert(!errors.includes('111-22-3333'), 'assert errors should not leak raw ssn')
+  assert(!errors.includes('Alice'), 'assert auditColumns should limit row payload')
+
+  const jsonStep = ops.jsonSchema(
+    { type: 'object', required: ['user'] },
+    { mode: 'filter', audit: true, auditLimit: 1, auditColumns: ['_line'], auditRedact: ['_line'], auditMaxBytes: 2048 }
+  )
+  assert(jsonStep.args.audit_columns[0] === '_line', 'jsonSchema helper should pass auditColumns')
+  assert(jsonStep.args.audit_redact[0] === '_line', 'jsonSchema helper should pass auditRedact')
+  assert(jsonStep.args.audit_max_bytes === 2048, 'jsonSchema helper should pass auditMaxBytes')
+  result = await pipeline([
+    codec.text({ batchSize: 1 }),
+    jsonStep,
+    codec.textEncode(),
+  ]).run({ input: '{"ssn":"111-22-3333"}\n' })
+  assert(result.statsText.includes('"op":"json-schema"'), 'jsonSchema audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'jsonSchema audit should redact selected row text')
+  assert(!result.statsText.includes('111-22-3333'), 'jsonSchema audit should not leak raw JSON text')
+
+  const fillStep = ops.fillNull({ note: 'SECRET' }, {
+    audit: true,
+    auditLimit: 1,
+    auditColumns: ['note'],
+    auditRedact: ['note'],
+  })
+  assert(fillStep.args.audit_columns[0] === 'note', 'fillNull helper should pass auditColumns')
+  assert(fillStep.args.audit_redact[0] === 'note', 'fillNull helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 1, nulls: ['NA'] }),
+    fillStep,
+    codec.csvEncode(),
+  ]).run({ input: 'name,note\nB,NA\nC,ok\n' })
+  assert(result.statsText.includes('"op":"fill-null"'), 'fill-null audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'fill-null audit should redact filled value')
+  assert(!result.statsText.includes('SECRET'), 'fill-null audit should not leak filled value')
+  assert(!result.statsText.includes('"B"'), 'fill-null auditColumns should limit row payload')
+
+  const replaceStep = ops.replace('ssn', '111', '999', {
+    audit: true,
+    auditLimit: 1,
+    auditColumns: ['ssn'],
+    auditRedact: ['ssn'],
+  })
+  assert(replaceStep.args.audit_columns[0] === 'ssn', 'replace helper should pass auditColumns')
+  assert(replaceStep.args.audit_redact[0] === 'ssn', 'replace helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    replaceStep,
+    codec.csvEncode(),
+  ]).run({ input: 'name,ssn\nAlice,111-22-3333\nBob,222-33-4444\n' })
+  assert(result.statsText.includes('"op":"replace"'), 'replace audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'replace audit should redact changed values')
+  assert(!result.statsText.includes('111'), 'replace audit should not leak raw pattern/source fragment')
+  assert(!result.statsText.includes('999'), 'replace audit should not leak raw replacement fragment')
+  assert(!result.statsText.includes('Alice'), 'replace auditColumns should limit row payload')
+
+
+  const castStep = ops.cast({ secret: 'int' }, {
+    audit: true,
+    auditLimit: 1,
+    auditColumns: ['secret'],
+    auditRedact: ['secret'],
+  })
+  assert(castStep.args.audit_columns[0] === 'secret', 'cast helper should pass auditColumns')
+  assert(castStep.args.audit_redact[0] === 'secret', 'cast helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    castStep,
+    codec.csvEncode(),
+  ]).run({ input: 'name,secret\nAlice,111-22-3333\n' })
+  assert(result.statsText.includes('"op":"cast"'), 'cast audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'cast audit should redact actual/before/after')
+  assert(!result.statsText.includes('111'), 'cast audit should not leak raw source fragment')
+  assert(!result.statsText.includes('Alice'), 'cast auditColumns should limit row payload')
+
+  const normalizeStep = ops.normalize(['score'], {
+    audit: true,
+    auditLimit: 1,
+    auditColumns: ['score'],
+    auditRedact: ['score'],
+  })
+  assert(normalizeStep.args.audit_columns[0] === 'score', 'normalize helper should pass auditColumns')
+  assert(normalizeStep.args.audit_redact[0] === 'score', 'normalize helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 2 }),
+    normalizeStep,
+    codec.csvEncode(),
+  ]).run({ input: 'name,score\nAlice,100\nBob,200\n', allowBlocking: true })
+  assert(result.statsText.includes('"op":"normalize"'), 'normalize audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'normalize audit should redact values and stats')
+  assert(!result.statsText.includes('100'), 'normalize audit should not leak min/before value')
+  assert(!result.statsText.includes('200'), 'normalize audit should not leak max/source value')
+  assert(!result.statsText.includes('Alice'), 'normalize auditColumns should limit row payload')
+
+  const frequencyStep = ops.frequency(['city'], {
+    maxValues: 1,
+    overflow: 'other',
+    audit: true,
+    auditLimit: 1,
+    auditColumns: ['city'],
+    auditRedact: ['city'],
+  })
+  assert(frequencyStep.args.audit_columns[0] === 'city', 'frequency helper should pass auditColumns')
+  assert(frequencyStep.args.audit_redact[0] === 'city', 'frequency helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    frequencyStep,
+    codec.csvEncode(),
+  ]).run({ input: 'name,city\nAlice,NY\nBob,LA\n' })
+  assert(result.statsText.includes('"op":"frequency"'), 'frequency audit should emit')
+  assert(result.statsText.includes('"event":"category_overflow"'), 'frequency audit should identify overflow event')
+  assert(result.statsText.includes('[REDACTED]'), 'frequency audit should redact overflow value and row data')
+  assert(!result.statsText.includes('LA'), 'frequency audit should not leak overflow value')
+  assert(!result.statsText.includes('Bob'), 'frequency auditColumns should limit row payload')
+  assert(!result.statsText.includes('Alice'), 'frequency auditColumns should limit row payload')
+  assert(result.statsText.includes('"data":{"city":"[REDACTED]"}'), 'frequency audit should redact row payload')
+
+  const repairStep = codec.csv({ repair: true, audit: true, auditLimit: 1, auditRedact: ['raw'] })
+  assert(repairStep.args.audit_redact[0] === 'raw', 'csv helper should pass auditRedact')
+  result = await pipeline([
+    repairStep,
+    codec.csvEncode(),
+  ]).run({ input: 'name,secret\nAlice,SECRET,extra\n' })
+  assert(result.statsText.includes('"event":"row_repaired"'), 'csv repair audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'csv repair audit should redact raw record')
+  assert(!result.statsText.includes('SECRET'), 'csv repair audit should not leak raw value')
+  assert(!result.statsText.includes('Alice'), 'csv repair audit should not leak raw row')
+  const repairErrors = result.errors.toString('utf-8')
+  assert(repairErrors.includes('csv_field_count'), 'csv repair diagnostic should emit')
+  assert(repairErrors.includes('[REDACTED]'), 'csv repair diagnostic should redact raw record')
+  assert(!repairErrors.includes('SECRET'), 'csv repair diagnostic should not leak raw value')
+  assert(!repairErrors.includes('Alice'), 'csv repair diagnostic should not leak raw row')
+
+  const teeStep = ops.tee({
+    expr: expr("col('age') >= 20"),
+    channel: 'audit',
+    columns: ['name', 'ssn'],
+    limit: 1,
+    auditColumns: ['ssn'],
+    auditRedact: ['ssn'],
+  })
+  assert(teeStep.args.audit_columns[0] === 'ssn', 'tee helper should pass auditColumns')
+  assert(teeStep.args.audit_redact[0] === 'ssn', 'tee helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    teeStep,
+    codec.csvEncode(),
+  ]).run({ input: data })
+  assert(result.statsText.includes('"op":"tee"'), 'tee audit should emit')
+  assert(result.statsText.includes('[REDACTED]'), 'tee audit should redact selected column')
+  assert(!result.statsText.includes('111-22-3333'), 'tee audit should not leak raw ssn')
+  assert(!result.statsText.includes('Alice'), 'tee auditColumns should limit row payload')
+
+  const quarantineStep = ops.quarantine(expr("col('age') < 30"), {
+    auditColumns: ['ssn'],
+    auditRedact: ['ssn'],
+  })
+  assert(quarantineStep.args.audit_columns[0] === 'ssn', 'quarantine helper should pass auditColumns')
+  assert(quarantineStep.args.audit_redact[0] === 'ssn', 'quarantine helper should pass auditRedact')
+  result = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    quarantineStep,
+    codec.csvEncode(),
+  ]).run({ input: data })
+  const quarantineErrors = result.errors.toString('utf-8')
+  assert(quarantineErrors.includes('"op":"quarantine"'), 'quarantine should emit error record')
+  assert(quarantineErrors.includes('[REDACTED]'), 'quarantine should redact selected column')
+  assert(!quarantineErrors.includes('111-22-3333'), 'quarantine should not leak raw ssn')
+  assert(!quarantineErrors.includes('Alice'), 'quarantine auditColumns should limit row payload')
+
+})
+
+
 await test('schema infer', async () => {
   const step = ops.schemaInfer({ rows: 2 })
   assert(step.op === 'schema-infer', 'schemaInfer helper should set op')
@@ -2083,6 +2529,35 @@ await test('explode', async () => {
   const lines = text.trim().split('\n')
   assert(lines.length === 5, `should have 5 lines (header + 4), got ${lines.length}`)
 })
+
+await test('row expansion caps', async () => {
+  const explodeStep = ops.explode('tags', '|', {
+    maxTokensPerRow: 2,
+    maxOutputRowsPerInputRow: 2,
+    maxOutputRowsPerBatch: 3,
+    maxTokenBytes: 8,
+  })
+  assert(explodeStep.args.max_tokens_per_row === 2, 'explode helper should set max_tokens_per_row')
+  assert(explodeStep.args.max_output_rows_per_input_row === 2, 'explode helper should set max_output_rows_per_input_row')
+  assert(explodeStep.args.max_output_rows_per_batch === 3, 'explode helper should set max_output_rows_per_batch')
+  assert(explodeStep.args.max_token_bytes === 8, 'explode helper should set max_token_bytes')
+  await assertRejects(
+    () => pipeline([codec.csv(), explodeStep, codec.csvEncode()]).run({ input: 'name,tags\nAlice,a|b|c\n' }),
+    /max_tokens_per_row=2/
+  )
+  await assertRejects(
+    () => pipeline([codec.csv(), ops.explode('tags', { maxTokenBytes: 1 }), codec.csvEncode()]).run({ input: 'name,tags\nAlice,aa\n' }),
+    /max_token_bytes=1/
+  )
+  const unpivotStep = ops.unpivot(['q1', 'q2'], { maxOutputRowsPerInputRow: 1, maxOutputRowsPerBatch: 2 })
+  assert(unpivotStep.args.max_output_rows_per_input_row === 1, 'unpivot helper should set max_output_rows_per_input_row')
+  assert(unpivotStep.args.max_output_rows_per_batch === 2, 'unpivot helper should set max_output_rows_per_batch')
+  await assertRejects(
+    () => pipeline([codec.csv(), unpivotStep, codec.csvEncode()]).run({ input: 'id,q1,q2\n1,10,20\n' }),
+    /max_output_rows_per_input_row=1/
+  )
+})
+
 
 await test('step running-sum', async () => {
   const p = pipeline([
@@ -2166,6 +2641,12 @@ await test('key-state caps', async () => {
   assert(freqArgs.other === 'REST', 'frequency helper should set other label')
   assert(freqArgs.audit === true, 'frequency helper should set audit')
   assert(freqArgs.audit_limit === 2, 'frequency helper should set audit_limit')
+  const freqPrivacyArgs = ops.frequency(['city'], { auditColumns: ['city'], auditRedact: ['city'], auditHashColumns: ['city'], auditMaxBytes: 100, auditMaxCellBytes: 8 }).args
+  assert(freqPrivacyArgs.audit_columns[0] === 'city', 'frequency helper should set audit_columns')
+  assert(freqPrivacyArgs.audit_redact[0] === 'city', 'frequency helper should set audit_redact')
+  assert(freqPrivacyArgs.audit_hash_columns[0] === 'city', 'frequency helper should set audit_hash_columns')
+  assert(freqPrivacyArgs.audit_max_bytes === 100, 'frequency helper should set audit_max_bytes')
+  assert(freqPrivacyArgs.audit_max_cell_bytes === 8, 'frequency helper should set audit_max_cell_bytes')
   const onehotArgs = ops.onehot('city', { drop: true, categories: ['NY', 'LA'], maxCategories: 3, unknown: 'other' }).args
   assert(onehotArgs.drop === true, 'onehot helper should set drop')
   assert(onehotArgs.categories.length === 2, 'onehot helper should set categories')
@@ -2354,7 +2835,7 @@ await test('join lookup caps', async () => {
   async function expectJoinCapError(step, expected) {
     let failed = false
     try {
-      await pipeline([codec.csv(), step, codec.csvEncode()]).run({ input: 'id\n1\n' })
+      await pipeline([codec.csv(), step, codec.csvEncode()]).run({ input: 'id\n1\n', allowFs: true })
     } catch (e) {
       failed = e.message.includes(expected)
     }
@@ -2379,7 +2860,7 @@ await test('join output caps', async () => {
   async function expectJoinCapError(step, expected) {
     let failed = false
     try {
-      await pipeline([codec.csv({ batchSize: 1 }), step, codec.csvEncode()]).run({ input: 'id\n1\n' })
+      await pipeline([codec.csv({ batchSize: 1 }), step, codec.csvEncode()]).run({ input: 'id\n1\n', allowFs: true })
     } catch (e) {
       failed = e.message.includes(expected)
     }
@@ -2393,7 +2874,7 @@ await test('join output caps', async () => {
       codec.csv({ batchSize: 1 }),
       ops.join(lookup, 'id', { maxMatchesPerRow: 2, maxOutputRows: 2, maxStateBytes: 65536 }),
       codec.csvEncode(),
-    ]).run({ input: 'id\n1\n' })
+    ]).run({ input: 'id\n1\n', allowFs: true })
     assert(result.outputText.includes('1,a'), 'join should emit first duplicate match')
     assert(result.outputText.includes('1,b'), 'join should emit second duplicate match')
     assert(result.statsText.includes('"op":"join"'), 'join stats should include op name')
@@ -2416,7 +2897,7 @@ await test('join typed keys', async () => {
   writeFileSync(typedLookup, 'id,val\n1,string-one\nx,other\n')
   let mismatchFailed = false
   try {
-    await pipeline([codec.csv({ batchSize: 1 }), ops.join(typedLookup, 'id'), codec.csvEncode()]).run({ input: 'id\n1\n' })
+    await pipeline([codec.csv({ batchSize: 1 }), ops.join(typedLookup, 'id'), codec.csvEncode()]).run({ input: 'id\n1\n', allowFs: true })
   } catch (e) {
     mismatchFailed = e.message.includes('join key types differ')
   } finally {
@@ -2431,7 +2912,7 @@ await test('join typed keys', async () => {
       codec.csv({ batchSize: 1 }),
       ops.join(sentinelLookup, 'id'),
       codec.csvEncode(),
-    ]).run({ input: 'id,name\n,empty\n\\N,literal\n' })
+    ]).run({ input: 'id,name\n,empty\n\\N,literal\n', allowFs: true })
     assert(result.outputText.includes('\\N,literal,sentinel'), 'string sentinel key should match literal string row')
     assert(!result.outputText.includes('empty'), 'null key should not collide with literal sentinel string')
   } finally {
@@ -2452,21 +2933,21 @@ await test('filtering joins', async () => {
       codec.csv(),
       ops.semiJoin(lookup, 'id', { maxLookupBytes: 1024, maxStateBytes: 4096 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(semi.outputText.trim() === 'id,name\n1,Alice\n3,Charlie', 'semi-join should filter matching left rows without duplicates')
 
     const anti = await pipeline([
       codec.csv(),
       ops.antiJoin(lookup, 'id', { maxLookupBytes: 1024, maxStateBytes: 4096 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(anti.outputText.trim() === 'id,name\n2,Bob', 'anti-join should keep only unmatched left rows')
 
     const antiEmpty = await pipeline([
       codec.csv(),
       ops.antiJoin(empty, 'id', { maxLookupBytes: 1024 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(antiEmpty.outputText.trim() === 'id,name\n1,Alice\n2,Bob\n3,Charlie', 'anti-join against empty lookup should keep all left rows')
   } finally {
     unlinkSync(lookup)
@@ -2485,21 +2966,21 @@ await test('sorted join mode', async () => {
       codec.csv({ batchSize: 2 }),
       ops.semiJoin(lookup, 'id', { sorted: true }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(semi.outputText.trim() === 'id,name\n1,Alice\n2,Bob\n2,Beth\n4,Dave', 'sorted semi-join should stream lookup keys')
 
     const anti = await pipeline([
       codec.csv({ batchSize: 2 }),
       ops.antiJoin(lookup, 'id', { sorted: true }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(anti.outputText.trim() === 'id,name\n3,Cara', 'sorted anti-join should keep unmatched left rows')
 
     const inner = await pipeline([
       codec.csv({ batchSize: 2 }),
       ops.join(lookup, 'id', { sorted: true, maxMatchesPerRow: 2 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(inner.outputText.includes('1,Alice,a'), 'sorted inner join should include id=1')
     assert(inner.outputText.includes('2,Bob,b'), 'sorted inner join should include first duplicate match')
     assert(inner.outputText.includes('2,Bob,c'), 'sorted inner join should include second duplicate match')
@@ -2510,7 +2991,7 @@ await test('sorted join mode', async () => {
       codec.csv({ batchSize: 2 }),
       ops.join(lookup, 'id', { how: 'left', sorted: true, maxMatchesPerRow: 2 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(left.outputText.includes('3,Cara,'), 'sorted left join should emit nulls for unmatched rows')
 
     let failed = false
@@ -2519,7 +3000,7 @@ await test('sorted join mode', async () => {
         codec.csv({ batchSize: 1 }),
         ops.semiJoin(lookup, 'id', { sorted: true }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n2,Bob\n1,Alice\n', memory: '64KB' })
+      ]).run({ input: 'id,name\n2,Bob\n1,Alice\n', memory: '64KB', allowFs: true })
     } catch (e) {
       failed = e.message.includes('left side is not sorted')
     }
@@ -2542,14 +3023,14 @@ await test('set ops', async () => {
       codec.csv(),
       ops.intersect(lookup, { maxLookupBytes: 1024, maxLookupKeys: 10, maxOutputKeys: 10 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(inter.outputText.trim() === 'id,name\n1,Alice\n3,Charlie', 'intersect should keep distinct matching rows')
 
     const interByte = await pipeline([
       codec.csv(),
       ops.intersect(lookup, { maxLookupBytes: 1024, maxStateBytes: 4096 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(interByte.outputText.trim() === 'id,name\n1,Alice\n3,Charlie', 'intersect should accept maxStateBytes without maxOutputKeys')
     assert(interByte.statsText.includes('"max_state_bytes":4096'), 'intersect stats should report max_state_bytes')
 
@@ -2559,7 +3040,7 @@ await test('set ops', async () => {
         codec.csv(),
         ops.intersect(lookup, { maxLookupBytes: 1024, maxStateBytes: 128 }),
         codec.csvEncode(),
-      ]).run({ input, memory: '64KB' })
+      ]).run({ input, memory: '64KB', allowFs: true })
     } catch (e) {
       interByteCapFailed = e.message.includes('max_state_bytes=128')
     }
@@ -2569,7 +3050,7 @@ await test('set ops', async () => {
       codec.csv(),
       ops.setdiff(lookup, { maxLookupBytes: 1024, maxLookupKeys: 10, maxOutputKeys: 10 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(diff.outputText.trim() === 'id,name\n2,Bob\n3,Other', 'setdiff should keep distinct unmatched rows')
 
     writeFileSync(lookup, 'id,label\n1,a\n1,a2\n3,c\n')
@@ -2578,14 +3059,14 @@ await test('set ops', async () => {
       codec.csv({ batchSize: 2 }),
       ops.intersectAll(lookup, { columns: ['id'], maxLookupBytes: 1024, maxLookupKeys: 10 }),
       codec.csvEncode(),
-    ]).run({ input: bagInput, memory: '64KB' })
+    ]).run({ input: bagInput, memory: '64KB', allowFs: true })
     assert(interAll.outputText.trim() === 'id,name\n1,A1\n1,A2\n3,C', 'intersectAll should keep lookup-count matching copies')
 
     const diffAll = await pipeline([
       codec.csv({ batchSize: 2 }),
       ops.setdiffAll(lookup, { columns: ['id'], maxLookupBytes: 1024, maxLookupKeys: 10 }),
       codec.csvEncode(),
-    ]).run({ input: bagInput, memory: '64KB' })
+    ]).run({ input: bagInput, memory: '64KB', allowFs: true })
     assert(diffAll.outputText.trim() === 'id,name\n1,A3\n2,B\n3,C2', 'setdiffAll should consume lookup-count copies')
 
     let bagCapFailed = false
@@ -2594,7 +3075,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.intersectAll(lookup, { columns: ['id'], maxLookupBytes: 1024, maxLookupKeys: 1 }),
         codec.csvEncode(),
-      ]).run({ input: bagInput, memory: '64KB' })
+      ]).run({ input: bagInput, memory: '64KB', allowFs: true })
     } catch (e) {
       bagCapFailed = e.message.includes('max_lookup_keys=1')
     }
@@ -2606,7 +3087,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.setdiffAll(lookup, { columns: ['id'], maxLookupBytes: 1024 }),
         codec.csvEncode(),
-      ]).run({ input: bagInput, memory: '64KB' })
+      ]).run({ input: bagInput, memory: '64KB', allowFs: true })
     } catch (e) {
       bagPolicyFailed = e.message.includes('max_lookup_keys or max_state_bytes')
     }
@@ -2618,14 +3099,14 @@ await test('set ops', async () => {
       codec.csv({ batchSize: 1 }),
       ops.unionAll(lookup),
       codec.csvEncode(),
-    ]).run({ input: 'id,name\n1,Alice\n2,Bob\n', memory: '64KB' })
+    ]).run({ input: 'id,name\n1,Alice\n2,Bob\n', memory: '64KB', allowFs: true })
     assert(unionAll.outputText.trim() === 'id,name\n1,Alice\n2,Bob\n1,Alice\n3,Charlie', 'unionAll should append file rows and preserve duplicates')
 
     const union = await pipeline([
       codec.csv({ batchSize: 1 }),
       ops.union(lookup, { maxOutputKeys: 10 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(union.outputText.trim() === 'id,name\n1,Alice\n2,Bob\n3,Charlie\n3,Other', 'union should keep first distinct rows across left and lookup')
     assert(union.statsText.includes('"emitted_keys":4'), 'union stats should report emitted key count')
     assert(union.statsText.includes('"emitted_key_bytes":'), 'union stats should report retained key bytes')
@@ -2636,7 +3117,7 @@ await test('set ops', async () => {
       codec.csv({ batchSize: 1 }),
       ops.union(lookup, { maxStateBytes: 4096 }),
       codec.csvEncode(),
-    ]).run({ input, memory: '64KB' })
+    ]).run({ input, memory: '64KB', allowFs: true })
     assert(unionByte.outputText.trim() === 'id,name\n1,Alice\n2,Bob\n3,Charlie\n3,Other', 'union should accept maxStateBytes without maxOutputKeys')
 
     writeFileSync(lookup, 'id,name\n1,A_file\n1,A_file_dup\n3,C_file\n5,E_file\n5,E_file_dup\n')
@@ -2644,7 +3125,7 @@ await test('set ops', async () => {
       codec.csv({ batchSize: 2 }),
       ops.union(lookup, { columns: ['id'], sorted: true }),
       codec.csvEncode(),
-    ]).run({ input: 'id,name\n1,A_left\n1,A_left_dup\n2,B_left\n4,D_left\n5,E_left\n', memory: '64KB' })
+    ]).run({ input: 'id,name\n1,A_left\n1,A_left_dup\n2,B_left\n4,D_left\n5,E_left\n', memory: '64KB', allowFs: true })
     assert(sortedUnion.outputText.trim() === 'id,name\n1,A_left\n2,B_left\n3,C_file\n4,D_left\n5,E_left', 'sorted union should merge sorted inputs and prefer left rows')
     assert(sortedUnion.statsText.includes('"emitted_keys":5'), 'sorted union stats should report emitted keys')
 
@@ -2654,7 +3135,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.union(lookup, { columns: ['id'], sorted: true }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n2,B\n1,A\n', memory: '64KB' })
+      ]).run({ input: 'id,name\n2,B\n1,A\n', memory: '64KB', allowFs: true })
     } catch (e) {
       unionLeftSortedFailed = e.message.includes('union: left side is not sorted')
     }
@@ -2667,7 +3148,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.union(lookup, { columns: ['id'], sorted: true }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n2,B\n4,D\n', memory: '64KB' })
+      ]).run({ input: 'id,name\n2,B\n4,D\n', memory: '64KB', allowFs: true })
     } catch (e) {
       unionFileSortedFailed = e.message.includes('union: file side is not sorted')
     }
@@ -2681,7 +3162,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.union(lookup, { maxStateBytes: 128 }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n1,Alice\n', memory: '64KB' })
+      ]).run({ input: 'id,name\n1,Alice\n', memory: '64KB', allowFs: true })
     } catch (e) {
       unionByteCapFailed = e.message.includes('max_state_bytes=128')
     }
@@ -2693,7 +3174,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.union(lookup, { maxOutputKeys: 2 }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n1,Alice\n2,Bob\n', memory: '64KB' })
+      ]).run({ input: 'id,name\n1,Alice\n2,Bob\n', memory: '64KB', allowFs: true })
     } catch (e) {
       unionCapFailed = e.message.includes('max_output_keys=2')
     }
@@ -2703,7 +3184,7 @@ await test('set ops', async () => {
       codec.csv(),
       ops.intersect(keyLookup, { columns: ['id'], maxLookupBytes: 1024, maxLookupKeys: 10, maxOutputKeys: 10 }),
       codec.csvEncode(),
-    ]).run({ input: 'id,name\n1,Alice\n2,Bob\n3,Charlie\n3,Other\n', memory: '64KB' })
+    ]).run({ input: 'id,name\n1,Alice\n2,Bob\n3,Charlie\n3,Other\n', memory: '64KB', allowFs: true })
     assert(byId.outputText.trim() === 'id,name\n1,Alice\n3,Charlie', 'intersect columns should dedupe by selected key')
 
     const sortedLookup = '/tmp/tranfi-node-set-sorted-lookup.csv'
@@ -2713,14 +3194,14 @@ await test('set ops', async () => {
       codec.csv({ batchSize: 2 }),
       ops.intersect(sortedLookup, { columns: ['id'], sorted: true }),
       codec.csvEncode(),
-    ]).run({ input: sortedInput, memory: '64KB' })
+    ]).run({ input: sortedInput, memory: '64KB', allowFs: true })
     assert(sortedInter.outputText.trim() === 'id,name\n1,Alice\n3,Charlie\n5,Eve', 'sorted intersect should stream and dedupe adjacent keys')
 
     const sortedDiff = await pipeline([
       codec.csv({ batchSize: 2 }),
       ops.setdiff(sortedLookup, { columns: ['id'], sorted: true }),
       codec.csvEncode(),
-    ]).run({ input: sortedInput, memory: '64KB' })
+    ]).run({ input: sortedInput, memory: '64KB', allowFs: true })
     assert(sortedDiff.outputText.trim() === 'id,name\n2,Bob\n4,Dana', 'sorted setdiff should stream and dedupe adjacent keys')
 
     writeFileSync(sortedLookup, 'id,label\n1,x\n1,x2\n3,y\n5,z\n5,z2\n')
@@ -2728,14 +3209,14 @@ await test('set ops', async () => {
       codec.csv({ batchSize: 2 }),
       ops.intersectAll(sortedLookup, { columns: ['id'], sorted: true }),
       codec.csvEncode(),
-    ]).run({ input: sortedInput, memory: '64KB' })
+    ]).run({ input: sortedInput, memory: '64KB', allowFs: true })
     assert(sortedBag.outputText.trim() === 'id,name\n1,Alice\n1,Alicia\n3,Charlie\n5,Eve', 'sorted intersectAll should emit min left/lookup copies')
 
     const sortedBagDiff = await pipeline([
       codec.csv({ batchSize: 2 }),
       ops.setdiffAll(sortedLookup, { columns: ['id'], sorted: true }),
       codec.csvEncode(),
-    ]).run({ input: sortedInput, memory: '64KB' })
+    ]).run({ input: sortedInput, memory: '64KB', allowFs: true })
     assert(sortedBagDiff.outputText.trim() === 'id,name\n2,Bob\n3,Other\n4,Dana', 'sorted setdiffAll should emit excess left copies')
 
     let failedBagSorted = false
@@ -2744,7 +3225,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.intersectAll(sortedLookup, { columns: ['id'], sorted: true }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n2,Bob\n1,Alice\n', memory: '64KB' })
+      ]).run({ input: 'id,name\n2,Bob\n1,Alice\n', memory: '64KB', allowFs: true })
     } catch (e) {
       failedBagSorted = e.message.includes('intersect-all: left side is not sorted')
     }
@@ -2756,7 +3237,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.intersect(sortedLookup, { columns: ['id'], sorted: true }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n2,Bob\n1,Alice\n', memory: '64KB' })
+      ]).run({ input: 'id,name\n2,Bob\n1,Alice\n', memory: '64KB', allowFs: true })
     } catch (e) {
       failedSorted = e.message.includes('left side is not sorted')
     }
@@ -2768,7 +3249,7 @@ await test('set ops', async () => {
         codec.csv({ batchSize: 1 }),
         ops.intersect(keyLookup, { columns: ['id'], maxLookupKeys: 1 }),
         codec.csvEncode(),
-      ]).run({ input: 'id,name\n1,Alice\n' })
+      ]).run({ input: 'id,name\n1,Alice\n', allowFs: true })
     } catch (e) {
       failed = e.message.includes('max_lookup_keys=1')
     }
@@ -2932,16 +3413,149 @@ await test('hash', async () => {
   assert(text.includes('_hash'), 'should have _hash column')
 })
 
-await test('sample', async () => {
-  const p = pipeline([
-    codec.csv(),
-    ops.sample(2),
-    codec.csvEncode(),
-  ])
-  const result = await p.run({ input: 'name\nAlice\nBob\nCharlie\nDiana\nEve\n' })
-  const text = result.outputText
-  const lines = text.trim().split('\n')
-  assert(lines.length === 3, `should have 3 lines (header + 2), got ${lines.length}`)
+await test('H14 numeric missing/type policies', async () => {
+  assert(ops.bin('x', [10], { missing: 'null', onTypeError: 'null' }).args.on_type_error === 'null', 'bin helper should expose type policy')
+  assert(ops.ewma('x', 0.5, { missing: 'null' }).args.missing === 'null', 'ewma helper should expose missing policy')
+  assert(ops.anomaly('x', { onTypeError: 'null' }).args.on_type_error === 'null', 'anomaly helper should expose type policy')
+  assert(ops.window('x', 3, 'avg', { missing: 'null', onTypeError: 'null' }).args.on_type_error === 'null', 'window helper should expose type policy')
+  assert(ops.rollingSum('x', 3, { result: 'sum3', missing: 'null', onTypeError: 'null' }).args.missing === 'null', 'rolling helper should expose missing policy')
+  assert(ops.interpolate('x', { method: 'forward', missing: 'null', onTypeError: 'null' }).args.on_type_error === 'null', 'interpolate helper should expose type policy')
+  assert(ops.datetime('x', { extract: ['year'], missing: 'null', onTypeError: 'null' }).args.on_type_error === 'null', 'datetime helper should expose type policy')
+  assert(ops.dateTrunc('x', 'month', { result: 'x_month', missing: 'null', onTypeError: 'null' }).args.missing === 'null', 'dateTrunc helper should expose missing policy')
+  assert(ops.normalize(['x'], { missing: 'null', onTypeError: 'null' }).args.on_type_error === 'null', 'normalize helper should expose type policy')
+  assert(ops.acf('x', { lags: 2, missing: 'null', onTypeError: 'null' }).args.missing === 'null', 'acf helper should expose missing policy')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.ewma('missing', 0.5), codec.csvEncode()]).run({ input: 'x\n1\n' }), /ewma: column 'missing' not found/)
+  let result = await pipeline([codec.csv(), ops.ewma('missing', 0.5, { missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,missing_ewma', '1,']), 'ewma missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.ewma('missing', 0.5, { missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'ewma missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.csv(), ops.ewma('x', 0.5), codec.csvEncode()]).run({ input: 'x\na\n' }), /ewma: column 'x' must be numeric/)
+  result = await pipeline([codec.csv(), ops.ewma('x', 0.5, { onTypeError: 'null' }), codec.csvEncode()]).run({ input: 'x\na\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,x_ewma', 'a,']), 'ewma on_type_error=null should append nulls')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.anomaly('missing'), codec.csvEncode()]).run({ input: 'x\n1\n' }), /anomaly: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.anomaly('missing', { missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,missing_anomaly', '1,']), 'anomaly missing=null should append nulls')
+  await assertRejects(() => pipeline([codec.csv(), ops.anomaly('x'), codec.csvEncode()]).run({ input: 'x\na\n' }), /anomaly: column 'x' must be numeric/)
+  result = await pipeline([codec.csv(), ops.anomaly('x', { onTypeError: 'null' }), codec.csvEncode()]).run({ input: 'x\na\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,x_anomaly', 'a,']), 'anomaly on_type_error=null should append nulls')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.bin('missing', [10]), codec.csvEncode()]).run({ input: 'x\n1\n' }), /bin: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.bin('missing', [10], { missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,missing_bin', '1,']), 'bin missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.bin('missing', [10], { missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'bin missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.csv(), ops.bin('x', [10]), codec.csvEncode()]).run({ input: 'x\na\n' }), /bin: column 'x' must be numeric/)
+  result = await pipeline([codec.csv(), ops.bin('x', [10], { onTypeError: 'null' }), codec.csvEncode()]).run({ input: 'x\na\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,x_bin', 'a,']), 'bin on_type_error=null should append nulls')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.window('missing', 3, 'avg'), codec.csvEncode()]).run({ input: 'x\n1\n' }), /window: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.window('missing', 3, 'avg', { missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,missing_avg3', '1,']), 'window missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.window('missing', 3, 'avg', { missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'window missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.csv(), ops.window('x', 3, 'avg'), codec.csvEncode()]).run({ input: 'x\na\n' }), /window: column 'x' must be numeric/)
+  result = await pipeline([codec.csv(), ops.window('x', 3, 'avg', { result: 'x_avg', onTypeError: 'null' }), codec.csvEncode()]).run({ input: 'x\na\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,x_avg', 'a,']), 'window on_type_error=null should append nulls')
+  result = await pipeline([codec.csv(), ops.window('name', 3, 'count', 'name_count'), codec.csvEncode()]).run({ input: 'name\nAlice\nBob\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['name,name_count', 'Alice,1', 'Bob,2']), 'window count should accept nonnumeric input')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.rollingSum('missing', 3, { result: 'sum3' }), codec.csvEncode()]).run({ input: 'x\n1\n' }), /rolling-sum: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.rollingSum('missing', 3, { result: 'sum3', missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,sum3', '1,']), 'rolling missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.rollingSum('missing', 3, { result: 'sum3', missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'rolling missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.csv(), ops.rollingSum('x', 3, { result: 'sum3' }), codec.csvEncode()]).run({ input: 'x\na\n' }), /rolling-sum: column 'x' must be numeric/)
+  result = await pipeline([codec.csv(), ops.rollingMean('x', 3, { result: 'mean3', onTypeError: 'null' }), codec.csvEncode()]).run({ input: 'x\na\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,mean3', 'a,']), 'rolling on_type_error=null should append nulls')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.interpolate('missing', { method: 'forward' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true }), /interpolate: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.interpolate('missing', { method: 'forward', missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,missing', '1,']), 'interpolate missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.interpolate('missing', { method: 'forward', missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'interpolate missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.csv(), ops.interpolate('x', { method: 'forward' }), codec.csvEncode()]).run({ input: 'x\na\n', allowBlocking: true }), /interpolate: column 'x' must be numeric/)
+  result = await pipeline([codec.csv(), ops.interpolate('x', { method: 'forward', onTypeError: 'null' }), codec.csvEncode()]).run({ input: 'x\na\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.split('\n').slice(0, 2)) === JSON.stringify(['x', '']), 'interpolate on_type_error=null should null source values')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.datetime('missing', ['year']), codec.csvEncode()]).run({ input: 'x\n1\n' }), /datetime: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.datetime('missing', { extract: ['year'], missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,missing_year', '1,']), 'datetime missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.datetime('missing', { extract: ['year'], missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'datetime missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.jsonl(), ops.datetime('x', ['year']), codec.csvEncode()]).run({ input: '{"x":true}\n' }), /datetime: column 'x' must be string, date, or timestamp/)
+  result = await pipeline([codec.jsonl(), ops.datetime('x', { extract: ['year'], onTypeError: 'null' }), codec.csvEncode()]).run({ input: '{"x":true}\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,x_year', 'true,']), 'datetime on_type_error=null should append nulls')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.dateTrunc('missing', 'month'), codec.csvEncode()]).run({ input: 'x\n1\n' }), /date-trunc: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.dateTrunc('missing', 'month', { result: 'month_start', missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,month_start', '1,']), 'dateTrunc missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.dateTrunc('missing', 'month', { missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n' })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'dateTrunc missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.jsonl(), ops.dateTrunc('x', 'month'), codec.csvEncode()]).run({ input: '{"x":true}\n' }), /date-trunc: column 'x' must be string, date, or timestamp/)
+  result = await pipeline([codec.jsonl(), ops.dateTrunc('x', 'month', { onTypeError: 'null' }), codec.csvEncode()]).run({ input: '{"x":true}\n' })
+  assert(JSON.stringify(result.outputText.split('\n').slice(0, 2)) === JSON.stringify(['x', '']), 'dateTrunc on_type_error=null should null source values')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.normalize(['missing']), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true }), /normalize: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.normalize(['missing'], { missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x,missing', '1,']), 'normalize missing=null should append nulls')
+  result = await pipeline([codec.csv(), ops.normalize(['missing'], { missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['x', '1']), 'normalize missing=ignore should pass through')
+  await assertRejects(() => pipeline([codec.jsonl(), ops.normalize(['x']), codec.csvEncode()]).run({ input: '{"x":true}\n', allowBlocking: true }), /normalize: column 'x' must be numeric/)
+  result = await pipeline([codec.jsonl(), ops.normalize(['x'], { onTypeError: 'null' }), codec.csvEncode()]).run({ input: '{"x":true}\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.split('\n').slice(0, 2)) === JSON.stringify(['x', '']), 'normalize on_type_error=null should null source values')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.acf('missing', { lags: 2 }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true }), /acf: column 'missing' not found/)
+  result = await pipeline([codec.csv(), ops.acf('missing', { lags: 2, missing: 'null' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['lag,acf', '0,', '1,', '2,']), 'acf missing=null should emit null acf rows')
+  result = await pipeline([codec.csv(), ops.acf('missing', { lags: 2, missing: 'ignore' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true })
+  assert(result.outputText === '', 'acf missing=ignore should emit no aggregate')
+  await assertRejects(() => pipeline([codec.jsonl(), ops.acf('x', { lags: 2 }), codec.csvEncode()]).run({ input: '{"x":true}\n', allowBlocking: true }), /acf: column 'x' must be numeric/)
+  result = await pipeline([codec.jsonl(), ops.acf('x', { lags: 2, onTypeError: 'null' }), codec.csvEncode()]).run({ input: '{"x":true}\n', allowBlocking: true })
+  assert(JSON.stringify(result.outputText.trim().split('\n')) === JSON.stringify(['lag,acf', '0,', '1,', '2,']), 'acf on_type_error=null should emit null acf rows')
+
+  await assertRejects(() => pipeline([codec.csv(), ops.ewma('x', 2), codec.csvEncode()]).run({ input: 'x\n1\n' }), /ewma: alpha must be a finite number between 0 and 1/)
+  await assertRejects(() => pipeline([codec.csv(), ops.anomaly('x', { threshold: -1 }), codec.csvEncode()]).run({ input: 'x\n1\n' }), /anomaly: threshold must be a non-negative finite number/)
+  await assertRejects(() => pipeline([codec.csv(), ops.bin('x', [10, 10]), codec.csvEncode()]).run({ input: 'x\n1\n' }), /bin: boundaries must be finite, strictly increasing numbers/)
+  await assertRejects(() => pipeline([codec.csv(), ops.window('x', 0, 'avg'), codec.csvEncode()]).run({ input: 'x\n1\n' }), /window: size must be an integer/)
+  await assertRejects(() => pipeline([codec.csv(), ops.window('x', 3, 'nope'), codec.csvEncode()]).run({ input: 'x\n1\n' }), /window: func must be avg, sum, min, max, or count/)
+  await assertRejects(() => pipeline([codec.csv(), ops.interpolate('x', { method: 'nearest' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true }), /interpolate: method must be forward, backward, or linear/)
+  await assertRejects(() => pipeline([codec.csv(), ops.datetime('x', ['decade']), codec.csvEncode()]).run({ input: 'x\n2024-01-01\n' }), /datetime: extract must contain year/)
+  await assertRejects(() => pipeline([codec.csv(), ops.dateTrunc('x', 'decade'), codec.csvEncode()]).run({ input: 'x\n2024-01-01\n' }), /date-trunc: trunc must be year/)
+  await assertRejects(() => pipeline([codec.csv(), ops.normalize(['x'], { method: 'bad' }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true }), /normalize: method must be minmax or zscore/)
+  await assertRejects(() => pipeline([codec.csv(), ops.acf('x', { lags: 0 }), codec.csvEncode()]).run({ input: 'x\n1\n', allowBlocking: true }), /acf: lags must be an integer/)
+})
+
+await test('sample seed determinism', async () => {
+  const input = 'name\nAlice\nBob\nCharlie\nDiana\nEve\nFrank\nGrace\n'
+  const defaultStep = ops.sample(3)
+  assert(!Object.prototype.hasOwnProperty.call(defaultStep.args, 'seed'), 'sample default should omit seed')
+  const seededStep = ops.sample(3, { seed: 123 })
+  assert(seededStep.args.seed === 123, 'sample helper should set numeric seed')
+  const randomStep = ops.sample(3, { seed: 'random' })
+  assert(randomStep.args.seed === 'random', 'sample helper should set random seed mode')
+
+  const run = async (step, chunkSize) => {
+    const result = await pipeline([
+      codec.csv({ batchSize: 2 }),
+      step,
+      codec.csvEncode(),
+    ]).run({ input, chunkSize })
+    return result.outputText.trim().split('\n')
+  }
+
+  const defaultA = await run(defaultStep, 7)
+  const defaultB = await run(ops.sample(3), 3)
+  assert(JSON.stringify(defaultA) === JSON.stringify(defaultB), 'default sample should be stable across chunk cuts')
+  assert(JSON.stringify(defaultA) === JSON.stringify(['name', 'Eve', 'Frank', 'Charlie']), 'default sample rows should be deterministic')
+
+  const seedA = await run(seededStep, 7)
+  const seedB = await run(ops.sample(3, { seed: 123 }), 3)
+  assert(JSON.stringify(seedA) === JSON.stringify(seedB), 'same seed should be stable across chunk cuts')
+  assert(JSON.stringify(seedA) === JSON.stringify(['name', 'Alice', 'Grace', 'Charlie']), 'seeded sample rows should be deterministic')
+  const seedOther = await run(ops.sample(3, { seed: 124 }), 7)
+  assert(JSON.stringify(seedOther) === JSON.stringify(['name', 'Alice', 'Grace', 'Eve']), 'different seed should produce known rows')
 })
 
 console.log('\nText + Grep:')
@@ -2955,6 +3569,21 @@ await test('text passthrough', async () => {
   const text = result.outputText
   assert(text.includes('hello world'), 'should have hello world')
   assert(text.includes('foo bar'), 'should have foo bar')
+})
+
+await test('text max record bytes', async () => {
+  const step = codec.textDecode({ maxRecordBytes: 8, maxErrorBytes: 5 })
+  assert(step.args.max_record_bytes === 8, 'helper should expose max_record_bytes')
+  assert(step.args.max_error_bytes === 5, 'helper should expose max_error_bytes')
+
+  const p = pipeline([
+    codec.text({ maxRecordBytes: 8, maxErrorBytes: 5 }),
+    codec.textEncode(),
+  ])
+  await assertRejects(
+    () => p.run({ input: 'ok\n123456789', chunkSize: 4 }),
+    /text record exceeds max_record_bytes/
+  )
 })
 
 await test('text + grep', async () => {
@@ -3302,19 +3931,20 @@ const { startServer } = require('../js/src/server.js')
 const { writeFileSync, mkdirSync, rmSync, existsSync } = require('fs')
 
 const testDataDir = '/tmp/tranfi-test-serve'
-const testAppDir = join(__dirname, '..', '..', 'app', 'dist')
-const hasApp = existsSync(join(testAppDir, 'index.html'))
+const testAppDir = '/tmp/tranfi-test-serve-app'
 
-if (hasApp) {
-  // Set up test data
-  if (existsSync(testDataDir)) rmSync(testDataDir, { recursive: true })
-  mkdirSync(testDataDir, { recursive: true })
-  writeFileSync(join(testDataDir, 'test.csv'), 'name,age\nAlice,30\nBob,25\nCharlie,35\n')
-  writeFileSync(join(testDataDir, 'data.jsonl'), '{"x":1}\n{"x":2}\n')
+// Set up test data and a minimal app shell so API tests do not depend on a generated app/dist.
+if (existsSync(testDataDir)) rmSync(testDataDir, { recursive: true })
+if (existsSync(testAppDir)) rmSync(testAppDir, { recursive: true })
+mkdirSync(testDataDir, { recursive: true })
+mkdirSync(testAppDir, { recursive: true })
+writeFileSync(join(testAppDir, 'index.html'), '<!doctype html><html><head></head><body>tranfi test app</body></html>')
+writeFileSync(join(testDataDir, 'test.csv'), 'name,age\nAlice,30\nBob,25\nCharlie,35\n')
+writeFileSync(join(testDataDir, 'data.jsonl'), '{"x":1}\n{"x":2}\n')
 
-  const server = startServer({ port: 0, dataDir: testDataDir, appDir: testAppDir })
-  const addr = server.address()
-  const base = `http://localhost:${addr.port}`
+const server = startServer({ port: 0, dataDir: testDataDir, appDir: testAppDir })
+const addr = server.address()
+const base = `http://localhost:${addr.port}`
 
   await test('GET /api/version', async () => {
     const res = await fetch(`${base}/api/version`)
@@ -3369,6 +3999,29 @@ if (hasApp) {
     assert(!data.output.includes('Bob'), 'output should not have Bob (25)')
   })
 
+  await test('POST /api/run hosted audit omits row payload by default', async () => {
+    const res = await fetch(`${base}/api/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: 'test.csv', dsl: 'csv | filter "age > 100" audit audit_limit=2 | csv' })
+    })
+    const data = await res.json()
+    assert(data.stats.includes('audit'), 'stats should include audit records')
+    assert(!data.stats.includes('Alice'), 'hosted default should omit Alice row payload')
+    assert(!data.stats.includes('Bob'), 'hosted default should omit Bob row payload')
+    assert(!data.stats.includes('Charlie'), 'hosted default should omit Charlie row payload')
+  })
+
+  await test('POST /api/run hosted audit respects explicit row payload opt-in', async () => {
+    const res = await fetch(`${base}/api/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file: 'test.csv', dsl: 'csv | filter "age > 100" audit audit_limit=1 audit_include_row=true | csv' })
+    })
+    const data = await res.json()
+    assert(data.stats.includes('Alice'), 'explicit audit_include_row=true should include row payload')
+  })
+
   await test('POST /api/run missing file', async () => {
     const res = await fetch(`${base}/api/run`, {
       method: 'POST',
@@ -3392,11 +4045,9 @@ if (hasApp) {
     assert(html.includes('__TRANFI_SERVER__'), 'should inject server config')
   })
 
-  server.close()
-  rmSync(testDataDir, { recursive: true })
-} else {
-  console.log('  (skipped — app/dist/ not found)')
-}
+server.close()
+rmSync(testDataDir, { recursive: true })
+rmSync(testAppDir, { recursive: true })
 
 // ---- SQL Transpiler ----
 
@@ -3837,6 +4488,187 @@ if (createTranfi) {
 
 
 
+
+  await test('wasm schema regex budgets', async () => {
+    const result = tf.run(
+      'csv batch_size=1 | schema regex=code:^[A-Z]+$ max_regex_pattern_bytes=32 max_regex_cell_bytes=3 mode=warn | csv',
+      'code\nAA\nTOOLONG\n'
+    )
+    assert(result.outputText.includes('AA'), 'wasm schema regex budget should keep passing row in warn mode')
+    assert(result.outputText.includes('TOOLONG'), 'wasm schema regex budget should keep failing row in warn mode')
+    const errors = new TextDecoder().decode(result.errors)
+    assert(errors.includes('schema_failure'), 'wasm over-cap regex cell should emit schema failure')
+    assert(errors.includes('"rule":"regex"'), 'wasm over-cap regex cell should count as regex failure')
+    assert(errors.includes('cell exceeds 3 bytes'), 'wasm over-cap regex cell should report cap failure')
+    assert(result.statsText.includes('"checked_rows":2'), 'wasm schema regex budget stats should count rows')
+    assert(result.statsText.includes('"passed_rows":1'), 'wasm schema regex budget stats should count passing row')
+    assert(result.statsText.includes('"failed_rows":1'), 'wasm schema regex budget stats should count failing row')
+    assert(result.statsText.includes('"regex_failures":1'), 'wasm schema regex budget stats should count regex failures')
+    assert(result.statsText.includes('"max_regex_pattern_bytes":32'), 'wasm schema regex budget stats should report pattern cap')
+    assert(result.statsText.includes('"max_regex_cell_bytes":3'), 'wasm schema regex budget stats should report cell cap')
+
+    assertThrows(
+      () => tf.run('csv | schema regex=code:^[A-Z]+$ max_regex_pattern_bytes=3 mode=warn | csv', 'code\nAA\n'),
+      /max_regex_pattern_bytes/
+    )
+  })
+
+
+  await test('wasm schema audit privacy controls', async () => {
+    const data = 'name,ssn,age\nAliciaSecret,111-22-3333,200\n'
+    let result = tf.run(
+      'csv batch_size=1 | schema max=age:120 mode=filter audit audit_include_row=false | csv',
+      data
+    )
+    assert(result.statsText.includes('"type":"audit"'), 'wasm schema audit should emit audit record')
+    assert(!result.statsText.includes('"data"'), 'wasm audit_include_row=false should omit row payload')
+    assert(!result.statsText.includes('AliciaSecret'), 'wasm audit_include_row=false should not leak name')
+    assert(!result.statsText.includes('111-22-3333'), 'wasm audit_include_row=false should not leak ssn')
+
+    result = tf.run(
+      'csv batch_size=1 | schema values=ssn:OK mode=filter audit audit_columns=ssn audit_redact=ssn | csv',
+      data
+    )
+    assert(result.statsText.includes('[REDACTED]'), 'wasm schema audit should redact selected column')
+    assert(!result.statsText.includes('111-22-3333'), 'wasm schema audit should not leak raw ssn')
+    assert(!result.statsText.includes('AliciaSecret'), 'wasm schema audit_columns should limit row payload columns')
+
+    result = tf.run(
+      'csv batch_size=1 | schema regex=ssn:^OK$ mode=warn audit_redact=ssn | csv',
+      data
+    )
+    const errors = new TextDecoder().decode(result.errors)
+    assert(errors.includes('schema_failure'), 'wasm schema warn should emit failure')
+    assert(errors.includes('[REDACTED]'), 'wasm schema errors should redact actual values')
+    assert(!errors.includes('111-22-3333'), 'wasm schema errors should not leak raw ssn')
+  })
+
+
+  await test('wasm audit privacy migrated producers', async () => {
+    const data = 'name,ssn,age\nAlice,111-22-3333,20\nBob,222-33-4444,40\n'
+    let result = tf.run(
+      'csv batch_size=1 | filter "col(age) > 30" audit audit_include_row=false | csv',
+      data
+    )
+    assert(result.statsText.includes('"op":"filter"'), 'wasm filter audit should emit')
+    assert(!result.statsText.includes('"data"'), 'wasm filter audit_include_row=false should omit row payload')
+    assert(!result.statsText.includes('Alice'), 'wasm filter audit should not leak omitted row name')
+    assert(!result.statsText.includes('111-22-3333'), 'wasm filter audit should not leak omitted ssn')
+
+    result = tf.run(
+      'csv batch_size=1 | validate "col(age) > 30" audit audit_columns=ssn audit_redact=ssn | csv',
+      data
+    )
+    assert(result.statsText.includes('"op":"validate"'), 'wasm validate audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm validate audit should redact selected column')
+    assert(!result.statsText.includes('111-22-3333'), 'wasm validate audit should not leak raw ssn')
+    assert(!result.statsText.includes('Alice'), 'wasm validate auditColumns should limit payload')
+
+    result = tf.run(
+      'csv batch_size=1 | assert "col(age) > 30" action=warn audit_columns=ssn audit_hash_columns=ssn | csv',
+      data
+    )
+    const errors = new TextDecoder().decode(result.errors)
+    assert(errors.includes('assert_failure'), 'wasm assert warning should emit failure record')
+    assert(errors.includes('fnv1a64:'), 'wasm assert errors should hash selected column')
+    assert(!errors.includes('111-22-3333'), 'wasm assert errors should not leak raw ssn')
+    assert(!errors.includes('Alice'), 'wasm assert auditColumns should limit payload')
+
+    result = tf.run(
+      'text | json-schema required=user mode=filter audit audit_columns=_line audit_redact=_line | text',
+      '{"ssn":"111-22-3333"}\n'
+    )
+    assert(result.statsText.includes('"op":"json-schema"'), 'wasm json-schema audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm json-schema audit should redact row text')
+    assert(!result.statsText.includes('111-22-3333'), 'wasm json-schema audit should not leak raw JSON text')
+
+    result = tf.run(
+      'csv batch_size=1 nulls=NA | fill-null note=SECRET audit audit_columns=note audit_redact=note | csv',
+      'name,note\nB,NA\nC,ok\n'
+    )
+    assert(result.statsText.includes('"op":"fill-null"'), 'wasm fill-null audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm fill-null audit should redact filled value')
+    assert(!result.statsText.includes('SECRET'), 'wasm fill-null audit should not leak filled value')
+    assert(!result.statsText.includes('"B"'), 'wasm fill-null auditColumns should limit row payload')
+
+    result = tf.run(
+      'csv batch_size=1 | replace ssn 111 999 audit audit_columns=ssn audit_redact=ssn | csv',
+      'name,ssn\nAlice,111-22-3333\nBob,222-33-4444\n'
+    )
+    assert(result.statsText.includes('"op":"replace"'), 'wasm replace audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm replace audit should redact changed values')
+    assert(!result.statsText.includes('111'), 'wasm replace audit should not leak raw pattern/source fragment')
+    assert(!result.statsText.includes('999'), 'wasm replace audit should not leak raw replacement fragment')
+    assert(!result.statsText.includes('Alice'), 'wasm replace auditColumns should limit row payload')
+
+
+    result = tf.run(
+      'csv batch_size=1 | cast secret=int audit audit_columns=secret audit_redact=secret | csv',
+      'name,secret\nAlice,111-22-3333\n'
+    )
+    assert(result.statsText.includes('"op":"cast"'), 'wasm cast audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm cast audit should redact actual/before/after')
+    assert(!result.statsText.includes('111'), 'wasm cast audit should not leak raw source fragment')
+    assert(!result.statsText.includes('Alice'), 'wasm cast auditColumns should limit row payload')
+
+    result = tf.run(
+      'csv batch_size=2 | normalize score audit audit_columns=score audit_redact=score | csv',
+      'name,score\nAlice,100\nBob,200\n',
+      { allowBlocking: true }
+    )
+    assert(result.statsText.includes('"op":"normalize"'), 'wasm normalize audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm normalize audit should redact values and stats')
+    assert(!result.statsText.includes('100'), 'wasm normalize audit should not leak min/before value')
+    assert(!result.statsText.includes('200'), 'wasm normalize audit should not leak max/source value')
+    assert(!result.statsText.includes('Alice'), 'wasm normalize auditColumns should limit row payload')
+
+    result = tf.run(
+      'csv batch_size=1 | frequency city max_values=1 overflow=other audit audit_limit=1 audit_columns=city audit_redact=city | csv',
+      'name,city\nAlice,NY\nBob,LA\n'
+    )
+    assert(result.statsText.includes('"op":"frequency"'), 'wasm frequency audit should emit')
+    assert(result.statsText.includes('"event":"category_overflow"'), 'wasm frequency audit should identify overflow event')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm frequency audit should redact overflow value and row data')
+    assert(!result.statsText.includes('LA'), 'wasm frequency audit should not leak overflow value')
+    assert(!result.statsText.includes('Bob'), 'wasm frequency auditColumns should limit row payload')
+    assert(!result.statsText.includes('Alice'), 'wasm frequency auditColumns should limit row payload')
+    assert(result.statsText.includes('"data":{"city":"[REDACTED]"}'), 'wasm frequency audit should redact row payload')
+
+    result = tf.run(
+      'csv batch_size=1 repair=true audit audit_limit=1 audit_redact=raw | csv',
+      'name,secret\nAlice,SECRET,extra\n'
+    )
+    assert(result.statsText.includes('"event":"row_repaired"'), 'wasm csv repair audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm csv repair audit should redact raw record')
+    assert(!result.statsText.includes('SECRET'), 'wasm csv repair audit should not leak raw value')
+    assert(!result.statsText.includes('Alice'), 'wasm csv repair audit should not leak raw row')
+    const repairErrors = new TextDecoder().decode(result.errors)
+    assert(repairErrors.includes('csv_field_count'), 'wasm csv repair diagnostic should emit')
+    assert(repairErrors.includes('[REDACTED]'), 'wasm csv repair diagnostic should redact raw record')
+    assert(!repairErrors.includes('SECRET'), 'wasm csv repair diagnostic should not leak raw value')
+    assert(!repairErrors.includes('Alice'), 'wasm csv repair diagnostic should not leak raw row')
+
+    result = tf.run(
+      'csv batch_size=1 | tee "col(age) >= 20" channel=audit columns=name,ssn limit=1 audit_columns=ssn audit_redact=ssn | csv',
+      data
+    )
+    assert(result.statsText.includes('"op":"tee"'), 'wasm tee audit should emit')
+    assert(result.statsText.includes('[REDACTED]'), 'wasm tee audit should redact selected column')
+    assert(!result.statsText.includes('111-22-3333'), 'wasm tee audit should not leak raw ssn')
+    assert(!result.statsText.includes('Alice'), 'wasm tee auditColumns should limit row payload')
+
+    result = tf.run(
+      'csv batch_size=1 | quarantine "col(age) < 30" audit_columns=ssn audit_redact=ssn | csv',
+      data
+    )
+    const quarantineErrors = new TextDecoder().decode(result.errors)
+    assert(quarantineErrors.includes('"op":"quarantine"'), 'wasm quarantine should emit error record')
+    assert(quarantineErrors.includes('[REDACTED]'), 'wasm quarantine should redact selected column')
+    assert(!quarantineErrors.includes('111-22-3333'), 'wasm quarantine should not leak raw ssn')
+    assert(!quarantineErrors.includes('Alice'), 'wasm quarantine auditColumns should limit row payload')
+
+  })
+
   await test('wasm tee side channel', async () => {
     const result = tf.run('csv batch_size=1 | tee "col(age) >= 30" columns=name limit=2 name=age_sample | csv',
       'name,age\nAlice,30\nBob,25\nCara,35\nDave,45\n')
@@ -3954,6 +4786,61 @@ if (createTranfi) {
     assert(lines[4] === 'true,true,false', 'wasm rolling bool crosses chunk boundary')
   })
 
+  await test('wasm H14 numeric missing/type policies', async () => {
+    assertThrows(
+      () => tf.run('csv | ewma x 0.5 | csv', 'x\na\n'),
+      /ewma: column 'x' must be numeric/
+    )
+    assertThrows(
+      () => tf.run('csv | anomaly missing | csv', 'x\n1\n'),
+      /anomaly: column 'missing' not found/
+    )
+    assertThrows(
+      () => tf.run('csv | bin x 10 | csv', 'x\na\n'),
+      /bin: column 'x' must be numeric/
+    )
+    assertThrows(
+      () => tf.run('csv | window x 3 avg | csv', 'x\na\n'),
+      /window: column 'x' must be numeric/
+    )
+    assertThrows(
+      () => tf.run('csv | rolling-sum missing 3 sum3 | csv', 'x\n1\n'),
+      /rolling-sum: column 'missing' not found/
+    )
+    assertThrows(
+      () => tf.run('csv | interpolate x forward | csv', 'x\na\n', { allowBlocking: true }),
+      /interpolate: column 'x' must be numeric/
+    )
+    assertThrows(
+      () => tf.run('jsonl | datetime x year | csv', '{"x":true}\n'),
+      /datetime: column 'x' must be string, date, or timestamp/
+    )
+    assertThrows(
+      () => tf.run('jsonl | date-trunc x month | csv', '{"x":true}\n'),
+      /date-trunc: column 'x' must be string, date, or timestamp/
+    )
+    assertThrows(
+      () => tf.run('csv | normalize missing | csv', 'x\n1\n', { allowBlocking: true }),
+      /normalize: column 'missing' not found/
+    )
+    assertThrows(
+      () => tf.run('jsonl | acf x 2 | csv', '{"x":true}\n', { allowBlocking: true }),
+      /acf: column 'x' must be numeric/
+    )
+    const result = tf.run('csv | ewma x 0.5 on_type_error=null | anomaly missing missing=null | bin missing 10 missing=null | window missing 3 avg missing=null | rolling-sum missing 3 sum3 missing=null | rolling-mean x 3 mean3 on_type_error=null | interpolate interp forward missing=null | datetime dt year missing=null | date-trunc d month result=d_month missing=null | csv', 'x\na\n', { allowBlocking: true })
+    const lines = result.outputText.trim().split('\n')
+    assert(lines[0] === 'x,x_ewma,missing_anomaly,missing_bin,missing_avg3,sum3,mean3,interp,dt_year,d_month', 'wasm H14 null policy header')
+    assert(lines[1] === 'a,,,,,,,,,', 'wasm H14 null policy row')
+    const typeNull = tf.run('csv | interpolate x forward on_type_error=null | csv', 'x\na\n', { allowBlocking: true })
+    assert(typeNull.outputText.split('\n')[1] === '', 'wasm interpolate type null should null source value')
+    const dateTypeNull = tf.run('jsonl | date-trunc x month on_type_error=null | csv', '{"x":true}\n')
+    assert(dateTypeNull.outputText.split('\n')[1] === '', 'wasm date-trunc type null should null source value')
+    const normalizeNull = tf.run('csv | normalize missing missing=null | csv', 'x\n1\n', { allowBlocking: true })
+    assert(normalizeNull.outputText.trim().split('\n').join('|') === 'x,missing|1,', 'wasm normalize missing=null should append nulls')
+    const acfNull = tf.run('csv | acf missing 2 missing=null | csv', 'x\n1\n', { allowBlocking: true })
+    assert(acfNull.outputText.trim().split('\n').join('|') === 'lag,acf|0,|1,|2,', 'wasm acf missing=null should emit null acf rows')
+  })
+
   await test('wasm native memory policy', async () => {
     assertThrows(
       () => tf.run('csv | sort age | csv', 'name,age\nAlice,30\nBob,25\n'),
@@ -3995,6 +4882,13 @@ if (createTranfi) {
     assertThrows(
       () => tf.run('csv | sort age | csv', 'name,age\nAlice,30\nBob,25\n', { spillDir: '/tmp/tranfi-wasm-spill', memory: '1KB' }),
       /spillDir is not supported by standalone WASM native execution/
+    )
+  })
+
+  await test('wasm host policy rejects core file paths', async () => {
+    assertThrows(
+      () => tf.run('csv | join /tmp/tranfi-wasm-missing.csv on id max_lookup_bytes=1024 max_state_bytes=4096 | csv', 'id\n1\n'),
+      /allow_fs=false|host policy export unavailable/
     )
   })
 
@@ -4147,6 +5041,32 @@ if (createTranfi) {
       assert(false, 'wasm oversized CSV record should fail')
     } catch (err) {
       assert(String(err.message || err).includes('csv record exceeds max_record_bytes'), 'wasm error should mention max_record_bytes')
+    }
+  })
+
+  await test('wasm jsonl and text max record bytes', async () => {
+    try {
+      tf.run('jsonl max_record_bytes=16 | csv', '{"id":1}\n{"name":"abcdefghijklmnop"}')
+      assert(false, 'wasm oversized JSONL record should fail')
+    } catch (err) {
+      assert(String(err.message || err).includes('jsonl record exceeds max_record_bytes'), 'wasm JSONL error should mention max_record_bytes')
+    }
+
+    try {
+      tf.run('text max_record_bytes=8 | text', 'ok\n123456789')
+      assert(false, 'wasm oversized text record should fail')
+    } catch (err) {
+      assert(String(err.message || err).includes('text record exceeds max_record_bytes'), 'wasm text error should mention max_record_bytes')
+    }
+  })
+
+
+  await test('wasm codec batch_size clamp', async () => {
+    try {
+      tf.run('csv batch_size=65537 | csv', 'a\n1\n')
+      assert(false, 'wasm oversized batch_size should fail')
+    } catch (err) {
+      assert(String(err.message || err).includes('batch_size'), 'wasm error should mention batch_size')
     }
   })
 

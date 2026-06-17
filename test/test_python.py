@@ -135,6 +135,40 @@ def test_csv_comments_empty_rows_and_trim_control():
     assert header_only.output_text == 'name,score\n'
 
 
+
+def make_wide_csv(n_cols):
+    headers = ','.join(f'col{i}' for i in range(n_cols))
+    row = ','.join(f'v{i}' for i in range(n_cols))
+    return f'{headers}\n{row}\n'.encode()
+
+
+def test_csv_wide_columns_and_max_columns():
+    step = tf.codec.csv(max_columns=3)
+    assert step['args']['max_columns'] == 3
+
+    result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.codec.csv_encode(),
+    ]).run(input=make_wide_csv(300), chunk_size=17)
+    text = result.output_text
+    assert 'col255' in text
+    assert 'col299' in text
+    assert 'v255' in text
+    assert 'v299' in text
+
+    with pytest.raises(RuntimeError, match='csv record exceeds max_columns'):
+        tf.pipeline([
+            tf.codec.csv(max_columns=3),
+            tf.codec.csv_encode(),
+        ]).run(input=b'a,b,c,d\n1,2,3,4\n', chunk_size=2)
+
+    long_name = 'a' * 4097
+    with pytest.raises(RuntimeError, match='column name'):
+        tf.pipeline([
+            tf.codec.csv(),
+            tf.codec.csv_encode(),
+        ]).run(input=(long_name + '\n1\n').encode(), chunk_size=11)
+
 def test_csv_repair_diagnostics():
     p = tf.pipeline([
         tf.codec.csv(batch_size=2, repair=True, max_error_bytes=5, audit=True, audit_limit=1),
@@ -462,6 +496,28 @@ def test_jsonl_malformed_records():
     ])
     with pytest.raises(RuntimeError, match='jsonl decode failed at line 2'):
         failing.run(input=b'{"name":"Alice","age":30}\nnot json\n')
+
+
+def test_jsonl_max_record_bytes():
+    step = tf.codec.jsonl(max_record_bytes=16, max_error_bytes=6)
+    assert step['args']['max_record_bytes'] == 16
+    assert step['args']['max_error_bytes'] == 6
+    step = tf.codec.jsonl_decode(max_record_bytes=17)
+    assert step['args']['max_record_bytes'] == 17
+
+    p = tf.pipeline([
+        tf.codec.jsonl(max_record_bytes=16, max_error_bytes=6),
+        tf.codec.csv_encode(),
+    ])
+    with pytest.raises(RuntimeError, match='jsonl record exceeds max_record_bytes'):
+        p.run(input=b'{"id":1}\n{"name":"abcdefghijklmnop"}', chunk_size=7)
+
+    long_name = 'a' * 4097
+    with pytest.raises(RuntimeError, match='column name'):
+        tf.pipeline([
+            tf.codec.jsonl(),
+            tf.codec.csv_encode(),
+        ]).run(input=(f'{{"{long_name}":1}}\n').encode(), chunk_size=13)
 
 
 def test_jsonl_filter():
@@ -1558,6 +1614,21 @@ def test_native_memory_policy():
 
 # ---- New operator tests ----
 
+
+def test_host_policy_denies_core_fs_by_default(tmp_path):
+    lookup = tmp_path / 'lookup.csv'
+    lookup.write_text('id,val\n1,a\n')
+    p = tf.pipeline([
+        tf.codec.csv(),
+        tf.ops.join(str(lookup), 'id', max_lookup_bytes=1024),
+        tf.codec.csv_encode(),
+    ])
+    with pytest.raises(RuntimeError, match='allow_fs=false'):
+        p.run(input=b'id\n1\n')
+    result = p.run(input=b'id\n1\n', allow_fs=True)
+    assert '1,a' in result.output_text
+
+
 def test_ops_tail():
     data = bytes([10]).join([
         b'name,age', b'Alice,30', b'Bob,25', b'Charlie,35', b''
@@ -1800,11 +1871,18 @@ def test_ops_validate_rules(tmp_path):
     )
     file_step = tf.ops.validate(rules_file=rules_path)
     assert file_step['args']['rules_file'] == str(rules_path)
+    with pytest.raises(RuntimeError, match='allow_fs=false'):
+        tf.pipeline([
+            tf.codec.csv(batch_size=1),
+            file_step,
+            tf.codec.csv_encode(),
+        ]).run(input=b'name,age\nAlice,30\nBob,-1\nCara,20\n')
     result = tf.pipeline([
         tf.codec.csv(batch_size=1),
         file_step,
         tf.codec.csv_encode(),
-    ]).run(input=b'name,age\nAlice,30\nBob,-1\nCara,20\n')
+    ]).run(input=b'name,age\nAlice,30\nBob,-1\nCara,20\n',
+          allow_fs=True, allow_rules_file=True)
     assert 'Alice,30,true' in result.output_text
     assert 'Bob,-1,false' in result.output_text
     assert '"suite":"quality_file"' in result.stats_text
@@ -1907,11 +1985,14 @@ def test_ops_assert_actions():
         ]).run(input=data)
 
     aggregate_args = tf.ops.assert_(aggregate='sum:amount', op='>=', value=100, action='warn',
-                                    name='sales_total', message='too low')['args']
+                                    name='sales_total', message='too low',
+                                    tolerance=1e-9, rel=False)['args']
     assert aggregate_args['aggregate'] == 'sum:amount'
     assert aggregate_args['op'] == '>='
     assert aggregate_args['value'] == 100.0
     assert aggregate_args['action'] == 'warn'
+    assert aggregate_args['tolerance'] == 1e-9
+    assert aggregate_args['rel'] is False
 
     amount_data = b'name,amount\nA,30\nB,20\n'
     aggregate_warn = tf.pipeline([
@@ -1941,6 +2022,33 @@ def test_ops_assert_actions():
             tf.ops.assert_(aggregate='count', op='>=', value=3, action='fail'),
             tf.codec.csv_encode(),
         ]).run(input=amount_data)
+
+
+    large_amount_data = b'amount\n1000000000000000\n'
+    relative_pass = tf.pipeline([
+        tf.codec.csv(),
+        tf.ops.assert_(aggregate='sum:amount', op='==', value=1000000000000100, action='fail'),
+        tf.codec.csv_encode(),
+    ]).run(input=large_amount_data)
+    assert '"aggregate_passed":true' in relative_pass.stats_text
+    assert '"relative_tolerance":true' in relative_pass.stats_text
+    assert relative_pass.errors == b''
+
+    absolute_warn = tf.pipeline([
+        tf.codec.csv(),
+        tf.ops.assert_(aggregate='sum:amount', op='==', value=1000000000000100,
+                       tolerance=1e-12, rel=False, action='warn'),
+        tf.codec.csv_encode(),
+    ]).run(input=large_amount_data)
+    assert 'aggregate_assert_failed' in absolute_warn.errors.decode('utf-8')
+    assert '"relative_tolerance":false' in absolute_warn.stats_text
+
+    whitespace_value = tf.pipeline([
+        tf.codec.csv(),
+        {'op': 'assert', 'args': {'aggregate': 'sum:amount', 'op': '==', 'value': '50 ', 'action': 'fail'}},
+        tf.codec.csv_encode(),
+    ]).run(input=amount_data)
+    assert '"aggregate_passed":true' in whitespace_value.stats_text
 
 
 def test_ops_schema_actions():
@@ -2089,6 +2197,353 @@ def test_ops_schema_selectors():
     assert '"regex_failures":1' in result.stats_text
 
 
+
+def test_ops_schema_regex_budgets():
+    step = tf.ops.schema(
+        regex={'code': '^[A-Z]+$'},
+        max_regex_pattern_bytes=32,
+        max_regex_cell_bytes=3,
+        mode='warn',
+    )
+    assert step['args']['max_regex_pattern_bytes'] == 32
+    assert step['args']['max_regex_cell_bytes'] == 3
+
+    result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        step,
+        tf.codec.csv_encode(),
+    ]).run(input=b'code\nAA\nTOOLONG\n')
+    assert 'AA' in result.output_text
+    assert 'TOOLONG' in result.output_text
+    errors = result.errors.decode('utf-8')
+    assert 'schema_failure' in errors
+    assert '"rule":"regex"' in errors
+    assert 'regex cell within max_regex_cell_bytes' in errors
+    assert 'cell exceeds 3 bytes' in errors
+    assert '"checked_rows":2' in result.stats_text
+    assert '"passed_rows":1' in result.stats_text
+    assert '"failed_rows":1' in result.stats_text
+    assert '"regex_failures":1' in result.stats_text
+    assert '"max_regex_pattern_bytes":32' in result.stats_text
+    assert '"max_regex_cell_bytes":3' in result.stats_text
+
+    with pytest.raises(RuntimeError, match='max_regex_pattern_bytes'):
+        tf.pipeline([
+            tf.codec.csv(),
+            tf.ops.schema(regex={'code': '^[A-Z]+$'}, max_regex_pattern_bytes=3, mode='warn'),
+            tf.codec.csv_encode(),
+        ]).run(input=b'code\nAA\n')
+
+    with pytest.raises(RuntimeError, match='max_regex_pattern_bytes'):
+        tf.pipeline([
+            tf.codec.csv(),
+            tf.ops.schema(regex={'ends_with(code)': '^[A-Z]+$'}, max_regex_pattern_bytes=3, mode='warn'),
+            tf.codec.csv_encode(),
+        ]).run(input=b'code\nAA\n')
+
+
+def test_ops_schema_audit_privacy_controls():
+    data = b'name,ssn,age\nAliciaSecret,111-22-3333,200\n'
+    step = tf.ops.schema(
+        values={'ssn': ['OK']},
+        mode='filter',
+        audit=True,
+        audit_limit=1,
+        audit_include_row=True,
+        audit_columns=['ssn'],
+        audit_redact=['ssn'],
+        audit_hash_columns=['name'],
+        audit_max_bytes=1024,
+        audit_max_cell_bytes=3,
+    )
+    assert step['args']['audit_include_row'] is True
+    assert step['args']['audit_columns'] == ['ssn']
+    assert step['args']['audit_redact'] == ['ssn']
+    assert step['args']['audit_hash_columns'] == ['name']
+    assert step['args']['audit_max_bytes'] == 1024
+    assert step['args']['audit_max_cell_bytes'] == 3
+
+    no_row = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.schema(max={'age': 120}, mode='filter', audit=True, audit_limit=1, audit_include_row=False),
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert '"type":"audit"' in no_row.stats_text
+    assert '"data"' not in no_row.stats_text
+    assert 'AliciaSecret' not in no_row.stats_text
+    assert '111-22-3333' not in no_row.stats_text
+
+    redacted = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.schema(values={'ssn': ['OK']}, mode='filter', audit=True, audit_limit=1,
+                      audit_columns=['ssn'], audit_redact=['ssn']),
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert '[REDACTED]' in redacted.stats_text
+    assert '111-22-3333' not in redacted.stats_text
+    assert 'AliciaSecret' not in redacted.stats_text
+
+    hashed = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.schema(values={'ssn': ['OK']}, mode='filter', audit=True, audit_limit=1,
+                      audit_hash_columns=['ssn']),
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert 'fnv1a64:' in hashed.stats_text
+    assert '111-22-3333' not in hashed.stats_text
+
+    capped = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.schema(max={'age': 120}, mode='filter', audit=True, audit_limit=1,
+                      audit_max_cell_bytes=3),
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert 'Ali...' in capped.stats_text
+    assert '111...' in capped.stats_text
+    assert 'AliciaSecret' not in capped.stats_text
+    assert '111-22-3333' not in capped.stats_text
+
+    byte_capped = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.schema(max={'age': 120}, mode='filter', audit=True, audit_limit=1,
+                      audit_max_bytes=1),
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert '_audit_truncated' in byte_capped.stats_text
+    assert 'AliciaSecret' not in byte_capped.stats_text
+    assert '111-22-3333' not in byte_capped.stats_text
+
+    warned = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.schema(regex={'ssn': '^OK$'}, mode='warn', audit_redact=['ssn']),
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    errors = warned.errors.decode('utf-8')
+    assert 'schema_failure' in errors
+    assert '[REDACTED]' in errors
+    assert '111-22-3333' not in errors
+
+
+def test_ops_audit_privacy_migrated_producers():
+    data = b'name,ssn,age\nAlice,111-22-3333,20\nBob,222-33-4444,40\n'
+
+    filter_step = tf.ops.filter(
+        tf.expr("col('age') > 30"),
+        audit=True,
+        audit_limit=1,
+        audit_include_row=False,
+        audit_redact=['ssn'],
+        audit_max_cell_bytes=3,
+    )
+    assert filter_step['args']['audit_include_row'] is False
+    assert filter_step['args']['audit_redact'] == ['ssn']
+    assert filter_step['args']['audit_max_cell_bytes'] == 3
+    filtered = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        filter_step,
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert '"op":"filter"' in filtered.stats_text
+    assert '"data"' not in filtered.stats_text
+    assert 'Alice' not in filtered.stats_text
+    assert '111-22-3333' not in filtered.stats_text
+
+    validate_step = tf.ops.validate(
+        tf.expr("col('age') > 30"),
+        audit=True,
+        audit_limit=1,
+        audit_columns=['ssn'],
+        audit_redact=['ssn'],
+    )
+    assert validate_step['args']['audit_columns'] == ['ssn']
+    assert validate_step['args']['audit_redact'] == ['ssn']
+    validated = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        validate_step,
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert '"op":"validate"' in validated.stats_text
+    assert '[REDACTED]' in validated.stats_text
+    assert '111-22-3333' not in validated.stats_text
+    assert 'Alice' not in validated.stats_text
+
+    assert_step = tf.ops.assert_(
+        tf.expr("col('age') > 30"),
+        action='warn',
+        audit_columns=['ssn'],
+        audit_hash_columns=['ssn'],
+    )
+    assert assert_step['args']['audit_columns'] == ['ssn']
+    assert assert_step['args']['audit_hash_columns'] == ['ssn']
+    asserted = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        assert_step,
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    errors = asserted.errors.decode('utf-8')
+    assert 'assert_failure' in errors
+    assert 'fnv1a64:' in errors
+    assert '111-22-3333' not in errors
+    assert 'Alice' not in errors
+
+    json_step = tf.ops.json_schema(
+        {'type': 'object', 'required': ['user']},
+        mode='filter',
+        audit=True,
+        audit_limit=1,
+        audit_columns=['_line'],
+        audit_redact=['_line'],
+        audit_max_bytes=2048,
+    )
+    assert json_step['args']['audit_columns'] == ['_line']
+    assert json_step['args']['audit_redact'] == ['_line']
+    assert json_step['args']['audit_max_bytes'] == 2048
+    json_result = tf.pipeline([
+        tf.codec.text(batch_size=1),
+        json_step,
+        tf.codec.text_encode(),
+    ]).run(input=b'{"ssn":"111-22-3333"}\n')
+    assert '"op":"json-schema"' in json_result.stats_text
+    assert '[REDACTED]' in json_result.stats_text
+    assert '111-22-3333' not in json_result.stats_text
+
+
+    fill_step = tf.ops.fill_null(
+        note='SECRET',
+        audit=True,
+        audit_limit=1,
+        audit_columns=['note'],
+        audit_redact=['note'],
+    )
+    assert fill_step['args']['audit_columns'] == ['note']
+    assert fill_step['args']['audit_redact'] == ['note']
+    fill_result = tf.pipeline([
+        tf.codec.csv(batch_size=1, nulls=['NA']),
+        fill_step,
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,note\nB,NA\nC,ok\n')
+    assert '"op":"fill-null"' in fill_result.stats_text
+    assert '[REDACTED]' in fill_result.stats_text
+    assert 'SECRET' not in fill_result.stats_text
+    assert '"B"' not in fill_result.stats_text
+
+    replace_step = tf.ops.replace(
+        'ssn',
+        '111',
+        '999',
+        audit=True,
+        audit_limit=1,
+        audit_columns=['ssn'],
+        audit_redact=['ssn'],
+    )
+    assert replace_step['args']['audit_columns'] == ['ssn']
+    assert replace_step['args']['audit_redact'] == ['ssn']
+    replace_result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        replace_step,
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,ssn\nAlice,111-22-3333\nBob,222-33-4444\n')
+    assert '"op":"replace"' in replace_result.stats_text
+    assert '[REDACTED]' in replace_result.stats_text
+    assert '111' not in replace_result.stats_text
+    assert '999' not in replace_result.stats_text
+    assert 'Alice' not in replace_result.stats_text
+
+
+    cast_step = tf.ops.cast(
+        secret='int',
+        audit=True,
+        audit_limit=1,
+        audit_columns=['secret'],
+        audit_redact=['secret'],
+    )
+    assert cast_step['args']['audit_columns'] == ['secret']
+    assert cast_step['args']['audit_redact'] == ['secret']
+    cast_result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        cast_step,
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,secret\nAlice,111-22-3333\n')
+    assert '"op":"cast"' in cast_result.stats_text
+    assert '[REDACTED]' in cast_result.stats_text
+    assert '111' not in cast_result.stats_text
+    assert 'Alice' not in cast_result.stats_text
+
+    normalize_step = tf.ops.normalize(
+        ['score'],
+        audit=True,
+        audit_limit=1,
+        audit_columns=['score'],
+        audit_redact=['score'],
+    )
+    assert normalize_step['args']['audit_columns'] == ['score']
+    assert normalize_step['args']['audit_redact'] == ['score']
+    normalize_result = tf.pipeline([
+        tf.codec.csv(batch_size=2),
+        normalize_step,
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,score\nAlice,100\nBob,200\n', allow_blocking=True)
+    assert '"op":"normalize"' in normalize_result.stats_text
+    assert '[REDACTED]' in normalize_result.stats_text
+    assert '100' not in normalize_result.stats_text
+    assert '200' not in normalize_result.stats_text
+    assert 'Alice' not in normalize_result.stats_text
+
+    repair_step = tf.codec.csv(repair=True, audit=True, audit_limit=1, audit_redact=['raw'])
+    assert repair_step['args']['audit_redact'] == ['raw']
+    repair_result = tf.pipeline([
+        repair_step,
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,secret\nAlice,SECRET,extra\n')
+    assert '"event":"row_repaired"' in repair_result.stats_text
+    assert '[REDACTED]' in repair_result.stats_text
+    assert 'SECRET' not in repair_result.stats_text
+    assert 'Alice' not in repair_result.stats_text
+    repair_errors = repair_result.errors.decode('utf-8')
+    assert 'csv_field_count' in repair_errors
+    assert '[REDACTED]' in repair_errors
+    assert 'SECRET' not in repair_errors
+    assert 'Alice' not in repair_errors
+
+    tee_step = tf.ops.tee(
+        tf.expr("col('age') >= 20"),
+        channel='audit',
+        columns=['name', 'ssn'],
+        limit=1,
+        audit_columns=['ssn'],
+        audit_redact=['ssn'],
+    )
+    assert tee_step['args']['audit_columns'] == ['ssn']
+    assert tee_step['args']['audit_redact'] == ['ssn']
+    tee_result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tee_step,
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    assert '"op":"tee"' in tee_result.stats_text
+    assert '[REDACTED]' in tee_result.stats_text
+    assert '111-22-3333' not in tee_result.stats_text
+    assert 'Alice' not in tee_result.stats_text
+
+    quarantine_step = tf.ops.quarantine(
+        tf.expr("col('age') < 30"),
+        audit_columns=['ssn'],
+        audit_redact=['ssn'],
+    )
+    assert quarantine_step['args']['audit_columns'] == ['ssn']
+    assert quarantine_step['args']['audit_redact'] == ['ssn']
+    quarantine_result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        quarantine_step,
+        tf.codec.csv_encode(),
+    ]).run(input=data)
+    quarantine_errors = quarantine_result.errors.decode('utf-8')
+    assert '"op":"quarantine"' in quarantine_errors
+    assert '[REDACTED]' in quarantine_errors
+    assert '111-22-3333' not in quarantine_errors
+    assert 'Alice' not in quarantine_errors
+
+
 def test_ops_schema_infer():
     step = tf.ops.schema_infer(rows=2)
     assert step['op'] == 'schema-infer'
@@ -2137,6 +2592,35 @@ def test_ops_explode():
     text = result.output_text
     lines = text.strip().split('\n')
     assert len(lines) == 5  # header + 4 rows (3 for Alice + 1 for Bob)
+
+
+def test_row_expansion_caps():
+    explode_step = tf.ops.explode('tags', '|', max_tokens_per_row=2,
+                                  max_output_rows_per_input_row=2, max_output_rows_per_batch=3,
+                                  max_token_bytes=8)
+    assert explode_step['args']['max_tokens_per_row'] == 2
+    assert explode_step['args']['max_output_rows_per_input_row'] == 2
+    assert explode_step['args']['max_output_rows_per_batch'] == 3
+    assert explode_step['args']['max_token_bytes'] == 8
+
+    with pytest.raises(RuntimeError, match='max_tokens_per_row=2'):
+        tf.pipeline([tf.codec.csv(), explode_step, tf.codec.csv_encode()]).run(
+            input=b'name,tags\nAlice,a|b|c\n')
+
+    with pytest.raises(RuntimeError, match='max_token_bytes=1'):
+        tf.pipeline([
+            tf.codec.csv(),
+            tf.ops.explode('tags', max_token_bytes=1),
+            tf.codec.csv_encode(),
+        ]).run(input=b'name,tags\nAlice,aa\n')
+
+    unpivot_step = tf.ops.unpivot(['q1', 'q2'], max_output_rows_per_input_row=1,
+                                  max_output_rows_per_batch=2)
+    assert unpivot_step['args']['max_output_rows_per_input_row'] == 1
+    assert unpivot_step['args']['max_output_rows_per_batch'] == 2
+    with pytest.raises(RuntimeError, match='max_output_rows_per_input_row=1'):
+        tf.pipeline([tf.codec.csv(), unpivot_step, tf.codec.csv_encode()]).run(
+            input=b'id,q1,q2\n1,10,20\n')
 
 
 def test_ops_step():
@@ -2194,6 +2678,20 @@ def test_ops_frequency():
     assert '"overflow_count":3' in overflow_result.stats_text
     assert '"retained_state_bytes":' in overflow_result.stats_text
 
+    privacy_result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.frequency(['city'], max_values=1, overflow='other', audit=True, audit_limit=1,
+                         audit_columns=['city'], audit_redact=['city']),
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,city\nAlice,NY\nBob,LA\n')
+    assert '"op":"frequency"' in privacy_result.stats_text
+    assert '"event":"category_overflow"' in privacy_result.stats_text
+    assert '[REDACTED]' in privacy_result.stats_text
+    assert 'LA' not in privacy_result.stats_text
+    assert 'Bob' not in privacy_result.stats_text
+    assert 'Alice' not in privacy_result.stats_text
+    assert '"data":{"city":"[REDACTED]"}' in privacy_result.stats_text
+
 def test_key_state_cap_helpers_and_errors():
     unique_sorted_args = tf.ops.unique(['city'], sorted=True)['args']
     assert unique_sorted_args['sorted'] is True
@@ -2225,6 +2723,12 @@ def test_key_state_cap_helpers_and_errors():
     assert freq_args['other'] == 'REST'
     assert freq_args['audit'] is True
     assert freq_args['audit_limit'] == 2
+    freq_privacy_args = tf.ops.frequency(['city'], audit_columns=['city'], audit_redact=['city'], audit_hash_columns=['city'], audit_max_bytes=100, audit_max_cell_bytes=8)['args']
+    assert freq_privacy_args['audit_columns'] == ['city']
+    assert freq_privacy_args['audit_redact'] == ['city']
+    assert freq_privacy_args['audit_hash_columns'] == ['city']
+    assert freq_privacy_args['audit_max_bytes'] == 100
+    assert freq_privacy_args['audit_max_cell_bytes'] == 8
     onehot_args = tf.ops.onehot('city', drop=True, categories=['NY', 'LA'], max_categories=3, unknown='other')['args']
     assert onehot_args['drop'] is True
     assert onehot_args['categories'] == ['NY', 'LA']
@@ -2440,28 +2944,28 @@ def test_join_lookup_caps(tmp_path):
             tf.codec.csv(),
             tf.ops.join(str(lookup), 'id', max_lookup_rows=1),
             tf.codec.csv_encode(),
-        ]).run(input=b'id\n1\n')
+        ]).run(input=b'id\n1\n', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='max_lookup_keys=1'):
         tf.pipeline([
             tf.codec.csv(),
             tf.ops.join(str(lookup), 'id', max_lookup_keys=1),
             tf.codec.csv_encode(),
-        ]).run(input=b'id\n1\n')
+        ]).run(input=b'id\n1\n', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='max_lookup_bytes=8'):
         tf.pipeline([
             tf.codec.csv(),
             tf.ops.join(str(lookup), 'id', max_lookup_bytes=8),
             tf.codec.csv_encode(),
-        ]).run(input=b'id\n1\n')
+        ]).run(input=b'id\n1\n', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='max_state_bytes=512'):
         tf.pipeline([
             tf.codec.csv(batch_size=1),
             tf.ops.join(str(lookup), 'id', max_state_bytes=512),
             tf.codec.csv_encode(),
-        ]).run(input=b'id\n1\n')
+        ]).run(input=b'id\n1\n', allow_fs=True)
 
 
 def test_join_output_caps(tmp_path):
@@ -2473,20 +2977,20 @@ def test_join_output_caps(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.join(str(lookup), 'id', max_matches_per_row=1),
             tf.codec.csv_encode(),
-        ]).run(input=b'id\n1\n')
+        ]).run(input=b'id\n1\n', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='max_output_rows=1'):
         tf.pipeline([
             tf.codec.csv(batch_size=1),
             tf.ops.join(str(lookup), 'id', max_output_rows=1),
             tf.codec.csv_encode(),
-        ]).run(input=b'id\n1\n')
+        ]).run(input=b'id\n1\n', allow_fs=True)
 
     result = tf.pipeline([
         tf.codec.csv(batch_size=1),
         tf.ops.join(str(lookup), 'id', max_matches_per_row=2, max_output_rows=2, max_state_bytes=65536),
         tf.codec.csv_encode(),
-    ]).run(input=b'id\n1\n')
+    ]).run(input=b'id\n1\n', allow_fs=True)
     assert '1,a' in result.output_text
     assert '1,b' in result.output_text
     assert '"op":"join"' in result.stats_text
@@ -2507,7 +3011,7 @@ def test_join_typed_keys(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.join(str(typed_lookup), 'id'),
             tf.codec.csv_encode(),
-        ]).run(input=b'id\n1\n')
+        ]).run(input=b'id\n1\n', allow_fs=True)
 
     sentinel_lookup = tmp_path / 'sentinel_lookup.csv'
     sentinel_lookup.write_text('id,val\n\\N,sentinel\nx,other\n')
@@ -2515,7 +3019,7 @@ def test_join_typed_keys(tmp_path):
         tf.codec.csv(batch_size=1),
         tf.ops.join(str(sentinel_lookup), 'id'),
         tf.codec.csv_encode(),
-    ]).run(input=b'id,name\n,empty\n\\N,literal\n')
+    ]).run(input=b'id,name\n,empty\n\\N,literal\n', allow_fs=True)
     assert '\\N,literal,sentinel' in result.output_text
     assert 'empty' not in result.output_text
 
@@ -2529,14 +3033,14 @@ def test_filtering_joins(tmp_path):
         tf.codec.csv(),
         tf.ops.semi_join(str(lookup), 'id', max_lookup_bytes=1024, max_state_bytes=4096),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert semi.output_text.splitlines() == ['id,name', '1,Alice', '3,Charlie']
 
     anti = tf.pipeline([
         tf.codec.csv(),
         tf.ops.anti_join(str(lookup), 'id', max_lookup_bytes=1024, max_state_bytes=4096),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert anti.output_text.splitlines() == ['id,name', '2,Bob']
 
     empty = tmp_path / 'empty_lookup.csv'
@@ -2545,7 +3049,7 @@ def test_filtering_joins(tmp_path):
         tf.codec.csv(),
         tf.ops.anti_join(str(empty), 'id', max_lookup_bytes=1024),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert anti_empty.output_text.splitlines() == ['id,name', '1,Alice', '2,Bob', '3,Charlie']
 
     sorted_lookup = tmp_path / 'sorted_lookup.csv'
@@ -2556,21 +3060,21 @@ def test_filtering_joins(tmp_path):
         tf.codec.csv(batch_size=2),
         tf.ops.semi_join(str(sorted_lookup), 'id', sorted=True),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     assert sorted_semi.output_text.splitlines() == ['id,name', '1,Alice', '2,Bob', '2,Beth', '4,Dave']
 
     sorted_anti = tf.pipeline([
         tf.codec.csv(batch_size=2),
         tf.ops.anti_join(str(sorted_lookup), 'id', sorted=True),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     assert sorted_anti.output_text.splitlines() == ['id,name', '3,Cara']
 
     sorted_inner = tf.pipeline([
         tf.codec.csv(batch_size=2),
         tf.ops.join(str(sorted_lookup), 'id', sorted=True, max_matches_per_row=2),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     inner_lines = sorted_inner.output_text.splitlines()
     assert 'id,name,val' in inner_lines[0]
     assert '1,Alice,a' in inner_lines
@@ -2584,7 +3088,7 @@ def test_filtering_joins(tmp_path):
         tf.codec.csv(batch_size=2),
         tf.ops.join(str(sorted_lookup), 'id', how='left', sorted=True, max_matches_per_row=2),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     assert '3,Cara,' in sorted_left.output_text
 
     with pytest.raises(RuntimeError, match='left side is not sorted'):
@@ -2592,7 +3096,7 @@ def test_filtering_joins(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.semi_join(str(sorted_lookup), 'id', sorted=True),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n2,Bob\n1,Alice\n', memory='64KB')
+        ]).run(input=b'id,name\n2,Bob\n1,Alice\n', memory='64KB', allow_fs=True)
 
 
 def test_set_ops(tmp_path):
@@ -2604,14 +3108,14 @@ def test_set_ops(tmp_path):
         tf.codec.csv(),
         tf.ops.intersect(str(lookup), max_lookup_bytes=1024, max_lookup_keys=10, max_output_keys=10),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert inter.output_text.splitlines() == ['id,name', '1,Alice', '3,Charlie']
 
     inter_byte = tf.pipeline([
         tf.codec.csv(),
         tf.ops.intersect(str(lookup), max_lookup_bytes=1024, max_state_bytes=4096),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert inter_byte.output_text.splitlines() == ['id,name', '1,Alice', '3,Charlie']
     assert '"max_state_bytes":4096' in inter_byte.stats_text
 
@@ -2620,13 +3124,13 @@ def test_set_ops(tmp_path):
             tf.codec.csv(),
             tf.ops.intersect(str(lookup), max_lookup_bytes=1024, max_state_bytes=128),
             tf.codec.csv_encode(),
-        ]).run(input=data, memory='64KB')
+        ]).run(input=data, memory='64KB', allow_fs=True)
 
     diff = tf.pipeline([
         tf.codec.csv(),
         tf.ops.setdiff(str(lookup), max_lookup_bytes=1024, max_lookup_keys=10, max_output_keys=10),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert diff.output_text.splitlines() == ['id,name', '2,Bob', '3,Other']
 
     lookup.write_text('id,label\n1,a\n1,a2\n3,c\n')
@@ -2635,14 +3139,14 @@ def test_set_ops(tmp_path):
         tf.codec.csv(batch_size=2),
         tf.ops.intersect_all(str(lookup), columns=['id'], max_lookup_bytes=1024, max_lookup_keys=10),
         tf.codec.csv_encode(),
-    ]).run(input=bag_data, memory='64KB')
+    ]).run(input=bag_data, memory='64KB', allow_fs=True)
     assert inter_all.output_text.splitlines() == ['id,name', '1,A1', '1,A2', '3,C']
 
     diff_all = tf.pipeline([
         tf.codec.csv(batch_size=2),
         tf.ops.setdiff_all(str(lookup), columns=['id'], max_lookup_bytes=1024, max_lookup_keys=10),
         tf.codec.csv_encode(),
-    ]).run(input=bag_data, memory='64KB')
+    ]).run(input=bag_data, memory='64KB', allow_fs=True)
     assert diff_all.output_text.splitlines() == ['id,name', '1,A3', '2,B', '3,C2']
 
     with pytest.raises(RuntimeError, match='max_lookup_keys=1'):
@@ -2650,14 +3154,14 @@ def test_set_ops(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.intersect_all(str(lookup), columns=['id'], max_lookup_bytes=1024, max_lookup_keys=1),
             tf.codec.csv_encode(),
-        ]).run(input=bag_data, memory='64KB')
+        ]).run(input=bag_data, memory='64KB', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='max_lookup_keys or max_state_bytes'):
         tf.pipeline([
             tf.codec.csv(batch_size=1),
             tf.ops.setdiff_all(str(lookup), columns=['id'], max_lookup_bytes=1024),
             tf.codec.csv_encode(),
-        ]).run(input=bag_data, memory='64KB')
+        ]).run(input=bag_data, memory='64KB', allow_fs=True)
 
     lookup.write_text('id,name\n1,Alice\n3,Charlie\n')
 
@@ -2665,14 +3169,14 @@ def test_set_ops(tmp_path):
         tf.codec.csv(batch_size=1),
         tf.ops.union_all(str(lookup)),
         tf.codec.csv_encode(),
-    ]).run(input=b'id,name\n1,Alice\n2,Bob\n', memory='64KB')
+    ]).run(input=b'id,name\n1,Alice\n2,Bob\n', memory='64KB', allow_fs=True)
     assert union_all.output_text.splitlines() == ['id,name', '1,Alice', '2,Bob', '1,Alice', '3,Charlie']
 
     union = tf.pipeline([
         tf.codec.csv(batch_size=1),
         tf.ops.union(str(lookup), max_output_keys=10),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert union.output_text.splitlines() == ['id,name', '1,Alice', '2,Bob', '3,Charlie', '3,Other']
     assert '"emitted_keys":4' in union.stats_text
     assert '"emitted_key_bytes":' in union.stats_text
@@ -2683,7 +3187,7 @@ def test_set_ops(tmp_path):
         tf.codec.csv(batch_size=1),
         tf.ops.union(str(lookup), max_state_bytes=4096),
         tf.codec.csv_encode(),
-    ]).run(input=data, memory='64KB')
+    ]).run(input=data, memory='64KB', allow_fs=True)
     assert union_byte.output_text.splitlines() == ['id,name', '1,Alice', '2,Bob', '3,Charlie', '3,Other']
 
     lookup.write_text('id,name\n1,A_file\n1,A_file_dup\n3,C_file\n5,E_file\n5,E_file_dup\n')
@@ -2691,7 +3195,7 @@ def test_set_ops(tmp_path):
         tf.codec.csv(batch_size=2),
         tf.ops.union(str(lookup), columns=['id'], sorted=True),
         tf.codec.csv_encode(),
-    ]).run(input=b'id,name\n1,A_left\n1,A_left_dup\n2,B_left\n4,D_left\n5,E_left\n', memory='64KB')
+    ]).run(input=b'id,name\n1,A_left\n1,A_left_dup\n2,B_left\n4,D_left\n5,E_left\n', memory='64KB', allow_fs=True)
     assert sorted_union.output_text.splitlines() == ['id,name', '1,A_left', '2,B_left', '3,C_file', '4,D_left', '5,E_left']
     assert '"emitted_keys":5' in sorted_union.stats_text
 
@@ -2700,7 +3204,7 @@ def test_set_ops(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.union(str(lookup), columns=['id'], sorted=True),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n2,B\n1,A\n', memory='64KB')
+        ]).run(input=b'id,name\n2,B\n1,A\n', memory='64KB', allow_fs=True)
 
     lookup.write_text('id,name\n3,C\n1,A\n')
     with pytest.raises(RuntimeError, match='union: file side is not sorted'):
@@ -2708,7 +3212,7 @@ def test_set_ops(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.union(str(lookup), columns=['id'], sorted=True),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n2,B\n4,D\n', memory='64KB')
+        ]).run(input=b'id,name\n2,B\n4,D\n', memory='64KB', allow_fs=True)
 
     lookup.write_text('id,name\n1,Alice\n3,Charlie\n')
 
@@ -2717,14 +3221,14 @@ def test_set_ops(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.union(str(lookup), max_state_bytes=128),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n1,Alice\n', memory='64KB')
+        ]).run(input=b'id,name\n1,Alice\n', memory='64KB', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='max_output_keys=2'):
         tf.pipeline([
             tf.codec.csv(batch_size=1),
             tf.ops.union(str(lookup), max_output_keys=2),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n1,Alice\n2,Bob\n', memory='64KB')
+        ]).run(input=b'id,name\n1,Alice\n2,Bob\n', memory='64KB', allow_fs=True)
 
     key_lookup = tmp_path / 'set_lookup_key.csv'
     key_lookup.write_text('id,label\n1,x\n3,y\n')
@@ -2733,7 +3237,7 @@ def test_set_ops(tmp_path):
         tf.ops.intersect(str(key_lookup), columns=['id'], max_lookup_bytes=1024,
                          max_lookup_keys=10, max_output_keys=10),
         tf.codec.csv_encode(),
-    ]).run(input=b'id,name\n1,Alice\n2,Bob\n3,Charlie\n3,Other\n', memory='64KB')
+    ]).run(input=b'id,name\n1,Alice\n2,Bob\n3,Charlie\n3,Other\n', memory='64KB', allow_fs=True)
     assert by_id.output_text.splitlines() == ['id,name', '1,Alice', '3,Charlie']
 
     sorted_lookup = tmp_path / 'set_lookup_sorted.csv'
@@ -2743,14 +3247,14 @@ def test_set_ops(tmp_path):
         tf.codec.csv(batch_size=2),
         tf.ops.intersect(str(sorted_lookup), columns=['id'], sorted=True),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     assert sorted_inter.output_text.splitlines() == ['id,name', '1,Alice', '3,Charlie', '5,Eve']
 
     sorted_diff = tf.pipeline([
         tf.codec.csv(batch_size=2),
         tf.ops.setdiff(str(sorted_lookup), columns=['id'], sorted=True),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     assert sorted_diff.output_text.splitlines() == ['id,name', '2,Bob', '4,Dana']
 
     sorted_lookup.write_text('id,label\n1,x\n1,x2\n3,y\n5,z\n5,z2\n')
@@ -2758,14 +3262,14 @@ def test_set_ops(tmp_path):
         tf.codec.csv(batch_size=2),
         tf.ops.intersect_all(str(sorted_lookup), columns=['id'], sorted=True),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     assert sorted_bag.output_text.splitlines() == ['id,name', '1,Alice', '1,Alicia', '3,Charlie', '5,Eve']
 
     sorted_bag_diff = tf.pipeline([
         tf.codec.csv(batch_size=2),
         tf.ops.setdiff_all(str(sorted_lookup), columns=['id'], sorted=True),
         tf.codec.csv_encode(),
-    ]).run(input=sorted_data, memory='64KB')
+    ]).run(input=sorted_data, memory='64KB', allow_fs=True)
     assert sorted_bag_diff.output_text.splitlines() == ['id,name', '2,Bob', '3,Other', '4,Dana']
 
     with pytest.raises(RuntimeError, match='intersect-all: left side is not sorted'):
@@ -2773,14 +3277,14 @@ def test_set_ops(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.intersect_all(str(sorted_lookup), columns=['id'], sorted=True),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n2,Bob\n1,Alice\n', memory='64KB')
+        ]).run(input=b'id,name\n2,Bob\n1,Alice\n', memory='64KB', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='left side is not sorted'):
         tf.pipeline([
             tf.codec.csv(batch_size=1),
             tf.ops.intersect(str(sorted_lookup), columns=['id'], sorted=True),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n2,Bob\n1,Alice\n', memory='64KB')
+        ]).run(input=b'id,name\n2,Bob\n1,Alice\n', memory='64KB', allow_fs=True)
 
     bad_lookup = tmp_path / 'set_lookup_bad_sorted.csv'
     bad_lookup.write_text('id,label\n3,y\n1,x\n')
@@ -2789,14 +3293,14 @@ def test_set_ops(tmp_path):
             tf.codec.csv(batch_size=1),
             tf.ops.intersect(str(bad_lookup), columns=['id'], sorted=True),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n1,Alice\n3,Charlie\n', memory='64KB')
+        ]).run(input=b'id,name\n1,Alice\n3,Charlie\n', memory='64KB', allow_fs=True)
 
     with pytest.raises(RuntimeError, match='max_lookup_keys=1'):
         tf.pipeline([
             tf.codec.csv(batch_size=1),
             tf.ops.intersect(str(key_lookup), columns=['id'], max_lookup_keys=1),
             tf.codec.csv_encode(),
-        ]).run(input=b'id,name\n1,Alice\n')
+        ]).run(input=b'id,name\n1,Alice\n', allow_fs=True)
 
 
 def test_ops_top():
@@ -2991,16 +3495,178 @@ def test_ops_hash():
     assert '_hash' in text
 
 
-def test_ops_sample():
-    p = tf.pipeline([
-        tf.codec.csv(),
-        tf.ops.sample(2),
-        tf.codec.csv_encode(),
-    ])
-    result = p.run(input=b'name\nAlice\nBob\nCharlie\nDiana\nEve\n')
-    text = result.output_text
-    lines = text.strip().split('\n')
-    assert len(lines) == 3  # header + 2 sampled rows
+def test_h14_numeric_missing_type_policies():
+    assert tf.ops.bin('x', [10], missing='null', on_type_error='null')['args']['on_type_error'] == 'null'
+    assert tf.ops.ewma('x', 0.5, missing='null')['args']['missing'] == 'null'
+    assert tf.ops.anomaly('x', on_type_error='null')['args']['on_type_error'] == 'null'
+    assert tf.ops.window('x', 3, 'avg', missing='null', on_type_error='null')['args']['on_type_error'] == 'null'
+    assert tf.ops.rolling_sum('x', 3, 'sum3', missing='null', on_type_error='null')['args']['missing'] == 'null'
+    assert tf.ops.interpolate('x', 'forward', missing='null', on_type_error='null')['args']['on_type_error'] == 'null'
+    assert tf.ops.datetime('x', ['year'], missing='null', on_type_error='null')['args']['on_type_error'] == 'null'
+    assert tf.ops.date_trunc('x', 'month', result='x_month', missing='null', on_type_error='null')['args']['missing'] == 'null'
+    assert tf.ops.normalize(['x'], missing='null', on_type_error='null')['args']['on_type_error'] == 'null'
+    assert tf.ops.acf('x', lags=2, missing='null', on_type_error='null')['args']['missing'] == 'null'
+
+    with pytest.raises(RuntimeError, match="ewma: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.ewma('missing', 0.5), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    null_ewma = tf.pipeline([tf.codec.csv(), tf.ops.ewma('missing', 0.5, missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert null_ewma.output_text.strip().split('\n') == ['x,missing_ewma', '1,']
+    ignore_ewma = tf.pipeline([tf.codec.csv(), tf.ops.ewma('missing', 0.5, missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert ignore_ewma.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="ewma: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.csv(), tf.ops.ewma('x', 0.5), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    type_null_ewma = tf.pipeline([tf.codec.csv(), tf.ops.ewma('x', 0.5, on_type_error='null'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    assert type_null_ewma.output_text.strip().split('\n') == ['x,x_ewma', 'a,']
+
+    with pytest.raises(RuntimeError, match="anomaly: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.anomaly('missing'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    null_anomaly = tf.pipeline([tf.codec.csv(), tf.ops.anomaly('missing', missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert null_anomaly.output_text.strip().split('\n') == ['x,missing_anomaly', '1,']
+    with pytest.raises(RuntimeError, match="anomaly: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.csv(), tf.ops.anomaly('x'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    type_null_anomaly = tf.pipeline([tf.codec.csv(), tf.ops.anomaly('x', on_type_error='null'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    assert type_null_anomaly.output_text.strip().split('\n') == ['x,x_anomaly', 'a,']
+
+    with pytest.raises(RuntimeError, match="bin: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.bin('missing', [10]), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    null_bin = tf.pipeline([tf.codec.csv(), tf.ops.bin('missing', [10], missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert null_bin.output_text.strip().split('\n') == ['x,missing_bin', '1,']
+    ignore_bin = tf.pipeline([tf.codec.csv(), tf.ops.bin('missing', [10], missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert ignore_bin.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="bin: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.csv(), tf.ops.bin('x', [10]), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    type_null_bin = tf.pipeline([tf.codec.csv(), tf.ops.bin('x', [10], on_type_error='null'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    assert type_null_bin.output_text.strip().split('\n') == ['x,x_bin', 'a,']
+
+    with pytest.raises(RuntimeError, match="window: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.window('missing', 3, 'avg'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    null_window = tf.pipeline([tf.codec.csv(), tf.ops.window('missing', 3, 'avg', missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert null_window.output_text.strip().split('\n') == ['x,missing_avg3', '1,']
+    ignore_window = tf.pipeline([tf.codec.csv(), tf.ops.window('missing', 3, 'avg', missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert ignore_window.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="window: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.csv(), tf.ops.window('x', 3, 'avg'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    type_null_window = tf.pipeline([tf.codec.csv(), tf.ops.window('x', 3, 'avg', 'x_avg', on_type_error='null'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    assert type_null_window.output_text.strip().split('\n') == ['x,x_avg', 'a,']
+    count_window = tf.pipeline([tf.codec.csv(), tf.ops.window('name', 3, 'count', 'name_count'), tf.codec.csv_encode()]).run(input=b'name\nAlice\nBob\n')
+    assert count_window.output_text.strip().split('\n') == ['name,name_count', 'Alice,1', 'Bob,2']
+
+    with pytest.raises(RuntimeError, match="rolling-sum: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.rolling_sum('missing', 3, 'sum3'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    null_roll = tf.pipeline([tf.codec.csv(), tf.ops.rolling_sum('missing', 3, 'sum3', missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert null_roll.output_text.strip().split('\n') == ['x,sum3', '1,']
+    ignore_roll = tf.pipeline([tf.codec.csv(), tf.ops.rolling_sum('missing', 3, 'sum3', missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert ignore_roll.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="rolling-sum: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.csv(), tf.ops.rolling_sum('x', 3, 'sum3'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    type_null_roll = tf.pipeline([tf.codec.csv(), tf.ops.rolling_mean('x', 3, 'mean3', on_type_error='null'), tf.codec.csv_encode()]).run(input=b'x\na\n')
+    assert type_null_roll.output_text.strip().split('\n') == ['x,mean3', 'a,']
+
+    with pytest.raises(RuntimeError, match="interpolate: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.interpolate('missing', 'forward'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    null_interp = tf.pipeline([tf.codec.csv(), tf.ops.interpolate('missing', 'forward', missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    assert null_interp.output_text.strip().split('\n') == ['x,missing', '1,']
+    ignore_interp = tf.pipeline([tf.codec.csv(), tf.ops.interpolate('missing', 'forward', missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    assert ignore_interp.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="interpolate: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.csv(), tf.ops.interpolate('x', 'forward'), tf.codec.csv_encode()]).run(input=b'x\na\n', allow_blocking=True)
+    type_null_interp = tf.pipeline([tf.codec.csv(), tf.ops.interpolate('x', 'forward', on_type_error='null'), tf.codec.csv_encode()]).run(input=b'x\na\n', allow_blocking=True)
+    assert type_null_interp.output_text.splitlines() == ['x', '']
+
+    with pytest.raises(RuntimeError, match="datetime: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.datetime('missing', ['year']), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    null_datetime = tf.pipeline([tf.codec.csv(), tf.ops.datetime('missing', ['year'], missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert null_datetime.output_text.strip().split('\n') == ['x,missing_year', '1,']
+    ignore_datetime = tf.pipeline([tf.codec.csv(), tf.ops.datetime('missing', ['year'], missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert ignore_datetime.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="datetime: column 'x' must be string, date, or timestamp"):
+        tf.pipeline([tf.codec.jsonl(), tf.ops.datetime('x', ['year']), tf.codec.csv_encode()]).run(input=b'{"x":true}\n')
+    type_null_datetime = tf.pipeline([tf.codec.jsonl(), tf.ops.datetime('x', ['year'], on_type_error='null'), tf.codec.csv_encode()]).run(input=b'{"x":true}\n')
+    assert type_null_datetime.output_text.strip().split('\n') == ['x,x_year', 'true,']
+
+    with pytest.raises(RuntimeError, match="date-trunc: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.date_trunc('missing', 'month'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    null_date_trunc = tf.pipeline([tf.codec.csv(), tf.ops.date_trunc('missing', 'month', result='month_start', missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert null_date_trunc.output_text.strip().split('\n') == ['x,month_start', '1,']
+    ignore_date_trunc = tf.pipeline([tf.codec.csv(), tf.ops.date_trunc('missing', 'month', missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    assert ignore_date_trunc.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="date-trunc: column 'x' must be string, date, or timestamp"):
+        tf.pipeline([tf.codec.jsonl(), tf.ops.date_trunc('x', 'month'), tf.codec.csv_encode()]).run(input=b'{"x":true}\n')
+    type_null_date_trunc = tf.pipeline([tf.codec.jsonl(), tf.ops.date_trunc('x', 'month', on_type_error='null'), tf.codec.csv_encode()]).run(input=b'{"x":true}\n')
+    assert type_null_date_trunc.output_text.splitlines() == ['x', '']
+
+    with pytest.raises(RuntimeError, match="normalize: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.normalize(['missing']), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    null_normalize = tf.pipeline([tf.codec.csv(), tf.ops.normalize(['missing'], missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    assert null_normalize.output_text.strip().split('\n') == ['x,missing', '1,']
+    ignore_normalize = tf.pipeline([tf.codec.csv(), tf.ops.normalize(['missing'], missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    assert ignore_normalize.output_text.strip().split('\n') == ['x', '1']
+    with pytest.raises(RuntimeError, match="normalize: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.jsonl(), tf.ops.normalize(['x']), tf.codec.csv_encode()]).run(input=b'{"x":true}\n', allow_blocking=True)
+    type_null_normalize = tf.pipeline([tf.codec.jsonl(), tf.ops.normalize(['x'], on_type_error='null'), tf.codec.csv_encode()]).run(input=b'{"x":true}\n', allow_blocking=True)
+    assert type_null_normalize.output_text.splitlines() == ['x', '']
+
+    with pytest.raises(RuntimeError, match="acf: column 'missing' not found"):
+        tf.pipeline([tf.codec.csv(), tf.ops.acf('missing', lags=2), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    null_acf = tf.pipeline([tf.codec.csv(), tf.ops.acf('missing', lags=2, missing='null'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    assert null_acf.output_text.strip().split('\n') == ['lag,acf', '0,', '1,', '2,']
+    ignore_acf = tf.pipeline([tf.codec.csv(), tf.ops.acf('missing', lags=2, missing='ignore'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    assert ignore_acf.output_text == ''
+    with pytest.raises(RuntimeError, match="acf: column 'x' must be numeric"):
+        tf.pipeline([tf.codec.jsonl(), tf.ops.acf('x', lags=2), tf.codec.csv_encode()]).run(input=b'{"x":true}\n', allow_blocking=True)
+    type_null_acf = tf.pipeline([tf.codec.jsonl(), tf.ops.acf('x', lags=2, on_type_error='null'), tf.codec.csv_encode()]).run(input=b'{"x":true}\n', allow_blocking=True)
+    assert type_null_acf.output_text.strip().split('\n') == ['lag,acf', '0,', '1,', '2,']
+
+    with pytest.raises(RuntimeError, match='ewma: alpha must be a finite number between 0 and 1'):
+        tf.pipeline([tf.codec.csv(), tf.ops.ewma('x', 2), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    with pytest.raises(RuntimeError, match='anomaly: threshold must be a non-negative finite number'):
+        tf.pipeline([tf.codec.csv(), tf.ops.anomaly('x', threshold=-1), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    with pytest.raises(RuntimeError, match='bin: boundaries must be finite, strictly increasing numbers'):
+        tf.pipeline([tf.codec.csv(), tf.ops.bin('x', [10, 10]), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    with pytest.raises(RuntimeError, match='window: size must be an integer'):
+        tf.pipeline([tf.codec.csv(), tf.ops.window('x', 0, 'avg'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    with pytest.raises(RuntimeError, match='window: func must be avg, sum, min, max, or count'):
+        tf.pipeline([tf.codec.csv(), tf.ops.window('x', 3, 'nope'), tf.codec.csv_encode()]).run(input=b'x\n1\n')
+    with pytest.raises(RuntimeError, match='interpolate: method must be forward, backward, or linear'):
+        tf.pipeline([tf.codec.csv(), tf.ops.interpolate('x', 'nearest'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    with pytest.raises(RuntimeError, match='datetime: extract must contain year'):
+        tf.pipeline([tf.codec.csv(), tf.ops.datetime('x', ['decade']), tf.codec.csv_encode()]).run(input=b'x\n2024-01-01\n')
+    with pytest.raises(RuntimeError, match='date-trunc: trunc must be year'):
+        tf.pipeline([tf.codec.csv(), tf.ops.date_trunc('x', 'decade'), tf.codec.csv_encode()]).run(input=b'x\n2024-01-01\n')
+    with pytest.raises(RuntimeError, match='normalize: method must be minmax or zscore'):
+        tf.pipeline([tf.codec.csv(), tf.ops.normalize(['x'], method='bad'), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+    with pytest.raises(RuntimeError, match='acf: lags must be an integer'):
+        tf.pipeline([tf.codec.csv(), tf.ops.acf('x', lags=0), tf.codec.csv_encode()]).run(input=b'x\n1\n', allow_blocking=True)
+
+
+def test_ops_sample_seed_determinism():
+    data = b'name\nAlice\nBob\nCharlie\nDiana\nEve\nFrank\nGrace\n'
+
+    default_step = tf.ops.sample(3)
+    assert 'seed' not in default_step['args']
+    seeded_step = tf.ops.sample(3, seed=123)
+    assert seeded_step['args']['seed'] == 123
+    random_step = tf.ops.sample(3, seed='random')
+    assert random_step['args']['seed'] == 'random'
+
+    def run(step, chunk_size):
+        p = tf.pipeline([
+            tf.codec.csv(batch_size=2),
+            step,
+            tf.codec.csv_encode(),
+        ])
+        return p.run(input=data, chunk_size=chunk_size).output_text.strip().split('\n')
+
+    default_a = run(default_step, 7)
+    default_b = run(tf.ops.sample(3), 3)
+    assert default_a == default_b
+    assert default_a == ['name', 'Eve', 'Frank', 'Charlie']
+
+    seed_a = run(seeded_step, 7)
+    seed_b = run(tf.ops.sample(3, seed=123), 3)
+    assert seed_a == seed_b
+    assert seed_a == ['name', 'Alice', 'Grace', 'Charlie']
+    assert run(tf.ops.sample(3, seed=124), 7) == ['name', 'Alice', 'Grace', 'Eve']
 
 
 def test_ops_text_grep():
@@ -3026,6 +3692,21 @@ def test_ops_text_passthrough():
     text = result.output_text
     assert 'hello world' in text
     assert 'foo bar' in text
+
+
+def test_ops_text_max_record_bytes():
+    step = tf.codec.text(max_record_bytes=8, max_error_bytes=5)
+    assert step['args']['max_record_bytes'] == 8
+    assert step['args']['max_error_bytes'] == 5
+    step = tf.codec.text_decode(max_record_bytes=9)
+    assert step['args']['max_record_bytes'] == 9
+
+    p = tf.pipeline([
+        tf.codec.text(max_record_bytes=8, max_error_bytes=5),
+        tf.codec.text_encode(),
+    ])
+    with pytest.raises(RuntimeError, match='text record exceeds max_record_bytes'):
+        p.run(input=b'ok\n123456789', chunk_size=4)
 
 
 def test_compile_dsl():

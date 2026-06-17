@@ -29,11 +29,8 @@ static int checked_add_mul_size(size_t *acc, size_t a, size_t b) {
 }
 
 static int json_size_arg(const cJSON *args, const char *name, size_t *out) {
-    const cJSON *item = cJSON_GetObjectItemCaseSensitive(args, name);
-    if (!cJSON_IsNumber(item) || item->valuedouble <= 0.0) return 0;
-    if (item->valuedouble > (double)SIZE_MAX) return -1;
-    *out = (size_t)item->valuedouble;
-    return 1;
+    return tf_json_get_size_arg(args, name, 1, TF_MAX_SAFE_SIZE_ARG,
+                                out, "memory-estimate");
 }
 
 static size_t json_array_len_arg(const cJSON *args, const char *name) {

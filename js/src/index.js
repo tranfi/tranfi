@@ -36,7 +36,7 @@ function expr(text) {
 }
 
 const codec = {
-  csv({ delimiter = ',', header = true, batchSize = 1024, repair = false, mode, strict = false, maxErrorBytes = 4096, maxRecordBytes = 64 * 1024 * 1024, audit = false, auditLimit, nulls, na, quotedNulls = true, comment, trimWs = true, skipEmptyRows = false, skip = 0, nMax, maxRows } = {}) {
+  csv({ delimiter = ',', header = true, batchSize = 1024, repair = false, mode, strict = false, maxErrorBytes = 4096, maxRecordBytes = 64 * 1024 * 1024, maxColumns = 8192, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes, nulls, na, quotedNulls = true, comment, trimWs = true, skipEmptyRows = false, skip = 0, nMax, maxRows } = {}) {
     const args = {}
     if (delimiter !== ',') args.delimiter = delimiter
     if (!header) args.header = false
@@ -46,8 +46,15 @@ const codec = {
     if (strict) args.strict = true
     if (maxErrorBytes !== 4096) args.max_error_bytes = Number(maxErrorBytes)
     if (maxRecordBytes !== 64 * 1024 * 1024) args.max_record_bytes = Number(maxRecordBytes)
+    if (maxColumns !== 8192) args.max_columns = Number(maxColumns)
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = Number(auditLimit)
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     if (nulls !== undefined) args.nulls = nulls
     else if (na !== undefined) args.na = na
     if (quotedNulls !== true) args.quoted_nulls = Boolean(quotedNulls)
@@ -70,11 +77,12 @@ const codec = {
     return { op: 'codec.csv.encode', args }
   },
 
-  jsonl({ batchSize = 1024, onError = 'skip', maxErrorBytes = 4096 } = {}) {
+  jsonl({ batchSize = 1024, onError = 'skip', maxErrorBytes = 4096, maxRecordBytes = 64 * 1024 * 1024 } = {}) {
     const args = {}
     if (batchSize !== 1024) args.batch_size = batchSize
     if (onError !== 'skip') args.on_error = onError
-    if (maxErrorBytes !== 4096) args.max_error_bytes = maxErrorBytes
+    if (maxErrorBytes !== 4096) args.max_error_bytes = Number(maxErrorBytes)
+    if (maxRecordBytes !== 64 * 1024 * 1024) args.max_record_bytes = Number(maxRecordBytes)
     return { op: 'codec.jsonl.decode', args }
   },
 
@@ -86,9 +94,11 @@ const codec = {
     return { op: 'codec.jsonl.encode', args: {} }
   },
 
-  text({ batchSize = 1024 } = {}) {
+  text({ batchSize = 1024, maxErrorBytes = 4096, maxRecordBytes = 64 * 1024 * 1024 } = {}) {
     const args = {}
     if (batchSize !== 1024) args.batch_size = batchSize
+    if (maxErrorBytes !== 4096) args.max_error_bytes = Number(maxErrorBytes)
+    if (maxRecordBytes !== 64 * 1024 * 1024) args.max_record_bytes = Number(maxRecordBytes)
     return { op: 'codec.text.decode', args }
   },
 
@@ -109,10 +119,16 @@ const codec = {
 }
 
 const ops = {
-  filter(expression, { audit = false, auditLimit } = {}) {
+  filter(expression, { audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { expr: expression }
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'filter', args }
   },
 
@@ -202,7 +218,7 @@ const ops = {
     return { op: 'tail', args: { n } }
   },
 
-  validate(expression, { audit = false, auditLimit, maxFailures, maxFailureRate, warnFailureRate, name, message, rules, rulesFile } = {}) {
+  validate(expression, { audit = false, auditLimit, maxFailures, maxFailureRate, warnFailureRate, name, message, rules, rulesFile, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = {}
     const isBuffer = typeof Buffer !== 'undefined' && Buffer.isBuffer(expression)
     const firstArgIsRules = rules === undefined && expression && typeof expression === 'object' && !isBuffer
@@ -215,6 +231,12 @@ const ops = {
     }
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     if (maxFailures !== undefined) args.max_failures = maxFailures
     if (maxFailureRate !== undefined) args.max_failure_rate = maxFailureRate
     if (warnFailureRate !== undefined) args.warn_failure_rate = warnFailureRate
@@ -223,7 +245,7 @@ const ops = {
     return { op: 'validate', args }
   },
 
-  assert(expression, { action = 'fail', name = 'assert', message = '', result = '_assert', audit = false, auditLimit, aggregate, op, value, column } = {}) {
+  assert(expression, { action = 'fail', name = 'assert', message = '', result = '_assert', audit = false, auditLimit, aggregate, op, value, column, tolerance, rel, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { action }
     if (aggregate !== undefined && aggregate !== null) {
       if (expression !== undefined && expression !== null) throw new Error('assert accepts either expression or aggregate, not both')
@@ -232,7 +254,10 @@ const ops = {
       args.op = op
       args.value = Number(value)
       if (column !== undefined && column !== null) args.column = column
+      if (tolerance !== undefined) args.tolerance = Number(tolerance)
+      if (rel !== undefined) args.rel = !!rel
     } else if (expression !== undefined && expression !== null) {
+      if (tolerance !== undefined || rel !== undefined) throw new Error('assert tolerance and rel require aggregate')
       args.expr = expression
     } else {
       throw new Error('assert requires expression or aggregate')
@@ -242,17 +267,29 @@ const ops = {
     if (result !== undefined && result !== null) args.result = result
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'assert', args }
   },
 
-  quarantine(expression, { name, message } = {}) {
+  quarantine(expression, { name, message, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { expr: expression }
     if (name !== undefined && name !== null) args.name = name
     if (message) args.message = message
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'quarantine', args }
   },
 
-  schema({ columns, required, nonNull, nullable, values, min, max, regex, mode = 'fail', name = 'schema', message = '', result = '_schema', audit = false, auditLimit } = {}) {
+  schema({ columns, required, nonNull, nullable, values, min, max, regex, mode = 'fail', name = 'schema', message = '', result = '_schema', audit = false, auditLimit, maxRegexPatternBytes, maxRegexCellBytes, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { mode, action: mode }
     if (columns !== undefined) args.columns = columns
     if (required !== undefined) args.required = required
@@ -267,6 +304,14 @@ const ops = {
     if (result !== undefined && result !== null) args.result = result
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
+    if (maxRegexPatternBytes !== undefined) args.max_regex_pattern_bytes = maxRegexPatternBytes
+    if (maxRegexCellBytes !== undefined) args.max_regex_cell_bytes = maxRegexCellBytes
     return { op: 'schema', args }
   },
 
@@ -276,10 +321,16 @@ const ops = {
     return { op: 'schema-infer', args }
   },
 
-  tee({ expr, channel = 'samples', columns, limit = 1000, every = 1, name = 'tee', includeRow = true } = {}) {
+  tee({ expr, channel = 'samples', columns, limit = 1000, every = 1, name = 'tee', includeRow = true, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { channel, limit, every, name, include_row: includeRow }
     if (expr !== undefined && expr !== null) args.expr = expr
     if (columns !== undefined && columns !== null) args.columns = columns
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'tee', args }
   },
 
@@ -289,17 +340,29 @@ const ops = {
     return { op: 'trim', args }
   },
 
-  fillNull(mapping, { audit = false, auditLimit } = {}) {
+  fillNull(mapping, { audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { mapping }
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'fill-null', args }
   },
 
-  cast(mapping, { audit = false, auditLimit } = {}) {
+  cast(mapping, { audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { mapping }
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'cast', args }
   },
 
@@ -310,11 +373,17 @@ const ops = {
     return { op: 'clip', args }
   },
 
-  replace(column, pattern, replacement, { regex = false, audit = false, auditLimit } = {}) {
+  replace(column, pattern, replacement, { regex = false, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { column, pattern, replacement }
     if (regex) args.regex = true
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'replace', args }
   },
 
@@ -324,8 +393,28 @@ const ops = {
     return { op: 'hash', args }
   },
 
-  bin(column, boundaries) {
-    return { op: 'bin', args: { column, boundaries } }
+  bin(column, boundaries, { missing, onTypeError } = {}) {
+    const args = { column, boundaries }
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
+    return { op: 'bin', args }
+  },
+
+  ewma(column, alpha, { result, missing, onTypeError } = {}) {
+    const args = { column, alpha }
+    if (result !== undefined) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
+    return { op: 'ewma', args }
+  },
+
+  anomaly(column, { threshold = 3.0, result, missing, onTypeError } = {}) {
+    const args = { column }
+    if (threshold !== undefined) args.threshold = threshold
+    if (result !== undefined) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
+    return { op: 'anomaly', args }
   },
 
   fillDown(columns) {
@@ -340,33 +429,45 @@ const ops = {
     return { op: 'step', args }
   },
 
-  window(column, size, func, result) {
+  window(column, size, func, resultOrOptions) {
     const args = { column, size, func }
-    if (result) args.result = result
+    const options = resultOrOptions && typeof resultOrOptions === 'object' ? resultOrOptions : { result: resultOrOptions }
+    const { result, missing, onTypeError } = options || {}
+    if (result !== undefined) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
     return { op: 'window', args }
   },
 
-  rollingSum(column, size, { result } = {}) {
+  rollingSum(column, size, { result, missing, onTypeError } = {}) {
     const args = { column, size }
-    if (result) args.result = result
+    if (result !== undefined) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
     return { op: 'rolling-sum', args }
   },
 
-  rollingMean(column, size, { result } = {}) {
+  rollingMean(column, size, { result, missing, onTypeError } = {}) {
     const args = { column, size }
-    if (result) args.result = result
+    if (result !== undefined) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
     return { op: 'rolling-mean', args }
   },
 
-  rollingMin(column, size, { result } = {}) {
+  rollingMin(column, size, { result, missing, onTypeError } = {}) {
     const args = { column, size }
-    if (result) args.result = result
+    if (result !== undefined) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
     return { op: 'rolling-min', args }
   },
 
-  rollingMax(column, size, { result } = {}) {
+  rollingMax(column, size, { result, missing, onTypeError } = {}) {
     const args = { column, size }
-    if (result) args.result = result
+    if (result !== undefined) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
     return { op: 'rolling-max', args }
   },
 
@@ -384,9 +485,18 @@ const ops = {
     return { op: 'rolling-all', args }
   },
 
-  explode(column, delimiter) {
+  explode(column, delimiter, options = {}) {
+    if (delimiter && typeof delimiter === 'object') {
+      options = delimiter
+      delimiter = undefined
+    }
     const args = { column }
     if (delimiter && delimiter !== ',') args.delimiter = delimiter
+    const { maxTokensPerRow, maxOutputRowsPerInputRow, maxOutputRowsPerBatch, maxTokenBytes } = options || {}
+    if (maxTokensPerRow !== undefined) args.max_tokens_per_row = maxTokensPerRow
+    if (maxOutputRowsPerInputRow !== undefined) args.max_output_rows_per_input_row = maxOutputRowsPerInputRow
+    if (maxOutputRowsPerBatch !== undefined) args.max_output_rows_per_batch = maxOutputRowsPerBatch
+    if (maxTokenBytes !== undefined) args.max_token_bytes = maxTokenBytes
     return { op: 'explode', args }
   },
 
@@ -396,8 +506,11 @@ const ops = {
     return { op: 'split', args }
   },
 
-  unpivot(columns) {
-    return { op: 'unpivot', args: { columns } }
+  unpivot(columns, { maxOutputRowsPerInputRow, maxOutputRowsPerBatch } = {}) {
+    const args = { columns }
+    if (maxOutputRowsPerInputRow !== undefined) args.max_output_rows_per_input_row = maxOutputRowsPerInputRow
+    if (maxOutputRowsPerBatch !== undefined) args.max_output_rows_per_batch = maxOutputRowsPerBatch
+    return { op: 'unpivot', args }
   },
 
   pivot(nameColumn, valueColumn, { agg, categories, maxCategories, sorted = false } = {}) {
@@ -409,14 +522,36 @@ const ops = {
     return { op: 'pivot', args }
   },
 
-  normalize(columns, { method = 'minmax', audit = false, auditLimit } = {}) {
+  interpolate(column, { method = 'linear', missing, onTypeError } = {}) {
+    const args = { column, method }
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
+    return { op: 'interpolate', args }
+  },
+
+  normalize(columns, { method = 'minmax', audit = false, auditLimit, missing, onTypeError, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const cols = Array.isArray(columns)
       ? columns
       : String(columns).split(',').map(c => c.trim()).filter(Boolean)
     const args = { columns: cols, method }
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
     return { op: 'normalize', args }
+  },
+
+  acf(column, { lags = 20, missing, onTypeError } = {}) {
+    const args = { column, lags }
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
+    return { op: 'acf', args }
   },
 
   top(n, column, desc = true) {
@@ -451,8 +586,10 @@ const ops = {
     return { op: 'slice-max', args: { n, column, desc: true, with_ties: false } }
   },
 
-  sample(n) {
-    return { op: 'sample', args: { n } }
+  sample(n, { seed = 0 } = {}) {
+    const args = { n }
+    if (seed !== 0) args.seed = seed
+    return { op: 'sample', args }
   },
 
   groupAgg(groupBy, aggs, { maxGroups, maxStateBytes, sorted = false } = {}) {
@@ -463,7 +600,7 @@ const ops = {
     return { op: 'group-agg', args }
   },
 
-  frequency(columns, { maxValues, maxStateBytes, overflow, other, audit = false, auditLimit } = {}) {
+  frequency(columns, { maxValues, maxStateBytes, overflow, other, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = {}
     if (columns) args.columns = columns
     if (maxValues !== undefined) args.max_values = maxValues
@@ -472,6 +609,12 @@ const ops = {
     if (other !== undefined) args.other = other
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'frequency', args }
   },
 
@@ -495,9 +638,20 @@ const ops = {
     return { op: 'label-encode', args }
   },
 
-  datetime(column, extract) {
+  datetime(column, extractOrOptions, options = {}) {
     const args = { column }
-    if (extract) args.extract = extract
+    let opts = options || {}
+    if (Array.isArray(extractOrOptions) || typeof extractOrOptions === 'string') {
+      args.extract = extractOrOptions
+    } else if (extractOrOptions && typeof extractOrOptions === 'object') {
+      opts = extractOrOptions
+    } else if (extractOrOptions !== undefined && extractOrOptions !== null) {
+      args.extract = extractOrOptions
+    }
+    if (opts.extract !== undefined) args.extract = opts.extract
+    if (opts.missing !== undefined) args.missing = opts.missing
+    if (opts.onTypeError !== undefined) args.on_type_error = opts.onTypeError
+    if (opts.on_type_error !== undefined) args.on_type_error = opts.on_type_error
     return { op: 'datetime', args }
   },
 
@@ -536,10 +690,16 @@ const ops = {
     return { op: 'json-filter', args }
   },
 
-  jsonSchema(schema, { column = '_line', mode = 'annotate', result = '_valid', audit = false, auditLimit } = {}) {
+  jsonSchema(schema, { column = '_line', mode = 'annotate', result = '_valid', audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { column, schema, mode, result }
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
+    if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow
+    if (auditColumns !== undefined) args.audit_columns = auditColumns
+    if (auditRedact !== undefined) args.audit_redact = auditRedact
+    if (auditHashColumns !== undefined) args.audit_hash_columns = auditHashColumns
+    if (auditMaxBytes !== undefined) args.audit_max_bytes = Number(auditMaxBytes)
+    if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     return { op: 'json-schema', args }
   },
 
@@ -691,9 +851,12 @@ const ops = {
     return { op: 'rleid', args }
   },
 
-  dateTrunc(column, trunc, { result } = {}) {
+  dateTrunc(column, trunc, { result, missing, onTypeError, on_type_error } = {}) {
     const args = { column, trunc }
     if (result) args.result = result
+    if (missing !== undefined) args.missing = missing
+    if (onTypeError !== undefined) args.on_type_error = onTypeError
+    if (on_type_error !== undefined) args.on_type_error = on_type_error
     return { op: 'date-trunc', args }
   }
 }

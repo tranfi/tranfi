@@ -165,17 +165,17 @@ Codecs convert between raw bytes and columnar batches. Every pipeline starts wit
 
 | Method | Description |
 |--------|-------------|
-| `codec.csv({ delimiter, header, batchSize, repair, mode, strict, maxErrorBytes, maxRecordBytes, nulls, quotedNulls, skip, nMax, maxRows, comment, trimWs, skipEmptyRows })` | CSV decoder. `mode: 'strict'` fails on field-count mismatches; `repair: true` / `mode: 'repair'` emits repair diagnostics; `maxRecordBytes` bounds buffered records; `nulls: ['NA']` adds null sentinels; `skip: 2`, `nMax: 100`, `comment: '#'`, `trimWs: false`, and `skipEmptyRows: true` control row-local parsing |
+| `codec.csv({ delimiter, header, batchSize, repair, mode, strict, maxErrorBytes, maxRecordBytes, maxColumns, nulls, quotedNulls, skip, nMax, maxRows, comment, trimWs, skipEmptyRows, audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | CSV decoder. `mode: 'strict'` fails on field-count mismatches; `repair: true` / `mode: 'repair'` emits repair diagnostics; `maxRecordBytes` bounds buffered records; `nulls: ['NA']` adds null sentinels; `skip: 2`, `nMax: 100`, `comment: '#'`, `trimWs: false`, and `skipEmptyRows: true` control row-local parsing; repair audit/raw diagnostics support privacy controls with pseudo-column `raw` |
 | `codec.csvEncode({ delimiter })` | CSV encoder |
-| `codec.jsonl({ batchSize, onError, maxErrorBytes })` | JSON Lines decoder. `onError` is `skip`, `fail`, `warn`, or `quarantine` |
+| `codec.jsonl({ batchSize, onError, maxErrorBytes, maxRecordBytes })` | JSON Lines decoder. `onError` is `skip`, `fail`, `warn`, or `quarantine` |
 | `codec.jsonlEncode()` | JSON Lines encoder |
-| `codec.text({ batchSize })` | Line-oriented text decoder (single `_line` column) |
+| `codec.text({ batchSize, maxErrorBytes, maxRecordBytes })` | Line-oriented text decoder (single `_line` column) |
 | `codec.textEncode()` | Text encoder |
 | `codec.tableEncode({ maxWidth, maxRows })` | Pretty-print Markdown table |
 
-CSV treats unquoted empty fields as null by default. Pass `nulls: ['NA', 'NULL']` to add sentinel strings; pass `quotedNulls: false` when quoted sentinels like `"NA"` or `""` should remain strings. Default field-count handling is permissive for compatibility. Use `mode: 'strict'` or `strict: true` to fail on row/header width mismatches. Use `repair: true` or `mode: 'repair'` to pad/truncate and collect JSONL diagnostics in `result.errors`; `maxErrorBytes` bounds raw previews. `maxRecordBytes` defaults to `67108864` bytes, caps the current record buffer before a newline is seen, and rejects with a `csv_record_too_large` diagnostic when exceeded; pass `0` to disable the guard. `skip: 2` discards preamble records before header/schema discovery; comments are applied after skipped rows. `nMax: 100` / `maxRows: 100` keeps at most that many decoded data rows after skip/comment/header handling and uses only one counter; `nMax: 0` preserves a header-only schema batch. `comment: '#'` removes text after an unquoted marker and skips comment-only rows; quoted markers are preserved. Unquoted spaces/tabs are trimmed by default; pass `trimWs: false` to preserve them. Blank physical rows after the header are preserved as all-null rows by default; pass `skipEmptyRows: true` to drop them.
+CSV treats unquoted empty fields as null by default. Pass `nulls: ['NA', 'NULL']` to add sentinel strings; pass `quotedNulls: false` when quoted sentinels like `"NA"` or `""` should remain strings. Default field-count handling is permissive for compatibility. Use `mode: 'strict'` or `strict: true` to fail on row/header width mismatches. Use `repair: true` or `mode: 'repair'` to pad/truncate and collect JSONL diagnostics in `result.errors`; `maxErrorBytes` bounds raw previews, and `auditIncludeRow`, `auditColumns`, `auditRedact`, `auditHashColumns`, `auditMaxBytes`, and `auditMaxCellBytes` govern repair audit/raw payloads with the raw preview exposed as pseudo-column `raw`. `maxRecordBytes` defaults to `67108864` bytes, caps the current record buffer before a newline is seen, and rejects with a `csv_record_too_large` diagnostic when exceeded; pass `0` to disable the guard. `maxColumns` defaults to `8192`; records above the cap reject with a bounded `csv_too_many_columns` diagnostic instead of silently dropping columns. Decoder size options are checked before execution: `batchSize` must be `1..65536`, `maxErrorBytes` must be `0..67108864`, `maxRecordBytes` must be `0..1073741824`, and `maxColumns` must be `1..65536`. `skip: 2` discards preamble records before header/schema discovery; comments are applied after skipped rows. `nMax: 100` / `maxRows: 100` keeps at most that many decoded data rows after skip/comment/header handling and uses only one counter; `nMax: 0` preserves a header-only schema batch. `comment: '#'` removes text after an unquoted marker and skips comment-only rows; quoted markers are preserved. Unquoted spaces/tabs are trimmed by default; pass `trimWs: false` to preserve them. Blank physical rows after the header are preserved as all-null rows by default; pass `skipEmptyRows: true` to drop them.
 
-Malformed JSONL records are skipped by default. Set `onError: 'warn'` or `onError: 'quarantine'` to keep valid rows and collect JSONL diagnostics in `result.errors`; set `onError: 'fail'` to reject on the first malformed line. `maxErrorBytes` bounds the raw preview stored in diagnostics.
+Malformed JSONL records are skipped by default. Set `onError: 'warn'` or `onError: 'quarantine'` to keep valid rows and collect JSONL diagnostics in `result.errors`; set `onError: 'fail'` to reject on the first malformed line. `maxErrorBytes` bounds the raw preview stored in diagnostics, and `maxRecordBytes` applies the same current-line guard as CSV/text.
 
 Cross-codec pipelines work naturally:
 
@@ -193,19 +193,19 @@ pipeline([codec.jsonl(), ops.sort(['name']), codec.csvEncode()])
 
 | Method | Description |
 |--------|-------------|
-| `ops.filter(expr)` | Keep rows matching expression |
+| `ops.filter(expr, { audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes }?)` | Keep rows matching expression; optional dropped-row audit records support row omission, column allowlists, redaction, hashes, and payload caps |
 | `ops.head(n)` | First N rows |
 | `ops.tail(n)` | Last N rows |
 | `ops.skip(n)` | Skip first N rows |
 | `ops.top(n, column, desc?)` | Top N by column value |
-| `ops.sample(n)` | Reservoir sampling (uniform random) |
+| `ops.sample(n, { seed })` | Deterministic bounded reservoir sampling; use `seed: 'random'` for nondeterministic mode |
 | `ops.grep(pattern, { invert, column, regex })` | Substring/regex filter |
-| `ops.validate(expr, { rules, rulesFile, audit, auditLimit, maxFailures, warnFailureRate, maxFailureRate, name, message }?)` | Add `_valid` boolean column, keep all rows; supports inline rules or local JSON rule-suite files; step stats include checked/passed/failed/failure-rate counters; optional bounded failure audit records and count/rate thresholds |
-| `ops.assert(expr, { action, name, message, result, aggregate, op, value, column }?)` | Row-local data-quality rule or finish-time O(1) aggregate assertion; aggregate mode supports `count`, `sum:col`, `avg:col`, `min:col`, `max:col`, `missing:col`, and `non_null:col` with `fail`/`warn` |
-| `ops.quarantine(expr, { name, message }?)` | Route rows matching expression to `errors` and drop them from main output |
-| `ops.schema({ columns, required, nonNull, nullable, values, min, max, regex, mode, result })` | Row-local table schema contract; fail, warn, filter, quarantine, or annotate |
+| `ops.validate(expr, { rules, rulesFile, audit, auditLimit, maxFailures, warnFailureRate, maxFailureRate, name, message, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes }?)` | Add `_valid` boolean column, keep all rows; supports inline rules or local JSON rule-suite files; bounded failure audit records support count/rate thresholds plus privacy controls |
+| `ops.assert(expr, { action, name, message, result, aggregate, op, value, column, tolerance, rel, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes }?)` | Row-local data-quality rule or finish-time O(1) aggregate assertion; row-local failure side-channel records support privacy controls |
+| `ops.quarantine(expr, { name, message, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes }?)` | Route rows matching expression to `errors` and drop them from main output; row payloads support privacy controls |
+| `ops.schema({ columns, required, nonNull, nullable, values, min, max, regex, mode='fail', result='_schema', maxRegexPatternBytes, maxRegexCellBytes, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | Row-local table schema contract; fail, warn, filter, quarantine, or annotate; regex budgets default to 4096-byte patterns and 65536-byte cells; schema audit/error records support row omission, column allowlists, redaction, stable non-cryptographic hashes, and row/cell payload caps |
 | `ops.schemaInfer({ rows })` | Bounded decoded-type/nullability schema report; defaults to 10000 sampled rows |
-| `ops.tee({ expr, channel, columns, limit, every, name })` | Preserve main rows and write bounded JSONL row snapshots to a side channel |
+| `ops.tee({ expr, channel, columns, limit, every, name, includeRow, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | Preserve main rows and write bounded JSONL row snapshots to a side channel; row payloads support privacy controls |
 
 ### Column operations
 
@@ -217,14 +217,18 @@ pipeline([codec.jsonl(), ops.sort(['name']), codec.csvEncode()])
 | `ops.derive(columns)` | Computed columns: `derive({ total: expr("col('a')*col('b')") })` |
 | `ops.sourceName({ result, defaultValue })` | Append the current host source path/name as a row-local string column |
 | `ops.across(columns, { fn, functions, names, replace })` | Apply row-local functions over selected columns |
-| `ops.cast(mapping, { audit, auditLimit })` | Type conversion; optional bounded value/coercion audit records |
+| `ops.cast(mapping, { audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | Type conversion; optional bounded value/coercion audit records support privacy controls |
 | `ops.trim(columns?)` | Strip whitespace |
-| `ops.fillNull(mapping, { audit, auditLimit })` | Replace nulls: `fillNull({ age: '0' })` |
+| `ops.fillNull(mapping, { audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | Replace nulls; optional bounded audit records support privacy controls |
 | `ops.fillDown(columns?)` | Forward-fill nulls |
 | `ops.clip(column, { min, max })` | Clamp numeric values |
-| `ops.replace(column, pattern, replacement, { regex, audit, auditLimit })` | String find/replace |
+| `ops.replace(column, pattern, replacement, { regex, audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | String find/replace; optional bounded audit records support privacy controls |
 | `ops.hash(columns?)` | Add `_hash` column (DJB2) |
-| `ops.bin(column, boundaries)` | Discretize into bins |
+| `ops.bin(column, boundaries, { missing, onTypeError })` | Discretize into bins with strict numeric-source defaults |
+| `ops.ewma(column, alpha, { result, missing, onTypeError })` | Exponentially weighted moving average |
+| `ops.anomaly(column, { threshold, result, missing, onTypeError })` | Streaming z-score anomaly flag |
+| `ops.normalize(columns, { method, audit, auditLimit, missing, onTypeError, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | Blocking minmax/zscore normalization; optional audit records support privacy controls |
+| `ops.acf(column, { lags, missing, onTypeError })` | Blocking autocorrelation table |
 
 `columns` may contain exact names or selector strings: `id:score`, `starts_with(score_)`, `ends_with(_id)`, `contains(temp)`, `matches(^score_)`, `where(numeric)`, strict `all_of(score,name)`, lenient `any_of(optional,score)`, exclusions with `!name` or `-name`, and boolean selector algebra such as `starts_with(score_)&where(numeric)`, `starts_with(score_)&!ends_with(raw)`, or `!(id:score)`. Ranges use input schema order and can be reversed. Helper matching is case-insensitive; exact names are case-sensitive. These selectors are resolved by the native schema-aware `select`, `relocate`, and `across` ops in `O(columns)` without retaining rows; SQL lowering rejects selector helpers without a known schema.
 
@@ -242,7 +246,7 @@ Example: `ops.across(['starts_with(score_)'], { fn: 'round' })` replaces selecte
 | Method | Description |
 |--------|-------------|
 | `ops.stats(statsList?)` | Column statistics. Stats: `count`, `min`, `max`, `sum`, `avg`, `stddev`, `variance`, `median`, `p25`, `p75`, `p90`, `p99`, `distinct`, `hist`, `sample` |
-| `ops.frequency(columns?, { maxValues, maxStateBytes, overflow, other, audit, auditLimit }?)` | Value counts; `overflow: "other"` can emit bounded category-overflow audit records |
+| `ops.frequency(columns?, { maxValues, maxStateBytes, overflow, other, audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes }?)` | Value counts; `overflow: "other"` can emit bounded category-overflow audit records with privacy controls |
 | `ops.groupAgg(groupBy, aggs)` | Group by + aggregate. `count` on a column counts non-null values; `column: '*'` counts rows. |
 
 ```js
@@ -259,8 +263,8 @@ ops.groupAgg(['city'], [
 | Method | Description |
 |--------|-------------|
 | `ops.step(column, func, result?)` | Running aggregation: `running-sum`, `running-avg`, `running-min`, `running-max`, `lag` |
-| `ops.window(column, size, func, result?)` | Sliding window: `avg`, `sum`, `min`, `max` |
-| `ops.rollingSum/rollingMean/rollingMin/rollingMax(column, size, { result })` | Named trailing fixed-row numeric windows |
+| `ops.window(column, size, func, resultOrOptions?)` | Sliding window: `avg`, `sum`, `min`, `max`; options include `result`, `missing`, `onTypeError` |
+| `ops.rollingSum/rollingMean/rollingMin/rollingMax(column, size, { result, missing, onTypeError })` | Named trailing fixed-row numeric windows; default missing/non-numeric source fails |
 | `ops.rollingAny/rollingAll(column, size, { result, nulls })` | Boolean trailing windows; `nulls`: `ignore`, `false`, `true`, `propagate` |
 | `ops.lead(column, { offset, result })` | Lookahead N rows |
 | `ops.lag(column, { offset, result })` | Previous-row shift |
@@ -272,26 +276,29 @@ ops.groupAgg(['city'], [
 
 | Method | Description |
 |--------|-------------|
-| `ops.explode(column, delimiter?)` | Split delimited string into rows |
+| `ops.explode(column, delimiter?, { maxTokensPerRow, maxOutputRowsPerInputRow, maxOutputRowsPerBatch, maxTokenBytes })` | Split delimited string into rows with optional expansion caps |
 | `ops.split(column, names, delimiter?)` | Split column into multiple columns |
-| `ops.unpivot(columns)` | Wide to long (melt) |
+| `ops.unpivot(columns, { maxOutputRowsPerInputRow, maxOutputRowsPerBatch })` | Wide to long (melt) with optional expansion caps |
 | `ops.stack(file, { tag, tagValue })` | Vertically concatenate another CSV file |
+
+`explode` caps fail fast with `maxTokensPerRow`, `maxOutputRowsPerInputRow`, `maxOutputRowsPerBatch`, or `maxTokenBytes` when a single row or batch would expand beyond the configured limit. `unpivot` supports `maxOutputRowsPerInputRow` and `maxOutputRowsPerBatch`.
 
 ### Date/time
 
 | Method | Description |
 |--------|-------------|
-| `ops.datetime(column, extract?)` | Extract parts: `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday` |
-| `ops.dateTrunc(column, trunc, { result })` | Truncate to: `year`, `month`, `day`, `hour`, `minute`, `second` |
+| `ops.datetime(column, extractOrOptions?)` | Extract parts: `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday`; accepts `{ extract, missing, onTypeError }` |
+| `ops.dateTrunc(column, trunc, { result, missing, onTypeError })` | Truncate to: `year`, `month`, `day`, `hour`, `minute`, `second` |
 
 ### Other
 
 | Method | Description |
 |--------|-------------|
 | `ops.flatten()` | Flatten nested columns |
+| `ops.interpolate(column, { method, missing, onTypeError })` | Fill nulls in a numeric column; default missing/non-numeric source fails |
 | `ops.jsonExtract(path, result, { column, type })` | Extract JSON Pointer/simple JSONPath value into a new column |
 | `ops.jsonFilter(path, { op, value, column, type })` | Filter rows by JSON Pointer/simple JSONPath predicate |
-| `ops.jsonSchema(schema, { column, mode, result })` | Validate JSON text with a supported JSON Schema subset |
+| `ops.jsonSchema(schema, { column, mode, result, audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes })` | Validate JSON text with a supported JSON Schema subset; filter-mode audit records support privacy controls |
 | `ops.jsonFlatten(fields, { column })` | Append declared JSON Pointer/simple JSONPath fields as bounded output columns |
 | `ops.reorder(columns)` | Alias for `select` |
 | `ops.dedup(columns?)` | Alias for `unique` |
@@ -390,6 +397,8 @@ await pipeline('csv | unique city max_keys=10000 | csv').run({ inputFile: 'data.
 ```
 
 Native Node execution supports spill-backed `sort`, capped unsorted `pivot`, unsorted `unique`/`dedup`, unsorted `group-agg`, capped unsorted `join` inner/left, unsorted `semi-join`/`anti-join`, unsorted set operations, and duplicate-eliminating `union` when `spillDir` is provided. `run()`, `iterChunks()`, `toReadable()`, and `writeTo()` drain finish-time merge output through N-API `finishStep()` instead of waiting for one whole `finish()`. Standalone WASM supports `allowBlocking` and `memory`, but rejects `spillDir` because browser/WASM spill storage would occupy WASM memory. Use the Node native addon, CLI/direct C, or `{ engine: 'duckdb' }` for external spill; with DuckDB, `memory` maps to `memory_limit` and `spillDir` maps to `temp_directory`.
+
+Plan-internal file reads are denied by default in Node and WASM. Pass `allowFs: true` for trusted local lookup files used by `join`, set operations, `union`, or `stack`; pass both `allowFs: true` and `allowRulesFile: true` for `validate rules_file=...`; pass `workspaceRoot` to pin resolved core plan paths inside a trusted directory. Supplying `spillDir` opts into local filesystem spill for Node native execution; standalone WASM still rejects spill. `inputFile` and `inputFiles` are host source adapters and are not controlled by `allowFs`.
 
 ## DuckDB engine
 
@@ -506,4 +515,4 @@ const tf = await createTranfi()
 
 ## Architecture
 
-The Node.js package wraps the same C11 core used by the CLI, Python, and WASM targets. Data flows through columnar batches with typed columns (`bool`, `int64`, `float64`, `string`, `date`, `timestamp`) and per-cell null bitmaps. `run({ inputFile })` streams files with `createReadStream()` and drains native/WASM main output after each push and each incremental finish boundary; by default it still collects the final output for convenience. `.gz` input files are decompressed through a `zlib.createGunzip()` source transform; use `compression: "none"` to force raw bytes or `compression: "gzip"` to force gzip for `inputFile`/`inputStream`. Use `inputStream`, `toReadable()`, `writeTo()`, `onOutput` with `collectOutput: false`, or `iterChunks()` for large inputs/outputs and backpressure-aware sinks. Native execution is strict by default: row-local and bounded-state operators stream, blocking operators require `allowBlocking: true` or supported `spillDir`, and capped key-state plans can be checked with `memory: "64MB"`.
+The Node.js package wraps the same C11 core used by the CLI, Python, and WASM targets. Data flows through columnar batches with typed columns (`bool`, `int64`, `float64`, `string`, `date`, `timestamp`) and per-cell null bitmaps. `run({ inputFile })` streams files with `createReadStream()` and drains native/WASM main output after each push and each incremental finish boundary; by default it still collects the final output for convenience. `.gz` input files are decompressed through a `zlib.createGunzip()` source transform; use `compression: "none"` to force raw bytes or `compression: "gzip"` to force gzip for `inputFile`/`inputStream`. Use `inputStream`, `toReadable()`, `writeTo()`, `onOutput` with `collectOutput: false`, or `iterChunks()` for large inputs/outputs and backpressure-aware sinks. Native execution is strict by default: row-local and bounded-state operators stream, blocking operators require `allowBlocking: true` or supported `spillDir`, capped key-state plans can be checked with `memory: "64MB"`, and core plan file reads require explicit host-policy options.

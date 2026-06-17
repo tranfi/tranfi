@@ -214,7 +214,7 @@ async function handleRun (res, dataDir, body) {
   if (!existsSync(filePath)) return sendError(res, `File not found: ${file}`, 404)
 
   const p = pipeline(dsl)
-  const result = await p.run({ inputFile: filePath })
+  const result = await p.run({ inputFile: filePath, hostedAuditDefaults: true })
 
   const output = result.outputText
   const stats = result.statsText

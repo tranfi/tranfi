@@ -25,11 +25,19 @@ static int clip_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++)
-        tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]);
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
     for (size_t r = 0; r < in->n_rows; r++) {
-        tf_batch_copy_row(ob, r, in, r);
-        ob->n_rows = r + 1;
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
     }
 
     int ci = tf_batch_col_index(ob, st->column);
@@ -40,12 +48,18 @@ static int clip_process(tf_step *self, tf_batch *in, tf_batch **out,
                 int64_t v = tf_batch_get_int64(ob, r, ci);
                 if (st->has_min && v < (int64_t)st->min_val) v = (int64_t)st->min_val;
                 if (st->has_max && v > (int64_t)st->max_val) v = (int64_t)st->max_val;
-                tf_batch_set_int64(ob, r, ci, v);
+                if (tf_batch_set_int64(ob, r, (size_t)ci, v) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
             } else if (ob->col_types[ci] == TF_TYPE_FLOAT64) {
                 double v = tf_batch_get_float64(ob, r, ci);
                 if (st->has_min && v < st->min_val) v = st->min_val;
                 if (st->has_max && v > st->max_val) v = st->max_val;
-                tf_batch_set_float64(ob, r, ci, v);
+                if (tf_batch_set_float64(ob, r, (size_t)ci, v) != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
             }
         }
     }
@@ -72,6 +86,7 @@ tf_step *tf_clip_create(const cJSON *args) {
     clip_state *st = calloc(1, sizeof(clip_state));
     if (!st) return NULL;
     st->column = strdup(col_j->valuestring);
+    if (!st->column) { free(st); return NULL; }
 
     cJSON *min_j = cJSON_GetObjectItemCaseSensitive(args, "min");
     if (cJSON_IsNumber(min_j)) { st->min_val = min_j->valuedouble; st->has_min = 1; }

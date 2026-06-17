@@ -7,9 +7,10 @@
         "csrc/cJSON.c",
         "csrc/arena.c",
         "csrc/buffer.c",
+        "csrc/size_utils.c",
+        "csrc/spill.c",
         "csrc/batch.c",
         "csrc/pipeline.c",
-        "csrc/plan.c",
         "csrc/expr.c",
         "csrc/selector.c",
         "csrc/memory_estimate.c",
@@ -91,7 +92,19 @@
       "include_dirs": [
         "csrc"
       ],
-      "cflags": ["-std=c11", "-Wall", "-D_POSIX_C_SOURCE=200809L"]
+      "cflags": [
+        "-std=c11",
+        "-Wall",
+        "-D_POSIX_C_SOURCE=200809L",
+        "-D_FORTIFY_SOURCE=3",
+        "-Werror=implicit-function-declaration",
+        "-Werror=incompatible-pointer-types",
+        "-Wformat",
+        "-Werror=format-security",
+        "-Werror=unused-result",
+        "-fno-common",
+        "-fstack-protector-strong"
+      ]
     }
   ]
 }

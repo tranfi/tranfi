@@ -25,31 +25,8 @@ typedef struct {
     size_t   checked_rows;
     size_t   kept_rows;
     size_t   quarantined_rows;
+    tf_audit_options audit_opts;
 } quarantine_state;
-
-static cJSON *quarantine_cell_to_json(const tf_batch *b, size_t row, size_t col) {
-    if (!b || col >= b->n_cols || row >= b->n_rows || tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));
-        case TF_TYPE_INT64: return cJSON_CreateNumber((double)tf_batch_get_int64(b, row, col));
-        case TF_TYPE_FLOAT64: return cJSON_CreateNumber(tf_batch_get_float64(b, row, col));
-        case TF_TYPE_STRING: return cJSON_CreateString(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE: return cJSON_CreateNumber((double)tf_batch_get_date(b, row, col));
-        case TF_TYPE_TIMESTAMP: return cJSON_CreateNumber((double)tf_batch_get_timestamp(b, row, col));
-        default: return cJSON_CreateNull();
-    }
-}
-
-static cJSON *quarantine_row_to_json(const tf_batch *b, size_t row) {
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) return NULL;
-    for (size_t c = 0; c < b->n_cols; c++) {
-        cJSON *value = quarantine_cell_to_json(b, row, c);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, b->col_names[c] ? b->col_names[c] : "", value);
-    }
-    return obj;
-}
 
 static int emit_quarantine_record(quarantine_state *st, const tf_batch *b, size_t row,
                                   tf_side_channels *side, const char *reason) {
@@ -65,22 +42,14 @@ static int emit_quarantine_record(quarantine_state *st, const tf_batch *b, size_
     cJSON_AddStringToObject(obj, "expr", st->expr_text ? st->expr_text : "");
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    cJSON *row_obj = quarantine_row_to_json(b, row);
+    cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(side->errors, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(side->errors, "\n");
+    int rc = tf_buffer_write_line(side->errors, line);
     free(line);
     return rc;
-}
-
-static int copy_schema(tf_batch *dst, const tf_batch *src) {
-    for (size_t c = 0; c < src->n_cols; c++) {
-        if (tf_batch_set_schema(dst, c, src->col_names[c], src->col_types[c]) != TF_OK) return TF_ERROR;
-    }
-    return TF_OK;
 }
 
 static int quarantine_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -90,7 +59,7 @@ static int quarantine_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    if (copy_schema(ob, in) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
+    if (tf_batch_clone_schema(ob, in) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
 
     size_t out_row = 0;
     for (size_t r = 0; r < in->n_rows; r++) {
@@ -145,6 +114,7 @@ static void quarantine_destroy(tf_step *self) {
         free(st->expr_text);
         free(st->name);
         free(st->message);
+        tf_audit_options_free(&st->audit_opts);
         free(st);
     }
     free(self);
@@ -163,6 +133,7 @@ tf_step *tf_quarantine_create(const cJSON *args) {
 
     quarantine_state *st = calloc(1, sizeof(quarantine_state));
     if (!st) { tf_expr_free(expr); return NULL; }
+    tf_audit_options_init(&st->audit_opts, 1);
     st->expr = expr;
     st->expr_text = strdup(expr_json->valuestring);
     cJSON *name_json = cJSON_GetObjectItemCaseSensitive(args, "name");
@@ -174,6 +145,16 @@ tf_step *tf_quarantine_create(const cJSON *args) {
         free(st->expr_text);
         free(st->name);
         free(st->message);
+        tf_audit_options_free(&st->audit_opts);
+        free(st);
+        return NULL;
+    }
+    if (tf_audit_options_parse(&st->audit_opts, args, "quarantine") != TF_OK) {
+        tf_expr_free(expr);
+        free(st->expr_text);
+        free(st->name);
+        free(st->message);
+        tf_audit_options_free(&st->audit_opts);
         free(st);
         return NULL;
     }
@@ -184,6 +165,7 @@ tf_step *tf_quarantine_create(const cJSON *args) {
         free(st->expr_text);
         free(st->name);
         free(st->message);
+        tf_audit_options_free(&st->audit_opts);
         free(st);
         return NULL;
     }

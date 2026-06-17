@@ -237,11 +237,9 @@ static int json_filter_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows > 0 ? in->n_rows : 1);
     if (!ob) return TF_ERROR;
-    for (size_t c = 0; c < in->n_cols; c++) {
-        if (tf_batch_set_schema(ob, c, in->col_names[c], in->col_types[c]) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
 
     int ci = tf_batch_col_index(in, st->column);
@@ -338,6 +336,7 @@ tf_step *tf_json_filter_create(const cJSON *args) {
     if (!args) return NULL;
     cJSON *path_j = cJSON_GetObjectItemCaseSensitive(args, "path");
     if (!cJSON_IsString(path_j)) return NULL;
+    if (tf_json_path_validate(path_j->valuestring) != TF_OK) return NULL;
 
     cJSON *column_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     const char *column = cJSON_IsString(column_j) && column_j->valuestring[0] != '\0'

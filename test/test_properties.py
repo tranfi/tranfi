@@ -9,7 +9,7 @@ Tests invariants that must hold for any valid input data:
 - Derive column addition
 - Chunk-boundary parity for representative streaming pipelines
 - CSV codec fuzz cases for quotes, invalid UTF-8 bytes, and record-size caps
-- JSONL codec fuzz cases for valid objects, malformed diagnostics, and fail-fast errors
+- JSONL/text codec fuzz cases for valid objects, malformed diagnostics, fail-fast errors, and record-size caps
 - DSL parser fuzz cases for valid pipelines, alias normalization, and clean failures
 - Expression parser fuzz cases for row-local filters/derives and clean failures
 - Schema validator fuzz cases for annotate/filter/quarantine row routing
@@ -24,7 +24,9 @@ import sys
 import csv
 import io
 import json
+import struct
 import tempfile
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'py'))
 build_dir = os.path.join(os.path.dirname(__file__), '..', 'build')
@@ -73,15 +75,22 @@ def parse_jsonl_output(text):
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
+def float_bits(value):
+    return struct.unpack('>Q', struct.pack('>d', float(value)))[0]
+
+
 def compile_dsl_plan(dsl):
     """Compile DSL and parse the returned recipe JSON."""
     return json.loads(tf.compile_dsl(dsl))
 
 
-def run_pipeline(steps, data, allow_blocking=False):
+def run_pipeline(steps, data, allow_blocking=False, chunk_size=None):
     """Run a pipeline and return output text."""
     p = tf.pipeline(steps)
-    result = p.run(input=data, allow_blocking=allow_blocking)
+    kwargs = {'input': data, 'allow_blocking': allow_blocking}
+    if chunk_size is not None:
+        kwargs['chunk_size'] = chunk_size
+    result = p.run(**kwargs)
     return result.output_text
 
 
@@ -538,6 +547,46 @@ def expr_string_case(draw):
 # --- Tests ---
 
 @given(
+    value=st.floats(width=64, allow_nan=False, allow_infinity=False),
+    chunk_size=st.sampled_from([1, 2, 3, 7, 64]),
+)
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
+def test_float_roundtrip_bits_csv_and_jsonl(value, chunk_size):
+    data = f"x\n{repr(value)}\n".encode('ascii')
+    expected = float_bits(value)
+
+    csv_out = run_pipeline([tf.codec.csv(batch_size=1), tf.codec.csv_encode()], data, chunk_size=chunk_size)
+    _, csv_rows = parse_csv_output(csv_out)
+    assert len(csv_rows) == 1
+    assert float_bits(float(csv_rows[0][0])) == expected
+
+    jsonl_out = run_pipeline([tf.codec.csv(batch_size=1), tf.codec.jsonl_encode()], data, chunk_size=chunk_size)
+    json_rows = [json.loads(line, parse_int=float) for line in jsonl_out.splitlines() if line.strip()]
+    assert len(json_rows) == 1
+    assert isinstance(json_rows[0]['x'], float)
+    assert float_bits(json_rows[0]['x']) == expected
+
+
+
+def test_csv_wide_columns_and_max_columns_chunk_boundaries():
+    headers = [f'col{i}' for i in range(300)]
+    row = [f'v{i}' for i in range(300)]
+    data = make_csv(headers, [row])
+    for chunk_size in [1, 2, 3, 7, 64, len(data)]:
+        out = run_pipeline([tf.codec.csv(batch_size=1), tf.codec.csv_encode()], data, chunk_size=chunk_size)
+        out_headers, out_rows = parse_csv_output(out)
+        assert len(out_headers) == 300
+        assert out_headers[255] == 'col255'
+        assert out_headers[299] == 'col299'
+        assert out_rows == [row]
+
+    over_cap = b'a,b,c,d\n1,2,3,4\n'
+    for chunk_size in [1, 2, 7, len(over_cap)]:
+        with pytest.raises(RuntimeError, match='csv record exceeds max_columns'):
+            run_pipeline([tf.codec.csv(max_columns=3), tf.codec.csv_encode()], over_cap, chunk_size=chunk_size)
+
+
+@given(
     rows=st.lists(
         st.lists(safe_cell, min_size=3, max_size=3),
         min_size=1, max_size=20
@@ -922,6 +971,36 @@ def test_csv_max_record_bytes_rejects_oversized_record_across_chunks():
             assert 'csv record exceeds max_record_bytes' in str(exc)
         else:
             raise AssertionError(f'max_record_bytes did not fail for chunk size {chunk_size}')
+
+
+def test_jsonl_max_record_bytes_rejects_oversized_record_across_chunks():
+    """JSONL record-size caps must fail consistently across chunk cuts."""
+    data = b'{"id":1}\n{"name":"' + (b'x' * 80) + b'"}'
+    for chunk_size in chunk_parity_sizes(data):
+        try:
+            tf.pipeline('jsonl max_record_bytes=32 | csv').run(
+                input=data,
+                chunk_size=chunk_size,
+            )
+        except RuntimeError as exc:
+            assert 'jsonl record exceeds max_record_bytes' in str(exc)
+        else:
+            raise AssertionError(f'jsonl max_record_bytes did not fail for chunk size {chunk_size}')
+
+
+def test_text_max_record_bytes_rejects_oversized_record_across_chunks():
+    """Text record-size caps must bound long no-newline lines across chunk cuts."""
+    data = b'ok\n' + (b'x' * 80)
+    for chunk_size in chunk_parity_sizes(data):
+        try:
+            tf.pipeline('text max_record_bytes=32 | text').run(
+                input=data,
+                chunk_size=chunk_size,
+            )
+        except RuntimeError as exc:
+            assert 'text record exceeds max_record_bytes' in str(exc)
+        else:
+            raise AssertionError(f'text max_record_bytes did not fail for chunk size {chunk_size}')
 
 
 # --- JSONL codec fuzz and boundary tests ---
