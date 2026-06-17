@@ -11203,6 +11203,20 @@ static void test_compile_dsl(void) {
     assert(strstr(json, "\"memory_class\":\"bounded_state\"") != NULL);
     assert(strstr(json, "\"emit_class\":\"per_batch\"") != NULL);
     assert(strstr(json, "\"schema_class\":\"stable\"") != NULL);
+    assert(strstr(json, "\"state_bytes_estimate\":null") != NULL);
+    tf_string_free(json);
+
+    json = tf_compile_dsl("csv | unique name max_keys=3 | csv",
+                          strlen("csv | unique name max_keys=3 | csv"), &error);
+    assert(json != NULL);
+    assert(strstr(json, "\"state_bytes_estimate\":1888") != NULL);
+    assert(strstr(json, "state_bytes_reason") == NULL);
+    tf_string_free(json);
+
+    json = tf_compile_dsl("csv | unique name | csv", strlen("csv | unique name | csv"), &error);
+    assert(json != NULL);
+    assert(strstr(json, "\"state_bytes_estimate\":null") != NULL);
+    assert(strstr(json, "\"state_bytes_reason\":\"step 'unique' needs max_keys") != NULL);
     tf_string_free(json);
 }
 

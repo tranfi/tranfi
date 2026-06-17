@@ -99,6 +99,7 @@ grep -q "blocking step 'pivot'" "$tmp/err" || fail "missing unguarded pivot bloc
 # Capped key-state plans get conservative byte estimates and enforce the budget.
 "$bin" --explain --memory=max:64KB 'csv | unique name max_keys=2 | csv' > "$tmp/explain" 2> "$tmp/err"
 grep -q '^state_bytes_estimate:' "$tmp/explain" || fail "explain missing key-state byte estimate"
+grep -q '"state_bytes_estimate":1600' "$tmp/explain" || fail "explain IR missing key-state byte estimate"
 "$bin" --memory max:64KB 'csv | unique name max_keys=2 | csv' < "$input" > "$tmp/out" 2> "$tmp/err"
 grep -q '^Bob,30' "$tmp/out" || fail "capped unique failed under sufficient memory policy"
 if "$bin" --memory max:1KB 'csv | unique name max_keys=2 | csv' < "$input" > "$tmp/out" 2> "$tmp/err"; then

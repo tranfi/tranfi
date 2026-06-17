@@ -3741,6 +3741,7 @@ def test_compile_dsl():
     assert data['steps'][1]['memory_class'] == 'bounded_state'
     assert data['steps'][1]['emit_class'] == 'per_batch'
     assert data['steps'][1]['state_estimate'] == 'O(1)'
+    assert data['steps'][1]['state_bytes_estimate'] is None
     assert data['steps'][1]['schema_class'] == 'stable'
     assert data['steps'][2]['op'] == 'codec.csv.encode'
 
@@ -3751,6 +3752,11 @@ def test_compile_dsl():
         'codec.csv.decode', 'derive', 'sort', 'unique', 'group-agg', 'codec.csv.encode'
     ]
     assert aliases['steps'][3]['args']['max_keys'] == 7
+    assert aliases['steps'][3]['state_bytes_estimate'] == 3040
+
+    uncapped_unique = json.loads(tf.compile_dsl('csv | unique city | csv'))
+    assert uncapped_unique['steps'][1]['state_bytes_estimate'] is None
+    assert 'needs max_keys' in uncapped_unique['steps'][1]['state_bytes_reason']
 
     slice_plan = json.loads(tf.compile_dsl('csv | slice_head n=2 | slice-tail 1 | csv'))
     assert slice_plan['steps'][1]['op'] == 'slice-head'

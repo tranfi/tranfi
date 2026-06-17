@@ -11,7 +11,7 @@
  * }
  */
 
-#include "ir.h"
+#include "internal.h"
 #include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +99,17 @@ char *tf_ir_to_json(const tf_ir_plan *plan) {
         cJSON_AddStringToObject(step, "emit_class", tf_emit_class_name(node->emit_class));
         cJSON_AddStringToObject(step, "schema_class", tf_schema_class_name(node->schema_class));
         cJSON_AddStringToObject(step, "state_estimate", node->state_estimate ? node->state_estimate : "unknown");
+        size_t state_bytes = 0;
+        char state_reason[192] = {0};
+        if (tf_estimate_step_state_bytes(node, &state_bytes, state_reason, sizeof(state_reason))) {
+            cJSON_AddNumberToObject(step, "state_bytes_estimate", (double)state_bytes);
+        } else {
+            cJSON_AddNullToObject(step, "state_bytes_estimate");
+            if (node->memory_class == TF_MEM_KEY_STATE || node->memory_class == TF_MEM_BLOCKING) {
+                cJSON_AddStringToObject(step, "state_bytes_reason",
+                                        state_reason[0] ? state_reason : "no native byte estimator");
+            }
+        }
         cJSON_AddItemToArray(steps, step);
     }
 

@@ -3810,12 +3810,18 @@ await test('compileDsl', async () => {
   assert(data.steps[1].memory_class === 'bounded_state', 'head memory metadata')
   assert(data.steps[1].emit_class === 'per_batch', 'head emit metadata')
   assert(data.steps[1].state_estimate === 'O(1)', 'head state estimate')
+  assert(data.steps[1].state_bytes_estimate === null, 'head has no retained byte estimate')
   assert(data.steps[1].schema_class === 'stable', 'head schema metadata')
   assert(data.steps[2].op === 'codec.csv.encode', 'third step is csv encode')
 
   const aliasPlan = JSON.parse(await compileDsl("csv | mutate total=col('price')*2 | arrange -total | distinct city max_keys=7 | summarize city count:*:rows | csv"))
   assert(aliasPlan.steps.map(step => step.op).join(',') === 'codec.csv.decode,derive,sort,unique,group-agg,codec.csv.encode', 'aliases should normalize to canonical ops')
   assert(aliasPlan.steps[3].args.max_keys === 7, 'distinct alias should preserve unique args')
+  assert(aliasPlan.steps[3].state_bytes_estimate === 3040, 'capped distinct alias should expose byte estimate')
+
+  const uncappedUnique = JSON.parse(await compileDsl('csv | unique city | csv'))
+  assert(uncappedUnique.steps[1].state_bytes_estimate === null, 'uncapped unique should expose null byte estimate')
+  assert(String(uncappedUnique.steps[1].state_bytes_reason || '').includes('needs max_keys'), 'uncapped unique should explain missing byte cap')
 
   const slicePlan = JSON.parse(await compileDsl('csv | slice_head n=2 | slice-tail 1 | csv'))
   assert(slicePlan.steps[1].op === 'slice-head', 'slice_head alias should normalize')
