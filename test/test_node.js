@@ -4166,6 +4166,13 @@ await test('compileToSql grep literal metacharacters', async () => {
   assert(!backslashSql.includes(' LIKE '), 'backslash grep should not lower through LIKE wildcards')
 })
 
+await test('compileToSql rejects sample', async () => {
+  await assertRejects(
+    () => compileToSql('csv | sample 2 seed=42 | csv'),
+    /sample.*cannot be lowered to SQL/
+  )
+})
+
 await test('compileToSql between', async () => {
   const sql = await compileToSql('csv | filter "between(col(\'age\'), 25, 35)" | csv')
   assert(sql.includes('"age" BETWEEN 25 AND 35'), 'between should lower to SQL BETWEEN')
@@ -4399,6 +4406,13 @@ if (hasDuckDB) {
           `DuckDB grep parity failed for ${dsl}\nnative=${native.outputText}\nduck=${duck.outputText}`)
       }
     }
+  })
+
+  await test('duckdb rejects sample', async () => {
+    await assertRejects(
+      () => pipeline('csv | sample 2 seed=42 | csv', { engine: 'duckdb' }).run({ input: csvData }),
+      /sample.*cannot be lowered to SQL/
+    )
   })
 
   await test('duckdb select', async () => {

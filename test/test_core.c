@@ -4619,6 +4619,17 @@ static void test_compile_to_sql_grep_literal_chars(void) {
     tf_string_free(sql);
 }
 
+static void test_compile_to_sql_rejects_sample(void) {
+    const char *dsl = "csv | sample 2 seed=42 | csv";
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql == NULL);
+    assert(error != NULL);
+    assert(strstr(error, "sample") != NULL);
+    assert(strstr(error, "cannot be lowered to SQL") != NULL);
+    free(error);
+}
+
 static void test_pipeline_create_from_ir(void) {
     const char *json =
         "{\"steps\":["
@@ -12453,6 +12464,7 @@ int main(int argc, char **argv) {
     printf("\nCompiler:\n");
     TEST(test_compile_native_valid);
     TEST(test_compile_to_sql_grep_literal_chars);
+    TEST(test_compile_to_sql_rejects_sample);
     TEST(test_pipeline_create_from_ir);
     TEST(test_public_ir_api);
 

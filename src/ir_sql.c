@@ -730,9 +730,8 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
 
   /* ---- sample ---- */
   if (strcmp(op, "sample") == 0) {
-    int n = jint(args, "n", 100);
-    sb_appendf(sb, "%s AS (SELECT * FROM %s USING SAMPLE %d)", cte_name, prev, n);
-    return 0;
+    *error = strdup("sample: deterministic reservoir sampling cannot be lowered to SQL");
+    return -1;
   }
 
   /* ---- grep ---- */
