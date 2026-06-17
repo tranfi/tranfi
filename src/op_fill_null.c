@@ -172,7 +172,12 @@ static int fill_null_flush(tf_step *self, tf_batch **out, tf_side_channels *side
 static void fill_null_state_free(fill_null_state *st) {
     if (!st) return;
     tf_audit_options_free(&st->audit_opts);
-    for (size_t i = 0; i < st->n; i++) { free(st->col_names[i]); free(st->defaults[i]); }
+    if (st->col_names) {
+        for (size_t i = 0; i < st->n; i++) free(st->col_names[i]);
+    }
+    if (st->defaults) {
+        for (size_t i = 0; i < st->n; i++) free(st->defaults[i]);
+    }
     free(st->col_names);
     free(st->defaults);
     free(st);
@@ -201,6 +206,7 @@ tf_step *tf_fill_null_create(const cJSON *args) {
     int i = 0;
     cJSON *entry = NULL;
     cJSON_ArrayForEach(entry, mapping) {
+        if (!entry->string || !entry->string[0]) { fill_null_state_free(st); return NULL; }
         st->col_names[i] = strdup(entry->string);
         st->defaults[i] = strdup(cJSON_IsString(entry) ? entry->valuestring : "");
         if (!st->col_names[i] || !st->defaults[i]) { fill_null_state_free(st); return NULL; }

@@ -171,6 +171,11 @@ int main(void) {
         "a,b,c\n"
         "1,2\n"
         "3,4,5,6\n";
+    const char *audit_rows =
+        "name,city,note,secret\n"
+        "Alice,NY,NA,111\n"
+        "Bob,LA,,bad\n"
+        "Cara,SF,NA,12x\n";
 
     const char *union_lookup_path = "/tmp/tranfi_oom_union_lookup.csv";
     FILE *union_lookup = fopen(union_lookup_path, "wb");
@@ -339,6 +344,12 @@ int main(void) {
             360
         },
         {
+            "audit_privacy_producers",
+            "csv batch_size=1 nulls=NA | fill-null note=SECRET audit audit_columns=note audit_redact=note | cast secret=int audit audit_columns=secret audit_redact=secret | frequency city max_values=1 overflow=other audit audit_limit=1 audit_columns=city audit_redact=city | csv",
+            audit_rows,
+            620
+        },
+        {
             "aggregate_assert_grep_passthrough",
             "csv batch_size=1 | assert aggregate=sum:score op=>= value=60 action=warn | grep missing invert=true | csv",
             people,
@@ -379,6 +390,12 @@ int main(void) {
             "csv batch_size=1 | top 2 score | csv",
             people,
             260
+        },
+        {
+            "bounded_rank_aliases",
+            "csv batch_size=1 | bottom-k 3 score | slice-min name n=2 with_ties=false | csv",
+            people,
+            360
         },
         {
             "blocking_sort",
@@ -497,6 +514,12 @@ int main(void) {
         {
             "sorted_key_state_modes",
             "csv batch_size=1 | unique city sorted=true | group-agg city sum:score:total sorted=true | csv",
+            sorted_people,
+            360
+        },
+        {
+            "rowid_group_modes",
+            "csv batch_size=1 | rowid city result=city_row max_state_bytes=2048 | rowid city result=city_run sorted=true | csv",
             sorted_people,
             360
         },

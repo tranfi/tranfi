@@ -303,7 +303,9 @@ static int cast_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
 static void cast_state_free(cast_state *st) {
     if (!st) return;
     tf_audit_options_free(&st->audit_opts);
-    for (size_t i = 0; i < st->n; i++) free(st->col_names[i]);
+    if (st->col_names) {
+        for (size_t i = 0; i < st->n; i++) free(st->col_names[i]);
+    }
     free(st->col_names);
     free(st->target_types);
     free(st);
@@ -323,8 +325,8 @@ tf_step *tf_cast_create(const cJSON *args) {
     cast_state *st = calloc(1, sizeof(cast_state));
     if (!st) return NULL;
     tf_audit_options_init(&st->audit_opts, 1);
-    st->col_names = calloc((size_t)n, sizeof(char *));
-    st->target_types = calloc((size_t)n, sizeof(tf_type));
+    st->col_names = tf_callocarray_checked(n > 0 ? (size_t)n : 1, sizeof(char *));
+    st->target_types = tf_callocarray_checked(n > 0 ? (size_t)n : 1, sizeof(tf_type));
     st->n = (size_t)n;
     st->audit_limit = 1000;
     if (!st->col_names || !st->target_types) { cast_state_free(st); return NULL; }
@@ -332,6 +334,7 @@ tf_step *tf_cast_create(const cJSON *args) {
     int i = 0;
     cJSON *entry = NULL;
     cJSON_ArrayForEach(entry, mapping) {
+        if (!entry->string || !entry->string[0]) { cast_state_free(st); return NULL; }
         st->col_names[i] = strdup(entry->string);
         st->target_types[i] = cJSON_IsString(entry) ? parse_type(entry->valuestring) : TF_TYPE_NULL;
         if (!st->col_names[i]) { cast_state_free(st); return NULL; }
