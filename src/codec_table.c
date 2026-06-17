@@ -16,10 +16,8 @@
 
 #include "internal.h"
 #include "cJSON.h"
-#include "date_utils.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 #define TABLE_MAX_COLS      256
 #define TABLE_DEFAULT_WIDTH 40
@@ -36,33 +34,13 @@ typedef struct {
 
 /* Format a cell value as a string. Caller must free. */
 static char *cell_to_string(tf_batch *b, size_t row, size_t col) {
-    if (tf_batch_is_null(b, row, col)) return strdup("");
-
-    char buf[128];
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL:
-            return strdup(tf_batch_get_bool(b, row, col) ? "true" : "false");
-        case TF_TYPE_INT64:
-            snprintf(buf, sizeof(buf), "%lld", (long long)tf_batch_get_int64(b, row, col));
-            return strdup(buf);
-        case TF_TYPE_FLOAT64:
-            snprintf(buf, sizeof(buf), "%g", tf_batch_get_float64(b, row, col));
-            return strdup(buf);
-        case TF_TYPE_STRING:
-            return strdup(tf_batch_get_string(b, row, col));
-        case TF_TYPE_DATE: {
-            char dbuf[32];
-            tf_date_format(tf_batch_get_date(b, row, col), dbuf, sizeof(dbuf));
-            return strdup(dbuf);
-        }
-        case TF_TYPE_TIMESTAMP: {
-            char tsbuf[40];
-            tf_timestamp_format(tf_batch_get_timestamp(b, row, col), tsbuf, sizeof(tsbuf));
-            return strdup(tsbuf);
-        }
-        default:
-            return strdup("");
+    char buf[64];
+    const char *text = NULL;
+    if (tf_batch_format_cell_as_string(b, row, col, TF_CELL_STRING_HUMAN,
+                                       buf, sizeof(buf), &text) != TF_OK) {
+        return NULL;
     }
+    return strdup(text ? text : "");
 }
 
 static int table_capture_schema(table_encoder_state *st, const tf_batch *in) {

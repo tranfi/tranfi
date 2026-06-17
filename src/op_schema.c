@@ -570,35 +570,15 @@ static int parse_regex_map(schema_state *st, const cJSON *obj) {
 }
 
 static int cell_to_string(const tf_batch *b, size_t row, size_t col, char *buf, size_t buf_size) {
-    if (tf_batch_is_null(b, row, col)) {
+    const char *text = NULL;
+    if (tf_batch_format_cell_as_string(b, row, col, TF_CELL_STRING_NUMERIC_TIME,
+                                       buf, buf_size, &text) != TF_OK) {
         if (buf_size) buf[0] = '\0';
         return 0;
     }
-    switch (b->col_types[col]) {
-        case TF_TYPE_BOOL:
-            snprintf(buf, buf_size, "%s", tf_batch_get_bool(b, row, col) ? "true" : "false");
-            return 1;
-        case TF_TYPE_INT64:
-            snprintf(buf, buf_size, "%lld", (long long)tf_batch_get_int64(b, row, col));
-            return 1;
-        case TF_TYPE_FLOAT64:
-            snprintf(buf, buf_size, "%.17g", tf_batch_get_float64(b, row, col));
-            return 1;
-        case TF_TYPE_STRING: {
-            const char *s = tf_batch_get_string(b, row, col);
-            snprintf(buf, buf_size, "%s", s ? s : "");
-            return 1;
-        }
-        case TF_TYPE_DATE:
-            snprintf(buf, buf_size, "%d", (int)tf_batch_get_date(b, row, col));
-            return 1;
-        case TF_TYPE_TIMESTAMP:
-            snprintf(buf, buf_size, "%lld", (long long)tf_batch_get_timestamp(b, row, col));
-            return 1;
-        default:
-            if (buf_size) buf[0] = '\0';
-            return 0;
-    }
+    if (!text) return 0;
+    if (text != buf) snprintf(buf, buf_size, "%s", text);
+    return 1;
 }
 
 static int cell_to_number(const tf_batch *b, size_t row, size_t col, double *out) {

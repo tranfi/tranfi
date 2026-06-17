@@ -439,7 +439,7 @@ static void test_batch_schema_copy_helpers(void) {
     cols[0] = 99;
     assert(tf_batch_copy_selected_row(selected, 0, src, 0, cols, 2) == TF_ERROR);
 
-    tf_batch *fmt_src = tf_batch_create(6, 1);
+    tf_batch *fmt_src = tf_batch_create(7, 1);
     assert(fmt_src != NULL);
     assert(tf_batch_set_schema(fmt_src, 0, "flag", TF_TYPE_BOOL) == TF_OK);
     assert(tf_batch_set_schema(fmt_src, 1, "count", TF_TYPE_INT64) == TF_OK);
@@ -447,28 +447,54 @@ static void test_batch_schema_copy_helpers(void) {
     assert(tf_batch_set_schema(fmt_src, 3, "label", TF_TYPE_STRING) == TF_OK);
     assert(tf_batch_set_schema(fmt_src, 4, "day", TF_TYPE_DATE) == TF_OK);
     assert(tf_batch_set_schema(fmt_src, 5, "when", TF_TYPE_TIMESTAMP) == TF_OK);
+    assert(tf_batch_set_schema(fmt_src, 6, "missing", TF_TYPE_STRING) == TF_OK);
     assert(tf_batch_set_bool(fmt_src, 0, 0, true) == TF_OK);
     assert(tf_batch_set_int64(fmt_src, 0, 1, -42) == TF_OK);
-    assert(tf_batch_set_float64(fmt_src, 0, 2, 1.25) == TF_OK);
+    assert(tf_batch_set_float64(fmt_src, 0, 2, 0.1) == TF_OK);
     assert(tf_batch_set_string(fmt_src, 0, 3, "ok") == TF_OK);
-    assert(tf_batch_set_date(fmt_src, 0, 4, tf_date_from_ymd(2024, 3, 15)) == TF_OK);
-    assert(tf_batch_set_timestamp(fmt_src, 0, 5,
-                                  tf_timestamp_from_parts(2024, 3, 15, 12, 34, 56, 120000)) == TF_OK);
+    int32_t fmt_day = tf_date_from_ymd(2024, 3, 15);
+    int64_t fmt_when = tf_timestamp_from_parts(2024, 3, 15, 12, 34, 56, 120000);
+    assert(tf_batch_set_date(fmt_src, 0, 4, fmt_day) == TF_OK);
+    assert(tf_batch_set_timestamp(fmt_src, 0, 5, fmt_when) == TF_OK);
     assert(tf_batch_expose_row(fmt_src, 0) == TF_OK);
 
-    tf_batch *fmt_dst = tf_batch_create(6, 1);
+    char fmt_buf[64];
+    const char *fmt_text = NULL;
+    assert(tf_batch_format_cell_as_string(fmt_src, 0, 4, TF_CELL_STRING_ROUNDTRIP,
+                                          fmt_buf, sizeof(fmt_buf), &fmt_text) == TF_OK);
+    assert(fmt_text != NULL && strcmp(fmt_text, "2024-03-15") == 0);
+    assert(tf_batch_format_cell_as_string(fmt_src, 0, 6, TF_CELL_STRING_ROUNDTRIP,
+                                          fmt_buf, sizeof(fmt_buf), &fmt_text) == TF_OK);
+    assert(fmt_text == NULL);
+    assert(tf_batch_format_cell_as_string(fmt_src, 0, 2, TF_CELL_STRING_HUMAN,
+                                          fmt_buf, sizeof(fmt_buf), &fmt_text) == TF_OK);
+    assert(fmt_text != NULL && strcmp(fmt_text, "0.1") == 0);
+    char expected_num[64];
+    snprintf(expected_num, sizeof(expected_num), "%d", (int)fmt_day);
+    assert(tf_batch_format_cell_as_string(fmt_src, 0, 4, TF_CELL_STRING_NUMERIC_TIME,
+                                          fmt_buf, sizeof(fmt_buf), &fmt_text) == TF_OK);
+    assert(fmt_text != NULL && strcmp(fmt_text, expected_num) == 0);
+    snprintf(expected_num, sizeof(expected_num), "%lld", (long long)fmt_when);
+    assert(tf_batch_format_cell_as_string(fmt_src, 0, 5, TF_CELL_STRING_NUMERIC_TIME,
+                                          fmt_buf, sizeof(fmt_buf), &fmt_text) == TF_OK);
+    assert(fmt_text != NULL && strcmp(fmt_text, expected_num) == 0);
+    assert(tf_batch_format_cell_as_string(fmt_src, 1, 0, TF_CELL_STRING_ROUNDTRIP,
+                                          fmt_buf, sizeof(fmt_buf), &fmt_text) == TF_ERROR);
+
+    tf_batch *fmt_dst = tf_batch_create(7, 1);
     assert(fmt_dst != NULL);
-    for (size_t i = 0; i < 6; i++) {
+    for (size_t i = 0; i < 7; i++) {
         assert(tf_batch_set_schema(fmt_dst, i, fmt_src->col_names[i], TF_TYPE_STRING) == TF_OK);
         assert(tf_batch_copy_cell_as_string(fmt_dst, 0, i, fmt_src, 0, i) == TF_OK);
     }
     assert(tf_batch_expose_row(fmt_dst, 0) == TF_OK);
     assert(strcmp(tf_batch_get_string(fmt_dst, 0, 0), "true") == 0);
     assert(strcmp(tf_batch_get_string(fmt_dst, 0, 1), "-42") == 0);
-    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 2), "1.25") == 0);
+    assert(strcmp(tf_batch_get_string(fmt_dst, 0, 2), "0.10000000000000001") == 0);
     assert(strcmp(tf_batch_get_string(fmt_dst, 0, 3), "ok") == 0);
     assert(strcmp(tf_batch_get_string(fmt_dst, 0, 4), "2024-03-15") == 0);
     assert(strcmp(tf_batch_get_string(fmt_dst, 0, 5), "2024-03-15T12:34:56.12Z") == 0);
+    assert(tf_batch_is_null(fmt_dst, 0, 6));
     assert(tf_batch_copy_cell_as_string(fmt_src, 0, 0, fmt_dst, 0, 0) == TF_ERROR);
 
     tf_batch_free(fmt_dst);
@@ -724,6 +750,18 @@ static void test_pipeline_float_roundtrip_bits(void) {
             assert_jsonl_float_bits(values[i], chunks[j]);
         }
     }
+}
+
+static void test_pipeline_table_human_float_format(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"codec.table.encode\",\"args\":{}}"
+        "]}";
+    char out[1024];
+    run_plan_chunked(plan, "x\n0.1\n", 1, out, sizeof(out));
+    assert(strstr(out, "0.1") != NULL);
+    assert(strstr(out, "0.10000000000000001") == NULL);
 }
 
 typedef struct sink_capture {
@@ -11976,6 +12014,7 @@ int main(int argc, char **argv) {
     printf("\nPipeline (CSV):\n");
     TEST(test_pipeline_csv_passthrough);
     TEST(test_pipeline_float_roundtrip_bits);
+    TEST(test_pipeline_table_human_float_format);
     TEST(test_pipeline_sink_callbacks);
     TEST(test_pipeline_batch_sink_callbacks);
     TEST(test_pipeline_progress_callback);

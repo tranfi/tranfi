@@ -375,45 +375,83 @@ int tf_batch_copy_cell_index(tf_batch *dst, size_t dst_row, size_t dst_col,
     return tf_batch_copy_cell(dst, dst_row, dst_col, src, src_row, (size_t)src_col);
 }
 
+int tf_batch_format_cell_as_string(const tf_batch *src, size_t src_row, size_t src_col,
+                                   tf_cell_string_format format, char *buf, size_t buf_size,
+                                   const char **out) {
+    if (!src || !buf || buf_size == 0 || !out || src_row >= src->n_rows || src_col >= src->n_cols) {
+        return TF_ERROR;
+    }
+    *out = NULL;
+    buf[0] = '\0';
+    if (tf_batch_is_null(src, src_row, src_col)) return TF_OK;
+
+    int n = 0;
+    switch (src->col_types[src_col]) {
+        case TF_TYPE_STRING:
+            *out = tf_batch_get_string(src, src_row, src_col);
+            return TF_OK;
+        case TF_TYPE_INT64:
+            n = snprintf(buf, buf_size, "%lld",
+                         (long long)tf_batch_get_int64(src, src_row, src_col));
+            if (n < 0 || (size_t)n >= buf_size) return TF_ERROR;
+            *out = buf;
+            return TF_OK;
+        case TF_TYPE_FLOAT64:
+            if (format == TF_CELL_STRING_HUMAN) {
+                n = snprintf(buf, buf_size, "%g", tf_batch_get_float64(src, src_row, src_col));
+                if (n < 0 || (size_t)n >= buf_size) return TF_ERROR;
+            } else {
+                if (tf_format_float64(buf, buf_size,
+                                      tf_batch_get_float64(src, src_row, src_col)) != TF_OK) {
+                    return TF_ERROR;
+                }
+            }
+            *out = buf;
+            return TF_OK;
+        case TF_TYPE_BOOL:
+            *out = tf_batch_get_bool(src, src_row, src_col) ? "true" : "false";
+            return TF_OK;
+        case TF_TYPE_DATE:
+            if (format == TF_CELL_STRING_NUMERIC_TIME) {
+                n = snprintf(buf, buf_size, "%d", (int)tf_batch_get_date(src, src_row, src_col));
+                if (n < 0 || (size_t)n >= buf_size) return TF_ERROR;
+            } else {
+                tf_date_format(tf_batch_get_date(src, src_row, src_col), buf, buf_size);
+            }
+            *out = buf;
+            return TF_OK;
+        case TF_TYPE_TIMESTAMP:
+            if (format == TF_CELL_STRING_NUMERIC_TIME) {
+                n = snprintf(buf, buf_size, "%lld",
+                             (long long)tf_batch_get_timestamp(src, src_row, src_col));
+                if (n < 0 || (size_t)n >= buf_size) return TF_ERROR;
+            } else {
+                tf_timestamp_format(tf_batch_get_timestamp(src, src_row, src_col), buf, buf_size);
+            }
+            *out = buf;
+            return TF_OK;
+        default:
+            return TF_OK;
+    }
+}
+
 int tf_batch_copy_cell_as_string(tf_batch *dst, size_t dst_row, size_t dst_col,
                                  const tf_batch *src, size_t src_row, size_t src_col) {
     if (!dst || !src || src_row >= src->n_rows || src_col >= src->n_cols ||
         dst_col >= dst->n_cols || dst->col_types[dst_col] != TF_TYPE_STRING) {
         return TF_ERROR;
     }
-    if (tf_batch_is_null(src, src_row, src_col)) {
-        return tf_batch_set_null(dst, dst_row, dst_col);
-    }
 
     char buf[64];
-    int n = 0;
-    switch (src->col_types[src_col]) {
-        case TF_TYPE_STRING:
-            return tf_batch_set_string(dst, dst_row, dst_col,
-                                       tf_batch_get_string(src, src_row, src_col));
-        case TF_TYPE_INT64:
-            n = snprintf(buf, sizeof(buf), "%lld",
-                         (long long)tf_batch_get_int64(src, src_row, src_col));
-            if (n < 0 || (size_t)n >= sizeof(buf)) return TF_ERROR;
-            return tf_batch_set_string(dst, dst_row, dst_col, buf);
-        case TF_TYPE_FLOAT64:
-            if (tf_format_float64(buf, sizeof(buf),
-                                  tf_batch_get_float64(src, src_row, src_col)) != TF_OK) {
-                return TF_ERROR;
-            }
-            return tf_batch_set_string(dst, dst_row, dst_col, buf);
-        case TF_TYPE_BOOL:
-            return tf_batch_set_string(dst, dst_row, dst_col,
-                                       tf_batch_get_bool(src, src_row, src_col) ? "true" : "false");
-        case TF_TYPE_DATE:
-            tf_date_format(tf_batch_get_date(src, src_row, src_col), buf, sizeof(buf));
-            return tf_batch_set_string(dst, dst_row, dst_col, buf);
-        case TF_TYPE_TIMESTAMP:
-            tf_timestamp_format(tf_batch_get_timestamp(src, src_row, src_col), buf, sizeof(buf));
-            return tf_batch_set_string(dst, dst_row, dst_col, buf);
-        default:
-            return tf_batch_set_null(dst, dst_row, dst_col);
+    const char *text = NULL;
+    if (tf_batch_format_cell_as_string(src, src_row, src_col, TF_CELL_STRING_ROUNDTRIP,
+                                       buf, sizeof(buf), &text) != TF_OK) {
+        return TF_ERROR;
     }
+    if (!text) {
+        return tf_batch_set_null(dst, dst_row, dst_col);
+    }
+    return tf_batch_set_string(dst, dst_row, dst_col, text);
 }
 
 int tf_batch_clone_schema(tf_batch *dst, const tf_batch *src) {
@@ -668,30 +706,11 @@ cJSON *tf_audit_cell_to_json(const tf_batch *b, size_t row, size_t col, const tf
     if (tf_batch_is_null(b, row, col)) return cJSON_CreateNull();
     if (tf_audit_column_is_redacted(opts, name) || tf_audit_column_is_hashed(opts, name)) {
         char raw[128];
-        switch (b->col_types[col]) {
-            case TF_TYPE_BOOL:
-                snprintf(raw, sizeof(raw), "%s", tf_batch_get_bool(b, row, col) ? "true" : "false");
-                break;
-            case TF_TYPE_INT64:
-                snprintf(raw, sizeof(raw), "%lld", (long long)tf_batch_get_int64(b, row, col));
-                break;
-            case TF_TYPE_FLOAT64:
-                if (tf_format_float64(raw, sizeof(raw), tf_batch_get_float64(b, row, col)) != TF_OK)
-                    return NULL;
-                break;
-            case TF_TYPE_STRING:
-                return audit_string_json(opts, name, tf_batch_get_string(b, row, col));
-            case TF_TYPE_DATE:
-                snprintf(raw, sizeof(raw), "%d", (int)tf_batch_get_date(b, row, col));
-                break;
-            case TF_TYPE_TIMESTAMP:
-                snprintf(raw, sizeof(raw), "%lld", (long long)tf_batch_get_timestamp(b, row, col));
-                break;
-            default:
-                raw[0] = '\0';
-                break;
-        }
-        return audit_string_json(opts, name, raw);
+        const char *text = NULL;
+        if (tf_batch_format_cell_as_string(b, row, col, TF_CELL_STRING_NUMERIC_TIME,
+                                           raw, sizeof(raw), &text) != TF_OK)
+            return NULL;
+        return audit_string_json(opts, name, text ? text : "");
     }
     switch (b->col_types[col]) {
         case TF_TYPE_BOOL: return cJSON_CreateBool(tf_batch_get_bool(b, row, col));

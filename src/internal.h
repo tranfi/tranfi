@@ -181,6 +181,12 @@ int64_t   tf_batch_get_timestamp(const tf_batch *b, size_t row, size_t col);
 int tf_batch_col_index(const tf_batch *b, const char *name);
 
 /* Schema and row-copy helpers. */
+typedef enum tf_cell_string_format {
+    TF_CELL_STRING_ROUNDTRIP,   /* round-trip floats, ISO dates/timestamps */
+    TF_CELL_STRING_HUMAN,       /* short floats, ISO dates/timestamps */
+    TF_CELL_STRING_NUMERIC_TIME /* round-trip floats, numeric dates/timestamps */
+} tf_cell_string_format;
+
 TF_WARN_UNUSED int tf_batch_clone_schema(tf_batch *dst, const tf_batch *src);
 TF_WARN_UNUSED int tf_batch_clone_with_extra_cols(tf_batch *dst, const tf_batch *src,
                                                   const char **names, const tf_type *types,
@@ -189,6 +195,10 @@ TF_WARN_UNUSED int tf_batch_copy_cell(tf_batch *dst, size_t dst_row, size_t dst_
                                       const tf_batch *src, size_t src_row, size_t src_col);
 TF_WARN_UNUSED int tf_batch_copy_cell_index(tf_batch *dst, size_t dst_row, size_t dst_col,
                                             const tf_batch *src, size_t src_row, int src_col);
+TF_WARN_UNUSED int tf_batch_format_cell_as_string(const tf_batch *src, size_t src_row, size_t src_col,
+                                                  tf_cell_string_format format,
+                                                  char *buf, size_t buf_size,
+                                                  const char **out);
 TF_WARN_UNUSED int tf_batch_copy_cell_as_string(tf_batch *dst, size_t dst_row, size_t dst_col,
                                                 const tf_batch *src, size_t src_row, size_t src_col);
 TF_WARN_UNUSED int tf_batch_copy_selected_row(tf_batch *dst, size_t dst_row,
