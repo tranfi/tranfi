@@ -8,7 +8,7 @@ PYTEST ?= $(PYTHON) -m pytest
 SANITIZER_RUN := $(shell if command -v setarch >/dev/null 2>&1 && setarch "$$(uname -m)" -R true >/dev/null 2>&1; then printf 'setarch %s -R' "$$(uname -m)"; fi)
 ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
 
-.PHONY: all build test clean wasm app site verify fuzz fuzz-c-csv fuzz-c-expr fuzz-c-selector fuzz-c-dsl fuzz-c-jsonl fuzz-c-jsonpath
+.PHONY: all build test clean wasm app site verify fuzz fuzz-smoke fuzz-nightly fuzz-c-csv fuzz-c-expr fuzz-c-selector fuzz-c-dsl fuzz-c-jsonl fuzz-c-jsonpath
 .PHONY: build-c build-debug build-tsan build-node build-wasm build-js build-py sync-js-csrc sync-py-csrc
 .PHONY: check-js-csrc-sync check-py-csrc-sync check-csrc-sync sbom test-packaging test-packaging-install
 .PHONY: test-packaging-node test-packaging-node-install test-packaging-python test-packaging-python-install test-properties
@@ -160,32 +160,42 @@ test-packaging-install: test-packaging-python-install test-packaging-node-instal
 
 fuzz: fuzz-c-csv fuzz-c-expr fuzz-c-selector fuzz-c-dsl fuzz-c-jsonl fuzz-c-jsonpath
 
+fuzz-smoke:
+	$(MAKE) fuzz FUZZ_ARGS="$(FUZZ_SMOKE_ARGS)"
+
+fuzz-nightly:
+	$(MAKE) fuzz FUZZ_ARGS="$(FUZZ_NIGHTLY_ARGS)"
+
 fuzz-c-csv: build/fuzz_csv
-	@mkdir -p corpus/csv
-	$(ASAN_RUN) ./build/fuzz_csv corpus/csv $(FUZZ_ARGS)
+	@mkdir -p $(FUZZ_WORK_DIR)/csv
+	$(ASAN_RUN) ./build/fuzz_csv $(FUZZ_WORK_DIR)/csv $(FUZZ_SEED_DIR)/csv $(FUZZ_ARGS)
 
 fuzz-c-expr: build/fuzz_expr
-	@mkdir -p corpus/expr
-	$(ASAN_RUN) ./build/fuzz_expr corpus/expr $(FUZZ_ARGS)
+	@mkdir -p $(FUZZ_WORK_DIR)/expr
+	$(ASAN_RUN) ./build/fuzz_expr $(FUZZ_WORK_DIR)/expr $(FUZZ_SEED_DIR)/expr $(FUZZ_ARGS)
 
 fuzz-c-selector: build/fuzz_selector
-	@mkdir -p corpus/selector
-	$(ASAN_RUN) ./build/fuzz_selector corpus/selector $(FUZZ_ARGS)
+	@mkdir -p $(FUZZ_WORK_DIR)/selector
+	$(ASAN_RUN) ./build/fuzz_selector $(FUZZ_WORK_DIR)/selector $(FUZZ_SEED_DIR)/selector $(FUZZ_ARGS)
 
 fuzz-c-dsl: build/fuzz_dsl
-	@mkdir -p corpus/dsl
-	$(ASAN_RUN) ./build/fuzz_dsl corpus/dsl $(FUZZ_ARGS)
+	@mkdir -p $(FUZZ_WORK_DIR)/dsl
+	$(ASAN_RUN) ./build/fuzz_dsl $(FUZZ_WORK_DIR)/dsl $(FUZZ_SEED_DIR)/dsl $(FUZZ_ARGS)
 
 fuzz-c-jsonl: build/fuzz_jsonl
-	@mkdir -p corpus/jsonl
-	$(ASAN_RUN) ./build/fuzz_jsonl corpus/jsonl $(FUZZ_ARGS)
+	@mkdir -p $(FUZZ_WORK_DIR)/jsonl
+	$(ASAN_RUN) ./build/fuzz_jsonl $(FUZZ_WORK_DIR)/jsonl $(FUZZ_SEED_DIR)/jsonl $(FUZZ_ARGS)
 
 fuzz-c-jsonpath: build/fuzz_jsonpath
-	@mkdir -p corpus/jsonpath
-	$(ASAN_RUN) ./build/fuzz_jsonpath corpus/jsonpath $(FUZZ_ARGS)
+	@mkdir -p $(FUZZ_WORK_DIR)/jsonpath
+	$(ASAN_RUN) ./build/fuzz_jsonpath $(FUZZ_WORK_DIR)/jsonpath $(FUZZ_SEED_DIR)/jsonpath $(FUZZ_ARGS)
 
 FUZZ_CC ?= clang
 FUZZ_ARGS ?= -runs=256 -max_len=4096 -timeout=5
+FUZZ_SMOKE_ARGS ?= -runs=256 -max_len=4096 -timeout=5
+FUZZ_NIGHTLY_ARGS ?= -runs=8192 -max_len=8192 -timeout=10
+FUZZ_WORK_DIR ?= corpus
+FUZZ_SEED_DIR ?= test/corpus
 FUZZ_SRC = $(filter-out src/main.c,$(wildcard src/*.c))
 FUZZ_CFLAGS = -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
 	-D_POSIX_C_SOURCE=200809L -I src \

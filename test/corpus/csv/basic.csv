@@ -1,0 +1,4 @@
+id,name,score,flag
+1,Alice,3.5,true
+2,Bob,,false
+3,Carol,-0.25,true

@@ -1,0 +1,1 @@
+((((starts_with(s)|ends_with(e)))&where(numeric))|all_of(id,name))

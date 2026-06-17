@@ -1,0 +1,3 @@
+{"id":1,"value":1}
+{"id":"2","value":2.5,"extra":"x"}
+{"id":3,"value":null,"extra":{"nested":true}}

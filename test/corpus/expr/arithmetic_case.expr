@@ -1,0 +1,1 @@
+case_when(col(score) < 0, 'neg', col(score) + 1 >= 5, 'high', 'other')

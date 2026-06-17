@@ -2,7 +2,7 @@
 build/
 build-debug/
 build-tsan/
-corpus/
+/corpus/
 references/
 *.gcov
 _site/

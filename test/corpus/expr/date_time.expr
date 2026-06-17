@@ -1,0 +1,1 @@
+year(col(date)) >= 2020 and hour(col(ts)) >= 0

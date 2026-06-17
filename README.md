@@ -710,10 +710,12 @@ make test-float-rt       # ASan/UBSan exact CSV/JSONL float round-trip regressio
 make test-wide-csv       # ASan/UBSan wide-column and max_columns regressions
 make test-oom            # ASan/UBSan allocator-failure fault-injection regressions
 make fuzz                # finite native libFuzzer smoke for CSV/JSONL/DSL/expr/selector/jsonpath
+make fuzz-smoke          # CI-sized seeded native fuzz run
+make fuzz-nightly        # longer scheduled/manual seeded fuzz run
 make test-packaging      # csrc sync, artifact audits, clean install smokes
 ```
 
-Fuzz targets use the same ASan runner as debug tests and are finite by default; override `FUZZ_ARGS` for longer corpus or soak runs.
+Fuzz targets use the same ASan runner as debug tests and are finite by default. Curated seeds live in `test/corpus/<target>/`; generated corpus units go to the ignored `corpus/<target>/` work directories so local fuzzing does not dirty the tracked seeds. Override `FUZZ_ARGS`, `FUZZ_SMOKE_ARGS`, `FUZZ_NIGHTLY_ARGS`, `FUZZ_SEED_DIR`, or `FUZZ_WORK_DIR` for longer corpus or soak runs. GitHub Actions runs ASan/UBSan hardening plus seeded fuzz smoke on PRs/pushes and a longer seeded fuzz soak on schedule/manual dispatch.
 
 Package audits check that published Python/npm artifacts contain required runtime files and Apache license/notice files, and reject project-local files such as `PLAN.md`, `MEMORY.md`, `references/`, tests, build caches, lockfiles, and agent docs. The same gate installs the Python sdist into a temporary venv and an npm tarball into a temporary npm project, then runs a minimal CSV pipeline from each installed package.
 

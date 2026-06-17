@@ -1,0 +1,1 @@
+(where(string)|where(temporal))&!matches(^tmp_)

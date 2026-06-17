@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - 'CMakeLists.txt'
+      - 'README.md'
+      - '.github/workflows/ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - 'CMakeLists.txt'
+      - 'README.md'
+      - '.github/workflows/ci.yml'
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hardening:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang
+
+      - name: Release C tests
+        run: make test-c
+
+      - name: ASan/UBSan gates
+        run: |
+          make test-debug
+          make test-oom
+          make test-spill-sec
+          make test-depth-limits
+          make test-float-rt
+          make test-wide-csv
+
+  fuzz-smoke:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuzz toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang
+
+      - name: Seeded native fuzz smoke
+        run: make fuzz-smoke
+
+  fuzz-nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuzz toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang
+
+      - name: Seeded native fuzz soak
+        run: make fuzz-nightly
