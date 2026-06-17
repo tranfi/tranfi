@@ -426,7 +426,7 @@ int main(void) {
         },
         {
             "data_quality_audit",
-            "csv batch_size=1 | validate \"col(age) > 25\" audit audit_limit=2 | assert \"col(score) >= 20\" action=filter audit audit_limit=2 | schema name:string age:int city:string non_null=name,age min=age:0 max=age:120 values=city:NY,LA mode=filter audit audit_limit=2 | quarantine \"col(city) == 'LA'\" name=city_block message=la | csv",
+            "csv batch_size=1 | validate \"col(age) > 25\" audit audit_limit=2 | assert \"col(score) >= 20\" action=filter audit audit_limit=2 | schema name:string age:int city:string non_null=name,age min=age:0 max=age:120 values=city:NY,LA require_values_seen=true mode=filter audit audit_limit=2 | quarantine \"col(city) == 'LA'\" name=city_block message=la | csv",
             people,
             520
         },

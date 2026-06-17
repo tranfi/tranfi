@@ -2170,6 +2170,31 @@ def test_ops_schema_actions():
     assert args['name'] == 'schema_check'
     assert args['message'] == 'schema rule'
 
+    baseline = {
+        'columns': {'name': 'string', 'age': 'int', 'city': 'string'},
+        'values': {'city': ['NY', 'LA']},
+    }
+    baseline_step = tf.ops.schema(baseline=baseline, mode='warn', name='delivery_baseline')
+    assert baseline_step['args']['baseline']['columns']['age'] == 'int'
+
+    drifted = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        baseline_step,
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,age,city,extra\nAlice,30,NY,x\nBob,31,SF,y\n')
+    assert 'Alice,30,NY,x' in drifted.output_text
+    drift_errors = drifted.errors.decode('utf-8')
+    assert '"name":"delivery_baseline"' in drift_errors
+    assert '"rule":"extra_column"' in drift_errors
+    assert '"column":"extra"' in drift_errors
+    assert '"rule":"values"' in drift_errors
+    assert '"actual":"SF"' in drift_errors
+    assert '"rule":"missing_category"' in drift_errors
+    assert '"expected":"LA"' in drift_errors
+    assert '"baseline_mode":true' in drifted.stats_text
+    assert '"extra_column_failures":1' in drifted.stats_text
+    assert '"missing_category_failures":1' in drifted.stats_text
+
     annotated = tf.pipeline([
         tf.codec.csv(),
         schema_step('annotate', result='schema_ok'),

@@ -2097,6 +2097,31 @@ await test('schema actions', async () => {
   assert(helper.args.max.age === 120, 'schema helper should pass max')
   assert(helper.args.name === 'schema_check', 'schema helper should pass name')
 
+  const baseline = {
+    columns: { name: 'string', age: 'int', city: 'string' },
+    values: { city: ['NY', 'LA'] },
+  }
+  const baselineStep = ops.schema({ baseline, mode: 'warn', name: 'delivery_baseline' })
+  assert(baselineStep.args.baseline.columns.age === 'int', 'schema helper should pass baseline object')
+
+  const drifted = await pipeline([
+    codec.csv({ batchSize: 1 }),
+    baselineStep,
+    codec.csvEncode(),
+  ]).run({ input: 'name,age,city,extra\nAlice,30,NY,x\nBob,31,SF,y\n' })
+  assert(drifted.outputText.includes('Alice,30,NY,x'), 'baseline warning should preserve main rows')
+  const driftErrors = drifted.errors.toString('utf-8')
+  assert(driftErrors.includes('"name":"delivery_baseline"'), 'baseline drift should include check name')
+  assert(driftErrors.includes('"rule":"extra_column"'), 'baseline drift should report extra columns')
+  assert(driftErrors.includes('"column":"extra"'), 'baseline drift should report extra column name')
+  assert(driftErrors.includes('"rule":"values"'), 'baseline drift should report new categories')
+  assert(driftErrors.includes('"actual":"SF"'), 'baseline drift should report new category value')
+  assert(driftErrors.includes('"rule":"missing_category"'), 'baseline drift should report missing expected categories')
+  assert(driftErrors.includes('"expected":"LA"'), 'baseline drift should report missing category value')
+  assert(drifted.statsText.includes('"baseline_mode":true'), 'baseline stats should identify baseline mode')
+  assert(drifted.statsText.includes('"extra_column_failures":1'), 'baseline stats should count extra columns')
+  assert(drifted.statsText.includes('"missing_category_failures":1'), 'baseline stats should count missing categories')
+
   const annotated = await pipeline([
     codec.csv(),
     schemaStep('annotate', { result: 'schema_ok' }),

@@ -1114,6 +1114,10 @@ static cJSON *build_schema_args(const token_list *tokens, char **error) {
     size_t audit_max_cell_bytes = 0;
     size_t max_regex_pattern_bytes = 0;
     size_t max_regex_cell_bytes = 0;
+    int allow_extra_columns_set = 0;
+    int allow_extra_columns = 1;
+    int require_values_seen_set = 0;
+    int require_values_seen = 0;
     for (size_t i = 1; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         if (strncmp(tok, "columns=", 8) == 0) {
@@ -1149,6 +1153,18 @@ static cJSON *build_schema_args(const token_list *tokens, char **error) {
             long n = strtol(val, &end, 10);
             if (!val[0] || !end || *end != '\0' || n <= 0) goto invalid;
             max_regex_cell_bytes = (size_t)n;
+        } else if (strncmp(tok, "allow_extra_columns=", 20) == 0 || strncmp(tok, "allow-extra-columns=", 20) == 0) {
+            const char *val = strchr(tok, '=');
+            val = val ? val + 1 : "";
+            if (strcmp(val, "true") != 0 && strcmp(val, "false") != 0) goto invalid;
+            allow_extra_columns = strcmp(val, "true") == 0;
+            allow_extra_columns_set = 1;
+        } else if (strncmp(tok, "require_values_seen=", 20) == 0 || strncmp(tok, "require-values-seen=", 20) == 0) {
+            const char *val = strchr(tok, '=');
+            val = val ? val + 1 : "";
+            if (strcmp(val, "true") != 0 && strcmp(val, "false") != 0) goto invalid;
+            require_values_seen = strcmp(val, "true") == 0;
+            require_values_seen_set = 1;
         } else if (strncmp(tok, "mode=", 5) == 0) mode = tok + 5;
         else if (strncmp(tok, "action=", 7) == 0) mode = tok + 7;
         else if (strncmp(tok, "name=", 5) == 0) name = tok + 5;
@@ -1232,6 +1248,8 @@ static cJSON *build_schema_args(const token_list *tokens, char **error) {
     if (audit_max_cell_bytes > 0) cJSON_AddNumberToObject(args, "audit_max_cell_bytes", (double)audit_max_cell_bytes);
     if (max_regex_pattern_bytes > 0) cJSON_AddNumberToObject(args, "max_regex_pattern_bytes", (double)max_regex_pattern_bytes);
     if (max_regex_cell_bytes > 0) cJSON_AddNumberToObject(args, "max_regex_cell_bytes", (double)max_regex_cell_bytes);
+    if (allow_extra_columns_set) cJSON_AddBoolToObject(args, "allow_extra_columns", allow_extra_columns);
+    if (require_values_seen_set) cJSON_AddBoolToObject(args, "require_values_seen", require_values_seen);
     return args;
 invalid:
     cJSON_Delete(args);

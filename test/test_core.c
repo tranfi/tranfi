@@ -7476,6 +7476,74 @@ static void test_pipeline_schema_actions(void) {
     tf_pipeline_free(p);
 }
 
+static void test_pipeline_schema_baseline_drift(void) {
+    const char *csv =
+        "name,age,city,extra\n"
+        "Alice,30,NY,x\n"
+        "Bob,31,SF,y\n";
+    const char *warn_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"schema\",\"args\":{\"baseline\":{"
+        "\"columns\":{\"name\":\"string\",\"age\":\"int\",\"city\":\"string\"},"
+        "\"values\":{\"city\":[\"NY\",\"LA\"]}},"
+        "\"action\":\"warn\",\"name\":\"delivery_baseline\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    tf_pipeline *p = tf_pipeline_create(warn_plan, strlen(warn_plan));
+    assert(p != NULL);
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    uint8_t out[4096];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strstr((char *)out, "Alice,30,NY,x") != NULL);
+    assert(strstr((char *)out, "Bob,31,SF,y") != NULL);
+    uint8_t err[4096];
+    size_t en = tf_pipeline_pull(p, TF_CHAN_ERRORS, err, sizeof(err) - 1);
+    assert(en > 0);
+    err[en] = '\0';
+    assert(strstr((char *)err, "\"name\":\"delivery_baseline\"") != NULL);
+    assert(strstr((char *)err, "\"rule\":\"extra_column\"") != NULL);
+    assert(strstr((char *)err, "\"column\":\"extra\"") != NULL);
+    assert(strstr((char *)err, "\"rule\":\"values\"") != NULL);
+    assert(strstr((char *)err, "\"actual\":\"SF\"") != NULL);
+    assert(strstr((char *)err, "\"rule\":\"missing_category\"") != NULL);
+    assert(strstr((char *)err, "\"expected\":\"LA\"") != NULL);
+    n = tf_pipeline_pull(p, TF_CHAN_STATS, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strstr((char *)out, "\"baseline_mode\":true") != NULL);
+    assert(strstr((char *)out, "\"allow_extra_columns\":false") != NULL);
+    assert(strstr((char *)out, "\"require_values_seen\":true") != NULL);
+    assert(strstr((char *)out, "\"extra_column_failures\":1") != NULL);
+    assert(strstr((char *)out, "\"values_failures\":1") != NULL);
+    assert(strstr((char *)out, "\"missing_category_failures\":1") != NULL);
+    tf_pipeline_free(p);
+
+    const char *fail_csv = "name,city\nAlice,NY\n";
+    const char *fail_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"schema\",\"args\":{\"values\":{\"city\":[\"NY\",\"LA\"]},"
+        "\"require_values_seen\":true,\"action\":\"fail\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create(fail_plan, strlen(fail_plan));
+    assert(p != NULL);
+    assert(tf_pipeline_push(p, (const uint8_t *)fail_csv, strlen(fail_csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_ERROR);
+    assert(tf_pipeline_error(p) != NULL);
+    assert(strstr(tf_pipeline_error(p), "schema failed at finish: missing_category") != NULL);
+    en = tf_pipeline_pull(p, TF_CHAN_ERRORS, err, sizeof(err) - 1);
+    assert(en > 0);
+    err[en] = '\0';
+    assert(strstr((char *)err, "\"rule\":\"missing_category\"") != NULL);
+    assert(strstr((char *)err, "\"expected\":\"LA\"") != NULL);
+    tf_pipeline_free(p);
+}
+
 
 static void test_selector_depth_limit(void) {
     size_t depth = 300;
@@ -8736,7 +8804,7 @@ static void test_dsl_new_ops(void) {
 
 
     /* schema */
-    const char *dsl_schema = "csv | schema name:string age:int city:string non_null=name,age min=age:0 max=age:120 values=city:NY,LA mode=quarantine result=schema_ok audit audit_limit=2 | csv";
+    const char *dsl_schema = "csv | schema name:string age:int city:string non_null=name,age min=age:0 max=age:120 values=city:NY,LA allow_extra_columns=false require_values_seen=true mode=quarantine result=schema_ok audit audit_limit=2 | csv";
     plan = tf_dsl_parse(dsl_schema, strlen(dsl_schema), &error);
     assert(plan != NULL);
     assert(strcmp(plan->nodes[1].op, "schema") == 0);
@@ -8758,6 +8826,8 @@ static void test_dsl_new_ops(void) {
     cJSON *schema_city_values = cJSON_GetObjectItemCaseSensitive(schema_values, "city");
     assert(cJSON_IsArray(schema_city_values));
     assert(cJSON_GetArraySize(schema_city_values) == 2);
+    assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "allow_extra_columns")));
+    assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "require_values_seen")));
     tf_ir_plan_free(plan);
 
     /* json-flatten */
@@ -12628,6 +12698,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_quarantine);
     TEST(test_pipeline_assert_actions);
     TEST(test_pipeline_schema_actions);
+    TEST(test_pipeline_schema_baseline_drift);
     TEST(test_pipeline_schema_selectors);
     TEST(test_pipeline_schema_regex_budgets);
     TEST(test_pipeline_schema_audit_privacy_controls);

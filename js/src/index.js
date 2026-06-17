@@ -294,8 +294,9 @@ const ops = {
     return { op: 'quarantine', args }
   },
 
-  schema({ columns, required, nonNull, nullable, values, min, max, regex, mode = 'fail', name = 'schema', message = '', result = '_schema', audit = false, auditLimit, maxRegexPatternBytes, maxRegexCellBytes, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
+  schema({ baseline, columns, required, nonNull, nullable, values, min, max, regex, mode = 'fail', name = 'schema', message = '', result = '_schema', audit = false, auditLimit, maxRegexPatternBytes, maxRegexCellBytes, allowExtraColumns, requireValuesSeen, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { mode, action: mode }
+    if (baseline !== undefined) args.baseline = baseline
     if (columns !== undefined) args.columns = columns
     if (required !== undefined) args.required = required
     if (nonNull !== undefined) args.non_null = nonNull
@@ -317,6 +318,8 @@ const ops = {
     if (auditMaxCellBytes !== undefined) args.audit_max_cell_bytes = Number(auditMaxCellBytes)
     if (maxRegexPatternBytes !== undefined) args.max_regex_pattern_bytes = maxRegexPatternBytes
     if (maxRegexCellBytes !== undefined) args.max_regex_cell_bytes = maxRegexCellBytes
+    if (allowExtraColumns !== undefined) args.allow_extra_columns = !!allowExtraColumns
+    if (requireValuesSeen !== undefined) args.require_values_seen = !!requireValuesSeen
     return { op: 'schema', args }
   },
 

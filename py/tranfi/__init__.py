@@ -478,10 +478,14 @@ class ops:
                min=None, max=None, regex=None, mode='fail', name='schema',
                message='', result='_schema', audit=False, audit_limit=None,
                max_regex_pattern_bytes=None, max_regex_cell_bytes=None,
+               baseline=None,
+               allow_extra_columns=None, require_values_seen=None,
                audit_include_row=None, audit_columns=None, audit_redact=None,
                audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None):
         """Validate a row-local column contract. mode: fail, warn, filter, quarantine, annotate."""
         args = {'mode': mode, 'action': mode}
+        if baseline is not None:
+            args['baseline'] = baseline
         if columns is not None:
             args['columns'] = columns
         if required is not None:
@@ -524,6 +528,10 @@ class ops:
             args['max_regex_pattern_bytes'] = max_regex_pattern_bytes
         if max_regex_cell_bytes is not None:
             args['max_regex_cell_bytes'] = max_regex_cell_bytes
+        if allow_extra_columns is not None:
+            args['allow_extra_columns'] = bool(allow_extra_columns)
+        if require_values_seen is not None:
+            args['require_values_seen'] = bool(require_values_seen)
         return {'op': 'schema', 'args': args}
 
     @staticmethod
