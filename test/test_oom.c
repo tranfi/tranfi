@@ -115,23 +115,12 @@ static int run_case_once(const oom_case *tc) {
     return rc;
 }
 
-static int run_capture_once(const char *dsl, const char *input, char *main_out,
-                            size_t main_out_cap) {
+static int run_plan_capture_once(const char *json, const char *input, char *main_out,
+                                 size_t main_out_cap) {
     if (main_out_cap > 0) main_out[0] = '\0';
 
-    char *error = NULL;
-    char *json = tf_compile_dsl(dsl, strlen(dsl), &error);
-    if (!json) {
-        free(error);
-        return TF_ERROR;
-    }
-
     tf_pipeline *p = tf_pipeline_create(json, strlen(json));
-    tf_string_free(json);
-    if (!p) {
-        free(error);
-        return TF_ERROR;
-    }
+    if (!p) return TF_ERROR;
 
     int rc = TF_OK;
     size_t len = strlen(input);
@@ -150,8 +139,27 @@ static int run_capture_once(const char *dsl, const char *input, char *main_out,
     }
     drain_all(p);
     tf_pipeline_free(p);
+    return rc;
+}
+
+static int run_capture_once(const char *dsl, const char *input, char *main_out,
+                            size_t main_out_cap) {
+    char *error = NULL;
+    char *json = tf_compile_dsl(dsl, strlen(dsl), &error);
+    if (!json) {
+        free(error);
+        return TF_ERROR;
+    }
+
+    int rc = run_plan_capture_once(json, input, main_out, main_out_cap);
+    tf_string_free(json);
     free(error);
     return rc;
+}
+
+static int run_json_capture_once(const char *json, const char *input, char *main_out,
+                                 size_t main_out_cap) {
+    return run_plan_capture_once(json, input, main_out, main_out_cap);
 }
 
 static size_t count_successful_allocs(const oom_case *tc) {
@@ -183,15 +191,19 @@ static void run_case_with_oom(const oom_case *tc) {
     }
 }
 
-static void run_case_no_silent_output_oom(const char *name, const char *dsl,
-                                          const char *input,
-                                          size_t max_fail_points) {
+typedef int (*oom_capture_runner)(const char *spec, const char *input,
+                                  char *main_out, size_t main_out_cap);
+
+static void run_no_silent_output_oom_with_runner(const char *name, const char *spec,
+                                                 const char *input,
+                                                 size_t max_fail_points,
+                                                 oom_capture_runner runner) {
     char baseline[8192];
     oom_enabled = 1;
     oom_fail_at = (size_t)-1;
     oom_alloc_count = 0;
     oom_failed = 0;
-    int rc = run_capture_once(dsl, input, baseline, sizeof(baseline));
+    int rc = runner(spec, input, baseline, sizeof(baseline));
     oom_enabled = 0;
     assert(rc == TF_OK);
     assert(!oom_failed);
@@ -206,7 +218,7 @@ static void run_case_no_silent_output_oom(const char *name, const char *dsl,
         oom_fail_at = fail_at;
         oom_alloc_count = 0;
         oom_failed = 0;
-        rc = run_capture_once(dsl, input, got, sizeof(got));
+        rc = runner(spec, input, got, sizeof(got));
         oom_enabled = 0;
 
         if (oom_failed && rc == TF_OK && strcmp(got, baseline) != 0) {
@@ -216,6 +228,20 @@ static void run_case_no_silent_output_oom(const char *name, const char *dsl,
         }
         assert(oom_failed);
     }
+}
+
+static void run_case_no_silent_output_oom(const char *name, const char *dsl,
+                                          const char *input,
+                                          size_t max_fail_points) {
+    run_no_silent_output_oom_with_runner(name, dsl, input, max_fail_points,
+                                         run_capture_once);
+}
+
+static void run_json_no_silent_output_oom(const char *name, const char *json,
+                                          const char *input,
+                                          size_t max_fail_points) {
+    run_no_silent_output_oom_with_runner(name, json, input, max_fail_points,
+                                         run_json_capture_once);
 }
 
 static int run_sql_case_once(const oom_sql_case *tc) {
@@ -547,6 +573,22 @@ int main(void) {
     if (mkdir(spill_root, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create OOM spill root");
     }
+    char spill_sort_plan[1024];
+    int spill_sort_n = snprintf(
+        spill_sort_plan,
+        sizeof(spill_sort_plan),
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"sort\",\"args\":{\"columns\":[{\"name\":\"score\",\"desc\":false}],"
+        "\"spill_dir\":\"%s\",\"spill_run_rows\":2,\"spill_output_rows\":2}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}]}",
+        spill_root);
+    assert(spill_sort_n > 0 && (size_t)spill_sort_n < sizeof(spill_sort_plan));
+    run_json_no_silent_output_oom(
+        "spill_sort_key_materialization",
+        spill_sort_plan,
+        sorted_people,
+        360);
 
     const oom_case cases[] = {
         {
