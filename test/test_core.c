@@ -4667,6 +4667,49 @@ static void test_ir_validate_host_policy_workspace_resolver(void) {
     assert(tf_last_error() != NULL);
     assert(strstr(tf_last_error(), "host path resolver") != NULL);
     unlink(link_path);
+
+    char allowed_path[512];
+    snprintf(allowed_path, sizeof(allowed_path), "%s/allowed.csv", root);
+    unlink(allowed_path);
+    f = fopen(allowed_path, "wb");
+    assert(f != NULL);
+    fputs("name\nallowed\n", f);
+    fclose(f);
+
+    const char *toctou_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"stack\",\"args\":{\"file\":\"allowed.csv\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create_with_host_policy(toctou_plan, strlen(toctou_plan), &policy);
+    assert(p != NULL);
+    char *error = NULL;
+    tf_ir_plan *visible_plan = tf_ir_from_json(toctou_plan, strlen(toctou_plan), &error);
+    assert(visible_plan != NULL);
+    assert(error == NULL);
+    assert(tf_ir_validate_with_host_policy(visible_plan, &policy) == TF_OK);
+    assert(cJSON_GetObjectItemCaseSensitive(visible_plan->nodes[1].args,
+                                            TF_POLICY_VALIDATED_FILE_PATH_ARG) != NULL);
+    char *visible_json = tf_ir_to_json(visible_plan);
+    assert(visible_json != NULL);
+    assert(strstr(visible_json, TF_POLICY_VALIDATED_FILE_PATH_ARG) == NULL);
+    free(visible_json);
+    tf_ir_plan_free(visible_plan);
+    unlink(allowed_path);
+    assert(symlink(outside_path, allowed_path) == 0);
+    const char *toctou_csv = "name\ninside\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)toctou_csv, strlen(toctou_csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_ERROR);
+    n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    out[n] = '\0';
+    assert(strstr((char *)out, "inside") != NULL);
+    assert(strstr((char *)out, "outside") == NULL);
+    n = tf_pipeline_pull(p, TF_CHAN_ERRORS, out, sizeof(out) - 1);
+    out[n] = '\0';
+    assert(strstr((char *)out, "stack: cannot open file") != NULL);
+    tf_pipeline_free(p);
+    unlink(allowed_path);
     unlink(outside_path);
 #endif
 

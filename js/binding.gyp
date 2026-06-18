@@ -8,6 +8,7 @@
         "csrc/arena.c",
         "csrc/buffer.c",
         "csrc/size_utils.c",
+        "csrc/path_policy.c",
         "csrc/spill.c",
         "csrc/batch.c",
         "csrc/pipeline.c",

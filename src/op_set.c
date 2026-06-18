@@ -73,6 +73,7 @@ typedef struct {
 
 typedef struct {
     char   *file;
+    char   *validated_file;
     char  **columns;
     size_t  n_columns;
     size_t  max_lookup_rows;
@@ -466,12 +467,12 @@ static int set_map_contains(const set_hash_map *m, const char *key) {
     return set_map_find_bucket(m, key) != NULL;
 }
 
-static int set_write_error(tf_side_channels *side, const char *msg) {
+TF_WARN_UNUSED static int set_write_error(tf_side_channels *side, const char *msg) {
     return tf_side_write_error(side, msg);
 }
 
-static int set_limit_error(tf_side_channels *side, const char *op,
-                           const char *field, size_t limit, size_t actual) {
+TF_WARN_UNUSED static int set_limit_error(tf_side_channels *side, const char *op,
+                                          const char *field, size_t limit, size_t actual) {
     char msg[224];
     snprintf(msg, sizeof(msg), "%s: %s=%zu exceeded (%zu)", op, field, limit, actual);
     return set_write_error(side, msg);
@@ -606,9 +607,9 @@ static int csv_header_has_column(const uint8_t *data, size_t len, const char *na
     return 0;
 }
 
-static int csv_file_header_has_column(const char *path, const char *name) {
+static int csv_file_header_has_column(const char *path, const char *validated_path, const char *name) {
     if (!path || !name) return 0;
-    FILE *f = fopen(path, "rb");
+    FILE *f = tf_policy_fopen_read(path, validated_path);
     if (!f) return 0;
     size_t cap = 4096;
     uint8_t *buf = malloc(cap);
@@ -645,13 +646,13 @@ static int prepare_sorted_key_columns(set_state *st, const tf_batch *left,
         if (lc < 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: input column '%s' not found", op, name);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
-        if (!csv_file_header_has_column(st->file, name)) {
+        if (!csv_file_header_has_column(st->file, st->validated_file, name)) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: lookup column '%s' not found", op, name);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         left_cols[i] = lc;
@@ -761,13 +762,13 @@ static int set_spill_init_schema(set_state *st, const tf_batch *in, tf_side_chan
         if (lc < 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: input column '%s' not found", op, name ? name : "");
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
-        if (!csv_file_header_has_column(st->file, name)) {
+        if (!csv_file_header_has_column(st->file, st->validated_file, name)) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: lookup column '%s' not found", op, name ? name : "");
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         left_cols[i] = lc;
@@ -1287,8 +1288,10 @@ static int set_spill_count_lookup_key(set_state *st, const set_spill_row *row, t
     if (!key) return TF_ERROR;
     if (!st->spill_last_lookup_key || strcmp(st->spill_last_lookup_key, key) != 0) {
         if (st->max_lookup_keys > 0 && st->spill_lookup_keys >= st->max_lookup_keys) {
-            set_limit_error(side, set_mode_name(st->mode), "max_lookup_keys", st->max_lookup_keys, st->spill_lookup_keys + 1);
+            int err_rc = set_limit_error(side, set_mode_name(st->mode), "max_lookup_keys",
+                                         st->max_lookup_keys, st->spill_lookup_keys + 1);
             free(key);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         size_t key_bytes_delta = 0;
@@ -1332,8 +1335,9 @@ static int set_spill_process_lookup_batch(set_state *st, const tf_batch *batch, 
             if (rc < 0) {
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: lookup column '%s' not found", op, st->key_names[k]);
-                set_write_error(side, msg);
+                int err_rc = set_write_error(side, msg);
                 free(right_cols);
+                if (err_rc != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             right_cols[k] = rc;
@@ -1350,7 +1354,9 @@ static int set_spill_process_lookup_batch(set_state *st, const tf_batch *batch, 
     }
     for (size_t r = 0; r < batch->n_rows; r++) {
         if (st->max_lookup_rows > 0 && st->spill_lookup_rows >= st->max_lookup_rows) {
-            set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows, st->spill_lookup_rows + 1);
+            if (set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows,
+                                st->spill_lookup_rows + 1) != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         st->spill_lookup_rows++;
@@ -1385,11 +1391,11 @@ static int set_spill_process_lookup_batch(set_state *st, const tf_batch *batch, 
 static int set_spill_load_lookup_runs(set_state *st, tf_side_channels *side) {
     if (st->spill_lookup_loaded) return TF_OK;
     st->spill_lookup_loaded = 1;
-    FILE *f = fopen(st->file, "rb");
+    FILE *f = tf_policy_fopen_read(st->file, st->validated_file);
     if (!f) {
         char msg[128];
         snprintf(msg, sizeof(msg), "%s: cannot open lookup file", set_mode_name(st->mode));
-        set_write_error(side, msg);
+        if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
     tf_decoder *dec = tf_csv_decoder_create(NULL);
@@ -1405,7 +1411,9 @@ static int set_spill_load_lookup_runs(set_state *st, tf_side_channels *side) {
         if (n > 0) {
             bytes_read += n;
             if (st->max_lookup_bytes > 0 && bytes_read > st->max_lookup_bytes) {
-                set_limit_error(side, set_mode_name(st->mode), "max_lookup_bytes", st->max_lookup_bytes, bytes_read);
+                if (set_limit_error(side, set_mode_name(st->mode), "max_lookup_bytes",
+                                    st->max_lookup_bytes, bytes_read) != TF_OK)
+                    rc = TF_ERROR;
                 rc = TF_ERROR;
                 break;
             }
@@ -1414,7 +1422,7 @@ static int set_spill_load_lookup_runs(set_state *st, tf_side_channels *side) {
             if (ferror(f)) {
                 char msg[160];
                 snprintf(msg, sizeof(msg), "%s: failed reading lookup file", set_mode_name(st->mode));
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) rc = TF_ERROR;
                 rc = TF_ERROR;
                 break;
             }
@@ -1713,8 +1721,9 @@ static int sorted_set_capture_schema(set_state *st, const tf_batch *b,
         if (rc < 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: lookup column '%s' not found", op, st->key_names[i]);
-            set_write_error(side, msg);
+            int err_rc = set_write_error(side, msg);
             free(right_cols);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         right_cols[i] = rc;
@@ -1727,9 +1736,10 @@ static int sorted_set_capture_schema(set_state *st, const tf_batch *b,
 
 static int sorted_set_open(set_state *st, tf_side_channels *side) {
     if (!st || st->sorted_file || st->sorted_decoder) return TF_OK;
-    st->sorted_file = fopen(st->file, "rb");
+    st->sorted_file = tf_policy_fopen_read(st->file, st->validated_file);
     if (!st->sorted_file) {
-        set_write_error(side, st->mode == 0 ? "intersect: cannot open lookup file" : "setdiff: cannot open lookup file");
+        if (set_write_error(side, st->mode == 0 ? "intersect: cannot open lookup file" : "setdiff: cannot open lookup file") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     st->sorted_decoder = tf_csv_decoder_create(NULL);
@@ -1773,7 +1783,8 @@ static int sorted_set_next_batch(set_state *st, tf_side_channels *side) {
             rc = st->sorted_decoder->decode(st->sorted_decoder, buf, n, &batches, &n_batches, side);
         } else {
             if (ferror(st->sorted_file)) {
-                set_write_error(side, st->mode == 0 ? "intersect: failed reading lookup file" : "setdiff: failed reading lookup file");
+                if (set_write_error(side, st->mode == 0 ? "intersect: failed reading lookup file" : "setdiff: failed reading lookup file") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             st->sorted_flushed = 1;
@@ -1818,14 +1829,14 @@ static int sorted_set_load_row_if_needed(set_state *st, tf_side_channels *side) 
                 set_key_tuple_clear(&cur);
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: lookup key types changed", set_mode_name(st->mode));
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             if (cmp > 0) {
                 set_key_tuple_clear(&cur);
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: lookup side is not sorted by key", set_mode_name(st->mode));
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
         }
@@ -1868,7 +1879,7 @@ static int sorted_set_load_next_lookup_key(set_state *st, tf_side_channels *side
             set_key_tuple_clear(&row_key);
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: lookup key types changed", op);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         set_key_tuple_clear(&row_key);
@@ -1892,7 +1903,7 @@ static int sorted_set_ensure_lookup_at_least(set_state *st, const set_key_tuple 
         if (set_key_tuple_compare(&st->current_lookup_key, left_key, &cmp) != TF_OK) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: input and lookup key types differ", set_mode_name(st->mode));
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         if (cmp >= 0) return TF_OK;
@@ -1937,7 +1948,7 @@ static int set_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
                 tf_batch_free(ob);
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: left key types changed", op);
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             if (cmp > 0) {
@@ -1945,7 +1956,7 @@ static int set_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
                 tf_batch_free(ob);
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: left side is not sorted by key", op);
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             duplicate_left = (cmp == 0);
@@ -1986,7 +1997,7 @@ static int set_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
                 tf_batch_free(ob);
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: input and lookup key types differ", op);
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             in_lookup = (cmp == 0);
@@ -2019,7 +2030,7 @@ static int set_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
 
 static int read_lookup_file(set_state *st, uint8_t **out, size_t *out_len,
                             tf_side_channels *side) {
-    FILE *f = fopen(st->file, "rb");
+    FILE *f = tf_policy_fopen_read(st->file, st->validated_file);
     if (!f) return TF_ERROR;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return TF_ERROR; }
     long fsize = ftell(f);
@@ -2027,8 +2038,10 @@ static int read_lookup_file(set_state *st, uint8_t **out, size_t *out_len,
     if (fsize < 0) { fclose(f); return TF_ERROR; }
     if (st->max_lookup_bytes > 0 && (size_t)fsize > st->max_lookup_bytes) {
         fclose(f);
-        set_limit_error(side, set_mode_name(st->mode),
-                        "max_lookup_bytes", st->max_lookup_bytes, (size_t)fsize);
+        if (set_limit_error(side, set_mode_name(st->mode),
+                            "max_lookup_bytes", st->max_lookup_bytes,
+                            (size_t)fsize) != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     uint8_t *data = NULL;
@@ -2059,7 +2072,7 @@ static int prepare_key_columns(set_state *st, const tf_batch *left,
         if (lc < 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: input column '%s' not found", op, name);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         left_cols[i] = lc;
@@ -2068,14 +2081,14 @@ static int prepare_key_columns(set_state *st, const tf_batch *left,
             if (rc < 0) {
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: lookup column '%s' not found", op, name);
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) goto fail;
                 goto fail;
             }
             right_cols[i] = rc;
         } else if (!csv_header_has_column(raw, raw_len, name)) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: lookup column '%s' not found", op, name);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
     }
@@ -2111,7 +2124,9 @@ static int load_lookup(set_state *st, const tf_batch *left, tf_side_channels *si
         all_batches[i] = batches[i];
         total_rows += batches[i]->n_rows;
         if (st->max_lookup_rows > 0 && total_rows > st->max_lookup_rows) {
-            set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows, total_rows);
+            if (set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows,
+                                total_rows) != TF_OK)
+                goto fail;
             goto fail;
         }
     }
@@ -2119,7 +2134,9 @@ static int load_lookup(set_state *st, const tf_batch *left, tf_side_channels *si
         all_batches[n_batches + i] = flush_batches[i];
         total_rows += flush_batches[i]->n_rows;
         if (st->max_lookup_rows > 0 && total_rows > st->max_lookup_rows) {
-            set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows, total_rows);
+            if (set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows,
+                                total_rows) != TF_OK)
+                goto fail;
             goto fail;
         }
     }
@@ -2239,7 +2256,7 @@ static int set_copy_cell(tf_batch *dst, size_t dr, size_t dc,
         char msg[224];
         snprintf(msg, sizeof(msg), "%s: file column '%s' type does not match input schema",
                  op, src->col_names[sc] ? src->col_names[sc] : "");
-        set_write_error(side, msg);
+        if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
     switch (dt) {
@@ -2278,7 +2295,7 @@ static int set_spill_capture_union_right_schema(set_state *st, const tf_batch *b
         if (rc < 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: file column '%s' not found", op, st->spill_schema_names[c]);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         if (b->col_types[rc] != st->spill_schema_types[c] &&
@@ -2286,7 +2303,7 @@ static int set_spill_capture_union_right_schema(set_state *st, const tf_batch *b
             char msg[224];
             snprintf(msg, sizeof(msg), "%s: file column '%s' type does not match input schema",
                      op, st->spill_schema_names[c]);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         union_right_cols[c] = rc;
@@ -2296,7 +2313,7 @@ static int set_spill_capture_union_right_schema(set_state *st, const tf_batch *b
         if (rc < 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: file column '%s' not found", op, st->key_names[k]);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         key_right_cols[k] = rc;
@@ -2318,7 +2335,9 @@ static int set_spill_process_union_file_batch(set_state *st, const tf_batch *bat
     if (set_spill_capture_union_right_schema(st, batch, side) != TF_OK) return TF_ERROR;
     for (size_t r = 0; r < batch->n_rows; r++) {
         if (st->max_lookup_rows > 0 && st->union_file_rows >= st->max_lookup_rows) {
-            set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows, st->union_file_rows + 1);
+            if (set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows,
+                                st->union_file_rows + 1) != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         size_t dst = st->spill_left_buf->n_rows;
@@ -2340,8 +2359,11 @@ static int set_spill_process_union_file_batch(set_state *st, const tf_batch *bat
 static int set_spill_load_union_file_runs(set_state *st, tf_side_channels *side) {
     if (st->spill_lookup_loaded) return TF_OK;
     st->spill_lookup_loaded = 1;
-    FILE *f = fopen(st->file, "rb");
-    if (!f) { set_write_error(side, "union: cannot open file"); return TF_ERROR; }
+    FILE *f = tf_policy_fopen_read(st->file, st->validated_file);
+    if (!f) {
+        if (set_write_error(side, "union: cannot open file") != TF_OK) return TF_ERROR;
+        return TF_ERROR;
+    }
     tf_decoder *dec = tf_csv_decoder_create(NULL);
     if (!dec) { fclose(f); return TF_ERROR; }
     size_t bytes_read = 0;
@@ -2355,14 +2377,17 @@ static int set_spill_load_union_file_runs(set_state *st, tf_side_channels *side)
         if (n > 0) {
             bytes_read += n;
             if (st->max_lookup_bytes > 0 && bytes_read > st->max_lookup_bytes) {
-                set_limit_error(side, "union", "max_lookup_bytes", st->max_lookup_bytes, bytes_read);
+                if (set_limit_error(side, "union", "max_lookup_bytes",
+                                    st->max_lookup_bytes, bytes_read) != TF_OK)
+                    rc = TF_ERROR;
                 rc = TF_ERROR;
                 break;
             }
             rc = dec->decode(dec, buf, n, &batches, &n_batches, side);
         } else {
             if (ferror(f)) {
-                set_write_error(side, "union: failed reading file");
+                if (set_write_error(side, "union: failed reading file") != TF_OK)
+                    rc = TF_ERROR;
                 rc = TF_ERROR;
                 break;
             }
@@ -2408,7 +2433,10 @@ static int set_spill_produce_union_output_runs(set_state *st, tf_side_channels *
             st->spill_last_left_key = key;
             key = NULL;
             if (st->max_output_keys > 0 && st->spill_distinct_rows >= st->max_output_keys) {
-                set_limit_error(side, "union", "max_output_keys", st->max_output_keys, st->spill_distinct_rows + 1);
+                if (set_limit_error(side, "union", "max_output_keys",
+                                    st->max_output_keys,
+                                    st->spill_distinct_rows + 1) != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             if (set_spill_append_selected_row(st, &row->row) != TF_OK) return TF_ERROR;
@@ -2470,7 +2498,7 @@ static int union_capture_left_schema(set_state *st, const tf_batch *in,
             if (lc < 0) {
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: input column '%s' not found", op, name ? name : "");
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) goto fail;
                 goto fail;
             }
             left_cols[i] = lc;
@@ -2522,7 +2550,7 @@ static int union_capture_right_schema(set_state *st, const tf_batch *b,
         if (rc < 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "%s: file column '%s' not found", op, st->union_col_names[c]);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         if (b->col_types[rc] != st->union_col_types[c] &&
@@ -2530,7 +2558,7 @@ static int union_capture_right_schema(set_state *st, const tf_batch *b,
             char msg[224];
             snprintf(msg, sizeof(msg), "%s: file column '%s' type does not match input schema",
                      op, st->union_col_names[c]);
-            set_write_error(side, msg);
+            if (set_write_error(side, msg) != TF_OK) goto fail;
             goto fail;
         }
         union_right_cols[c] = rc;
@@ -2541,7 +2569,7 @@ static int union_capture_right_schema(set_state *st, const tf_batch *b,
             if (rc < 0) {
                 char msg[192];
                 snprintf(msg, sizeof(msg), "%s: file column '%s' not found", op, st->key_names[i]);
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) goto fail;
                 goto fail;
             }
             key_right_cols[i] = rc;
@@ -2603,12 +2631,14 @@ static int union_sorted_load_row_if_needed(set_state *st, tf_side_channels *side
             int cmp = 0;
             if (set_key_tuple_compare(&st->prev_lookup_key, &cur, &cmp) != TF_OK) {
                 set_key_tuple_clear(&cur);
-                set_write_error(side, "union: file key types changed");
+                if (set_write_error(side, "union: file key types changed") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             if (cmp > 0) {
                 set_key_tuple_clear(&cur);
-                set_write_error(side, "union: file side is not sorted by key");
+                if (set_write_error(side, "union: file side is not sorted by key") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
         }
@@ -2665,14 +2695,17 @@ static int union_sorted_load_next_right_key(set_state *st, tf_side_channels *sid
         int cmp = 0;
         if (set_key_tuple_compare(&st->current_lookup_key, &row_key, &cmp) != TF_OK) {
             set_key_tuple_clear(&row_key);
-            set_write_error(side, "union: file key types changed");
+            if (set_write_error(side, "union: file key types changed") != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         set_key_tuple_clear(&row_key);
         if (cmp != 0) break;
         st->union_file_rows++;
         if (st->max_lookup_rows > 0 && st->union_file_rows > st->max_lookup_rows) {
-            set_limit_error(side, "union", "max_lookup_rows", st->max_lookup_rows, st->union_file_rows);
+            if (set_limit_error(side, "union", "max_lookup_rows",
+                                st->max_lookup_rows, st->union_file_rows) != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         union_sorted_consume_row(st);
@@ -2690,7 +2723,9 @@ static int union_sorted_ensure_right_key(set_state *st, tf_side_channels *side) 
 
 static int union_sorted_note_emit(set_state *st, tf_side_channels *side) {
     if (st->max_output_keys > 0 && st->emitted.count >= st->max_output_keys) {
-        set_limit_error(side, "union", "max_output_keys", st->max_output_keys, st->emitted.count + 1);
+        if (set_limit_error(side, "union", "max_output_keys", st->max_output_keys,
+                            st->emitted.count + 1) != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     st->emitted.count++;
@@ -2742,13 +2777,14 @@ static int union_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
             if (set_key_tuple_compare(&st->prev_left_key, &left_key, &cmp) != TF_OK) {
                 set_key_tuple_clear(&left_key);
                 tf_batch_free(ob);
-                set_write_error(side, "union: left key types changed");
+                if (set_write_error(side, "union: left key types changed") != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             if (cmp > 0) {
                 set_key_tuple_clear(&left_key);
                 tf_batch_free(ob);
-                set_write_error(side, "union: left side is not sorted by key");
+                if (set_write_error(side, "union: left side is not sorted by key") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             duplicate_left = (cmp == 0);
@@ -2773,7 +2809,8 @@ static int union_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
             if (set_key_tuple_compare(&st->current_lookup_key, &left_key, &cmp) != TF_OK) {
                 set_key_tuple_clear(&left_key);
                 tf_batch_free(ob);
-                set_write_error(side, "union: input and file key types differ");
+                if (set_write_error(side, "union: input and file key types differ") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             if (cmp < 0) {
@@ -2894,18 +2931,20 @@ static int union_process(tf_step *self, tf_batch *in, tf_batch **out,
 static int union_open_file(set_state *st, tf_side_channels *side) {
     const char *op = set_mode_name(st->mode);
     if (st->sorted_file || st->sorted_decoder) return TF_OK;
-    st->sorted_file = fopen(st->file, "rb");
+    st->sorted_file = tf_policy_fopen_read(st->file, st->validated_file);
     if (!st->sorted_file) {
         char msg[160];
         snprintf(msg, sizeof(msg), "%s: cannot open file", op);
-        set_write_error(side, msg);
+        if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
     if (st->max_lookup_bytes > 0) {
         if (fseek(st->sorted_file, 0, SEEK_END) == 0) {
             long sz = ftell(st->sorted_file);
             if (sz >= 0 && (size_t)sz > st->max_lookup_bytes) {
-                set_limit_error(side, op, "max_lookup_bytes", st->max_lookup_bytes, (size_t)sz);
+                if (set_limit_error(side, op, "max_lookup_bytes", st->max_lookup_bytes,
+                                    (size_t)sz) != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             fseek(st->sorted_file, 0, SEEK_SET);
@@ -2942,7 +2981,7 @@ static int union_next_decoded_batch(set_state *st, tf_batch **out,
             if (ferror(st->sorted_file)) {
                 char msg[160];
                 snprintf(msg, sizeof(msg), "%s: failed reading file", op);
-                set_write_error(side, msg);
+                if (set_write_error(side, msg) != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             st->sorted_flushed = 1;
@@ -2986,9 +3025,11 @@ static int union_flush_next(tf_step *self, tf_batch **out, tf_side_channels *sid
         for (size_t r = 0; r < b->n_rows; r++) {
             st->union_file_rows++;
             if (st->max_lookup_rows > 0 && st->union_file_rows > st->max_lookup_rows) {
-                set_limit_error(side, op, "max_lookup_rows", st->max_lookup_rows, st->union_file_rows);
+                int err_rc = set_limit_error(side, op, "max_lookup_rows",
+                                             st->max_lookup_rows, st->union_file_rows);
                 tf_batch_free(ob);
                 tf_batch_free(b);
+                if (err_rc != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             if (st->mode == 2) {
@@ -3122,6 +3163,7 @@ static int set_flush_next(tf_step *self, tf_batch **out, tf_side_channels *side)
 static void set_state_free(set_state *st) {
     if (!st) return;
     free(st->file);
+    free(st->validated_file);
     if (st->columns) {
         for (size_t i = 0; i < st->n_columns; i++) free(st->columns[i]);
         free(st->columns);
@@ -3197,6 +3239,11 @@ static tf_step *set_create_common(const cJSON *args, int mode) {
     st->mode = mode;
     st->file = strdup(file_j->valuestring);
     if (!st->file) { set_state_free(st); return NULL; }
+    const char *validated = tf_policy_validated_path_arg(args, "file");
+    if (validated) {
+        st->validated_file = strdup(validated);
+        if (!st->validated_file) { set_state_free(st); return NULL; }
+    }
 
 
     cJSON *cols = cJSON_GetObjectItemCaseSensitive(args, "columns");
@@ -3303,6 +3350,11 @@ static tf_step *union_create_common(const cJSON *args, int all) {
     st->mode = all ? 3 : 2;
     st->file = strdup(file_j->valuestring);
     if (!st->file) { set_state_free(st); return NULL; }
+    const char *validated = tf_policy_validated_path_arg(args, "file");
+    if (validated) {
+        st->validated_file = strdup(validated);
+        if (!st->validated_file) { set_state_free(st); return NULL; }
+    }
 
     cJSON *sorted_j = cJSON_GetObjectItemCaseSensitive(args, "sorted");
     if (sorted_j) {

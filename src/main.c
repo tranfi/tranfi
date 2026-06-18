@@ -359,6 +359,11 @@ static char *cli_ir_to_normalized_dsl(const tf_ir_plan *ir) {
         if (sb_append(&sb, cli_normalized_step_name(node->op)) != 0) goto fail;
         if (node->args && cJSON_IsObject(node->args)) {
             for (const cJSON *arg = node->args->child; arg; arg = arg->next) {
+                if (arg->string &&
+                    (strcmp(arg->string, TF_POLICY_VALIDATED_FILE_PATH_ARG) == 0 ||
+                     strcmp(arg->string, TF_POLICY_VALIDATED_RULES_FILE_PATH_ARG) == 0)) {
+                    continue;
+                }
                 if (cli_append_normalized_arg(&sb, arg) != 0) goto fail;
             }
         }

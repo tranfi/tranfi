@@ -10,15 +10,11 @@
  * 6. No multiple decoders or encoders
  */
 
-#include "ir.h"
-#include "tranfi.h"
+#include "internal.h"
 #include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-
-#define TF_OK    0
-#define TF_ERROR (-1)
 
 static void set_plan_error(tf_ir_plan *plan, const char *msg) {
     free(plan->error);
@@ -213,6 +209,21 @@ static int policy_rewrite_path_arg(tf_ir_plan *plan, tf_ir_node *node,
         if (!cJSON_SetValuestring(item, resolved)) {
             set_plan_error(plan, "out of memory while resolving host path");
             return TF_ERROR;
+        }
+        if (!policy->resolve_path && !is_spill) {
+            const char *hidden = NULL;
+            if (strcmp(arg, "file") == 0) {
+                hidden = TF_POLICY_VALIDATED_FILE_PATH_ARG;
+            } else if (strcmp(arg, "rules_file") == 0 || strcmp(arg, "rulesFile") == 0) {
+                hidden = TF_POLICY_VALIDATED_RULES_FILE_PATH_ARG;
+            }
+            if (hidden) {
+                cJSON_DeleteItemFromObjectCaseSensitive(node->args, hidden);
+                if (tf_json_add_string(node->args, hidden, resolved) != TF_OK) {
+                    set_plan_error(plan, "out of memory while recording host path");
+                    return TF_ERROR;
+                }
+            }
         }
     }
     return TF_OK;

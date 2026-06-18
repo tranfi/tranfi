@@ -98,6 +98,7 @@ wasm: build-wasm
 test: test-c test-python test-properties test-node test-packaging fuzz-smoke
 
 test-c: build-c
+	@bash scripts/check-local-diagnostics.sh
 	@cmake --build build --target test_memory test_core test_wasm_api > /dev/null
 	@mkdir -p "$(TEST_TMPDIR)/memory"
 	@env $(TEST_MEMORY_ENV) ./build/test_memory

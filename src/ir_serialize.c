@@ -105,6 +105,10 @@ char *tf_ir_to_json(const tf_ir_plan *plan) {
         }
         if (node->args) {
             cJSON *args = cJSON_Duplicate(node->args, 1);
+            if (args) {
+                cJSON_DeleteItemFromObjectCaseSensitive(args, TF_POLICY_VALIDATED_FILE_PATH_ARG);
+                cJSON_DeleteItemFromObjectCaseSensitive(args, TF_POLICY_VALIDATED_RULES_FILE_PATH_ARG);
+            }
             if (!args || tf_json_add_item(step, "args", args) != TF_OK) {
                 cJSON_Delete(step);
                 cJSON_Delete(root);

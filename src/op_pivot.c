@@ -129,7 +129,7 @@ typedef struct {
 static int pivot_resolve_name(pivot_state *st, const char *name,
                               tf_side_channels *side);
 
-static int pivot_write_error(tf_side_channels *side, const char *msg) {
+TF_WARN_UNUSED static int pivot_write_error(tf_side_channels *side, const char *msg) {
     return tf_side_write_error(side, msg);
 }
 
@@ -925,7 +925,8 @@ static int pivot_init_spill_schema(pivot_state *st, const tf_batch *in, tf_side_
     st->name_ci = tf_batch_col_index(in, st->name_column);
     st->val_ci = tf_batch_col_index(in, st->value_column);
     if (st->name_ci < 0 || st->val_ci < 0) {
-        pivot_write_error(side, "pivot spill: name_column or value_column not found");
+        if (pivot_write_error(side, "pivot spill: name_column or value_column not found") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     st->pt_cols = tf_mallocarray_checked(in->n_cols, sizeof(int));
@@ -1389,13 +1390,15 @@ static int pivot_prepare_sorted(pivot_state *st, const tf_batch *in,
                                 tf_side_channels *side) {
     if (st->has_schema) return TF_OK;
     if (!st->categories_declared || st->n_names == 0) {
-        pivot_write_error(side, "pivot: sorted=true requires declared categories");
+        if (pivot_write_error(side, "pivot: sorted=true requires declared categories") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     st->name_ci = tf_batch_col_index(in, st->name_column);
     st->val_ci = tf_batch_col_index(in, st->value_column);
     if (st->name_ci < 0 || st->val_ci < 0) {
-        pivot_write_error(side, "pivot: name_column or value_column not found");
+        if (pivot_write_error(side, "pivot: name_column or value_column not found") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     st->pt_cols = tf_mallocarray_checked(in->n_cols, sizeof(int));

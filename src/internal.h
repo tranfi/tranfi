@@ -308,6 +308,13 @@ typedef struct tf_side_channels {
 
 TF_WARN_UNUSED int tf_side_write_error(tf_side_channels *side, const char *msg);
 
+/* Hidden IR args added by the built-in workspace_root resolver. */
+#define TF_POLICY_VALIDATED_FILE_PATH_ARG       "_tf_validated_file_path"
+#define TF_POLICY_VALIDATED_RULES_FILE_PATH_ARG "_tf_validated_rules_file_path"
+
+const char *tf_policy_validated_path_arg(const cJSON *args, const char *path_arg);
+FILE *tf_policy_fopen_read(const char *path, const char *validated_path);
+
 typedef struct tf_step {
     /* Process one input batch, produce zero or one output batch.
      * *out is set to a new batch (caller frees) or NULL if filtered away. */

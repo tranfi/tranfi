@@ -398,7 +398,9 @@ static cJSON *load_validate_rules_file(const cJSON *args, int *status) {
         return NULL;
     }
 
-    FILE *f = fopen(path_json->valuestring, "rb");
+    const char *validated_path = tf_policy_validated_path_arg(args, "rules_file");
+    if (!validated_path) validated_path = tf_policy_validated_path_arg(args, "rulesFile");
+    FILE *f = tf_policy_fopen_read(path_json->valuestring, validated_path);
     if (!f) {
         tf_set_last_error("validate: unable to read rules_file");
         return NULL;

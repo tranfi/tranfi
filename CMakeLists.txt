@@ -51,6 +51,7 @@ set(CORE_SOURCES
     src/arena.c
     src/buffer.c
     src/size_utils.c
+    src/path_policy.c
     src/batch.c
     src/pipeline.c
     src/expr.c

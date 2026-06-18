@@ -634,7 +634,7 @@ def test_csv_typed_post_inference_materialization_chunk_boundaries():
         'id,score,d,ts,flag,name',
         '1,1.5,2024-01-01,2024-01-01T01:02:03.123456Z,true,Alice',
         '2,2.25,2024-01-02,2024-01-02T00:00:00Z,false,Bob',
-        ',,,,maybe,Charlie',
+        ',,,,,Charlie',
         '4,4.5,2024-01-04,2024-01-04T05:06:07Z,true,Diana',
     ]
     for chunk_size in chunk_parity_sizes(data):

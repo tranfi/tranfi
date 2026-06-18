@@ -68,6 +68,7 @@ typedef struct {
 
 typedef struct {
     char       *file;
+    char       *validated_file;
     char       *left_col;
     char       *right_col;
     int         how;          /* 0=inner, 1=left, 2=semi, 3=anti */
@@ -196,13 +197,13 @@ static int join_check_unsorted_state_bytes(const join_state *st,
 static int join_reserve_output_row(join_state *st, tf_side_channels *side);
 static size_t join_spill_retained_state_bytes(const join_state *st);
 
-static int join_write_error(tf_side_channels *side, const char *msg) {
+TF_WARN_UNUSED static int join_write_error(tf_side_channels *side, const char *msg) {
     return tf_side_write_error(side, msg);
 }
 
-static int join_limit_error_context(tf_side_channels *side, const char *field,
-                                    size_t limit, size_t actual,
-                                    const char *context) {
+TF_WARN_UNUSED static int join_limit_error_context(tf_side_channels *side, const char *field,
+                                                   size_t limit, size_t actual,
+                                                   const char *context) {
     char msg[224];
     snprintf(msg, sizeof(msg),
              "join: %s=%zu exceeded %s (%zu)",
@@ -210,8 +211,8 @@ static int join_limit_error_context(tf_side_channels *side, const char *field,
     return join_write_error(side, msg);
 }
 
-static int join_limit_error(tf_side_channels *side, const char *field,
-                            size_t limit, size_t actual) {
+TF_WARN_UNUSED static int join_limit_error(tf_side_channels *side, const char *field,
+                                           size_t limit, size_t actual) {
     return join_limit_error_context(side, field, limit, actual,
                                     "while loading lookup side");
 }
@@ -254,9 +255,10 @@ static int map_insert(join_state *st, join_hash_map *m,
             /* Add row to existing bucket */
             join_bucket *b = &m->buckets[idx];
             if (st->max_matches_per_row > 0 && b->n_rows >= st->max_matches_per_row) {
-                join_limit_error_context(side, "max_matches_per_row",
-                                         st->max_matches_per_row, b->n_rows + 1,
-                                         "for lookup key");
+                if (join_limit_error_context(side, "max_matches_per_row",
+                                             st->max_matches_per_row, b->n_rows + 1,
+                                             "for lookup key") != TF_OK)
+                    return -1;
                 return -1;
             }
             if (b->n_rows >= b->rows_cap) {
@@ -283,7 +285,9 @@ static int map_insert(join_state *st, join_hash_map *m,
     }
 
     if (st->max_lookup_keys > 0 && m->count >= st->max_lookup_keys) {
-        join_limit_error(side, "max_lookup_keys", st->max_lookup_keys, m->count + 1);
+        if (join_limit_error(side, "max_lookup_keys", st->max_lookup_keys,
+                             m->count + 1) != TF_OK)
+            return -1;
         return -1;
     }
 
@@ -513,9 +517,9 @@ static int csv_header_has_column(const uint8_t *data, size_t len, const char *na
     return 0;
 }
 
-static int csv_file_header_has_column(const char *path, const char *name) {
+static int csv_file_header_has_column(const char *path, const char *validated_path, const char *name) {
     if (!path || !name) return 0;
-    FILE *f = fopen(path, "rb");
+    FILE *f = tf_policy_fopen_read(path, validated_path);
     if (!f) return 0;
     size_t cap = 4096;
     uint8_t *buf = malloc(cap);
@@ -616,13 +620,15 @@ static tf_batch *sorted_join_create_run_batch(const join_state *st) {
 
 static int sorted_join_open(join_state *st, tf_side_channels *side) {
     if (!st || st->sorted_file || st->sorted_decoder) return TF_OK;
-    if (!csv_file_header_has_column(st->file, st->right_col)) {
-        join_write_error(side, "sorted join: lookup file is missing join column");
+    if (!csv_file_header_has_column(st->file, st->validated_file, st->right_col)) {
+        if (join_write_error(side, "sorted join: lookup file is missing join column") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
-    st->sorted_file = fopen(st->file, "rb");
+    st->sorted_file = tf_policy_fopen_read(st->file, st->validated_file);
     if (!st->sorted_file) {
-        join_write_error(side, "sorted join: cannot open lookup file");
+        if (join_write_error(side, "sorted join: cannot open lookup file") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     st->sorted_decoder = tf_csv_decoder_create(NULL);
@@ -641,7 +647,8 @@ static int sorted_join_next_batch(join_state *st, tf_side_channels *side) {
         if (st->sorted_batches && st->sorted_batch_index < st->sorted_n_batches) {
             st->sorted_current = st->sorted_batches[st->sorted_batch_index++];
             if (st->sorted_current && sorted_join_capture_schema(st, st->sorted_current) != TF_OK) {
-                join_write_error(side, "sorted join: failed to resolve lookup schema");
+                if (join_write_error(side, "sorted join: failed to resolve lookup schema") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             st->sorted_row = 0;
@@ -668,7 +675,8 @@ static int sorted_join_next_batch(join_state *st, tf_side_channels *side) {
             rc = st->sorted_decoder->decode(st->sorted_decoder, buf, n, &batches, &n_batches, side);
         } else {
             if (ferror(st->sorted_file)) {
-                join_write_error(side, "sorted join: failed reading lookup file");
+                if (join_write_error(side, "sorted join: failed reading lookup file") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             st->sorted_flushed = 1;
@@ -714,12 +722,14 @@ static int sorted_join_advance_lookup(join_state *st, tf_side_channels *side) {
             int cmp = 0;
             if (join_key_compare_values(&st->prev_lookup_key, &cur, &cmp) != TF_OK) {
                 join_key_value_clear(&cur);
-                join_write_error(side, "sorted join: lookup key type changed across batches");
+                if (join_write_error(side, "sorted join: lookup key type changed across batches") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             if (cmp > 0) {
                 join_key_value_clear(&cur);
-                join_write_error(side, "sorted join: lookup side is not sorted by join key");
+                if (join_write_error(side, "sorted join: lookup side is not sorted by join key") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
         }
@@ -768,15 +778,18 @@ static int sorted_join_load_next_run(join_state *st, tf_side_channels *side) {
         int cmp = 0;
         if (join_key_compare_value_to_cell(&st->right_run_key, st->sorted_current,
                                            st->sorted_row, st->lookup_join_col, &cmp) != TF_OK) {
-            join_write_error(side, "sorted join: lookup key type changed across rows");
+            if (join_write_error(side, "sorted join: lookup key type changed across rows") != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         if (cmp != 0) break;
 
         if (st->how < 2) {
             if (st->max_matches_per_row > 0 && st->right_run->n_rows >= st->max_matches_per_row) {
-                join_limit_error_context(side, "max_matches_per_row", st->max_matches_per_row,
-                                         st->right_run->n_rows + 1, "for sorted lookup key");
+                if (join_limit_error_context(side, "max_matches_per_row", st->max_matches_per_row,
+                                             st->right_run->n_rows + 1,
+                                             "for sorted lookup key") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             size_t dst = st->right_run->n_rows;
@@ -800,7 +813,8 @@ static int sorted_join_ensure_run_at_least(join_state *st, const tf_batch *left,
     while (st->have_right_run) {
         int cmp = 0;
         if (join_key_compare_value_to_cell(&st->right_run_key, left, left_row, left_ci, &cmp) != TF_OK) {
-            join_write_error(side, "sorted join: left and lookup join key types differ");
+            if (join_write_error(side, "sorted join: left and lookup join key types differ") != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         if (cmp >= 0) return TF_OK;
@@ -819,12 +833,14 @@ static int sorted_join_check_left_order(join_state *st, const tf_batch *left,
         int cmp = 0;
         if (join_key_compare_values(&st->prev_left_key, &cur, &cmp) != TF_OK) {
             join_key_value_clear(&cur);
-            join_write_error(side, "sorted join: left join key type changed across batches");
+            if (join_write_error(side, "sorted join: left join key type changed across batches") != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         if (cmp > 0) {
             join_key_value_clear(&cur);
-            join_write_error(side, "sorted join: left side is not sorted by join key");
+            if (join_write_error(side, "sorted join: left side is not sorted by join key") != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
     }
@@ -849,7 +865,7 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
     int *lookup_out_cols = NULL;
     join_hash_map map = {0};
 
-    f = fopen(st->file, "rb");
+    f = tf_policy_fopen_read(st->file, st->validated_file);
     if (!f) return TF_ERROR;
 
     /* Read entire lookup file, guarded by max_lookup_bytes when provided. */
@@ -858,7 +874,9 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
     if (fseek(f, 0, SEEK_SET) != 0) goto fail;
     if (fsize <= 0) goto fail;
     if (st->max_lookup_bytes > 0 && (size_t)fsize > st->max_lookup_bytes) {
-        join_limit_error(side, "max_lookup_bytes", st->max_lookup_bytes, (size_t)fsize);
+        if (join_limit_error(side, "max_lookup_bytes", st->max_lookup_bytes,
+                             (size_t)fsize) != TF_OK)
+            goto fail;
         goto fail;
     }
 
@@ -883,7 +901,9 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
         all_batches[i] = batches[i];
         total_rows += batches[i]->n_rows;
         if (st->max_lookup_rows > 0 && total_rows > st->max_lookup_rows) {
-            join_limit_error(side, "max_lookup_rows", st->max_lookup_rows, total_rows);
+            if (join_limit_error(side, "max_lookup_rows", st->max_lookup_rows,
+                                 total_rows) != TF_OK)
+                goto fail;
             goto fail;
         }
     }
@@ -891,7 +911,9 @@ static int load_lookup(join_state *st, tf_side_channels *side) {
         all_batches[n_batches + i] = flush_batches[i];
         total_rows += flush_batches[i]->n_rows;
         if (st->max_lookup_rows > 0 && total_rows > st->max_lookup_rows) {
-            join_limit_error(side, "max_lookup_rows", st->max_lookup_rows, total_rows);
+            if (join_limit_error(side, "max_lookup_rows", st->max_lookup_rows,
+                                 total_rows) != TF_OK)
+                goto fail;
             goto fail;
         }
     }
@@ -1048,9 +1070,10 @@ fail:
 
 static int join_reserve_output_row(join_state *st, tf_side_channels *side) {
     if (st->max_output_rows > 0 && st->output_rows >= st->max_output_rows) {
-        join_limit_error_context(side, "max_output_rows",
-                                 st->max_output_rows, st->output_rows + 1,
-                                 "while emitting joined output");
+        if (join_limit_error_context(side, "max_output_rows",
+                                     st->max_output_rows, st->output_rows + 1,
+                                     "while emitting joined output") != TF_OK)
+            return 0;
         return 0;
     }
     st->output_rows++;
@@ -1139,19 +1162,22 @@ static tf_batch *join_spill_create_output_batch(const join_state *st, size_t cap
 
 static int join_spill_check_input_schema(join_state *st, const tf_batch *in, tf_side_channels *side) {
     if (in->n_cols != st->spill_n_cols) {
-        join_write_error(side, "join spill: input schema changed across batches");
+        if (join_write_error(side, "join spill: input schema changed across batches") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     for (size_t c = 0; c < in->n_cols; c++) {
         if (in->col_types[c] != st->spill_schema_types[c] ||
             strcmp(in->col_names[c] ? in->col_names[c] : "", st->spill_schema_names[c]) != 0) {
-            join_write_error(side, "join spill: input schema changed across batches");
+            if (join_write_error(side, "join spill: input schema changed across batches") != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
     }
     int left_ci = tf_batch_col_index(in, st->left_col);
     if (left_ci < 0 || left_ci != st->spill_left_join_col) {
-        join_write_error(side, "join spill: left join column is missing or moved");
+        if (join_write_error(side, "join spill: left join column is missing or moved") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     return TF_OK;
@@ -1161,7 +1187,8 @@ static int join_spill_init_schema(join_state *st, const tf_batch *in, tf_side_ch
     if (st->spill_has_schema) return join_spill_check_input_schema(st, in, side);
     int left_ci = tf_batch_col_index(in, st->left_col);
     if (left_ci < 0) {
-        join_write_error(side, "join spill: left join column not found");
+        if (join_write_error(side, "join spill: left join column not found") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     st->spill_n_cols = in->n_cols;
@@ -1727,8 +1754,10 @@ static int join_spill_count_lookup_key(join_state *st, const join_spill_row *row
     if (!key) return TF_ERROR;
     if (!st->spill_last_lookup_key || strcmp(st->spill_last_lookup_key, key) != 0) {
         if (st->max_lookup_keys > 0 && st->spill_lookup_keys >= st->max_lookup_keys) {
-            join_limit_error(side, "max_lookup_keys", st->max_lookup_keys, st->spill_lookup_keys + 1);
+            int err_rc = join_limit_error(side, "max_lookup_keys", st->max_lookup_keys,
+                                          st->spill_lookup_keys + 1);
             free(key);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         size_t key_bytes_delta = 0;
@@ -1796,14 +1825,16 @@ static int join_spill_capture_lookup_schema(join_state *st, const tf_batch *batc
 
     if (st->spill_lookup_n_cols > 0) {
         if (batch->n_cols != st->spill_lookup_n_cols || lookup_ci != st->spill_lookup_join_col) {
-            join_write_error(side, "join spill: lookup schema changed across batches");
+            if (join_write_error(side, "join spill: lookup schema changed across batches") != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         for (size_t c = 0; c < batch->n_cols; c++) {
             if (batch->col_types[c] != st->spill_lookup_schema_types[c] ||
                 strcmp(batch->col_names[c] ? batch->col_names[c] : "",
                        st->spill_lookup_schema_names[c] ? st->spill_lookup_schema_names[c] : "") != 0) {
-                join_write_error(side, "join spill: lookup schema changed across batches");
+                if (join_write_error(side, "join spill: lookup schema changed across batches") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
         }
@@ -1858,11 +1889,13 @@ static int join_spill_process_lookup_batch(join_state *st, const tf_batch *batch
                                            tf_side_channels *side) {
     int lookup_ci = tf_batch_col_index(batch, st->right_col);
     if (lookup_ci < 0) {
-        join_write_error(side, "join spill: lookup file is missing join column");
+        if (join_write_error(side, "join spill: lookup file is missing join column") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     if (batch->col_types[lookup_ci] != st->spill_schema_types[st->spill_left_join_col]) {
-        join_write_error(side, "join spill: left and lookup join key types differ");
+        if (join_write_error(side, "join spill: left and lookup join key types differ") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     if (st->how < 2) {
@@ -1875,7 +1908,9 @@ static int join_spill_process_lookup_batch(join_state *st, const tf_batch *batch
     }
     for (size_t r = 0; r < batch->n_rows; r++) {
         if (st->max_lookup_rows > 0 && st->lookup_rows >= st->max_lookup_rows) {
-            join_limit_error(side, "max_lookup_rows", st->max_lookup_rows, st->lookup_rows + 1);
+            if (join_limit_error(side, "max_lookup_rows", st->max_lookup_rows,
+                                 st->lookup_rows + 1) != TF_OK)
+                return TF_ERROR;
             return TF_ERROR;
         }
         size_t dst = st->spill_lookup_buf->n_rows;
@@ -1898,13 +1933,15 @@ static int join_spill_process_lookup_batch(join_state *st, const tf_batch *batch
 static int join_spill_load_lookup_runs(join_state *st, tf_side_channels *side) {
     if (st->spill_lookup_loaded) return TF_OK;
     st->spill_lookup_loaded = 1;
-    if (!csv_file_header_has_column(st->file, st->right_col)) {
-        join_write_error(side, "join spill: lookup file is missing join column");
+    if (!csv_file_header_has_column(st->file, st->validated_file, st->right_col)) {
+        if (join_write_error(side, "join spill: lookup file is missing join column") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
-    FILE *f = fopen(st->file, "rb");
+    FILE *f = tf_policy_fopen_read(st->file, st->validated_file);
     if (!f) {
-        join_write_error(side, "join spill: cannot open lookup file");
+        if (join_write_error(side, "join spill: cannot open lookup file") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     tf_decoder *dec = tf_csv_decoder_create(NULL);
@@ -1920,14 +1957,17 @@ static int join_spill_load_lookup_runs(join_state *st, tf_side_channels *side) {
         if (n > 0) {
             bytes_read += n;
             if (st->max_lookup_bytes > 0 && bytes_read > st->max_lookup_bytes) {
-                join_limit_error(side, "max_lookup_bytes", st->max_lookup_bytes, bytes_read);
+                if (join_limit_error(side, "max_lookup_bytes", st->max_lookup_bytes,
+                                     bytes_read) != TF_OK)
+                    rc = TF_ERROR;
                 rc = TF_ERROR;
                 break;
             }
             rc = dec->decode(dec, buf, n, &batches, &n_batches, side);
         } else {
             if (ferror(f)) {
-                join_write_error(side, "join spill: failed reading lookup file");
+                if (join_write_error(side, "join spill: failed reading lookup file") != TF_OK)
+                    rc = TF_ERROR;
                 rc = TF_ERROR;
                 break;
             }
@@ -1969,17 +2009,20 @@ static int join_spill_output_ordinal(join_state *st, uint64_t left_ordinal,
         return TF_OK;
     }
     if (st->max_matches_per_row == 0) {
-        join_write_error(side, "join spill: inner/left joins need max_matches_per_row to bound lookup key runs");
+        if (join_write_error(side, "join spill: inner/left joins need max_matches_per_row to bound lookup key runs") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     if (match_idx >= st->max_matches_per_row) {
-        join_limit_error_context(side, "max_matches_per_row", st->max_matches_per_row,
-                                 match_idx + 1, "for spilled lookup key");
+        if (join_limit_error_context(side, "max_matches_per_row", st->max_matches_per_row,
+                                     match_idx + 1, "for spilled lookup key") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     uint64_t slots = (uint64_t)st->max_matches_per_row;
     if (slots == 0 || left_ordinal > (UINT64_MAX - (uint64_t)match_idx) / slots) {
-        join_write_error(side, "join spill: output ordinal overflow");
+        if (join_write_error(side, "join spill: output ordinal overflow") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     *out = left_ordinal * slots + (uint64_t)match_idx;
@@ -2065,9 +2108,12 @@ static int join_spill_collect_lookup_run(join_state *st, const join_spill_row *l
         if (cmp != 0) break;
         if (join_spill_count_lookup_key(st, &lookup->row, side) != TF_OK) { tf_batch_free(run); return TF_ERROR; }
         if (st->max_matches_per_row > 0 && run->n_rows >= st->max_matches_per_row) {
-            join_limit_error_context(side, "max_matches_per_row", st->max_matches_per_row,
-                                     run->n_rows + 1, "for spilled lookup key");
+            int err_rc = join_limit_error_context(side, "max_matches_per_row",
+                                                  st->max_matches_per_row,
+                                                  run->n_rows + 1,
+                                                  "for spilled lookup key");
             tf_batch_free(run);
+            if (err_rc != TF_OK) return TF_ERROR;
             return TF_ERROR;
         }
         size_t dst = run->n_rows;
@@ -2096,7 +2142,8 @@ static int join_spill_produce_mutating_output_runs(join_state *st, tf_side_chann
 
     if (join_spill_load_lookup_runs(st, side) != TF_OK) return TF_ERROR;
     if (st->spill_lookup_n_cols == 0) {
-        join_write_error(side, "join spill: inner/left joins need a non-empty lookup to infer output schema");
+        if (join_write_error(side, "join spill: inner/left joins need a non-empty lookup to infer output schema") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
     if (join_spill_open_readers(st, 0) != TF_OK) return TF_ERROR;
@@ -2330,11 +2377,13 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (sorted_join_advance_lookup(st, side) != TF_OK) return TF_ERROR;
         if (st->how < 2) {
             if (!st->sorted_have_row) {
-                join_write_error(side, "sorted join: mutating joins need a non-empty lookup to infer output schema");
+                if (join_write_error(side, "sorted join: mutating joins need a non-empty lookup to infer output schema") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
             if (st->max_matches_per_row == 0) {
-                join_write_error(side, "sorted join: inner/left joins need max_matches_per_row to bound the current lookup key run");
+                if (join_write_error(side, "sorted join: inner/left joins need max_matches_per_row to bound the current lookup key run") != TF_OK)
+                    return TF_ERROR;
                 return TF_ERROR;
             }
         }
@@ -2378,8 +2427,9 @@ static int sorted_join_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (st->have_right_run) {
             int cmp = 0;
             if (join_key_compare_value_to_cell(&st->right_run_key, in, r, left_ci, &cmp) != TF_OK) {
-                join_write_error(side, "sorted join: left and lookup join key types differ");
+                int err_rc = join_write_error(side, "sorted join: left and lookup join key types differ");
                 tf_batch_free(ob);
+                if (err_rc != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             has_match = (cmp == 0);
@@ -2433,7 +2483,8 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
     int left_ci = tf_batch_col_index(in, st->left_col);
     if (left_ci < 0) return TF_ERROR;
     if (st->have_lookup_key_type && in->col_types[left_ci] != st->lookup_key_type) {
-        join_write_error(side, "join: left and lookup join key types differ");
+        if (join_write_error(side, "join: left and lookup join key types differ") != TF_OK)
+            return TF_ERROR;
         return TF_ERROR;
     }
 
@@ -2474,10 +2525,12 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
         } else if (bucket) {
             if (st->max_matches_per_row > 0 && bucket->n_rows > st->max_matches_per_row) {
-                join_limit_error_context(side, "max_matches_per_row",
-                                         st->max_matches_per_row, bucket->n_rows,
-                                         "for input row");
+                int err_rc = join_limit_error_context(side, "max_matches_per_row",
+                                                      st->max_matches_per_row,
+                                                      bucket->n_rows,
+                                                      "for input row");
                 tf_batch_free(ob);
+                if (err_rc != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             /* Emit one row per match */
@@ -2669,6 +2722,7 @@ static int join_append_stats(tf_step *self, tf_buffer *out) {
 static void join_state_free(join_state *st) {
     if (!st) return;
     free(st->file);
+    free(st->validated_file);
     free(st->left_col);
     free(st->right_col);
     if (st->lookup) tf_batch_free(st->lookup);
@@ -2730,6 +2784,11 @@ tf_step *tf_join_create(const cJSON *args) {
 
     st->file = strdup(file_j->valuestring);
     if (!st->file) { join_state_free(st); return NULL; }
+    const char *validated = tf_policy_validated_path_arg(args, "file");
+    if (validated) {
+        st->validated_file = strdup(validated);
+        if (!st->validated_file) { join_state_free(st); return NULL; }
+    }
 
     /* Parse "on" field: "col" or "left_col=right_col" */
     const char *on = on_j->valuestring;

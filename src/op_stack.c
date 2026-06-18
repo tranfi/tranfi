@@ -19,6 +19,7 @@
 
 typedef struct {
     char *file_path;
+    char *validated_file_path;
     char *tag_col;       /* NULL if no tag */
     char *tag_value;     /* value for appended rows */
     char *tag_value_in;  /* value for passthrough rows (filename or "input") */
@@ -58,6 +59,7 @@ static void stack_state_free(stack_state *st) {
     if (!st) return;
     stack_close_file_reader(st);
     free(st->file_path);
+    free(st->validated_file_path);
     free(st->tag_col);
     free(st->tag_value);
     free(st->tag_value_in);
@@ -69,16 +71,16 @@ static void stack_destroy(tf_step *self) {
     free(self);
 }
 
-static int stack_write_error(tf_side_channels *side, const char *msg) {
+TF_WARN_UNUSED static int stack_write_error(tf_side_channels *side, const char *msg) {
     return tf_side_write_error(side, msg);
 }
 
 static int stack_open_file_reader(stack_state *st, tf_side_channels *side) {
     if (st->file_started) return TF_OK;
     st->file_started = 1;
-    st->file = fopen(st->file_path, "rb");
+    st->file = tf_policy_fopen_read(st->file_path, st->validated_file_path);
     if (!st->file) {
-        stack_write_error(side, "stack: cannot open file");
+        if (stack_write_error(side, "stack: cannot open file") != TF_OK) return TF_ERROR;
         return TF_ERROR;
     }
     st->decoder = tf_csv_decoder_create(NULL);
@@ -119,9 +121,10 @@ static int stack_next_decoded_file_batch(stack_state *st, tf_batch **out,
             rc = st->decoder->decode(st->decoder, buf, n, &batches, &n_batches, side);
         } else {
             if (ferror(st->file)) {
-                stack_write_error(side, "stack: failed reading file");
+                int err_rc = stack_write_error(side, "stack: failed reading file");
                 stack_close_file_reader(st);
                 st->file_done = 1;
+                if (err_rc != TF_OK) return TF_ERROR;
                 return TF_ERROR;
             }
             rc = st->decoder->flush(st->decoder, &batches, &n_batches, side);
@@ -239,6 +242,11 @@ tf_step *tf_stack_create(const cJSON *args) {
 
     st->file_path = strdup(file->valuestring);
     if (!st->file_path) { stack_state_free(st); return NULL; }
+    const char *validated = tf_policy_validated_path_arg(args, "file");
+    if (validated) {
+        st->validated_file_path = strdup(validated);
+        if (!st->validated_file_path) { stack_state_free(st); return NULL; }
+    }
 
     cJSON *tag = cJSON_GetObjectItemCaseSensitive(args, "tag");
     if (cJSON_IsString(tag) && tag->valuestring[0]) {
