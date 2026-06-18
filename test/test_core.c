@@ -4641,6 +4641,143 @@ static void test_compile_to_sql_rejects_stats(void) {
     free(error);
 }
 
+typedef struct {
+    const char *name;
+    const char *dsl;
+    const char *needle;
+} sql_supported_case;
+
+typedef struct {
+    const char *name;
+    const char *dsl;
+    const char *needle;
+} sql_rejected_case;
+
+static void assert_compile_to_sql_supported(const sql_supported_case *tc) {
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(tc->dsl, strlen(tc->dsl), &error);
+    if (!sql) {
+        fprintf(stderr, "SQL support case failed: %s: %s\n",
+                tc->name, error ? error : "unknown");
+    }
+    assert(sql != NULL);
+    assert(error == NULL);
+    if (tc->needle) {
+        assert(strstr(sql, tc->needle) != NULL);
+    }
+    tf_string_free(sql);
+}
+
+static void assert_compile_to_sql_rejected(const sql_rejected_case *tc) {
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(tc->dsl, strlen(tc->dsl), &error);
+    if (sql) {
+        fprintf(stderr, "SQL rejection case compiled unexpectedly: %s: %s\n",
+                tc->name, sql);
+    }
+    assert(sql == NULL);
+    assert(error != NULL);
+    assert(strstr(error, tc->needle) != NULL);
+    free(error);
+}
+
+static void test_compile_to_sql_supported_matrix(void) {
+    const sql_supported_case cases[] = {
+        {"filter", "csv | filter \"col('age') > 25\" | csv", "WHERE"},
+        {"relocate-default", "csv | relocate score | csv", "EXCLUDE"},
+        {"select", "csv | select name,age | csv", "SELECT \"name\", \"age\""},
+        {"rename", "csv | rename age=years | csv", "RENAME"},
+        {"derive", "csv | derive total=col('price')*col('qty') | csv", "\"total\""},
+        {"validate-expression", "csv | validate \"col('age') > 0\" | csv", "\"_valid\""},
+        {"trim-explicit", "csv | trim name,city | csv", "trim(\"name\")"},
+        {"fill-null", "csv | fill-null age=0 | csv", "COALESCE"},
+        {"cast", "csv | cast age=int | csv", "CAST(\"age\" AS BIGINT)"},
+        {"clip", "csv | clip score min=0 max=100 | csv", "GREATEST"},
+        {"replace", "csv | replace name Alice Alicia | csv", "replace(\"name\""},
+        {"hash-columns", "csv | hash name,age | csv", "hash(\"name\", \"age\")"},
+        {"bin", "csv | bin score 80,90 | csv", "CASE WHEN"},
+        {"sort", "csv | sort -score | csv", "ORDER BY \"score\" DESC"},
+        {"head", "csv | head 10 | csv", "LIMIT 10"},
+        {"tail", "csv | tail 10 | csv", "_total - 10"},
+        {"skip", "csv | skip 5 | csv", "OFFSET 5"},
+        {"top", "csv | top 10 score | csv", "ORDER BY \"score\" DESC LIMIT 10"},
+        {"top-k", "csv | top-k 10 score | csv", "ORDER BY \"score\" DESC LIMIT 10"},
+        {"bottom-k", "csv | bottom-k 10 score | csv", "ORDER BY \"score\" ASC LIMIT 10"},
+        {"slice-min", "csv | slice-min score n=10 | csv", "ORDER BY \"score\" ASC LIMIT 10"},
+        {"slice-max", "csv | slice-max score n=10 | csv", "ORDER BY \"score\" DESC LIMIT 10"},
+        {"unique", "csv | unique city | csv", "SELECT DISTINCT ON"},
+        {"dedup", "csv | dedup | csv", "SELECT DISTINCT *"},
+        {"group-agg", "csv | group-agg city sum:price:total | csv", "SUM(\"price\")"},
+        {"frequency", "csv | frequency city | csv", "\"value\", COUNT(*)"},
+        {"join", "csv | join lookup.csv on city | csv", "INNER JOIN read_csv_auto"},
+        {"semi-join", "csv | semi-join lookup.csv on city | csv", "WHERE EXISTS"},
+        {"anti-join", "csv | anti-join lookup.csv on city | csv", "WHERE NOT EXISTS"},
+        {"intersect", "csv | intersect other.csv | csv", " INTERSECT SELECT "},
+        {"setdiff", "csv | setdiff other.csv | csv", " EXCEPT SELECT "},
+        {"intersect-all", "csv | intersect-all other.csv | csv", " INTERSECT ALL SELECT "},
+        {"setdiff-all", "csv | setdiff-all other.csv | csv", " EXCEPT ALL SELECT "},
+        {"union", "csv | union other.csv | csv", " UNION SELECT "},
+        {"union-all", "csv | union-all other.csv | csv", " UNION ALL SELECT "},
+        {"stack", "csv | stack other.csv | csv", "UNION ALL SELECT"},
+        {"explode", "csv | explode tags ; | csv", "string_split"},
+        {"split", "csv | split name \" \" first,last | csv", "string_split"},
+        {"unpivot", "csv | unpivot jan,feb | csv", "UNPIVOT"},
+        {"pivot", "csv | pivot metric value sum | csv", "PIVOT"},
+        {"step", "csv | step price running-sum cumsum | csv", "UNBOUNDED PRECEDING"},
+        {"lead", "csv | lead price 1 next_price | csv", "LEAD"},
+        {"lag", "csv | lag price 1 prev_price | csv", "LAG"},
+        {"shift-lead", "csv | shift price 1 next_price type=lead | csv", "LEAD"},
+        {"rowid", "csv | rowid | csv", "ROW_NUMBER()"},
+        {"rleid", "csv | rleid city result=run | csv", "__tf_rleid_changed"},
+        {"window", "csv | window price 3 avg ma3 | csv", "ROWS BETWEEN 2 PRECEDING"},
+        {"rolling-any", "csv | rolling-any flag 3 any3 | csv", "BOOL_OR"},
+        {"datetime", "csv | datetime date year,month | csv", "EXTRACT(year"},
+        {"date-trunc", "csv | date-trunc date month date_month | csv", "date_trunc('month'"},
+    };
+    size_t n = sizeof(cases) / sizeof(cases[0]);
+    for (size_t i = 0; i < n; i++) {
+        assert_compile_to_sql_supported(&cases[i]);
+    }
+}
+
+static void test_compile_to_sql_rejected_matrix(void) {
+    const sql_rejected_case cases[] = {
+        {"relocate-anchored", "csv | relocate score before=age | csv", "requires known schema"},
+        {"select-selector", "csv | select starts_with(score_) | csv", "selector helpers"},
+        {"assert", "csv | assert \"col('age') > 0\" | csv", "unsupported op"},
+        {"schema", "csv | schema age:int | csv", "unsupported op"},
+        {"schema-infer", "csv | schema infer rows=10 | csv", "unsupported op"},
+        {"trim-all", "csv | trim | csv", "requires explicit columns"},
+        {"sample", "csv | sample 10 seed=1 | csv", "deterministic reservoir"},
+        {"unique-sorted", "csv | unique city sorted=true | csv", "adjacent-run mode"},
+        {"unique-approx", "csv | unique city mode=approx | csv", "approximate mode"},
+        {"frequency-all", "csv | frequency | csv", "requires explicit columns"},
+        {"frequency-overflow", "csv | frequency city max_values=2 overflow=other | csv", "overflow=other"},
+        {"selected-key-set", "csv | intersect other.csv columns=id | csv", "all-column set operations"},
+        {"stats", "csv | stats count | csv", "native report shape"},
+        {"scan", "csv | scan count | csv", "unsupported op"},
+        {"source-name", "csv | source-name src | csv", "unsupported op"},
+        {"json-extract", "text | json-extract /user/id user_id type=int | csv", "unsupported op"},
+        {"json-filter", "text | json-filter /user/age >= 30 type=float | csv", "unsupported op"},
+        {"json-schema", "text | json-schema required=user mode=filter | csv", "unsupported op"},
+        {"json-flatten", "text | json-flatten fields=/user/id:user_id:int | csv", "unsupported op"},
+        {"across", "csv | across name lower | csv", "unsupported op"},
+        {"onehot", "csv | onehot city | csv", "unsupported op"},
+        {"label-encode", "csv | label-encode city | csv", "unsupported op"},
+        {"split-data", "csv | split-data 0.8 | csv", "unsupported op"},
+        {"ewma", "csv | ewma price 0.3 | csv", "unsupported op"},
+        {"diff", "csv | diff price | csv", "unsupported op"},
+        {"anomaly", "csv | anomaly price 3.0 | csv", "unsupported op"},
+        {"interpolate", "csv | interpolate price linear | csv", "unsupported op"},
+        {"normalize", "csv | normalize price minmax | csv", "unsupported op"},
+        {"acf", "csv | acf price 3 | csv", "unsupported op"},
+    };
+    size_t n = sizeof(cases) / sizeof(cases[0]);
+    for (size_t i = 0; i < n; i++) {
+        assert_compile_to_sql_rejected(&cases[i]);
+    }
+}
+
 static void test_pipeline_create_from_ir(void) {
     const char *json =
         "{\"steps\":["
@@ -12661,6 +12798,8 @@ int main(int argc, char **argv) {
     TEST(test_compile_to_sql_grep_literal_chars);
     TEST(test_compile_to_sql_rejects_sample);
     TEST(test_compile_to_sql_rejects_stats);
+    TEST(test_compile_to_sql_supported_matrix);
+    TEST(test_compile_to_sql_rejected_matrix);
     TEST(test_pipeline_create_from_ir);
     TEST(test_public_ir_api);
 

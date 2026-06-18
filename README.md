@@ -136,10 +136,12 @@ SQL compatibility is intentionally conservative:
 
 | Surface | Native/WASM | DuckDB SQL | SQLite/Postgres |
 |---------|-------------|------------|-----------------|
-| Row/project ops | all row-local streaming ops | supported for explicit-schema forms such as `filter`, `select`, `relocate`, `rename`, `derive`, `trim cols`, `fill-null`, `cast`, `clip`, `replace`, `bin`, `grep` | recognized but rejected |
-| Ordered/window ops | bounded or blocking by contract | supported for `head`, `tail`, `skip`, `sort`, top/slice aliases, `rowid`, `rleid`, `lag`, `lead`, `shift`, `step`, and rolling aliases | recognized but rejected |
-| Aggregation/set ops | native key-state, sorted, or spill modes | supported for SQL-safe `unique`, `group-agg`, explicit-column `frequency`, joins, all-column set ops, `pivot`, `explode`, `split`, `unpivot`, and `union-all`/`stack` forms | recognized but rejected |
-| Native-only contracts | streaming side channels, audits, schema/rule checks, deterministic `sample`, `stats`/`scan`, JSON row ops, data-prep blocking ops, category encoders, host metadata | rejected or not lowered until the SQL output shape and memory contract are equivalent | recognized but rejected |
+| Row/project ops | all row-local streaming ops | supported for explicit-schema `filter`, `select`, default-front `relocate`, `rename`, `derive`, single-expression `validate`, `trim cols`, `fill-null`, `cast`, `clip`, `replace`, `hash`, `bin`, and `grep`; selector helpers and anchored `relocate before/after` reject until SQL planning has schema | recognized but rejected |
+| Ordered/window ops | bounded or blocking by contract | supported for `head`, `tail`, `skip`, `sort`, `top`/`top-k`/`bottom-k`, `slice-head`/`slice-tail`/`slice-min`/`slice-max`, `rowid`, `rleid`, `lag`, `lead`, `shift`, `step`, `fill-down`, numeric rolling/window ops, boolean rolling ops, `datetime`, and `date-trunc` | recognized but rejected |
+| Aggregation/reshape/set ops | native key-state, sorted, or spill modes | supported for SQL-safe `unique`, `dedup`, `group-agg`, explicit-column `frequency`, `join`/`semi-join`/`anti-join`, all-column `intersect`/`setdiff`/`intersect-all`/`setdiff-all`/`union`/`union-all`, `stack`, `explode`, `split`, `unpivot`, and `pivot`; selected-key set semantics reject because native keeps stable first-left rows | recognized but rejected |
+| Native-only contracts | streaming side channels, audits, schema/rule checks, deterministic `sample`, `stats`/`scan`, JSON row ops, `across`, data-prep ops (`ewma`, `diff`, `anomaly`, `interpolate`, `normalize`, `acf`), category encoders, `split-data`, and host metadata (`source-name`) | rejected or not lowered until the SQL output shape and memory contract are equivalent | recognized but rejected |
+
+The C core has a compile-to-SQL compatibility matrix test for these supported and rejected families, while the Python gate runs DuckDB parity on representative SQL-safe pipelines. Treat a successful SQL compile as an explicit target choice, not as a fallback for native streaming features.
 
 ```bash
 tranfi --target sql --dialect duckdb 'csv | filter "age > 25" | sort -age | head 10 | csv'
@@ -753,7 +755,7 @@ The core/debug suites also cover checked batch setters and shared schema/row-cop
 Or individually:
 
 ```bash
-./build/test_core        # 300 C core tests
+./build/test_core        # 302 C core tests
 ./build/test_memory      # 34 native streaming memory regression tests
 python -m pytest test/   # Python tests (inc. DuckDB engine)
 node test/test_node.js   # Node.js tests (inc. SQL transpiler, DuckDB, WASM)
