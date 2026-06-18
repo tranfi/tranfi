@@ -628,6 +628,59 @@ int main(void) {
         spill_pivot_dsl,
         pivot_silent_rows,
         520);
+    char spill_join_dsl[768];
+    int spill_join_n = snprintf(
+        spill_join_dsl,
+        sizeof(spill_join_dsl),
+        "csv batch_size=1 | join %s on city max_matches_per_row=2 "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        join_lookup_path,
+        spill_root);
+    assert(spill_join_n > 0 && (size_t)spill_join_n < sizeof(spill_join_dsl));
+    run_case_no_silent_output_oom(
+        "spill_join_inner_key_materialization",
+        spill_join_dsl,
+        people,
+        700);
+    spill_join_n = snprintf(
+        spill_join_dsl,
+        sizeof(spill_join_dsl),
+        "csv batch_size=1 | join %s on city --left max_matches_per_row=2 "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        join_lookup_path,
+        spill_root);
+    assert(spill_join_n > 0 && (size_t)spill_join_n < sizeof(spill_join_dsl));
+    run_case_no_silent_output_oom(
+        "spill_join_left_key_materialization",
+        spill_join_dsl,
+        people,
+        740);
+    spill_join_n = snprintf(
+        spill_join_dsl,
+        sizeof(spill_join_dsl),
+        "csv batch_size=1 | semi-join %s on city "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        join_lookup_path,
+        spill_root);
+    assert(spill_join_n > 0 && (size_t)spill_join_n < sizeof(spill_join_dsl));
+    run_case_no_silent_output_oom(
+        "spill_join_semi_key_materialization",
+        spill_join_dsl,
+        people,
+        640);
+    spill_join_n = snprintf(
+        spill_join_dsl,
+        sizeof(spill_join_dsl),
+        "csv batch_size=1 | anti-join %s on city "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        join_lookup_path,
+        spill_root);
+    assert(spill_join_n > 0 && (size_t)spill_join_n < sizeof(spill_join_dsl));
+    run_case_no_silent_output_oom(
+        "spill_join_anti_key_materialization",
+        spill_join_dsl,
+        people,
+        640);
     char spill_sort_plan[1024];
     int spill_sort_n = snprintf(
         spill_sort_plan,
