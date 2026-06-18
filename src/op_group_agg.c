@@ -168,6 +168,14 @@ static agg_func parse_agg_func(const char *s) {
     return AGG_COUNT;
 }
 
+static char *group_agg_default_name(const char *column, const char *func) {
+    char *suffix = tf_string_append_suffix_checked("_", func ? func : "count");
+    if (!suffix) return NULL;
+    char *name = tf_string_append_suffix_checked(column ? column : "", suffix);
+    free(suffix);
+    return name;
+}
+
 static int key_append(char **buf, size_t *buf_cap, size_t *buf_len,
                       const char *data, size_t data_len) {
     size_t need = 0;
@@ -624,7 +632,7 @@ static int group_agg_init_spill_schema(group_agg_state *st, const tf_batch *in) 
     st->schema_types = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(tf_type));
     if (!st->schema_names || !st->schema_types) return TF_ERROR;
     for (size_t c = 0; c < in->n_cols; c++) {
-        st->schema_names[c] = strdup(in->col_names[c] ? in->col_names[c] : "");
+        st->schema_names[c] = tf_strdup_checked(in->col_names[c] ? in->col_names[c] : "");
         if (!st->schema_names[c]) return TF_ERROR;
         st->schema_types[c] = in->col_types[c];
     }
@@ -641,13 +649,13 @@ static int group_agg_init_spill_schema(group_agg_state *st, const tf_batch *in) 
     if (!st->out_schema_names || !st->out_schema_types) return TF_ERROR;
     for (size_t k = 0; k < st->n_group_cols; k++) {
         int ci = st->group_indices[k];
-        st->out_schema_names[k] = strdup(st->group_cols[k] ? st->group_cols[k] : "?");
+        st->out_schema_names[k] = tf_strdup_checked(st->group_cols[k] ? st->group_cols[k] : "?");
         if (!st->out_schema_names[k]) return TF_ERROR;
         st->out_schema_types[k] = ci >= 0 ? in->col_types[ci] : TF_TYPE_STRING;
     }
     for (size_t k = 0; k < st->n_aggs; k++) {
         size_t c = st->n_group_cols + k;
-        st->out_schema_names[c] = strdup(st->aggs[k].name ? st->aggs[k].name : "agg");
+        st->out_schema_names[c] = tf_strdup_checked(st->aggs[k].name ? st->aggs[k].name : "agg");
         if (!st->out_schema_names[c]) return TF_ERROR;
         st->out_schema_types[c] = TF_TYPE_FLOAT64;
     }
@@ -1192,7 +1200,7 @@ static int group_agg_start_spill_group(group_agg_state *st, const char *key,
                                        tf_batch **current_key_batch,
                                        group_accum *accum,
                                        uint64_t *first_ordinal) {
-    *current_key = strdup(key);
+    *current_key = tf_strdup_checked(key);
     if (!*current_key) return TF_ERROR;
     *current_key_batch = group_agg_create_key_batch(st);
     if (!*current_key_batch) {
@@ -1530,7 +1538,7 @@ static int find_or_add_group(group_agg_state *st, const char *key,
     if (ensure_key_batch(st, in, group_indices) != 0) return -1;
     if (tf_batch_ensure_capacity(map->key_batch, next_count) != TF_OK) return -1;
 
-    char *dup = strdup(key);
+    char *dup = tf_strdup_checked(key);
     if (!dup) return -1;
     group_accum accum;
     if (group_accum_init(&accum, st->n_aggs) != 0) { free(dup); return -1; }
@@ -1784,7 +1792,7 @@ tf_step *tf_group_agg_create(const cJSON *args) {
     cJSON *aggs_j = cJSON_GetObjectItemCaseSensitive(args, "aggs");
     if (!cJSON_IsArray(group_by) || !cJSON_IsArray(aggs_j)) return NULL;
 
-    group_agg_state *st = calloc(1, sizeof(group_agg_state));
+    group_agg_state *st = tf_callocarray_checked(1, sizeof(group_agg_state));
     if (!st) return NULL;
     st->output_batch_rows = GROUP_AGG_DEFAULT_OUTPUT_ROWS;
 
@@ -1794,7 +1802,7 @@ tf_step *tf_group_agg_create(const cJSON *args) {
     cJSON *spill_dir_j = cJSON_GetObjectItemCaseSensitive(args, "spill_dir");
     if (cJSON_IsString(spill_dir_j) && spill_dir_j->valuestring && spill_dir_j->valuestring[0]) {
         st->use_spill = 1;
-        st->spill_dir = strdup(spill_dir_j->valuestring);
+        st->spill_dir = tf_strdup_checked(spill_dir_j->valuestring);
         if (!st->spill_dir) { group_agg_state_free(st); return NULL; }
         if (tf_spill_session_create(st->spill_dir, &st->spill) != TF_OK) { group_agg_state_free(st); return NULL; }
         size_t parsed_size = 0;
@@ -1842,7 +1850,7 @@ tf_step *tf_group_agg_create(const cJSON *args) {
     for (int i = 0; i < ng; i++) {
         cJSON *item = cJSON_GetArrayItem(group_by, i);
         if (cJSON_IsString(item)) {
-            st->group_cols[i] = strdup(item->valuestring);
+            st->group_cols[i] = tf_strdup_checked(item->valuestring);
             if (!st->group_cols[i]) { group_agg_state_free(st); return NULL; }
         }
     }
@@ -1856,22 +1864,19 @@ tf_step *tf_group_agg_create(const cJSON *args) {
         cJSON *col = cJSON_GetObjectItemCaseSensitive(item, "column");
         cJSON *func = cJSON_GetObjectItemCaseSensitive(item, "func");
         cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
-        st->aggs[i].column = strdup(cJSON_IsString(col) ? col->valuestring : "");
+        st->aggs[i].column = tf_strdup_checked(cJSON_IsString(col) ? col->valuestring : "");
         if (!st->aggs[i].column) { group_agg_state_free(st); return NULL; }
         st->aggs[i].func = cJSON_IsString(func) ? parse_agg_func(func->valuestring) : AGG_COUNT;
         if (cJSON_IsString(name)) {
-            st->aggs[i].name = strdup(name->valuestring);
+            st->aggs[i].name = tf_strdup_checked(name->valuestring);
         } else {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "%s_%s",
-                     st->aggs[i].column,
-                     cJSON_IsString(func) ? func->valuestring : "count");
-            st->aggs[i].name = strdup(buf);
+            st->aggs[i].name = group_agg_default_name(st->aggs[i].column,
+                                                      cJSON_IsString(func) ? func->valuestring : "count");
         }
         if (!st->aggs[i].name) { group_agg_state_free(st); return NULL; }
     }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { group_agg_state_free(st); return NULL; }
     step->process = group_agg_process;
     step->flush = group_agg_flush;

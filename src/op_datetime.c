@@ -161,25 +161,42 @@ static int datetime_passthrough(tf_batch *in, tf_batch **out) {
     return TF_OK;
 }
 
-static size_t datetime_extra_columns(const datetime_state *st, const char **extra_names,
-                                     tf_type *extra_types, char extra_name_storage[8][256]) {
-    size_t n_extra = 0;
-#define ADD_DATETIME_EXTRA(name) do { \
-        snprintf(extra_name_storage[n_extra], sizeof(extra_name_storage[n_extra]), "%s_%s", st->column, name); \
-        extra_names[n_extra] = extra_name_storage[n_extra]; \
-        extra_types[n_extra] = TF_TYPE_INT64; \
-        n_extra++; \
+static void datetime_free_extra_names(char **owned_names, size_t n_extra) {
+    for (size_t i = 0; i < n_extra; i++) free(owned_names[i]);
+}
+
+static int datetime_add_extra_column(const datetime_state *st, const char *suffix,
+                                     const char **extra_names, char **owned_names,
+                                     tf_type *extra_types, size_t *n_extra) {
+    char *name = tf_string_append_suffix_checked(st->column, suffix);
+    if (!name) return TF_ERROR;
+    owned_names[*n_extra] = name;
+    extra_names[*n_extra] = name;
+    extra_types[*n_extra] = TF_TYPE_INT64;
+    (*n_extra)++;
+    return TF_OK;
+}
+
+static int datetime_extra_columns(const datetime_state *st, const char **extra_names,
+                                  char **owned_names, tf_type *extra_types, size_t *n_extra) {
+    *n_extra = 0;
+#define ADD_DATETIME_EXTRA(suffix) do { \
+        if (datetime_add_extra_column(st, suffix, extra_names, owned_names, \
+                                      extra_types, n_extra) != TF_OK) { \
+            datetime_free_extra_names(owned_names, *n_extra); \
+            return TF_ERROR; \
+        } \
     } while (0)
-    if (st->w_year) ADD_DATETIME_EXTRA("year");
-    if (st->w_month) ADD_DATETIME_EXTRA("month");
-    if (st->w_day) ADD_DATETIME_EXTRA("day");
-    if (st->w_hour) ADD_DATETIME_EXTRA("hour");
-    if (st->w_minute) ADD_DATETIME_EXTRA("minute");
-    if (st->w_second) ADD_DATETIME_EXTRA("second");
-    if (st->w_weekday) ADD_DATETIME_EXTRA("weekday");
-    if (st->w_epoch) ADD_DATETIME_EXTRA("epoch");
+    if (st->w_year) ADD_DATETIME_EXTRA("_year");
+    if (st->w_month) ADD_DATETIME_EXTRA("_month");
+    if (st->w_day) ADD_DATETIME_EXTRA("_day");
+    if (st->w_hour) ADD_DATETIME_EXTRA("_hour");
+    if (st->w_minute) ADD_DATETIME_EXTRA("_minute");
+    if (st->w_second) ADD_DATETIME_EXTRA("_second");
+    if (st->w_weekday) ADD_DATETIME_EXTRA("_weekday");
+    if (st->w_epoch) ADD_DATETIME_EXTRA("_epoch");
 #undef ADD_DATETIME_EXTRA
-    return n_extra;
+    return TF_OK;
 }
 
 static int datetime_set_extra_nulls(tf_batch *ob, size_t row, size_t start, size_t n_extra) {
@@ -208,11 +225,6 @@ static int datetime_process(tf_step *self, tf_batch *in, tf_batch **out,
     datetime_state *st = self->state;
     *out = NULL;
 
-    const char *extra_names[8];
-    tf_type extra_types[8];
-    char extra_name_storage[8][256];
-    size_t n_extra = datetime_extra_columns(st, extra_names, extra_types, extra_name_storage);
-
     int ci = tf_batch_col_index(in, st->column);
     int force_null = 0;
     if (ci < 0) {
@@ -230,12 +242,29 @@ static int datetime_process(tf_step *self, tf_batch *in, tf_batch **out,
         force_null = 1;
     }
 
-    tf_batch *ob = tf_batch_create(in->n_cols + n_extra, in->n_rows);
-    if (!ob) return TF_ERROR;
+    const char *extra_names[8];
+    char *owned_extra_names[8] = {0};
+    tf_type extra_types[8];
+    size_t n_extra = 0;
+    if (datetime_extra_columns(st, extra_names, owned_extra_names, extra_types, &n_extra) != TF_OK)
+        return TF_ERROR;
+
+    size_t out_cols = 0;
+    if (tf_size_add(in->n_cols, n_extra, &out_cols) != TF_OK) {
+        datetime_free_extra_names(owned_extra_names, n_extra);
+        return TF_ERROR;
+    }
+    tf_batch *ob = tf_batch_create(out_cols, in->n_rows);
+    if (!ob) {
+        datetime_free_extra_names(owned_extra_names, n_extra);
+        return TF_ERROR;
+    }
     if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, n_extra) != TF_OK) {
+        datetime_free_extra_names(owned_extra_names, n_extra);
         tf_batch_free(ob);
         return TF_ERROR;
     }
+    datetime_free_extra_names(owned_extra_names, n_extra);
 
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
@@ -319,9 +348,9 @@ tf_step *tf_datetime_create(const cJSON *args) {
         return NULL;
     }
 
-    datetime_state *st = calloc(1, sizeof(datetime_state));
+    datetime_state *st = tf_callocarray_checked(1, sizeof(datetime_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 
     cJSON *extract = cJSON_GetObjectItemCaseSensitive(args, "extract");
@@ -355,7 +384,7 @@ tf_step *tf_datetime_create(const cJSON *args) {
         return NULL;
     }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st); return NULL; }
     step->process = datetime_process;
     step->flush = datetime_flush;

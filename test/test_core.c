@@ -12318,6 +12318,61 @@ static void test_pipeline_generated_suffix_ops_preserve_long_default_names(void)
     assert_csv_header_has_suffix(out, str_col, "_encoded");
 }
 
+static void test_pipeline_datetime_group_agg_preserve_long_default_names(void) {
+    char date_col[301];
+    char value_col[301];
+    memset(date_col, 'd', sizeof(date_col) - 1);
+    memset(value_col, 'v', sizeof(value_col) - 1);
+    date_col[sizeof(date_col) - 1] = '\0';
+    value_col[sizeof(value_col) - 1] = '\0';
+
+    char datetime_input[512];
+    int n = snprintf(datetime_input, sizeof(datetime_input),
+                     "%s\n"
+                     "2024-05-06 01:02:03\n",
+                     date_col);
+    assert(n > 0 && (size_t)n < sizeof(datetime_input));
+
+    char datetime_plan[2048];
+    n = snprintf(datetime_plan, sizeof(datetime_plan),
+                 "{\"steps\":["
+                 "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+                 "{\"op\":\"datetime\",\"args\":{\"column\":\"%s\",\"extract\":[\"year\",\"month\",\"day\"]}},"
+                 "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+                 "]}",
+                 date_col);
+    assert(n > 0 && (size_t)n < sizeof(datetime_plan));
+
+    char datetime_out[4096];
+    run_plan_chunked(datetime_plan, datetime_input, 17, datetime_out, sizeof(datetime_out));
+    assert_csv_header_has_suffix(datetime_out, date_col, "_year");
+    assert_csv_header_has_suffix(datetime_out, date_col, "_month");
+    assert_csv_header_has_suffix(datetime_out, date_col, "_day");
+
+    char group_input[1024];
+    n = snprintf(group_input, sizeof(group_input),
+                 "city,%s\n"
+                 "A,1\n"
+                 "A,2\n",
+                 value_col);
+    assert(n > 0 && (size_t)n < sizeof(group_input));
+
+    char group_plan[2048];
+    n = snprintf(group_plan, sizeof(group_plan),
+                 "{\"steps\":["
+                 "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+                 "{\"op\":\"group-agg\",\"args\":{\"group_by\":[\"city\"],\"max_groups\":8,"
+                 "\"aggs\":[{\"column\":\"%s\",\"func\":\"sum\"}]}},"
+                 "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+                 "]}",
+                 value_col);
+    assert(n > 0 && (size_t)n < sizeof(group_plan));
+
+    char group_out[4096];
+    run_plan_chunked(group_plan, group_input, 11, group_out, sizeof(group_out));
+    assert_csv_header_has_suffix(group_out, value_col, "_sum");
+}
+
 static void test_pipeline_rleid(void) {
     char out[2048];
     run_dsl("csv batch_size=2 | rleid city,status result=run_id | csv",
@@ -13116,6 +13171,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_shift_lead_large_offset_chunks);
     TEST(test_pipeline_suffix_ops_preserve_long_default_names);
     TEST(test_pipeline_generated_suffix_ops_preserve_long_default_names);
+    TEST(test_pipeline_datetime_group_agg_preserve_long_default_names);
     TEST(test_pipeline_rleid);
     TEST(test_pipeline_ewma);
     TEST(test_pipeline_h14_numeric_missing_type_policies);

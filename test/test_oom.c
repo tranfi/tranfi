@@ -370,6 +370,12 @@ int main(void) {
             760
         },
         {
+            "datetime_group_agg_generated_schema_args",
+            "csv batch_size=1 | datetime d extract=year,month missing=null on_type_error=null | group-agg active sum:score max_groups=8 | csv",
+            reshape_dates,
+            840
+        },
+        {
             "csv_strict_good_rows",
             "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
             people,
