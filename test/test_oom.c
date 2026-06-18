@@ -507,6 +507,12 @@ int main(void) {
         "2,LA,20\n"
         "3,NY,30\n"
         "4,SF,40\n";
+    const char *pivot_silent_rows =
+        "id,metric,value\n"
+        "1,x,10\n"
+        "1,y,20\n"
+        "2,x,30\n"
+        "2,z,40\n";
     run_case_no_silent_output_oom(
         "frequency_key_materialization",
         "csv batch_size=1 | frequency city max_values=8 max_state_bytes=1048576 | csv",
@@ -543,6 +549,16 @@ int main(void) {
         "csv batch_size=1 | group-agg city sum:score:total count:*:rows sorted=true | csv",
         sorted_people,
         620);
+    run_case_no_silent_output_oom(
+        "pivot_capped_materialization",
+        "csv batch_size=1 | pivot metric value sum max_categories=4 | csv",
+        pivot_silent_rows,
+        520);
+    run_case_no_silent_output_oom(
+        "pivot_sorted_materialization",
+        "csv batch_size=1 | pivot metric value sum categories=x,y,z sorted=true | csv",
+        pivot_silent_rows,
+        520);
     const char *sorted_union_lookup_path = "/tmp/tranfi_oom_sorted_union_lookup.csv";
     FILE *sorted_union_lookup = fopen(sorted_union_lookup_path, "wb");
     assert(sorted_union_lookup);
@@ -598,6 +614,20 @@ int main(void) {
         spill_group_agg_dsl,
         key_state_silent_rows,
         620);
+    char spill_pivot_dsl[512];
+    int spill_pivot_n = snprintf(
+        spill_pivot_dsl,
+        sizeof(spill_pivot_dsl),
+        "csv batch_size=1 | pivot metric value sum max_categories=4 "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        spill_root);
+    assert(spill_pivot_n > 0 &&
+           (size_t)spill_pivot_n < sizeof(spill_pivot_dsl));
+    run_case_no_silent_output_oom(
+        "pivot_spill_materialization",
+        spill_pivot_dsl,
+        pivot_silent_rows,
+        520);
     char spill_sort_plan[1024];
     int spill_sort_n = snprintf(
         spill_sort_plan,
