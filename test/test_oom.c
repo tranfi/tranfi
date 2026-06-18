@@ -329,6 +329,12 @@ int main(void) {
             560
         },
         {
+            "dsl_quality_builder_args",
+            "csv batch_size=1 | tee \"col(score) >= 10\" channel=stats columns=name,city limit=2 every=1 include_row=false audit_hash_columns=name audit_max_bytes=256 | assert aggregate=missing_rate:score op=<= value=0.5 tolerance=0.01 rel=false action=warn name=score_missing audit audit_columns=name,score audit_redact=score audit_max_cell_bytes=16 | schema columns=name:string,city:string,score:number required=name values=city:NY,LA min=score:0 allow_extra_columns=false mode=annotate result=schema_ok audit audit_include_row=false audit_columns=name,city audit_hash_columns=city max_regex_pattern_bytes=64 max_regex_cell_bytes=128 | quarantine \"col(city) == 'SF'\" name=sf_rows message=blocked audit audit_include_row=false | csv",
+            people,
+            760
+        },
+        {
             "csv_strict_good_rows",
             "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
             people,

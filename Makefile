@@ -6,7 +6,7 @@ NODE ?= node
 TWINE ?= twine
 PYTEST ?= $(PYTHON) -m pytest
 PACKAGE_TMPDIR ?= $(CURDIR)/build/tmp
-PACKAGE_ENV := TMPDIR="$(PACKAGE_TMPDIR)" TEMP="$(PACKAGE_TMPDIR)" TMP="$(PACKAGE_TMPDIR)" TRANFI_TEST_TMPDIR="$(PACKAGE_TMPDIR)/package-smoke" PIP_CACHE_DIR="$(PACKAGE_TMPDIR)/pip-cache"
+PACKAGE_ENV := TMPDIR="$(PACKAGE_TMPDIR)" TEMP="$(PACKAGE_TMPDIR)" TMP="$(PACKAGE_TMPDIR)" TRANFI_TEST_TMPDIR="$(PACKAGE_TMPDIR)/package-smoke" PIP_CACHE_DIR="$(PACKAGE_TMPDIR)/pip-cache" npm_config_cache="$(PACKAGE_TMPDIR)/npm-cache"
 PY_BUILD_ENV := $(PACKAGE_ENV)
 SANITIZER_RUN := $(shell if command -v setarch >/dev/null 2>&1 && setarch "$$(uname -m)" -R true >/dev/null 2>&1; then printf 'setarch %s -R' "$$(uname -m)"; fi)
 ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
@@ -153,7 +153,7 @@ test-packaging-python: sbom sync-py-csrc check-py-csrc-sync
 
 test-packaging-node: sbom sync-js-csrc check-js-csrc-sync
 	@mkdir -p "$(PACKAGE_TMPDIR)" build
-	@cd js && $(PACKAGE_ENV) npm_config_cache=../build/npm-pack-audit $(NPM) pack --dry-run --json > ../build/npm-pack-dry-run.json
+	@cd js && $(PACKAGE_ENV) $(NPM) pack --dry-run --json > ../build/npm-pack-dry-run.json
 	@$(PYTHON) scripts/audit-package-artifacts.py --npm-json build/npm-pack-dry-run.json
 
 test-packaging-python-install: test-packaging-python
@@ -161,7 +161,7 @@ test-packaging-python-install: test-packaging-python
 
 test-packaging-node-install: test-packaging-node
 	@rm -rf build/npm-install-smoke && mkdir -p "$(PACKAGE_TMPDIR)" build/npm-install-smoke
-	@cd js && $(PACKAGE_ENV) npm_config_cache=../build/npm-pack-audit $(NPM) pack --json --pack-destination ../build/npm-install-smoke > ../build/npm-pack-install.json
+	@cd js && $(PACKAGE_ENV) $(NPM) pack --json --pack-destination ../build/npm-install-smoke > ../build/npm-pack-install.json
 	@$(PYTHON) scripts/audit-package-artifacts.py --npm-json build/npm-pack-install.json
 	@$(PACKAGE_ENV) $(PYTHON) scripts/smoke-install-packages.py --npm-tarball "build/npm-install-smoke/tranfi-*.tgz" --node "$(NODE)" --npm "$(NPM)"
 
