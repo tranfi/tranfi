@@ -198,7 +198,7 @@ static void run_no_silent_output_oom_with_runner(const char *name, const char *s
                                                  const char *input,
                                                  size_t max_fail_points,
                                                  oom_capture_runner runner) {
-    char baseline[8192];
+    char baseline[65536];
     oom_enabled = 1;
     oom_fail_at = (size_t)-1;
     oom_alloc_count = 0;
@@ -213,7 +213,7 @@ static void run_no_silent_output_oom_with_runner(const char *name, const char *s
     assert(limit > 0);
 
     for (size_t fail_at = 1; fail_at <= limit; fail_at++) {
-        char got[8192];
+        char got[65536];
         oom_enabled = 1;
         oom_fail_at = fail_at;
         oom_alloc_count = 0;
@@ -585,10 +585,36 @@ int main(void) {
     const char *stack_path = "/tmp/tranfi_oom_stack.csv";
     FILE *stack_file = fopen(stack_path, "wb");
     assert(stack_file);
-    fputs("name,age,city,score,tags,x,y,color\n"
-          "Stacked,41,SF,40,z,7,8,green\n",
-          stack_file);
+    fputs("name,age,city,score,tags,x,y,color\n", stack_file);
+    for (int i = 0; i < 1200; i++) {
+        fprintf(stack_file, "Stacked%d,%d,%s,%d,z,%d,%d,%s\n",
+                i, 40 + (i % 17),
+                (i % 3 == 0) ? "NY" : (i % 3 == 1) ? "LA" : "SF",
+                i % 101, i % 11, i % 13,
+                (i % 3 == 0) ? "red" : (i % 3 == 1) ? "blue" : "green");
+    }
     assert(fclose(stack_file) == 0);
+    char stack_silent_dsl[512];
+    int stack_silent_n = snprintf(stack_silent_dsl, sizeof(stack_silent_dsl),
+                                  "csv batch_size=1 | stack %s --tag src | csv",
+                                  stack_path);
+    assert(stack_silent_n > 0 && (size_t)stack_silent_n < sizeof(stack_silent_dsl));
+    run_case_no_silent_output_oom(
+        "stack_append_stream_materialization",
+        stack_silent_dsl,
+        people,
+        900);
+    char union_all_silent_dsl[512];
+    int union_all_silent_n = snprintf(union_all_silent_dsl, sizeof(union_all_silent_dsl),
+                                      "csv batch_size=1 | union-all %s | csv",
+                                      union_lookup_path);
+    assert(union_all_silent_n > 0 &&
+           (size_t)union_all_silent_n < sizeof(union_all_silent_dsl));
+    run_case_no_silent_output_oom(
+        "union_all_append_stream_materialization",
+        union_all_silent_dsl,
+        people,
+        520);
     const char *rules_path = "/tmp/tranfi_oom_rules.json";
     FILE *rules_file = fopen(rules_path, "wb");
     assert(rules_file);
