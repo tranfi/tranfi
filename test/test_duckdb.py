@@ -465,6 +465,14 @@ class TestParityAggregation:
         dsl = 'csv | group-agg city sales:min:lo sales:max:hi | csv'
         assert_parity(dsl, data=CSV_SALES, float_cols={'lo', 'hi'})
 
+    def test_group_agg_default_alias(self):
+        dsl = 'csv | group-agg city sales:sum | csv'
+        native = tf.pipeline(dsl).run(input=CSV_SALES)
+        duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_SALES)
+        assert 'sales_sum' in native.output_text.splitlines()[0]
+        assert 'sales_sum' in duck.output_text.splitlines()[0]
+        assert 'sum_sales' not in duck.output_text.splitlines()[0]
+
     def test_frequency(self):
         assert_parity('csv | frequency city | csv', data=CSV_CITIES)
 
@@ -580,6 +588,13 @@ class TestParityDateTime:
         d_header = duck.output_text.strip().split('\n')[0]
         assert 'date_month' in n_header
         assert 'date_month' in d_header
+
+    def test_date_trunc_default_replaces_source(self):
+        dsl = 'csv | date-trunc date month | csv'
+        native = tf.pipeline(dsl).run(input=CSV_DATES)
+        duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_DATES)
+        assert native.output_text.strip().split('\n')[0] == 'id,date,value'
+        assert duck.output_text.strip().split('\n')[0] == 'id,date,value'
 
 
 class TestParityFillNull:

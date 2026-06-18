@@ -4656,6 +4656,51 @@ static void test_compile_to_sql_grep_literal_chars(void) {
     tf_string_free(sql);
 }
 
+static void assert_sql_has_generated_alias(const char *sql, const char *column, const char *suffix) {
+    char expected[384];
+    int n = snprintf(expected, sizeof(expected), "\"%s%s\"", column, suffix);
+    assert(n > 0 && (size_t)n < sizeof(expected));
+    assert(strstr(sql, expected) != NULL);
+}
+
+static void test_compile_to_sql_generated_default_aliases(void) {
+    char col[301];
+    memset(col, 'v', sizeof(col) - 1);
+    col[sizeof(col) - 1] = '\0';
+
+    char dsl[512];
+    int n = snprintf(dsl, sizeof(dsl), "csv | group-agg city sum:%s | csv", col);
+    assert(n > 0 && (size_t)n < sizeof(dsl));
+
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert_sql_has_generated_alias(sql, col, "_sum");
+    tf_string_free(sql);
+
+    memset(col, 'd', sizeof(col) - 1);
+    col[sizeof(col) - 1] = '\0';
+    n = snprintf(dsl, sizeof(dsl), "csv | datetime %s extract=year,month | csv", col);
+    assert(n > 0 && (size_t)n < sizeof(dsl));
+
+    sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert_sql_has_generated_alias(sql, col, "_year");
+    assert_sql_has_generated_alias(sql, col, "_month");
+    tf_string_free(sql);
+
+    sql = tf_compile_to_sql("csv | date-trunc date month | csv",
+                            strlen("csv | date-trunc date month | csv"), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert(strstr(sql, "SELECT * REPLACE") != NULL);
+    assert(strstr(sql, " AS \"date\"") != NULL);
+    assert(strstr(sql, "date_month") == NULL);
+    tf_string_free(sql);
+}
+
 static void test_compile_to_sql_rejects_sample(void) {
     const char *dsl = "csv | sample 2 seed=42 | csv";
     char *error = NULL;
@@ -12983,6 +13028,7 @@ int main(int argc, char **argv) {
     printf("\nCompiler:\n");
     TEST(test_compile_native_valid);
     TEST(test_compile_to_sql_grep_literal_chars);
+    TEST(test_compile_to_sql_generated_default_aliases);
     TEST(test_compile_to_sql_rejects_sample);
     TEST(test_compile_to_sql_rejects_stats);
     TEST(test_compile_to_sql_supported_matrix);

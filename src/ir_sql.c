@@ -143,13 +143,27 @@ static void sb_free(strbuf *sb) {
 
 /* ---- Expression AST to SQL ---- */
 
-/* Append a SQL-quoted identifier: "name" */
-static void sql_quote_ident(strbuf *sb, const char *name) {
-  sb_append(sb, "\"");
-  for (const char *p = name; *p; p++) {
+static void sql_quote_ident_part(strbuf *sb, const char *name) {
+  const char *safe = name ? name : "";
+  for (const char *p = safe; *p; p++) {
     if (*p == '"') sb_append(sb, "\"\"");
     else sb_appendn(sb, p, 1);
   }
+}
+
+/* Append a SQL-quoted identifier: "name" */
+static void sql_quote_ident(strbuf *sb, const char *name) {
+  sb_append(sb, "\"");
+  sql_quote_ident_part(sb, name);
+  sb_append(sb, "\"");
+}
+
+static void sql_quote_joined_ident(strbuf *sb, const char *prefix,
+                                   const char *middle, const char *suffix) {
+  sb_append(sb, "\"");
+  sql_quote_ident_part(sb, prefix);
+  sql_quote_ident_part(sb, middle);
+  sql_quote_ident_part(sb, suffix);
   sb_append(sb, "\"");
 }
 
@@ -979,9 +993,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
       sb_append(&sel, ") AS ");
       if (result) sql_quote_ident(&sel, result);
       else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_%s", func, col);
-        sql_quote_ident(&sel, buf);
+        sql_quote_joined_ident(&sel, col, "_", func);
       }
     }
     /* GROUP BY clause */
@@ -1505,10 +1517,8 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
         cJSON *part = cJSON_GetArrayItem(extract, i);
         if (!cJSON_IsString(part)) continue;
         const char *p = part->valuestring;
-        char result_name[128];
-        snprintf(result_name, sizeof(result_name), "%s_%s", column, p);
         sb_appendf(&der, ", EXTRACT(%s FROM %s::TIMESTAMP) AS ", p, qcol.data);
-        sql_quote_ident(&der, result_name);
+        sql_quote_joined_ident(&der, column, "_", p);
       }
     }
     sb_appendf(sb, "%s AS (SELECT *%s FROM %s)", cte_name, der.data, prev);
@@ -1527,14 +1537,15 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     sql_quote_ident(&qcol, column);
     strbuf qres;
     sb_init(&qres);
-    if (result) sql_quote_ident(&qres, result);
-    else {
-      char buf[128];
-      snprintf(buf, sizeof(buf), "%s_%s", column, trunc);
-      sql_quote_ident(&qres, buf);
+    int in_place = result == NULL;
+    sql_quote_ident(&qres, result ? result : column);
+    if (in_place) {
+      sb_appendf(sb, "%s AS (SELECT * REPLACE (date_trunc('%s', %s::TIMESTAMP) AS %s) FROM %s)",
+                 cte_name, trunc, qcol.data, qres.data, prev);
+    } else {
+      sb_appendf(sb, "%s AS (SELECT *, date_trunc('%s', %s::TIMESTAMP) AS %s FROM %s)",
+                 cte_name, trunc, qcol.data, qres.data, prev);
     }
-    sb_appendf(sb, "%s AS (SELECT *, date_trunc('%s', %s::TIMESTAMP) AS %s FROM %s)",
-               cte_name, trunc, qcol.data, qres.data, prev);
     sb_free(&qcol); sb_free(&qres);
     return 0;
   }
