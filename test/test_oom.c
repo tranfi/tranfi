@@ -418,6 +418,37 @@ int main(void) {
         set_silent_dsl,
         people,
         520);
+    const char *key_state_silent_rows =
+        "id,city,score\n"
+        "1,NY,10\n"
+        "2,LA,20\n"
+        "3,NY,30\n"
+        "4,SF,40\n";
+    run_case_no_silent_output_oom(
+        "frequency_key_materialization",
+        "csv batch_size=1 | frequency city max_values=8 max_state_bytes=1048576 | csv",
+        key_state_silent_rows,
+        520);
+    run_case_no_silent_output_oom(
+        "onehot_category_materialization",
+        "csv batch_size=1 | onehot city max_categories=8 max_state_bytes=1048576 | csv",
+        key_state_silent_rows,
+        520);
+    run_case_no_silent_output_oom(
+        "label_encode_category_materialization",
+        "csv batch_size=1 | label-encode city max_categories=8 max_state_bytes=1048576 | csv",
+        key_state_silent_rows,
+        520);
+    run_case_no_silent_output_oom(
+        "rowid_key_materialization",
+        "csv batch_size=1 | rowid city max_keys=8 max_state_bytes=1048576 | csv",
+        key_state_silent_rows,
+        520);
+    run_case_no_silent_output_oom(
+        "unique_key_materialization",
+        "csv batch_size=1 | unique city max_keys=8 max_state_bytes=1048576 | csv",
+        key_state_silent_rows,
+        520);
     const char *sorted_union_lookup_path = "/tmp/tranfi_oom_sorted_union_lookup.csv";
     FILE *sorted_union_lookup = fopen(sorted_union_lookup_path, "wb");
     assert(sorted_union_lookup);
