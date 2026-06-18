@@ -2851,6 +2851,13 @@ def test_ops_step():
     assert 'cumsum' in text
     assert '60' in text  # 10+20+30
 
+    args = tf.ops.step('name', 'running-sum', missing='null', on_type_error='null')['args']
+    assert args['missing'] == 'null'
+    assert args['on_type_error'] == 'null'
+    p = tf.pipeline([tf.codec.csv(), tf.ops.step('name', 'running-sum', on_type_error='null'), tf.codec.csv_encode()])
+    result = p.run(input=b'name\nAlice\nBob\n')
+    assert result.output_text.splitlines() == ['name,name_running-sum', 'Alice,', 'Bob,']
+
 
 def test_ops_frequency():
     data = bytes([10]).join([b'city', b'NY', b'LA', b'NY', b'NY', b'LA', b''])

@@ -1372,6 +1372,8 @@ static tf_arg_desc step_args[] = {
     {"column", "string", true, NULL},
     {"func", "string", true, NULL},
     {"result", "string", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc window_args[] = {
@@ -1611,6 +1613,8 @@ static tf_arg_desc diff_args[] = {
     {"column", "string", true, NULL},
     {"order", "int", false, "1"},
     {"result", "string", false, NULL},
+    {"missing", "string", false, "\"error\""},
+    {"on_type_error", "string", false, "\"fail\""},
 };
 
 static tf_arg_desc anomaly_args[] = {

@@ -719,11 +719,15 @@ class ops:
         return {'op': 'fill-down', 'args': args}
 
     @staticmethod
-    def step(column, func, result=None):
-        """Running aggregation. Example: tf.ops.step('price', 'running-sum', 'cumsum')"""
+    def step(column, func, result=None, missing=None, on_type_error=None):
+        """Running aggregation. missing: error/null/ignore; on_type_error: fail/null."""
         args = {'column': column, 'func': func}
         if result is not None:
             args['result'] = result
+        if missing is not None:
+            args['missing'] = missing
+        if on_type_error is not None:
+            args['on_type_error'] = on_type_error
         return {'op': 'step', 'args': args}
 
     @staticmethod

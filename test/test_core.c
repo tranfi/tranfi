@@ -13050,6 +13050,32 @@ static void test_pipeline_h14_numeric_missing_type_policies(void) {
     assert(line_starts_with(out, 0, "x,mean3"));
     assert(line_starts_with(out, 1, "a,"));
 
+    expect_dsl_runtime_error("csv | step missing running-sum | csv", "x\n1\n", "step: column 'missing' not found");
+    run_dsl("csv | step missing running-sum missing=null | csv", "x\n1\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,missing_running-sum"));
+    assert(line_starts_with(out, 1, "1,"));
+    run_dsl("csv | step missing running-sum missing=ignore | csv", "x\n1\n", out, sizeof(out));
+    assert(strcmp(out, "x\n1\n") == 0);
+    expect_dsl_runtime_error("csv | step x running-sum | csv", "x\na\n", "step: column 'x' must be numeric");
+    run_dsl("csv | step x running-sum x_sum on_type_error=null | csv", "x\na\nb\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,x_sum"));
+    assert(line_starts_with(out, 1, "a,"));
+    run_dsl("csv | step name running-count name_count | csv", "name\nAlice\nBob\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "name,name_count"));
+    assert(line_starts_with(out, 1, "Alice,1"));
+    assert(line_starts_with(out, 2, "Bob,2"));
+
+    expect_dsl_runtime_error("csv | diff missing | csv", "x\n1\n", "diff: column 'missing' not found");
+    run_dsl("csv | diff missing missing=null | csv", "x\n1\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,missing_diff"));
+    assert(line_starts_with(out, 1, "1,"));
+    run_dsl("csv | diff missing missing=ignore | csv", "x\n1\n", out, sizeof(out));
+    assert(strcmp(out, "x\n1\n") == 0);
+    expect_dsl_runtime_error("csv | diff x | csv", "x\na\n", "diff: column 'x' must be numeric");
+    run_dsl("csv | diff x on_type_error=null | csv", "x\na\nb\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,x_diff"));
+    assert(line_starts_with(out, 1, "a,"));
+
     expect_dsl_runtime_error("csv | interpolate missing forward | csv", "x\n1\n", "interpolate: column 'missing' not found");
     run_dsl("csv | interpolate missing forward missing=null | csv", "x\n1\n", out, sizeof(out));
     assert(line_starts_with(out, 0, "x,missing"));
@@ -13114,6 +13140,11 @@ static void test_pipeline_h14_numeric_missing_type_policies(void) {
     expect_dsl_compile_error("csv | window x 0 avg | csv", "window size must be a positive integer");
     expect_dsl_compile_error("csv | window x 3 nope | csv", "window func must be avg, sum, min, max, or count");
     expect_dsl_compile_error("csv | rolling-sum x 0 | csv", "rolling-sum size must be a positive integer");
+    expect_dsl_compile_error("csv | step x typo | csv", "step func must be running-sum");
+    expect_dsl_compile_error("csv | step x running-sum missing=bad | csv", "step missing must be error, null, or ignore");
+    expect_dsl_compile_error("csv | diff x 0 | csv", "diff order must be a positive integer");
+    expect_dsl_compile_error("csv | diff x order=9 | csv", "diff order must be <= 8");
+    expect_dsl_compile_error("csv | diff x missing=bad | csv", "diff missing must be error, null, or ignore");
     expect_dsl_compile_error("csv | interpolate x nearest | csv", "interpolate unexpected argument 'nearest'");
     expect_dsl_compile_error("csv | interpolate x method=nearest | csv", "interpolate method must be forward, backward, or linear");
     expect_dsl_compile_error("csv | datetime x decade | csv", "datetime extract must be year");
@@ -13135,8 +13166,8 @@ static void test_pipeline_diff(void) {
 
 static void test_pipeline_diff_order2(void) {
     char out[2048];
-    run_dsl("csv | diff x 2 | csv", "x\n1\n3\n7\n13\n", out, sizeof(out));
-    assert(line_starts_with(out, 0, "x,x_diff"));
+    run_dsl("csv | diff x order=2 result=x_d2 on_type_error=fail | csv", "x\n1\n3\n7\n13\n", out, sizeof(out));
+    assert(line_starts_with(out, 0, "x,x_d2"));
     /* order-2 diff: null, null, 7-2*3+1=2, 13-2*7+3=2 */
     assert(line_starts_with(out, 3, "7,2"));
     assert(line_starts_with(out, 4, "13,2"));

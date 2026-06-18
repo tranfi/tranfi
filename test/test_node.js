@@ -2761,6 +2761,19 @@ await test('step running-sum', async () => {
   const text = result.outputText
   assert(text.includes('cumsum'), 'should have cumsum column')
   assert(text.includes('60'), 'should have 60 (10+20+30)')
+
+  const args = ops.step('name', 'running-sum', { missing: 'null', onTypeError: 'null' }).args
+  assert(args.missing === 'null', 'step helper should set missing policy')
+  assert(args.on_type_error === 'null', 'step helper should set type policy')
+  const nullPolicy = await pipeline([
+    codec.csv(),
+    ops.step('name', 'running-sum', { onTypeError: 'null' }),
+    codec.csvEncode(),
+  ]).run({ input: 'name\nAlice\nBob\n' })
+  assert(
+    nullPolicy.outputText.trimEnd() === 'name,name_running-sum\nAlice,\nBob,',
+    'step onTypeError=null should emit null result cells for nonnumeric input'
+  )
 })
 
 await test('frequency', async () => {

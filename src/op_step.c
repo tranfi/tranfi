@@ -24,6 +24,17 @@ typedef enum {
     STEP_RATIO,
 } step_func;
 
+typedef enum {
+    STEP_MISSING_ERROR,
+    STEP_MISSING_NULL,
+    STEP_MISSING_IGNORE,
+} step_missing_policy;
+
+typedef enum {
+    STEP_TYPE_FAIL,
+    STEP_TYPE_NULL,
+} step_type_policy;
+
 typedef struct {
     char     *column;
     char     *result;
@@ -34,24 +45,94 @@ typedef struct {
     size_t    running_count;
     double    prev_val;
     int       has_prev;
+    step_missing_policy missing;
+    step_type_policy on_type_error;
 } step_state;
 
-static step_func parse_func(const char *s) {
-    if (strcmp(s, "running-sum") == 0 || strcmp(s, "cumsum") == 0) return STEP_RUNNING_SUM;
-    if (strcmp(s, "running-avg") == 0 || strcmp(s, "cumavg") == 0) return STEP_RUNNING_AVG;
-    if (strcmp(s, "running-min") == 0) return STEP_RUNNING_MIN;
-    if (strcmp(s, "running-max") == 0) return STEP_RUNNING_MAX;
-    if (strcmp(s, "running-count") == 0) return STEP_RUNNING_COUNT;
-    if (strcmp(s, "delta") == 0) return STEP_DELTA;
-    if (strcmp(s, "lag") == 0) return STEP_LAG;
-    if (strcmp(s, "ratio") == 0) return STEP_RATIO;
-    return STEP_RUNNING_SUM;
+static int parse_func(const char *s, step_func *out) {
+    if (!s || !out) return TF_ERROR;
+    if (strcmp(s, "running-sum") == 0 || strcmp(s, "cumsum") == 0) *out = STEP_RUNNING_SUM;
+    else if (strcmp(s, "running-avg") == 0 || strcmp(s, "cumavg") == 0) *out = STEP_RUNNING_AVG;
+    else if (strcmp(s, "running-min") == 0) *out = STEP_RUNNING_MIN;
+    else if (strcmp(s, "running-max") == 0) *out = STEP_RUNNING_MAX;
+    else if (strcmp(s, "running-count") == 0) *out = STEP_RUNNING_COUNT;
+    else if (strcmp(s, "delta") == 0) *out = STEP_DELTA;
+    else if (strcmp(s, "lag") == 0) *out = STEP_LAG;
+    else if (strcmp(s, "ratio") == 0) *out = STEP_RATIO;
+    else return TF_ERROR;
+    return TF_OK;
+}
+
+static int step_is_numeric_func(step_func func) {
+    return func != STEP_RUNNING_COUNT;
+}
+
+static int step_is_numeric_type(tf_type type) {
+    return type == TF_TYPE_INT64 || type == TF_TYPE_FLOAT64;
 }
 
 static double get_numeric(const tf_batch *b, size_t r, int ci) {
     if (b->col_types[ci] == TF_TYPE_INT64) return (double)tf_batch_get_int64(b, r, ci);
-    if (b->col_types[ci] == TF_TYPE_FLOAT64) return tf_batch_get_float64(b, r, ci);
-    return 0;
+    return tf_batch_get_float64(b, r, ci);
+}
+
+static void step_set_col_error(const char *column, const char *suffix) {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "step: column '%s' %s", column ? column : "", suffix);
+    tf_set_last_error(msg);
+}
+
+static int step_parse_missing_policy(const cJSON *args, step_missing_policy *out) {
+    *out = STEP_MISSING_ERROR;
+    const cJSON *j = cJSON_GetObjectItemCaseSensitive(args, "missing");
+    if (!j) return TF_OK;
+    if (!cJSON_IsString(j)) {
+        tf_set_last_error("step: missing must be error, null, or ignore");
+        return TF_ERROR;
+    }
+    if (strcmp(j->valuestring, "error") == 0) *out = STEP_MISSING_ERROR;
+    else if (strcmp(j->valuestring, "null") == 0) *out = STEP_MISSING_NULL;
+    else if (strcmp(j->valuestring, "ignore") == 0) *out = STEP_MISSING_IGNORE;
+    else {
+        tf_set_last_error("step: missing must be error, null, or ignore");
+        return TF_ERROR;
+    }
+    return TF_OK;
+}
+
+static int step_parse_type_policy(const cJSON *args, step_type_policy *out) {
+    *out = STEP_TYPE_FAIL;
+    const cJSON *j = cJSON_GetObjectItemCaseSensitive(args, "on_type_error");
+    if (!j) return TF_OK;
+    if (!cJSON_IsString(j)) {
+        tf_set_last_error("step: on_type_error must be fail or null");
+        return TF_ERROR;
+    }
+    if (strcmp(j->valuestring, "fail") == 0) *out = STEP_TYPE_FAIL;
+    else if (strcmp(j->valuestring, "null") == 0) *out = STEP_TYPE_NULL;
+    else {
+        tf_set_last_error("step: on_type_error must be fail or null");
+        return TF_ERROR;
+    }
+    return TF_OK;
+}
+
+static int step_passthrough(tf_batch *in, tf_batch **out) {
+    tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
+    if (!ob) return TF_ERROR;
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
+    for (size_t r = 0; r < in->n_rows; r++) {
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK ||
+            tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+    }
+    *out = ob;
+    return TF_OK;
 }
 
 static int step_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -59,6 +140,26 @@ static int step_process(tf_step *self, tf_batch *in, tf_batch **out,
     (void)side;
     step_state *st = self->state;
     *out = NULL;
+
+    int ci = tf_batch_col_index(in, st->column);
+    int force_null = 0;
+    if (ci < 0) {
+        if (st->missing == STEP_MISSING_ERROR) {
+            step_set_col_error(st->column, "not found");
+            return TF_ERROR;
+        }
+        if (st->missing == STEP_MISSING_IGNORE) {
+            return step_passthrough(in, out);
+        }
+        force_null = 1;
+    } else if (step_is_numeric_func(st->func) &&
+               !step_is_numeric_type(in->col_types[(size_t)ci])) {
+        if (st->on_type_error == STEP_TYPE_FAIL) {
+            step_set_col_error(st->column, "must be numeric");
+            return TF_ERROR;
+        }
+        force_null = 1;
+    }
 
     const char *extra_names[1] = {st->result};
     tf_type extra_types[1] = {TF_TYPE_FLOAT64};
@@ -69,21 +170,19 @@ static int step_process(tf_step *self, tf_batch *in, tf_batch **out,
         return TF_ERROR;
     }
 
-    int ci = tf_batch_col_index(in, st->column);
-
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
 
-        if (ci < 0 || tf_batch_is_null(in, r, ci)) {
+        if (force_null || tf_batch_is_null(in, r, (size_t)ci)) {
             if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             continue;
         }
 
-        double val = get_numeric(in, r, ci);
+        double val = step_is_numeric_func(st->func) ? get_numeric(in, r, ci) : 0.0;
         double result = 0;
         double next_running_sum = st->running_sum;
         double next_running_min = st->running_min;
@@ -193,13 +292,28 @@ tf_step *tf_step_create(const cJSON *args) {
     if (!args) return NULL;
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     cJSON *func_j = cJSON_GetObjectItemCaseSensitive(args, "func");
-    if (!cJSON_IsString(col_j) || !cJSON_IsString(func_j)) return NULL;
+    if (!cJSON_IsString(col_j) || !col_j->valuestring[0] ||
+        !cJSON_IsString(func_j) || !func_j->valuestring[0]) {
+        tf_set_last_error("step: column and func are required");
+        return NULL;
+    }
 
     step_state *st = tf_callocarray_checked(1, sizeof(step_state));
     if (!st) return NULL;
     st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
-    st->func = parse_func(func_j->valuestring);
+    if (parse_func(func_j->valuestring, &st->func) != TF_OK) {
+        tf_set_last_error("step: func must be running-sum, running-avg, running-min, running-max, running-count, delta, lag, or ratio");
+        free(st->column);
+        free(st);
+        return NULL;
+    }
+    if (step_parse_missing_policy(args, &st->missing) != TF_OK ||
+        step_parse_type_policy(args, &st->on_type_error) != TF_OK) {
+        free(st->column);
+        free(st);
+        return NULL;
+    }
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {

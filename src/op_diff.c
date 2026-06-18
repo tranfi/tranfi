@@ -12,18 +12,93 @@
 
 #define MAX_DIFF_ORDER 8
 
+typedef enum {
+    DIFF_MISSING_ERROR,
+    DIFF_MISSING_NULL,
+    DIFF_MISSING_IGNORE,
+} diff_missing_policy;
+
+typedef enum {
+    DIFF_TYPE_FAIL,
+    DIFF_TYPE_NULL,
+} diff_type_policy;
+
 typedef struct {
     char   *column;
     char   *result;
     int     order;
     double  prev[MAX_DIFF_ORDER]; /* circular buffer of previous values */
     int     count; /* rows seen so far */
+    diff_missing_policy missing;
+    diff_type_policy on_type_error;
 } diff_state;
+
+static int diff_is_numeric_type(tf_type type) {
+    return type == TF_TYPE_INT64 || type == TF_TYPE_FLOAT64;
+}
 
 static double get_numeric(const tf_batch *b, size_t r, int ci) {
     if (b->col_types[ci] == TF_TYPE_INT64) return (double)tf_batch_get_int64(b, r, ci);
-    if (b->col_types[ci] == TF_TYPE_FLOAT64) return tf_batch_get_float64(b, r, ci);
-    return 0;
+    return tf_batch_get_float64(b, r, ci);
+}
+
+static void diff_set_col_error(const char *column, const char *suffix) {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "diff: column '%s' %s", column ? column : "", suffix);
+    tf_set_last_error(msg);
+}
+
+static int diff_parse_missing_policy(const cJSON *args, diff_missing_policy *out) {
+    *out = DIFF_MISSING_ERROR;
+    const cJSON *j = cJSON_GetObjectItemCaseSensitive(args, "missing");
+    if (!j) return TF_OK;
+    if (!cJSON_IsString(j)) {
+        tf_set_last_error("diff: missing must be error, null, or ignore");
+        return TF_ERROR;
+    }
+    if (strcmp(j->valuestring, "error") == 0) *out = DIFF_MISSING_ERROR;
+    else if (strcmp(j->valuestring, "null") == 0) *out = DIFF_MISSING_NULL;
+    else if (strcmp(j->valuestring, "ignore") == 0) *out = DIFF_MISSING_IGNORE;
+    else {
+        tf_set_last_error("diff: missing must be error, null, or ignore");
+        return TF_ERROR;
+    }
+    return TF_OK;
+}
+
+static int diff_parse_type_policy(const cJSON *args, diff_type_policy *out) {
+    *out = DIFF_TYPE_FAIL;
+    const cJSON *j = cJSON_GetObjectItemCaseSensitive(args, "on_type_error");
+    if (!j) return TF_OK;
+    if (!cJSON_IsString(j)) {
+        tf_set_last_error("diff: on_type_error must be fail or null");
+        return TF_ERROR;
+    }
+    if (strcmp(j->valuestring, "fail") == 0) *out = DIFF_TYPE_FAIL;
+    else if (strcmp(j->valuestring, "null") == 0) *out = DIFF_TYPE_NULL;
+    else {
+        tf_set_last_error("diff: on_type_error must be fail or null");
+        return TF_ERROR;
+    }
+    return TF_OK;
+}
+
+static int diff_passthrough(tf_batch *in, tf_batch **out) {
+    tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
+    if (!ob) return TF_ERROR;
+    if (tf_batch_clone_schema(ob, in) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
+    for (size_t r = 0; r < in->n_rows; r++) {
+        if (tf_batch_copy_row(ob, r, in, r) != TF_OK ||
+            tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+    }
+    *out = ob;
+    return TF_OK;
 }
 
 static int diff_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -31,6 +106,25 @@ static int diff_process(tf_step *self, tf_batch *in, tf_batch **out,
     (void)side;
     diff_state *st = self->state;
     *out = NULL;
+
+    int ci = tf_batch_col_index(in, st->column);
+    int force_null = 0;
+    if (ci < 0) {
+        if (st->missing == DIFF_MISSING_ERROR) {
+            diff_set_col_error(st->column, "not found");
+            return TF_ERROR;
+        }
+        if (st->missing == DIFF_MISSING_IGNORE) {
+            return diff_passthrough(in, out);
+        }
+        force_null = 1;
+    } else if (!diff_is_numeric_type(in->col_types[(size_t)ci])) {
+        if (st->on_type_error == DIFF_TYPE_FAIL) {
+            diff_set_col_error(st->column, "must be numeric");
+            return TF_ERROR;
+        }
+        force_null = 1;
+    }
 
     const char *extra_names[1] = {st->result};
     tf_type extra_types[1] = {TF_TYPE_FLOAT64};
@@ -41,15 +135,13 @@ static int diff_process(tf_step *self, tf_batch *in, tf_batch **out,
         return TF_ERROR;
     }
 
-    int ci = tf_batch_col_index(in, st->column);
-
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
 
-        if (ci < 0 || tf_batch_is_null(in, r, ci)) {
+        if (force_null || tf_batch_is_null(in, r, (size_t)ci)) {
             if (tf_batch_set_null(ob, r, in->n_cols) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             if (tf_batch_expose_row(ob, r) != TF_OK) { tf_batch_free(ob); return TF_ERROR; }
             continue;
@@ -119,7 +211,10 @@ static void diff_destroy(tf_step *self) {
 tf_step *tf_diff_create(const cJSON *args) {
     if (!args) return NULL;
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
-    if (!cJSON_IsString(col_j)) return NULL;
+    if (!cJSON_IsString(col_j) || !col_j->valuestring[0]) {
+        tf_set_last_error("diff: column is required");
+        return NULL;
+    }
 
     diff_state *st = tf_callocarray_checked(1, sizeof(diff_state));
     if (!st) return NULL;
@@ -130,6 +225,12 @@ tf_step *tf_diff_create(const cJSON *args) {
     int has_order = tf_json_get_size_arg(args, "order", 1, MAX_DIFF_ORDER, &order, "diff");
     if (has_order < 0) { free(st->column); free(st); return NULL; }
     st->order = (int)order;
+    if (diff_parse_missing_policy(args, &st->missing) != TF_OK ||
+        diff_parse_type_policy(args, &st->on_type_error) != TF_OK) {
+        free(st->column);
+        free(st);
+        return NULL;
+    }
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {

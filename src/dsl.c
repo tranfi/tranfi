@@ -3155,22 +3155,62 @@ fail:
     return NULL;
 }
 
+static int dsl_step_func_valid(const char *s) {
+    return s && (
+        strcmp(s, "running-sum") == 0 || strcmp(s, "cumsum") == 0 ||
+        strcmp(s, "running-avg") == 0 || strcmp(s, "cumavg") == 0 ||
+        strcmp(s, "running-min") == 0 ||
+        strcmp(s, "running-max") == 0 ||
+        strcmp(s, "running-count") == 0 ||
+        strcmp(s, "delta") == 0 ||
+        strcmp(s, "lag") == 0 ||
+        strcmp(s, "ratio") == 0);
+}
+
 static cJSON *build_step_args(const token_list *tokens, char **error) {
-    /* step column func [result_name] */
+    /* step column func [result_name|result=...] [missing=error|null|ignore] [on_type_error=fail|null] */
     if (tokens->count < 3) {
         set_error(error, "step requires column and func");
+        return NULL;
+    }
+    if (!dsl_step_func_valid(tokens->items[2])) {
+        set_error(error, "step func must be running-sum, running-avg, running-min, running-max, running-count, delta, lag, or ratio");
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
     if (!args ||
         tf_json_add_string(args, "column", tokens->items[1]) != TF_OK ||
-        tf_json_add_string(args, "func", tokens->items[2]) != TF_OK ||
-        (tokens->count >= 4 && tf_json_add_string(args, "result", tokens->items[3]) != TF_OK)) {
-        cJSON_Delete(args);
-        set_oom_error_if_unset(error);
-        return NULL;
+        tf_json_add_string(args, "func", tokens->items[2]) != TF_OK) {
+        goto oom;
+    }
+    int result_set = 0;
+    for (size_t i = 3; i < tokens->count; i++) {
+        const char *tok = tokens->items[i];
+        int opt = add_h14_policy_option(args, tok, "step", error);
+        if (opt == TF_ERROR) goto fail_step;
+        if (opt == TF_OK) continue;
+        if (strncmp(tok, "result=", 7) == 0 || strncmp(tok, "as=", 3) == 0) {
+            const char *value = tok + (tok[0] == 'a' ? 3 : 7);
+            if (!*value) { set_error(error, "step result cannot be empty"); goto fail_step; }
+            if (result_set) { set_error(error, "step result specified more than once"); goto fail_step; }
+            if (tf_json_add_string(args, "result", value) != TF_OK) goto oom;
+            result_set = 1;
+            continue;
+        }
+        if (!result_set) {
+            if (tf_json_add_string(args, "result", tok) != TF_OK) goto oom;
+            result_set = 1;
+            continue;
+        }
+        set_errorf(error, "step unexpected argument '%s'", tok);
+        goto fail_step;
     }
     return args;
+oom:
+    set_oom_error_if_unset(error);
+fail_step:
+    cJSON_Delete(args);
+    return NULL;
 }
 
 static cJSON *build_flatten_args(const token_list *tokens, char **error) {
@@ -4714,28 +4754,61 @@ fail:
 }
 
 static cJSON *build_diff_args(const token_list *tokens, char **error) {
-    /* diff column [order] [result_name] */
+    /* diff column [order|order=N] [result_name|result=...] [missing=error|null|ignore] [on_type_error=fail|null] */
     if (tokens->count < 2) {
         set_error(error, "diff requires a column name");
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
     if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
-    if (tokens->count >= 3) {
-        char *end;
-        long order = strtol(tokens->items[2], &end, 10);
-        if (*end == '\0') {
-            if (tf_json_add_number(args, "order", order) != TF_OK) goto oom;
-            if (tokens->count >= 4)
-                if (tf_json_add_string(args, "result", tokens->items[3]) != TF_OK) goto oom;
-        } else {
-            if (tf_json_add_string(args, "result", tokens->items[2]) != TF_OK) goto oom;
+    int order_set = 0;
+    int result_set = 0;
+    for (size_t i = 2; i < tokens->count; i++) {
+        const char *tok = tokens->items[i];
+        int opt = add_h14_policy_option(args, tok, "diff", error);
+        if (opt == TF_ERROR) goto fail;
+        if (opt == TF_OK) continue;
+        if (strncmp(tok, "order=", 6) == 0) {
+            if (order_set) { set_error(error, "diff order specified more than once"); goto fail; }
+            size_t order = 0;
+            if (dsl_parse_positive_size(tok + 6, "diff order", &order, error) != TF_OK) goto fail;
+            if (order > 8) { set_error(error, "diff order must be <= 8"); goto fail; }
+            if (tf_json_add_number(args, "order", (double)order) != TF_OK) goto oom;
+            order_set = 1;
+            continue;
         }
+        if (strncmp(tok, "result=", 7) == 0 || strncmp(tok, "as=", 3) == 0) {
+            const char *value = tok + (tok[0] == 'a' ? 3 : 7);
+            if (!*value) { set_error(error, "diff result cannot be empty"); goto fail; }
+            if (result_set) { set_error(error, "diff result specified more than once"); goto fail; }
+            if (tf_json_add_string(args, "result", value) != TF_OK) goto oom;
+            result_set = 1;
+            continue;
+        }
+        if (!order_set) {
+            char *end = NULL;
+            long order = strtol(tok, &end, 10);
+            if (tok[0] != '\0' && *end == '\0') {
+                if (order <= 0) { set_error(error, "diff order must be a positive integer"); goto fail; }
+                if (order > 8) { set_error(error, "diff order must be <= 8"); goto fail; }
+                if (tf_json_add_number(args, "order", (double)order) != TF_OK) goto oom;
+                order_set = 1;
+                continue;
+            }
+        }
+        if (!result_set) {
+            if (tf_json_add_string(args, "result", tok) != TF_OK) goto oom;
+            result_set = 1;
+            continue;
+        }
+        set_errorf(error, "diff unexpected argument '%s'", tok);
+        goto fail;
     }
     return args;
 oom:
-    cJSON_Delete(args);
     set_oom_error_if_unset(error);
+fail:
+    cJSON_Delete(args);
     return NULL;
 }
 

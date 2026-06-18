@@ -432,9 +432,13 @@ const ops = {
     return { op: 'fill-down', args }
   },
 
-  step(column, func, result) {
+  step(column, func, resultOrOptions) {
     const args = { column, func }
+    const options = resultOrOptions && typeof resultOrOptions === 'object' ? resultOrOptions : { result: resultOrOptions }
+    const { result, missing, onTypeError } = options || {}
     if (result) args.result = result
+    if (missing) args.missing = missing
+    if (onTypeError) args.on_type_error = onTypeError
     return { op: 'step', args }
   },
 

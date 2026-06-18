@@ -1943,9 +1943,9 @@ int main(void) {
         },
         {
             "data_prep_policy_modes",
-            "csv batch_size=1 | interpolate missing forward missing=null | interpolate name forward on_type_error=null | normalize missing2 missing=null | normalize name on_type_error=null | csv",
+            "csv batch_size=1 | interpolate missing forward missing=null | interpolate name forward on_type_error=null | normalize missing2 missing=null | normalize name on_type_error=null | step missing3 running-sum missing=null | step name running-sum on_type_error=null | diff missing4 missing=null | diff name on_type_error=null | csv",
             people,
-            620
+            920
         },
         {
             "normalize_zscore_audit",
