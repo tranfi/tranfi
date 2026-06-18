@@ -3144,7 +3144,7 @@ static int json_flatten_type_valid(const char *type) {
 
 static int json_flatten_add_field_spec(cJSON *fields, const char *spec, char **error) {
     char *copy = strdup(spec ? spec : "");
-    if (!copy) return -1;
+    if (!copy) { set_oom_error_if_unset(error); return -1; }
     char *first = strchr(copy, ':');
     if (!first) {
         free(copy);
@@ -3168,18 +3168,28 @@ static int json_flatten_add_field_spec(cJSON *fields, const char *spec, char **e
         return -1;
     }
     cJSON *field = cJSON_CreateObject();
-    if (!field) { free(copy); return -1; }
-    cJSON_AddStringToObject(field, "path", path);
-    cJSON_AddStringToObject(field, "name", name);
-    cJSON_AddStringToObject(field, "type", type);
-    cJSON_AddItemToArray(fields, field);
+    if (!field ||
+        tf_json_add_string(field, "path", path) != TF_OK ||
+        tf_json_add_string(field, "name", name) != TF_OK ||
+        tf_json_add_string(field, "type", type) != TF_OK) {
+        cJSON_Delete(field);
+        free(copy);
+        set_oom_error_if_unset(error);
+        return -1;
+    }
+    if (tf_json_add_array_item(fields, field) != TF_OK) {
+        field = NULL;
+        free(copy);
+        set_oom_error_if_unset(error);
+        return -1;
+    }
     free(copy);
     return 0;
 }
 
 static int json_flatten_add_field_list(cJSON *fields, const char *spec, char **error) {
     char *copy = strdup(spec ? spec : "");
-    if (!copy) return -1;
+    if (!copy) { set_oom_error_if_unset(error); return -1; }
     char *saveptr = NULL;
     for (char *part = strtok_r(copy, ",", &saveptr); part; part = strtok_r(NULL, ",", &saveptr)) {
         if (part[0] == '\0') continue;
@@ -3197,7 +3207,7 @@ static cJSON *build_json_flatten_args(const token_list *tokens, char **error) {
     int saw_column = 0;
     cJSON *args = cJSON_CreateObject();
     cJSON *fields = cJSON_CreateArray();
-    if (!args || !fields) { cJSON_Delete(args); cJSON_Delete(fields); return NULL; }
+    if (!args || !fields) goto oom;
 
     for (size_t i = 1; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
@@ -3225,9 +3235,17 @@ static cJSON *build_json_flatten_args(const token_list *tokens, char **error) {
         set_error(error, "json-flatten requires fields=path:name[:type],...");
         cJSON_Delete(args); cJSON_Delete(fields); return NULL;
     }
-    cJSON_AddStringToObject(args, "column", column && column[0] ? column : "_line");
-    cJSON_AddItemToObject(args, "fields", fields);
+    if (tf_json_add_string(args, "column", column && column[0] ? column : "_line") != TF_OK ||
+        tf_json_add_item(args, "fields", fields) != TF_OK) {
+        fields = NULL;
+        goto oom;
+    }
     return args;
+oom:
+    cJSON_Delete(fields);
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_json_extract_args(const token_list *tokens, char **error) {
@@ -3284,10 +3302,15 @@ static cJSON *build_json_extract_args(const token_list *tokens, char **error) {
     }
 
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", column && column[0] ? column : "_line");
-    cJSON_AddStringToObject(args, "path", path);
-    cJSON_AddStringToObject(args, "result", result);
-    cJSON_AddStringToObject(args, "type", type);
+    if (!args ||
+        tf_json_add_string(args, "column", column && column[0] ? column : "_line") != TF_OK ||
+        tf_json_add_string(args, "path", path) != TF_OK ||
+        tf_json_add_string(args, "result", result) != TF_OK ||
+        tf_json_add_string(args, "type", type) != TF_OK) {
+        cJSON_Delete(args);
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     return args;
 }
 
@@ -3397,11 +3420,16 @@ static cJSON *build_json_filter_args(const token_list *tokens, char **error) {
     }
 
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", column && column[0] ? column : "_line");
-    cJSON_AddStringToObject(args, "path", path);
-    cJSON_AddStringToObject(args, "op", op);
-    if (value) cJSON_AddStringToObject(args, "value", value);
-    cJSON_AddStringToObject(args, "type", type);
+    if (!args ||
+        tf_json_add_string(args, "column", column && column[0] ? column : "_line") != TF_OK ||
+        tf_json_add_string(args, "path", path) != TF_OK ||
+        tf_json_add_string(args, "op", op) != TF_OK ||
+        (value && tf_json_add_string(args, "value", value) != TF_OK) ||
+        tf_json_add_string(args, "type", type) != TF_OK) {
+        cJSON_Delete(args);
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     return args;
 }
 
@@ -3421,14 +3449,19 @@ static int json_schema_mode_valid(const char *s) {
 
 static int json_schema_add_required(cJSON *schema, const char *spec, char **error) {
     cJSON *arr = cJSON_CreateArray();
-    if (!arr) return -1;
+    if (!arr) { set_oom_error_if_unset(error); return -1; }
     char *copy = strdup(spec ? spec : "");
-    if (!copy) { cJSON_Delete(arr); return -1; }
+    if (!copy) { cJSON_Delete(arr); set_oom_error_if_unset(error); return -1; }
     int n = 0;
     char *saveptr = NULL;
     for (char *part = strtok_r(copy, ",", &saveptr); part; part = strtok_r(NULL, ",", &saveptr)) {
         if (part[0] == '\0') continue;
-        cJSON_AddItemToArray(arr, cJSON_CreateString(part));
+        if (dsl_add_string_array_item(arr, part) != TF_OK) {
+            free(copy);
+            cJSON_Delete(arr);
+            set_oom_error_if_unset(error);
+            return -1;
+        }
         n++;
     }
     free(copy);
@@ -3437,7 +3470,11 @@ static int json_schema_add_required(cJSON *schema, const char *spec, char **erro
         set_error(error, "json-schema required= needs at least one field");
         return -1;
     }
-    cJSON_AddItemToObject(schema, "required", arr);
+    if (tf_json_add_item(schema, "required", arr) != TF_OK) {
+        arr = NULL;
+        set_oom_error_if_unset(error);
+        return -1;
+    }
     return 0;
 }
 
@@ -3445,12 +3482,16 @@ static int json_schema_add_types(cJSON *schema, const char *spec, char **error) 
     cJSON *props = cJSON_GetObjectItemCaseSensitive(schema, "properties");
     if (!props) {
         props = cJSON_CreateObject();
-        if (!props) return -1;
-        cJSON_AddItemToObject(schema, "properties", props);
+        if (!props) { set_oom_error_if_unset(error); return -1; }
+        if (tf_json_add_item(schema, "properties", props) != TF_OK) {
+            props = NULL;
+            set_oom_error_if_unset(error);
+            return -1;
+        }
     }
 
     char *copy = strdup(spec ? spec : "");
-    if (!copy) return -1;
+    if (!copy) { set_oom_error_if_unset(error); return -1; }
     int n = 0;
     char *saveptr = NULL;
     for (char *part = strtok_r(copy, ",", &saveptr); part; part = strtok_r(NULL, ",", &saveptr)) {
@@ -3470,9 +3511,18 @@ static int json_schema_add_types(cJSON *schema, const char *spec, char **error) 
             return -1;
         }
         cJSON *prop = cJSON_CreateObject();
-        if (!prop) { free(copy); return -1; }
-        cJSON_AddStringToObject(prop, "type", type);
-        cJSON_AddItemToObject(props, name, prop);
+        if (!prop || tf_json_add_string(prop, "type", type) != TF_OK) {
+            cJSON_Delete(prop);
+            free(copy);
+            set_oom_error_if_unset(error);
+            return -1;
+        }
+        if (tf_json_add_item(props, name, prop) != TF_OK) {
+            prop = NULL;
+            free(copy);
+            set_oom_error_if_unset(error);
+            return -1;
+        }
         n++;
     }
     free(copy);
@@ -3567,36 +3617,35 @@ static cJSON *build_json_schema_args(const token_list *tokens, char **error) {
     }
 
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", column && column[0] ? column : "_line");
-    cJSON_AddStringToObject(args, "mode", mode);
-    cJSON_AddStringToObject(args, "result", result && result[0] ? result : "_valid");
-    if (audit) cJSON_AddBoolToObject(args, "audit", 1);
-    if (audit_limit > 0) cJSON_AddNumberToObject(args, "audit_limit", (double)audit_limit);
-    if (audit_include_row_set) cJSON_AddBoolToObject(args, "audit_include_row", audit_include_row);
+    if (!args ||
+        tf_json_add_string(args, "column", column && column[0] ? column : "_line") != TF_OK ||
+        tf_json_add_string(args, "mode", mode) != TF_OK ||
+        tf_json_add_string(args, "result", result && result[0] ? result : "_valid") != TF_OK ||
+        (audit && tf_json_add_bool(args, "audit", 1) != TF_OK) ||
+        (audit_limit > 0 && tf_json_add_number(args, "audit_limit", (double)audit_limit) != TF_OK) ||
+        (audit_include_row_set && tf_json_add_bool(args, "audit_include_row", audit_include_row) != TF_OK)) {
+        goto oom;
+    }
     if (audit_columns && audit_columns[0] && add_audit_csv_arg(args, "audit_columns", audit_columns) != TF_OK) {
-        cJSON_Delete(args);
-        set_error(error, "json-schema: invalid audit_columns");
-        return NULL;
+        goto oom;
     }
     if (audit_redact && audit_redact[0] && add_audit_csv_arg(args, "audit_redact", audit_redact) != TF_OK) {
-        cJSON_Delete(args);
-        set_error(error, "json-schema: invalid audit_redact");
-        return NULL;
+        goto oom;
     }
     if (audit_hash_columns && audit_hash_columns[0] && add_audit_csv_arg(args, "audit_hash_columns", audit_hash_columns) != TF_OK) {
-        cJSON_Delete(args);
-        set_error(error, "json-schema: invalid audit_hash_columns");
-        return NULL;
+        goto oom;
     }
-    if (audit_max_bytes > 0) cJSON_AddNumberToObject(args, "audit_max_bytes", (double)audit_max_bytes);
-    if (audit_max_cell_bytes > 0) cJSON_AddNumberToObject(args, "audit_max_cell_bytes", (double)audit_max_cell_bytes);
+    if ((audit_max_bytes > 0 && tf_json_add_number(args, "audit_max_bytes", (double)audit_max_bytes) != TF_OK) ||
+        (audit_max_cell_bytes > 0 && tf_json_add_number(args, "audit_max_cell_bytes", (double)audit_max_cell_bytes) != TF_OK)) {
+        goto oom;
+    }
 
     if (schema_raw && strcmp(schema_raw, "true") == 0) {
-        cJSON_AddBoolToObject(args, "schema", 1);
+        if (tf_json_add_bool(args, "schema", 1) != TF_OK) goto oom;
     } else if (schema_raw && strcmp(schema_raw, "false") == 0) {
-        cJSON_AddBoolToObject(args, "schema", 0);
+        if (tf_json_add_bool(args, "schema", 0) != TF_OK) goto oom;
     } else if (schema_raw) {
-        cJSON_AddStringToObject(args, "schema", schema_raw);
+        if (tf_json_add_string(args, "schema", schema_raw) != TF_OK) goto oom;
     } else {
         if (!required && !types) {
             cJSON_Delete(args);
@@ -3604,7 +3653,10 @@ static cJSON *build_json_schema_args(const token_list *tokens, char **error) {
             return NULL;
         }
         cJSON *schema = cJSON_CreateObject();
-        cJSON_AddStringToObject(schema, "type", "object");
+        if (!schema || tf_json_add_string(schema, "type", "object") != TF_OK) {
+            cJSON_Delete(schema);
+            goto oom;
+        }
         if (required && json_schema_add_required(schema, required, error) != 0) {
             cJSON_Delete(schema);
             cJSON_Delete(args);
@@ -3615,9 +3667,16 @@ static cJSON *build_json_schema_args(const token_list *tokens, char **error) {
             cJSON_Delete(args);
             return NULL;
         }
-        cJSON_AddItemToObject(args, "schema", schema);
+        if (tf_json_add_item(args, "schema", schema) != TF_OK) {
+            schema = NULL;
+            goto oom;
+        }
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_grep_args(const token_list *tokens, char **error) {

@@ -574,6 +574,12 @@ int main(void) {
             360
         },
         {
+            "dsl_json_builder_args",
+            "text | json-extract column=_line path=/user/id result=user_id type=int | json-filter column=_line path=/user/name op=starts-with value=A type=string | json-flatten column=_line fields=/user/id:id:int,/user/name:name:string | json-schema schema=true mode=annotate result=json_ok audit audit_limit=1 audit_include_row=false audit_columns=_line audit_hash_columns=_line audit_max_bytes=256 audit_max_cell_bytes=64 | csv",
+            "{\"user\":{\"id\":42,\"name\":\"Ada\"}}\n{\"user\":{\"id\":7,\"name\":\"Ben\"}}\n{\"user\":{\"id\":9,\"name\":\"Alice\"}}\n",
+            620
+        },
+        {
             "stack_file",
             "csv batch_size=1 | stack /tmp/tranfi_oom_stack.csv --tag src | csv",
             people,
