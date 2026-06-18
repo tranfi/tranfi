@@ -362,6 +362,62 @@ int main(void) {
     assert(bag_lookup);
     fputs("city\nNY\n", bag_lookup);
     assert(fclose(bag_lookup) == 0);
+    char set_silent_dsl[768];
+    int set_silent_n = snprintf(set_silent_dsl, sizeof(set_silent_dsl),
+                                "csv batch_size=1 | intersect %s columns=city "
+                                "max_lookup_rows=10 max_lookup_keys=10 "
+                                "max_output_keys=10 max_state_bytes=1048576 | csv",
+                                bag_lookup_path);
+    assert(set_silent_n > 0 && (size_t)set_silent_n < sizeof(set_silent_dsl));
+    run_case_no_silent_output_oom(
+        "set_intersect_key_materialization",
+        set_silent_dsl,
+        people,
+        520);
+    set_silent_n = snprintf(set_silent_dsl, sizeof(set_silent_dsl),
+                            "csv batch_size=1 | setdiff %s columns=city "
+                            "max_lookup_rows=10 max_lookup_keys=10 "
+                            "max_output_keys=10 max_state_bytes=1048576 | csv",
+                            bag_lookup_path);
+    assert(set_silent_n > 0 && (size_t)set_silent_n < sizeof(set_silent_dsl));
+    run_case_no_silent_output_oom(
+        "set_setdiff_key_materialization",
+        set_silent_dsl,
+        people,
+        520);
+    set_silent_n = snprintf(set_silent_dsl, sizeof(set_silent_dsl),
+                            "csv batch_size=1 | intersect-all %s columns=city "
+                            "max_lookup_rows=10 max_lookup_keys=10 "
+                            "max_state_bytes=1048576 | csv",
+                            bag_lookup_path);
+    assert(set_silent_n > 0 && (size_t)set_silent_n < sizeof(set_silent_dsl));
+    run_case_no_silent_output_oom(
+        "set_intersect_all_key_materialization",
+        set_silent_dsl,
+        people,
+        520);
+    set_silent_n = snprintf(set_silent_dsl, sizeof(set_silent_dsl),
+                            "csv batch_size=1 | setdiff-all %s columns=city "
+                            "max_lookup_rows=10 max_lookup_keys=10 "
+                            "max_state_bytes=1048576 | csv",
+                            bag_lookup_path);
+    assert(set_silent_n > 0 && (size_t)set_silent_n < sizeof(set_silent_dsl));
+    run_case_no_silent_output_oom(
+        "set_setdiff_all_key_materialization",
+        set_silent_dsl,
+        people,
+        520);
+    set_silent_n = snprintf(set_silent_dsl, sizeof(set_silent_dsl),
+                            "csv batch_size=1 | union %s columns=city "
+                            "max_lookup_rows=10 max_lookup_bytes=4096 "
+                            "max_output_keys=10 max_state_bytes=1048576 | csv",
+                            union_lookup_path);
+    assert(set_silent_n > 0 && (size_t)set_silent_n < sizeof(set_silent_dsl));
+    run_case_no_silent_output_oom(
+        "set_union_key_materialization",
+        set_silent_dsl,
+        people,
+        520);
     const char *sorted_union_lookup_path = "/tmp/tranfi_oom_sorted_union_lookup.csv";
     FILE *sorted_union_lookup = fopen(sorted_union_lookup_path, "wb");
     assert(sorted_union_lookup);
