@@ -427,6 +427,11 @@ int main(void) {
     assert(bag_lookup);
     fputs("city\nNY\n", bag_lookup);
     assert(fclose(bag_lookup) == 0);
+    const char *spill_bag_lookup_path = "/tmp/tranfi_oom_spill_bag_lookup.csv";
+    FILE *spill_bag_lookup = fopen(spill_bag_lookup_path, "wb");
+    assert(spill_bag_lookup);
+    fputs("city\nNY\nNY\nLA\n", spill_bag_lookup);
+    assert(fclose(spill_bag_lookup) == 0);
     char set_silent_dsl[768];
     int set_silent_n = snprintf(set_silent_dsl, sizeof(set_silent_dsl),
                                 "csv batch_size=1 | intersect %s columns=city "
@@ -681,6 +686,72 @@ int main(void) {
         spill_join_dsl,
         people,
         640);
+    char spill_set_dsl[768];
+    int spill_set_n = snprintf(
+        spill_set_dsl,
+        sizeof(spill_set_dsl),
+        "csv batch_size=1 | intersect %s columns=city "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        spill_bag_lookup_path,
+        spill_root);
+    assert(spill_set_n > 0 && (size_t)spill_set_n < sizeof(spill_set_dsl));
+    run_case_no_silent_output_oom(
+        "spill_set_intersect_key_materialization",
+        spill_set_dsl,
+        people,
+        640);
+    spill_set_n = snprintf(
+        spill_set_dsl,
+        sizeof(spill_set_dsl),
+        "csv batch_size=1 | setdiff %s columns=city "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        spill_bag_lookup_path,
+        spill_root);
+    assert(spill_set_n > 0 && (size_t)spill_set_n < sizeof(spill_set_dsl));
+    run_case_no_silent_output_oom(
+        "spill_set_setdiff_key_materialization",
+        spill_set_dsl,
+        people,
+        640);
+    spill_set_n = snprintf(
+        spill_set_dsl,
+        sizeof(spill_set_dsl),
+        "csv batch_size=1 | intersect-all %s columns=city "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        spill_bag_lookup_path,
+        spill_root);
+    assert(spill_set_n > 0 && (size_t)spill_set_n < sizeof(spill_set_dsl));
+    run_case_no_silent_output_oom(
+        "spill_set_intersect_all_key_materialization",
+        spill_set_dsl,
+        people,
+        640);
+    spill_set_n = snprintf(
+        spill_set_dsl,
+        sizeof(spill_set_dsl),
+        "csv batch_size=1 | setdiff-all %s columns=city "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        spill_bag_lookup_path,
+        spill_root);
+    assert(spill_set_n > 0 && (size_t)spill_set_n < sizeof(spill_set_dsl));
+    run_case_no_silent_output_oom(
+        "spill_set_setdiff_all_key_materialization",
+        spill_set_dsl,
+        people,
+        640);
+    spill_set_n = snprintf(
+        spill_set_dsl,
+        sizeof(spill_set_dsl),
+        "csv batch_size=1 | union %s columns=city "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        union_lookup_path,
+        spill_root);
+    assert(spill_set_n > 0 && (size_t)spill_set_n < sizeof(spill_set_dsl));
+    run_case_no_silent_output_oom(
+        "spill_set_union_key_materialization",
+        spill_set_dsl,
+        people,
+        700);
     char spill_sort_plan[1024];
     int spill_sort_n = snprintf(
         spill_sort_plan,
@@ -1383,6 +1454,7 @@ int main(void) {
     remove(join_lookup_path);
     remove(join_sorted_lookup_path);
     remove(bag_lookup_path);
+    remove(spill_bag_lookup_path);
     remove(sorted_union_lookup_path);
     remove(stack_path);
     remove(rules_path);
