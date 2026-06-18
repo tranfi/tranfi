@@ -115,6 +115,45 @@ static int run_case_once(const oom_case *tc) {
     return rc;
 }
 
+static int run_capture_once(const char *dsl, const char *input, char *main_out,
+                            size_t main_out_cap) {
+    if (main_out_cap > 0) main_out[0] = '\0';
+
+    char *error = NULL;
+    char *json = tf_compile_dsl(dsl, strlen(dsl), &error);
+    if (!json) {
+        free(error);
+        return TF_ERROR;
+    }
+
+    tf_pipeline *p = tf_pipeline_create(json, strlen(json));
+    tf_string_free(json);
+    if (!p) {
+        free(error);
+        return TF_ERROR;
+    }
+
+    int rc = TF_OK;
+    size_t len = strlen(input);
+    if (tf_pipeline_push(p, (const uint8_t *)input, len) != TF_OK) rc = TF_ERROR;
+    if (rc == TF_OK && tf_pipeline_finish(p) != TF_OK) rc = TF_ERROR;
+
+    if (main_out_cap > 0) {
+        size_t off = 0;
+        while (off + 1 < main_out_cap) {
+            size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, (uint8_t *)main_out + off,
+                                        main_out_cap - off - 1);
+            if (n == 0) break;
+            off += n;
+        }
+        main_out[off] = '\0';
+    }
+    drain_all(p);
+    tf_pipeline_free(p);
+    free(error);
+    return rc;
+}
+
 static size_t count_successful_allocs(const oom_case *tc) {
     oom_enabled = 1;
     oom_fail_at = (size_t)-1;
@@ -140,6 +179,41 @@ static void run_case_with_oom(const oom_case *tc) {
         oom_failed = 0;
         (void)run_case_once(tc);
         oom_enabled = 0;
+        assert(oom_failed);
+    }
+}
+
+static void run_case_no_silent_output_oom(const char *name, const char *dsl,
+                                          const char *input,
+                                          size_t max_fail_points) {
+    char baseline[8192];
+    oom_enabled = 1;
+    oom_fail_at = (size_t)-1;
+    oom_alloc_count = 0;
+    oom_failed = 0;
+    int rc = run_capture_once(dsl, input, baseline, sizeof(baseline));
+    oom_enabled = 0;
+    assert(rc == TF_OK);
+    assert(!oom_failed);
+    size_t allocs = oom_alloc_count;
+    size_t limit = allocs;
+    if (max_fail_points > 0 && limit > max_fail_points) limit = max_fail_points;
+    assert(limit > 0);
+
+    for (size_t fail_at = 1; fail_at <= limit; fail_at++) {
+        char got[8192];
+        oom_enabled = 1;
+        oom_fail_at = fail_at;
+        oom_alloc_count = 0;
+        oom_failed = 0;
+        rc = run_capture_once(dsl, input, got, sizeof(got));
+        oom_enabled = 0;
+
+        if (oom_failed && rc == TF_OK && strcmp(got, baseline) != 0) {
+            fprintf(stderr, "%s: silent output drift at allocation %zu\n", name, fail_at);
+            fprintf(stderr, "baseline:\n%s\ngot:\n%s\n", baseline, got);
+            assert(!"OOM allocation failure changed successful output");
+        }
         assert(oom_failed);
     }
 }
@@ -261,6 +335,19 @@ int main(void) {
           "SF,870,West\n",
           join_lookup);
     assert(fclose(join_lookup) == 0);
+    char join_silent_dsl[512];
+    int join_silent_n = snprintf(join_silent_dsl, sizeof(join_silent_dsl),
+                                 "csv batch_size=1 | join %s on city "
+                                 "max_lookup_rows=10 max_lookup_keys=10 "
+                                 "max_state_bytes=1048576 max_matches_per_row=2 "
+                                 "max_output_rows=10 | csv",
+                                 join_lookup_path);
+    assert(join_silent_n > 0 && (size_t)join_silent_n < sizeof(join_silent_dsl));
+    run_case_no_silent_output_oom(
+        "hash_join_left_key_materialization",
+        join_silent_dsl,
+        "city,name\nNY,Alice\nSF,Cara\n",
+        520);
     const char *join_sorted_lookup_path = "/tmp/tranfi_oom_join_sorted_lookup.csv";
     FILE *join_sorted_lookup = fopen(join_sorted_lookup_path, "wb");
     assert(join_sorted_lookup);

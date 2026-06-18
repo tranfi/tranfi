@@ -2461,7 +2461,10 @@ static int join_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     for (size_t r = 0; r < in->n_rows; r++) {
         char *key = format_join_key(in, r, left_ci);
-        if (!key) continue;
+        if (!key) {
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
 
         join_bucket *bucket = map_find(&st->map, key);
         free(key);
