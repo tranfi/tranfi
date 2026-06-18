@@ -323,6 +323,12 @@ int main(void) {
             360
         },
         {
+            "csv_strict_good_rows",
+            "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
+            people,
+            320
+        },
+        {
             "row_selection_aliases",
             "csv batch_size=1 | reorder city,name,score | dedup city max_keys=8 | slice-head n=3 | slice-tail 2 | csv",
             people,
@@ -345,6 +351,12 @@ int main(void) {
             "csv batch_size=1 nulls=NA | trim name | fill-null city=unknown | cast age=float | clip age min=20 max=40 | replace city LA LosAngeles | derive doubled=col(score)*2 | csv",
             people,
             260
+        },
+        {
+            "cast_fail_policy_valid",
+            "csv batch_size=1 | cast age=int on_error=fail audit audit_limit=2 | csv",
+            people,
+            360
         },
         {
             "regex_replace_audit",
@@ -431,6 +443,18 @@ int main(void) {
             520
         },
         {
+            "validate_rate_warning",
+            "csv batch_size=1 | validate \"col(score) > 15\" audit audit_limit=1 warn_failure_rate=0.2 max_failure_rate=1 | csv",
+            people,
+            520
+        },
+        {
+            "assert_quarantine_action",
+            "csv batch_size=1 | assert \"col(score) >= 20\" action=quarantine name=score_min audit audit_limit=2 | csv",
+            people,
+            520
+        },
+        {
             "data_quality_annotate_schema",
             "csv batch_size=1 | validate \"col(age) > 0\" | assert \"col(score) >= 20\" action=annotate result=score_ok | schema name:string age:int city:string mode=annotate result=schema_ok | csv",
             people,
@@ -441,6 +465,12 @@ int main(void) {
             "csv batch_size=1 | schema columns=starts_with(score_):number,code:string non_null=starts_with(score_) min=where(number):0 max=starts_with(score_):100 regex=ends_with(code):^[A-Z]+$ max_regex_pattern_bytes=64 max_regex_cell_bytes=16 mode=warn | csv",
             selector_people,
             520
+        },
+        {
+            "schema_quarantine_action",
+            "csv batch_size=1 | schema name:string age:int city:string non_null=name,age min=age:0 max=age:120 values=city:NY,LA mode=quarantine name=schema_check message=schema_rule | csv",
+            sorted_people_unmatched,
+            560
         },
         {
             "validate_rules_file",
@@ -529,6 +559,12 @@ int main(void) {
         {
             "flush_report_schema_infer",
             "csv batch_size=1 | schema infer rows=3 | csv",
+            people,
+            320
+        },
+        {
+            "schema_infer_sample_limited",
+            "csv batch_size=1 | schema infer rows=1 | csv",
             people,
             320
         },
@@ -737,6 +773,12 @@ int main(void) {
             300
         },
         {
+            "jsonpath_dot_record_ops",
+            "text | json-extract $.user.name user_name | json-filter $.user.age >= 30 type=float | csv",
+            "{\"user\":{\"name\":\"Alice\",\"age\":30}}\n{\"user\":{\"name\":\"Bob\",\"age\":20}}\n",
+            300
+        },
+        {
             "json_filter_predicates",
             "text | json-filter /user/name starts-with A type=string | json-filter /tags contains vip type=string | csv",
             "{\"user\":{\"name\":\"Alice\"},\"tags\":\"vip,gold\"}\n{\"user\":{\"name\":\"Ada\"},\"tags\":\"basic\"}\n{\"user\":{\"name\":\"Bob\"},\"tags\":\"vip\"}\n",
@@ -753,6 +795,12 @@ int main(void) {
             "text | grep -r error | head 3 | text",
             "ok\nerror one\nwarn\nerror two\n",
             180
+        },
+        {
+            "text_replace_regex",
+            "text batch_size=1 | replace --regex _line \"error .*\" ERR | text",
+            "ok\nerror one\nwarn\nerror two\n",
+            300
         },
         {
             "text_passthrough",
