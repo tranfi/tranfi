@@ -56,6 +56,8 @@ TF_WARN_UNUSED int tf_size_grow_pow2(size_t current, size_t min_value, size_t mi
 TF_WARN_UNUSED void *tf_mallocarray_checked(size_t count, size_t elem_size);
 TF_WARN_UNUSED void *tf_callocarray_checked(size_t count, size_t elem_size);
 TF_WARN_UNUSED void *tf_reallocarray_checked(void *ptr, size_t count, size_t elem_size);
+TF_WARN_UNUSED char *tf_strdup_checked(const char *s);
+TF_WARN_UNUSED char *tf_string_append_suffix_checked(const char *prefix, const char *suffix);
 TF_WARN_UNUSED int tf_check_byte_limit(size_t n, size_t max_value,
                                        const char *context, const char *name);
 TF_WARN_UNUSED int tf_string_length_bounded(const char *s, size_t max_value,

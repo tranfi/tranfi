@@ -6,6 +6,7 @@
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int tf_format_float64(char *buf, size_t buf_size, double value) {
     if (!buf || buf_size == 0) return TF_ERROR;
@@ -69,6 +70,34 @@ void *tf_reallocarray_checked(void *ptr, size_t count, size_t elem_size) {
     if (tf_size_mul(count, elem_size, &bytes) != TF_OK) return NULL;
     if (bytes == 0) bytes = 1;
     return realloc(ptr, bytes);
+}
+
+char *tf_strdup_checked(const char *s) {
+    const char *src = s ? s : "";
+    size_t len = strlen(src);
+    size_t bytes = 0;
+    if (tf_size_add(len, 1, &bytes) != TF_OK) return NULL;
+    char *copy = tf_mallocarray_checked(bytes, sizeof(char));
+    if (!copy) return NULL;
+    memcpy(copy, src, bytes);
+    return copy;
+}
+
+char *tf_string_append_suffix_checked(const char *prefix, const char *suffix) {
+    const char *a = prefix ? prefix : "";
+    const char *b = suffix ? suffix : "";
+    size_t a_len = strlen(a);
+    size_t b_len = strlen(b);
+    size_t text_len = 0;
+    size_t bytes = 0;
+    if (tf_size_add(a_len, b_len, &text_len) != TF_OK ||
+        tf_size_add(text_len, 1, &bytes) != TF_OK) return NULL;
+    char *copy = tf_mallocarray_checked(bytes, sizeof(char));
+    if (!copy) return NULL;
+    memcpy(copy, a, a_len);
+    memcpy(copy + a_len, b, b_len);
+    copy[text_len] = '\0';
+    return copy;
 }
 
 static void tf_index_swap(size_t *a, size_t *b) {

@@ -125,9 +125,9 @@ static tf_step *lag_create_with_suffix(const cJSON *args, const char *suffix) {
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     if (!cJSON_IsString(col_j) || !col_j->valuestring[0]) return NULL;
 
-    lag_state *st = calloc(1, sizeof(lag_state));
+    lag_state *st = tf_callocarray_checked(1, sizeof(lag_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 
     size_t offset = 1;
@@ -139,15 +139,20 @@ static tf_step *lag_create_with_suffix(const cJSON *args, const char *suffix) {
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j) && res_j->valuestring[0]) {
-        st->result = strdup(res_j->valuestring);
+        st->result = tf_strdup_checked(res_j->valuestring);
     } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_%s", st->column, suffix);
-        st->result = strdup(buf);
+        char suffix_buf[64];
+        int n = snprintf(suffix_buf, sizeof(suffix_buf), "_%s", suffix ? suffix : "");
+        if (n < 0 || (size_t)n >= sizeof(suffix_buf)) {
+            free(st->column);
+            free(st);
+            return NULL;
+        }
+        st->result = tf_string_append_suffix_checked(st->column, suffix_buf);
     }
     if (!st->result) { free(st->column); free(st); return NULL; }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) {
         free(st->column);
         free(st->result);

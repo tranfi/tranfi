@@ -358,6 +358,12 @@ int main(void) {
             900
         },
         {
+            "simple_suffix_constructor_args",
+            "csv batch_size=1 | grep -v NOPE name | clip score min=0 max=100 | bin score 15 | lag score 1 | shift score offset=1 type=lead | csv",
+            people,
+            520
+        },
+        {
             "csv_strict_good_rows",
             "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
             people,

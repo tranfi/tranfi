@@ -12028,6 +12028,19 @@ static int line_starts_with(const char *output, int lineno, const char *prefix) 
     return strncmp(line, prefix, strlen(prefix)) == 0;
 }
 
+static int csv_header_has_exact(const char *output, const char *name) {
+    const char *p = output;
+    size_t n = strlen(name);
+    while (*p && *p != '\n') {
+        const char *end = p;
+        while (*end && *end != ',' && *end != '\n') end++;
+        if ((size_t)(end - p) == n && memcmp(p, name, n) == 0) return 1;
+        if (*end != ',') break;
+        p = end + 1;
+    }
+    return 0;
+}
+
 
 static void test_pipeline_unique_sorted(void) {
     char out[2048];
@@ -12223,6 +12236,42 @@ static void test_pipeline_shift_lead_large_offset_chunks(void) {
     assert(line_starts_with(out, 3, "3,30,"));
     assert(line_starts_with(out, 4, "4,40,"));
     assert(line_starts_with(out, 5, "5,50,"));
+}
+
+static void test_pipeline_suffix_ops_preserve_long_default_names(void) {
+    char col[301];
+    memset(col, 'a', sizeof(col) - 1);
+    col[sizeof(col) - 1] = '\0';
+
+    char input[512];
+    int n = snprintf(input, sizeof(input), "%s\n10\n20\n30\n", col);
+    assert(n > 0 && (size_t)n < sizeof(input));
+
+    char plan[2048];
+    n = snprintf(plan, sizeof(plan),
+                 "{\"steps\":["
+                 "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+                 "{\"op\":\"bin\",\"args\":{\"column\":\"%s\",\"boundaries\":[15]}},"
+                 "{\"op\":\"lag\",\"args\":{\"column\":\"%s\",\"offset\":1}},"
+                 "{\"op\":\"lead\",\"args\":{\"column\":\"%s\",\"offset\":1}},"
+                 "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+                 "]}",
+                 col, col, col);
+    assert(n > 0 && (size_t)n < sizeof(plan));
+
+    char out[4096];
+    run_plan_chunked(plan, input, 11, out, sizeof(out));
+
+    char expected[320];
+    n = snprintf(expected, sizeof(expected), "%s_bin", col);
+    assert(n > 0 && (size_t)n < sizeof(expected));
+    assert(csv_header_has_exact(out, expected));
+    n = snprintf(expected, sizeof(expected), "%s_lag", col);
+    assert(n > 0 && (size_t)n < sizeof(expected));
+    assert(csv_header_has_exact(out, expected));
+    n = snprintf(expected, sizeof(expected), "%s_lead", col);
+    assert(n > 0 && (size_t)n < sizeof(expected));
+    assert(csv_header_has_exact(out, expected));
 }
 
 static void test_pipeline_rleid(void) {
@@ -13021,6 +13070,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_lag_chunk_boundary);
     TEST(test_pipeline_lag_preserves_string_type);
     TEST(test_pipeline_shift_lead_large_offset_chunks);
+    TEST(test_pipeline_suffix_ops_preserve_long_default_names);
     TEST(test_pipeline_rleid);
     TEST(test_pipeline_ewma);
     TEST(test_pipeline_h14_numeric_missing_type_policies);

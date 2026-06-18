@@ -207,9 +207,9 @@ tf_step *tf_lead_create(const cJSON *args) {
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     if (!cJSON_IsString(col_j) || !col_j->valuestring[0]) return NULL;
 
-    lead_state *st = calloc(1, sizeof(lead_state));
+    lead_state *st = tf_callocarray_checked(1, sizeof(lead_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 
     size_t offset = 1;
@@ -221,15 +221,13 @@ tf_step *tf_lead_create(const cJSON *args) {
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j) && res_j->valuestring[0]) {
-        st->result = strdup(res_j->valuestring);
+        st->result = tf_strdup_checked(res_j->valuestring);
     } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_lead", st->column);
-        st->result = strdup(buf);
+        st->result = tf_string_append_suffix_checked(st->column, "_lead");
     }
     if (!st->result) { free(st->column); free(st); return NULL; }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) {
         free(st->column);
         free(st->result);

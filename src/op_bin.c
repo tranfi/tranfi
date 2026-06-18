@@ -125,16 +125,21 @@ static int bin_process(tf_step *self, tf_batch *in, tf_batch **out,
         force_null = 1;
     }
 
-    char bin_col_name[256];
-    snprintf(bin_col_name, sizeof(bin_col_name), "%s_bin", st->column);
+    char *bin_col_name = tf_string_append_suffix_checked(st->column, "_bin");
+    if (!bin_col_name) return TF_ERROR;
     const char *extra_names[1] = {bin_col_name};
     tf_type extra_types[1] = {TF_TYPE_STRING};
     tf_batch *ob = tf_batch_create(in->n_cols + 1, in->n_rows);
-    if (!ob) return TF_ERROR;
+    if (!ob) {
+        free(bin_col_name);
+        return TF_ERROR;
+    }
     if (tf_batch_clone_with_extra_cols(ob, in, extra_names, extra_types, 1) != TF_OK) {
+        free(bin_col_name);
         tf_batch_free(ob);
         return TF_ERROR;
     }
+    free(bin_col_name);
 
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
@@ -196,9 +201,9 @@ tf_step *tf_bin_create(const cJSON *args) {
         return NULL;
     }
 
-    bin_state *st = calloc(1, sizeof(bin_state));
+    bin_state *st = tf_callocarray_checked(1, sizeof(bin_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
     if (bin_parse_missing_policy(args, &st->missing) != TF_OK ||
         bin_parse_type_policy(args, &st->on_type_error) != TF_OK) {
@@ -216,7 +221,7 @@ tf_step *tf_bin_create(const cJSON *args) {
     }
     int n = cJSON_GetArraySize(bounds);
     if (n > 0) {
-        st->boundaries = malloc((size_t)n * sizeof(double));
+        st->boundaries = tf_mallocarray_checked((size_t)n, sizeof(double));
         if (!st->boundaries) { free(st->column); free(st); return NULL; }
         st->n_boundaries = (size_t)n;
         for (int i = 0; i < n; i++) {
@@ -233,7 +238,7 @@ tf_step *tf_bin_create(const cJSON *args) {
         }
     }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->boundaries); free(st); return NULL; }
     step->process = bin_process;
     step->flush = bin_flush;

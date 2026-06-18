@@ -83,9 +83,9 @@ tf_step *tf_clip_create(const cJSON *args) {
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     if (!cJSON_IsString(col_j)) return NULL;
 
-    clip_state *st = calloc(1, sizeof(clip_state));
+    clip_state *st = tf_callocarray_checked(1, sizeof(clip_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 
     cJSON *min_j = cJSON_GetObjectItemCaseSensitive(args, "min");
@@ -93,7 +93,7 @@ tf_step *tf_clip_create(const cJSON *args) {
     cJSON *max_j = cJSON_GetObjectItemCaseSensitive(args, "max");
     if (cJSON_IsNumber(max_j)) { st->max_val = max_j->valuedouble; st->has_max = 1; }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st); return NULL; }
     step->process = clip_process;
     step->flush = clip_flush;

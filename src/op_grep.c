@@ -142,17 +142,17 @@ tf_step *tf_grep_create(const cJSON *args) {
     cJSON *pattern_json = cJSON_GetObjectItemCaseSensitive(args, "pattern");
     if (!cJSON_IsString(pattern_json)) return NULL;
 
-    grep_state *st = calloc(1, sizeof(grep_state));
+    grep_state *st = tf_callocarray_checked(1, sizeof(grep_state));
     if (!st) return NULL;
 
-    st->pattern = strdup(pattern_json->valuestring);
+    st->pattern = tf_strdup_checked(pattern_json->valuestring);
     if (!st->pattern) { free(st); return NULL; }
 
     cJSON *column_json = cJSON_GetObjectItemCaseSensitive(args, "column");
     if (cJSON_IsString(column_json))
-        st->column = strdup(column_json->valuestring);
+        st->column = tf_strdup_checked(column_json->valuestring);
     else
-        st->column = strdup("_line");
+        st->column = tf_strdup_checked("_line");
     if (!st->column) { free(st->pattern); free(st); return NULL; }
 
     cJSON *invert_json = cJSON_GetObjectItemCaseSensitive(args, "invert");
@@ -171,7 +171,7 @@ tf_step *tf_grep_create(const cJSON *args) {
         }
     }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->pattern); free(st->column); free(st); return NULL; }
     step->process = grep_process;
     step->flush = grep_flush;
