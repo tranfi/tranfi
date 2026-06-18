@@ -357,6 +357,45 @@ int main(void) {
           "NY,8100,East2\n",
           join_sorted_lookup);
     assert(fclose(join_sorted_lookup) == 0);
+    char sorted_silent_dsl[768];
+    int sorted_silent_n = snprintf(sorted_silent_dsl, sizeof(sorted_silent_dsl),
+                                   "csv batch_size=1 | join %s on city sorted=true "
+                                   "max_matches_per_row=2 max_output_rows=16 | csv",
+                                   join_sorted_lookup_path);
+    assert(sorted_silent_n > 0 && (size_t)sorted_silent_n < sizeof(sorted_silent_dsl));
+    run_case_no_silent_output_oom(
+        "sorted_join_inner_key_materialization",
+        sorted_silent_dsl,
+        sorted_people,
+        620);
+    sorted_silent_n = snprintf(sorted_silent_dsl, sizeof(sorted_silent_dsl),
+                               "csv batch_size=1 | join %s on city --left sorted=true "
+                               "max_matches_per_row=2 max_output_rows=16 | csv",
+                               join_sorted_lookup_path);
+    assert(sorted_silent_n > 0 && (size_t)sorted_silent_n < sizeof(sorted_silent_dsl));
+    run_case_no_silent_output_oom(
+        "sorted_join_left_key_materialization",
+        sorted_silent_dsl,
+        sorted_people_unmatched,
+        620);
+    sorted_silent_n = snprintf(sorted_silent_dsl, sizeof(sorted_silent_dsl),
+                               "csv batch_size=1 | semi-join %s on city sorted=true | csv",
+                               join_sorted_lookup_path);
+    assert(sorted_silent_n > 0 && (size_t)sorted_silent_n < sizeof(sorted_silent_dsl));
+    run_case_no_silent_output_oom(
+        "sorted_join_semi_key_materialization",
+        sorted_silent_dsl,
+        sorted_people,
+        620);
+    sorted_silent_n = snprintf(sorted_silent_dsl, sizeof(sorted_silent_dsl),
+                               "csv batch_size=1 | anti-join %s on city sorted=true | csv",
+                               join_sorted_lookup_path);
+    assert(sorted_silent_n > 0 && (size_t)sorted_silent_n < sizeof(sorted_silent_dsl));
+    run_case_no_silent_output_oom(
+        "sorted_join_anti_key_materialization",
+        sorted_silent_dsl,
+        sorted_people_unmatched,
+        620);
     const char *bag_lookup_path = "/tmp/tranfi_oom_bag_lookup.csv";
     FILE *bag_lookup = fopen(bag_lookup_path, "wb");
     assert(bag_lookup);
@@ -418,6 +457,24 @@ int main(void) {
         set_silent_dsl,
         people,
         520);
+    sorted_silent_n = snprintf(sorted_silent_dsl, sizeof(sorted_silent_dsl),
+                               "csv batch_size=1 | intersect %s columns=city sorted=true | csv",
+                               sorted_lookup_path);
+    assert(sorted_silent_n > 0 && (size_t)sorted_silent_n < sizeof(sorted_silent_dsl));
+    run_case_no_silent_output_oom(
+        "sorted_set_intersect_key_materialization",
+        sorted_silent_dsl,
+        sorted_people,
+        520);
+    sorted_silent_n = snprintf(sorted_silent_dsl, sizeof(sorted_silent_dsl),
+                               "csv batch_size=1 | setdiff %s columns=city sorted=true | csv",
+                               sorted_lookup_path);
+    assert(sorted_silent_n > 0 && (size_t)sorted_silent_n < sizeof(sorted_silent_dsl));
+    run_case_no_silent_output_oom(
+        "sorted_set_setdiff_key_materialization",
+        sorted_silent_dsl,
+        sorted_people,
+        520);
     const char *key_state_silent_rows =
         "id,city,score\n"
         "1,NY,10\n"
@@ -458,6 +515,15 @@ int main(void) {
           "Sam,44,SF,41,s,10,10,green\n",
           sorted_union_lookup);
     assert(fclose(sorted_union_lookup) == 0);
+    sorted_silent_n = snprintf(sorted_silent_dsl, sizeof(sorted_silent_dsl),
+                               "csv batch_size=1 | union %s columns=city sorted=true | csv",
+                               sorted_union_lookup_path);
+    assert(sorted_silent_n > 0 && (size_t)sorted_silent_n < sizeof(sorted_silent_dsl));
+    run_case_no_silent_output_oom(
+        "sorted_set_union_key_materialization",
+        sorted_silent_dsl,
+        sorted_people,
+        620);
     const char *stack_path = "/tmp/tranfi_oom_stack.csv";
     FILE *stack_file = fopen(stack_path, "wb");
     assert(stack_file);
