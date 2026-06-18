@@ -34,6 +34,7 @@ def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None =
     merged_env.setdefault('TMPDIR', tmp)
     merged_env.setdefault('TEMP', tmp)
     merged_env.setdefault('TMP', tmp)
+    merged_env.setdefault('PIP_CACHE_DIR', str(temp_root() / 'pip-cache'))
     if env:
         merged_env.update(env)
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=merged_env, check=True)

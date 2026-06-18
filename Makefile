@@ -6,7 +6,8 @@ NODE ?= node
 TWINE ?= twine
 PYTEST ?= $(PYTHON) -m pytest
 PACKAGE_TMPDIR ?= $(CURDIR)/build/tmp
-PY_BUILD_ENV := TMPDIR="$(PACKAGE_TMPDIR)" TEMP="$(PACKAGE_TMPDIR)" TMP="$(PACKAGE_TMPDIR)"
+PACKAGE_ENV := TMPDIR="$(PACKAGE_TMPDIR)" TEMP="$(PACKAGE_TMPDIR)" TMP="$(PACKAGE_TMPDIR)" TRANFI_TEST_TMPDIR="$(PACKAGE_TMPDIR)/package-smoke" PIP_CACHE_DIR="$(PACKAGE_TMPDIR)/pip-cache"
+PY_BUILD_ENV := $(PACKAGE_ENV)
 SANITIZER_RUN := $(shell if command -v setarch >/dev/null 2>&1 && setarch "$$(uname -m)" -R true >/dev/null 2>&1; then printf 'setarch %s -R' "$$(uname -m)"; fi)
 ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
 BENCH_ROWS ?= 1000000
@@ -151,18 +152,18 @@ test-packaging-python: sbom sync-py-csrc check-py-csrc-sync
 	@$(PYTHON) scripts/audit-package-artifacts.py --python-sdist "py/dist/tranfi-*.tar.gz"
 
 test-packaging-node: sbom sync-js-csrc check-js-csrc-sync
-	@mkdir -p build
-	@cd js && npm_config_cache=../build/npm-pack-audit $(NPM) pack --dry-run --json > ../build/npm-pack-dry-run.json
+	@mkdir -p "$(PACKAGE_TMPDIR)" build
+	@cd js && $(PACKAGE_ENV) npm_config_cache=../build/npm-pack-audit $(NPM) pack --dry-run --json > ../build/npm-pack-dry-run.json
 	@$(PYTHON) scripts/audit-package-artifacts.py --npm-json build/npm-pack-dry-run.json
 
 test-packaging-python-install: test-packaging-python
-	@$(PYTHON) scripts/smoke-install-packages.py --python-sdist "py/dist/tranfi-*.tar.gz" --python "$(PYTHON)"
+	@$(PACKAGE_ENV) $(PYTHON) scripts/smoke-install-packages.py --python-sdist "py/dist/tranfi-*.tar.gz" --python "$(PYTHON)"
 
 test-packaging-node-install: test-packaging-node
-	@rm -rf build/npm-install-smoke && mkdir -p build/npm-install-smoke
-	@cd js && npm_config_cache=../build/npm-pack-audit $(NPM) pack --json --pack-destination ../build/npm-install-smoke > ../build/npm-pack-install.json
+	@rm -rf build/npm-install-smoke && mkdir -p "$(PACKAGE_TMPDIR)" build/npm-install-smoke
+	@cd js && $(PACKAGE_ENV) npm_config_cache=../build/npm-pack-audit $(NPM) pack --json --pack-destination ../build/npm-install-smoke > ../build/npm-pack-install.json
 	@$(PYTHON) scripts/audit-package-artifacts.py --npm-json build/npm-pack-install.json
-	@$(PYTHON) scripts/smoke-install-packages.py --npm-tarball "build/npm-install-smoke/tranfi-*.tgz" --node "$(NODE)" --npm "$(NPM)"
+	@$(PACKAGE_ENV) $(PYTHON) scripts/smoke-install-packages.py --npm-tarball "build/npm-install-smoke/tranfi-*.tgz" --node "$(NODE)" --npm "$(NPM)"
 
 test-packaging-install: test-packaging-python-install test-packaging-node-install
 
