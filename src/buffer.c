@@ -95,6 +95,18 @@ int tf_json_add_item(cJSON *obj, const char *name, cJSON *item) {
     return TF_OK;
 }
 
+int tf_json_add_array_item(cJSON *arr, cJSON *item) {
+    if (!arr || !item) {
+        cJSON_Delete(item);
+        return TF_ERROR;
+    }
+    if (!cJSON_AddItemToArray(arr, item)) {
+        cJSON_Delete(item);
+        return TF_ERROR;
+    }
+    return TF_OK;
+}
+
 size_t tf_buffer_read(tf_buffer *b, uint8_t *out, size_t len) {
     size_t avail = b->len - b->read_pos;
     if (len > avail) len = avail;

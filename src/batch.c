@@ -818,8 +818,10 @@ cJSON *tf_audit_row_to_json(const tf_batch *b, size_t row, const tf_audit_option
         const char *name = b->col_names[c] ? b->col_names[c] : "";
         if (opts && opts->n_columns > 0 && !audit_name_in_list(opts->columns, opts->n_columns, name)) continue;
         cJSON *value = tf_audit_cell_to_json(b, row, c, opts);
-        if (!value) { cJSON_Delete(obj); return NULL; }
-        cJSON_AddItemToObject(obj, name, value);
+        if (!value || tf_json_add_item(obj, name, value) != TF_OK) {
+            cJSON_Delete(obj);
+            return NULL;
+        }
     }
     if (opts && opts->max_bytes > 0) {
         char *printed = cJSON_PrintUnformatted(obj);
@@ -830,8 +832,11 @@ cJSON *tf_audit_row_to_json(const tf_batch *b, size_t row, const tf_audit_option
             cJSON_Delete(obj);
             obj = cJSON_CreateObject();
             if (!obj) return NULL;
-            cJSON_AddBoolToObject(obj, "_audit_truncated", 1);
-            cJSON_AddNumberToObject(obj, "max_bytes", (double)opts->max_bytes);
+            if (tf_json_add_bool(obj, "_audit_truncated", 1) != TF_OK ||
+                tf_json_add_number(obj, "max_bytes", (double)opts->max_bytes) != TF_OK) {
+                cJSON_Delete(obj);
+                return NULL;
+            }
         }
     }
     return obj;

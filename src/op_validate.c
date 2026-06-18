@@ -91,23 +91,34 @@ static int emit_validate_audit(validate_state *st, validate_rule *rule,
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "validate");
-    cJSON_AddStringToObject(obj, "event", "validation_failed");
-    cJSON_AddStringToObject(obj, "reason", "validate_false");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "action", "annotate");
-    cJSON_AddStringToObject(obj, "suite", st->name ? st->name : "validate");
-    cJSON_AddStringToObject(obj, "name", rule->name ? rule->name : "validate");
-    cJSON_AddStringToObject(obj, "expr", rule->expr_text ? rule->expr_text : "");
-    cJSON_AddStringToObject(obj, "result", "_valid");
-    cJSON_AddBoolToObject(obj, "valid", 0);
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    if (rule->message && rule->message[0]) cJSON_AddStringToObject(obj, "message", rule->message);
-    else if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "validate") != TF_OK ||
+        tf_json_add_string(obj, "event", "validation_failed") != TF_OK ||
+        tf_json_add_string(obj, "reason", "validate_false") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "action", "annotate") != TF_OK ||
+        tf_json_add_string(obj, "suite", st->name ? st->name : "validate") != TF_OK ||
+        tf_json_add_string(obj, "name", rule->name ? rule->name : "validate") != TF_OK ||
+        tf_json_add_string(obj, "expr", rule->expr_text ? rule->expr_text : "") != TF_OK ||
+        tf_json_add_string(obj, "result", "_valid") != TF_OK ||
+        tf_json_add_bool(obj, "valid", 0) != TF_OK ||
+        tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) {
+        goto done;
+    }
+    if (rule->message && rule->message[0]) {
+        if (tf_json_add_string(obj, "message", rule->message) != TF_OK) goto done;
+    } else if (st->message && st->message[0]) {
+        if (tf_json_add_string(obj, "message", st->message) != TF_OK) goto done;
+    }
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) {
         st->audit_emitted++;
@@ -125,19 +136,26 @@ static int emit_validate_threshold_error(validate_state *st, tf_side_channels *s
     if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "validate_failure");
-    cJSON_AddStringToObject(obj, "op", "validate");
-    cJSON_AddStringToObject(obj, "event", "threshold_exceeded");
-    cJSON_AddStringToObject(obj, "reason", "max_failures_exceeded");
-    cJSON_AddStringToObject(obj, "severity", "error");
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "validate");
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    cJSON_AddNumberToObject(obj, "checked_rows", (double)st->checked_rows);
-    cJSON_AddNumberToObject(obj, "failed_rows", (double)st->failed_rows);
-    cJSON_AddNumberToObject(obj, "failure_rate", validate_failure_rate(st->failed_rows, st->checked_rows));
-    cJSON_AddNumberToObject(obj, "max_failures", (double)st->max_failures);
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "validate_failure") != TF_OK ||
+        tf_json_add_string(obj, "op", "validate") != TF_OK ||
+        tf_json_add_string(obj, "event", "threshold_exceeded") != TF_OK ||
+        tf_json_add_string(obj, "reason", "max_failures_exceeded") != TF_OK ||
+        tf_json_add_string(obj, "severity", "error") != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "validate") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK ||
+        tf_json_add_number(obj, "checked_rows", (double)st->checked_rows) != TF_OK ||
+        tf_json_add_number(obj, "failed_rows", (double)st->failed_rows) != TF_OK ||
+        tf_json_add_number(obj, "failure_rate", validate_failure_rate(st->failed_rows, st->checked_rows)) != TF_OK ||
+        tf_json_add_number(obj, "max_failures", (double)st->max_failures) != TF_OK) {
+        goto done;
+    }
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     return rc;
 }
@@ -149,18 +167,25 @@ static int emit_validate_rate_event(validate_state *st, tf_side_channels *side,
     if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "validate_failure");
-    cJSON_AddStringToObject(obj, "op", "validate");
-    cJSON_AddStringToObject(obj, "event", event);
-    cJSON_AddStringToObject(obj, "reason", reason);
-    cJSON_AddStringToObject(obj, "severity", severity);
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "validate");
-    cJSON_AddNumberToObject(obj, "checked_rows", (double)st->checked_rows);
-    cJSON_AddNumberToObject(obj, "failed_rows", (double)st->failed_rows);
-    cJSON_AddNumberToObject(obj, "failure_rate", failure_rate);
-    cJSON_AddNumberToObject(obj, threshold_name, threshold);
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "validate_failure") != TF_OK ||
+        tf_json_add_string(obj, "op", "validate") != TF_OK ||
+        tf_json_add_string(obj, "event", event) != TF_OK ||
+        tf_json_add_string(obj, "reason", reason) != TF_OK ||
+        tf_json_add_string(obj, "severity", severity) != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "validate") != TF_OK ||
+        tf_json_add_number(obj, "checked_rows", (double)st->checked_rows) != TF_OK ||
+        tf_json_add_number(obj, "failed_rows", (double)st->failed_rows) != TF_OK ||
+        tf_json_add_number(obj, "failure_rate", failure_rate) != TF_OK ||
+        tf_json_add_number(obj, threshold_name, threshold) != TF_OK) {
+        goto done;
+    }
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     return rc;
 }
@@ -270,14 +295,22 @@ static int validate_append_rule_stats(validate_state *st, tf_buffer *out) {
         validate_rule *rule = &st->rules[i];
         cJSON *obj = cJSON_CreateObject();
         if (!obj) { cJSON_Delete(arr); return TF_ERROR; }
-        cJSON_AddStringToObject(obj, "name", rule->name ? rule->name : "validate");
-        cJSON_AddStringToObject(obj, "expr", rule->expr_text ? rule->expr_text : "");
-        cJSON_AddNumberToObject(obj, "checked_rows", (double)rule->checked_rows);
-        cJSON_AddNumberToObject(obj, "passed_rows", (double)rule->passed_rows);
-        cJSON_AddNumberToObject(obj, "failed_rows", (double)rule->failed_rows);
-        cJSON_AddNumberToObject(obj, "failure_rate", validate_failure_rate(rule->failed_rows, rule->checked_rows));
-        cJSON_AddNumberToObject(obj, "audit_emitted", (double)rule->audit_emitted);
-        cJSON_AddItemToArray(arr, obj);
+        if (tf_json_add_string(obj, "name", rule->name ? rule->name : "validate") != TF_OK ||
+            tf_json_add_string(obj, "expr", rule->expr_text ? rule->expr_text : "") != TF_OK ||
+            tf_json_add_number(obj, "checked_rows", (double)rule->checked_rows) != TF_OK ||
+            tf_json_add_number(obj, "passed_rows", (double)rule->passed_rows) != TF_OK ||
+            tf_json_add_number(obj, "failed_rows", (double)rule->failed_rows) != TF_OK ||
+            tf_json_add_number(obj, "failure_rate",
+                               validate_failure_rate(rule->failed_rows, rule->checked_rows)) != TF_OK ||
+            tf_json_add_number(obj, "audit_emitted", (double)rule->audit_emitted) != TF_OK) {
+            cJSON_Delete(obj);
+            cJSON_Delete(arr);
+            return TF_ERROR;
+        }
+        if (tf_json_add_array_item(arr, obj) != TF_OK) {
+            cJSON_Delete(arr);
+            return TF_ERROR;
+        }
     }
     char *printed = cJSON_PrintUnformatted(arr);
     cJSON_Delete(arr);

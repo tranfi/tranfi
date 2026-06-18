@@ -119,6 +119,7 @@ TF_WARN_UNUSED int tf_json_add_number(cJSON *obj, const char *name, double value
 TF_WARN_UNUSED int tf_json_add_bool(cJSON *obj, const char *name, int value);
 TF_WARN_UNUSED int tf_json_add_null(cJSON *obj, const char *name);
 TF_WARN_UNUSED int tf_json_add_item(cJSON *obj, const char *name, cJSON *item);
+TF_WARN_UNUSED int tf_json_add_array_item(cJSON *arr, cJSON *item);
 
 /* ---- Columnar batch ---- */
 /* (tf_type is defined in ir.h, included above) */

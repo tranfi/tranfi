@@ -294,19 +294,30 @@ static int emit_assert_audit(assert_state *st, const tf_batch *b, size_t row,
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "assert");
-    cJSON_AddStringToObject(obj, "event", event ? event : "row_dropped");
-    cJSON_AddStringToObject(obj, "reason", "assert_failed");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "action", assert_action_name(st->action));
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "assert");
-    cJSON_AddStringToObject(obj, "expr", st->expr_text ? st->expr_text : "");
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "assert") != TF_OK ||
+        tf_json_add_string(obj, "event", event ? event : "row_dropped") != TF_OK ||
+        tf_json_add_string(obj, "reason", "assert_failed") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "action", assert_action_name(st->action)) != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "assert") != TF_OK ||
+        tf_json_add_string(obj, "expr", st->expr_text ? st->expr_text : "") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) {
+        goto done;
+    }
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
@@ -317,19 +328,30 @@ static int emit_failure(assert_state *st, const tf_batch *b, size_t row,
     if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "assert_failure");
-    cJSON_AddStringToObject(obj, "op", "assert");
-    cJSON_AddStringToObject(obj, "action", assert_action_name(st->action));
-    cJSON_AddStringToObject(obj, "severity", st->action == ASSERT_WARN ? "warning" : "error");
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "assert");
-    cJSON_AddStringToObject(obj, "expr", st->expr_text ? st->expr_text : "");
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "assert_failure") != TF_OK ||
+        tf_json_add_string(obj, "op", "assert") != TF_OK ||
+        tf_json_add_string(obj, "action", assert_action_name(st->action)) != TF_OK ||
+        tf_json_add_string(obj, "severity", st->action == ASSERT_WARN ? "warning" : "error") != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "assert") != TF_OK ||
+        tf_json_add_string(obj, "expr", st->expr_text ? st->expr_text : "") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) {
+        goto done;
+    }
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
     if (include_row) {
         cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-        if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
+        if (row_obj) {
+            if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+        } else if (st->audit_opts.include_row) {
+            goto done;
+        }
     }
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     return rc;
 }
@@ -338,25 +360,40 @@ static int emit_aggregate_failure(assert_state *st, tf_side_channels *side, doub
     if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "assert_failure");
-    cJSON_AddStringToObject(obj, "op", "assert");
-    cJSON_AddStringToObject(obj, "reason", "aggregate_assert_failed");
-    cJSON_AddStringToObject(obj, "action", assert_action_name(st->action));
-    cJSON_AddStringToObject(obj, "severity", st->action == ASSERT_WARN ? "warning" : "error");
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "assert");
-    cJSON_AddStringToObject(obj, "aggregate", assert_agg_kind_name(st->agg_kind));
-    if (st->agg_col && st->agg_col[0]) cJSON_AddStringToObject(obj, "column", st->agg_col);
-    cJSON_AddStringToObject(obj, "comparison", assert_cmp_name(st->cmp));
-    cJSON_AddNumberToObject(obj, "threshold", st->threshold);
-    cJSON_AddNumberToObject(obj, "tolerance", st->tolerance);
-    cJSON_AddBoolToObject(obj, "relative_tolerance", st->relative_tolerance ? 1 : 0);
-    if (has_actual) cJSON_AddNumberToObject(obj, "actual", actual);
-    else cJSON_AddNullToObject(obj, "actual");
-    cJSON_AddNumberToObject(obj, "rows", (double)st->agg_rows);
-    cJSON_AddNumberToObject(obj, "non_null", (double)st->agg_non_null);
-    cJSON_AddNumberToObject(obj, "missing", (double)st->agg_missing);
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "assert_failure") != TF_OK ||
+        tf_json_add_string(obj, "op", "assert") != TF_OK ||
+        tf_json_add_string(obj, "reason", "aggregate_assert_failed") != TF_OK ||
+        tf_json_add_string(obj, "action", assert_action_name(st->action)) != TF_OK ||
+        tf_json_add_string(obj, "severity", st->action == ASSERT_WARN ? "warning" : "error") != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "assert") != TF_OK ||
+        tf_json_add_string(obj, "aggregate", assert_agg_kind_name(st->agg_kind)) != TF_OK ||
+        tf_json_add_string(obj, "comparison", assert_cmp_name(st->cmp)) != TF_OK ||
+        tf_json_add_number(obj, "threshold", st->threshold) != TF_OK ||
+        tf_json_add_number(obj, "tolerance", st->tolerance) != TF_OK ||
+        tf_json_add_bool(obj, "relative_tolerance", st->relative_tolerance ? 1 : 0) != TF_OK) {
+        goto done;
+    }
+    if (st->agg_col && st->agg_col[0] &&
+        tf_json_add_string(obj, "column", st->agg_col) != TF_OK) {
+        goto done;
+    }
+    if (has_actual) {
+        if (tf_json_add_number(obj, "actual", actual) != TF_OK) goto done;
+    } else if (tf_json_add_null(obj, "actual") != TF_OK) {
+        goto done;
+    }
+    if (tf_json_add_number(obj, "rows", (double)st->agg_rows) != TF_OK ||
+        tf_json_add_number(obj, "non_null", (double)st->agg_non_null) != TF_OK ||
+        tf_json_add_number(obj, "missing", (double)st->agg_missing) != TF_OK) {
+        goto done;
+    }
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     return rc;
 }

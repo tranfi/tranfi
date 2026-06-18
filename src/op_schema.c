@@ -669,32 +669,45 @@ static int cell_to_number(const tf_batch *b, size_t row, size_t col, double *out
 
 static int emit_failure(schema_state *st, const char *rule, const char *column,
                         const char *expected, const char *actual,
-                        const tf_batch *b, size_t row, tf_side_channels *side,
-                        int include_row) {
+                        const tf_batch *b, size_t source_row, size_t batch_row,
+                        tf_side_channels *side, int include_row) {
     if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "schema_failure");
-    cJSON_AddStringToObject(obj, "op", "schema");
-    cJSON_AddStringToObject(obj, "action", schema_action_name(st->action));
-    cJSON_AddStringToObject(obj, "severity", st->action == SCHEMA_WARN ? "warning" : "error");
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "schema");
-    cJSON_AddStringToObject(obj, "rule", rule ? rule : "schema");
-    if (column) cJSON_AddStringToObject(obj, "column", column);
-    if (expected) cJSON_AddStringToObject(obj, "expected", expected);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "schema_failure") != TF_OK ||
+        tf_json_add_string(obj, "op", "schema") != TF_OK ||
+        tf_json_add_string(obj, "action", schema_action_name(st->action)) != TF_OK ||
+        tf_json_add_string(obj, "severity", st->action == SCHEMA_WARN ? "warning" : "error") != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "schema") != TF_OK ||
+        tf_json_add_string(obj, "rule", rule ? rule : "schema") != TF_OK) {
+        goto done;
+    }
+    if (column && tf_json_add_string(obj, "column", column) != TF_OK) goto done;
+    if (expected && tf_json_add_string(obj, "expected", expected) != TF_OK) goto done;
     if (actual) {
         char actual_buf[256];
-        cJSON_AddStringToObject(obj, "actual",
-                                tf_audit_format_string_for_column(&st->audit_opts, column, actual,
-                                                                  actual_buf, sizeof(actual_buf)));
+        if (tf_json_add_string(obj, "actual",
+                               tf_audit_format_string_for_column(&st->audit_opts, column, actual,
+                                                                 actual_buf, sizeof(actual_buf))) != TF_OK) {
+            goto done;
+        }
     }
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    if (row > 0) cJSON_AddNumberToObject(obj, "row", (double)row);
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
+    if (source_row > 0 && tf_json_add_number(obj, "row", (double)source_row) != TF_OK) goto done;
     if (include_row && b) {
-        cJSON *row_obj = tf_audit_row_to_json(b, row - 1, &st->audit_opts);
-        if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
+        cJSON *row_obj = tf_audit_row_to_json(b, batch_row, &st->audit_opts);
+        if (row_obj) {
+            if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+        } else if (st->audit_opts.include_row) {
+            goto done;
+        }
     }
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     return rc;
 }
@@ -705,27 +718,40 @@ static int emit_schema_audit(schema_state *st, const char *rule, const char *col
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "schema");
-    cJSON_AddStringToObject(obj, "event", "row_dropped");
-    cJSON_AddStringToObject(obj, "reason", "schema_failed");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "action", schema_action_name(st->action));
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "schema");
-    cJSON_AddStringToObject(obj, "rule", rule ? rule : "schema");
-    if (column) cJSON_AddStringToObject(obj, "column", column);
-    if (expected) cJSON_AddStringToObject(obj, "expected", expected);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "schema") != TF_OK ||
+        tf_json_add_string(obj, "event", "row_dropped") != TF_OK ||
+        tf_json_add_string(obj, "reason", "schema_failed") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "action", schema_action_name(st->action)) != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "schema") != TF_OK ||
+        tf_json_add_string(obj, "rule", rule ? rule : "schema") != TF_OK) {
+        goto done;
+    }
+    if (column && tf_json_add_string(obj, "column", column) != TF_OK) goto done;
+    if (expected && tf_json_add_string(obj, "expected", expected) != TF_OK) goto done;
     if (actual) {
         char actual_buf[256];
-        cJSON_AddStringToObject(obj, "actual",
-                                tf_audit_format_string_for_column(&st->audit_opts, column, actual,
-                                                                  actual_buf, sizeof(actual_buf)));
+        if (tf_json_add_string(obj, "actual",
+                               tf_audit_format_string_for_column(&st->audit_opts, column, actual,
+                                                                 actual_buf, sizeof(actual_buf))) != TF_OK) {
+            goto done;
+        }
     }
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
+    if (tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) goto done;
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
@@ -734,7 +760,7 @@ static int emit_schema_audit(schema_state *st, const char *rule, const char *col
 static int handle_schema_level_failure(schema_state *st, const char *rule, const char *column,
                                        const char *expected, const char *actual,
                                        tf_side_channels *side) {
-    if (emit_failure(st, rule, column, expected, actual, NULL, 0, side, 0) != TF_OK)
+    if (emit_failure(st, rule, column, expected, actual, NULL, 0, 0, side, 0) != TF_OK)
         return TF_ERROR;
     if (st->action == SCHEMA_FAIL || st->action == SCHEMA_FILTER || st->action == SCHEMA_QUARANTINE) {
         char msg[512];
@@ -783,7 +809,7 @@ static int expand_schema_selectors(schema_state *st, const tf_batch *in, tf_side
             snprintf(msg, sizeof(msg), "schema selector failed: %s", error ? error : "invalid selector");
             int err_rc = emit_failure(st, "selector", NULL, "matching columns",
                                       error ? error : "invalid selector",
-                                      NULL, 0, side, 0);
+                                      NULL, 0, 0, side, 0);
             schema_record_failure(st, "schema");
             tf_set_last_error(msg);
             free(error);
@@ -876,7 +902,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = "non-null";
             snprintf(actual, actual_size, "null");
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -893,7 +919,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = "numeric";
             cell_to_string(in, row, col, actual, actual_size);
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -907,7 +933,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = expbuf;
             snprintf(actual, actual_size, "%.17g", val);
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -921,7 +947,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = expbuf;
             snprintf(actual, actual_size, "%.17g", val);
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -947,7 +973,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = "allowed value";
             snprintf(actual, actual_size, "%s", valbuf);
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -963,7 +989,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = "string";
             snprintf(actual, actual_size, "%s", type_name(in->col_types[col]));
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -976,7 +1002,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = "regex cell within max_regex_cell_bytes";
             snprintf(actual, actual_size, "cell exceeds %zu bytes", st->max_regex_cell_bytes);
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -988,7 +1014,7 @@ static int row_rule_ok(schema_state *st, schema_rule *r, const tf_batch *in, siz
             *expected = r->regex_pattern;
             snprintf(actual, actual_size, "%s", s ? s : "");
             if (st->action == SCHEMA_FAIL || st->action == SCHEMA_WARN || st->action == SCHEMA_QUARANTINE) {
-                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, side,
+                if (emit_failure(st, *failed_rule, r->column, *expected, actual, in, st->row_index, row, side,
                                  st->action == SCHEMA_FAIL || st->action == SCHEMA_QUARANTINE) != TF_OK)
                     return -1;
             }
@@ -1060,7 +1086,7 @@ static int schema_process(tf_step *self, tf_batch *in, tf_batch **out,
             if (st->action == SCHEMA_FAIL) {
                 if (!failed_rule &&
                     emit_failure(st, "schema", NULL, "valid schema", "invalid schema",
-                                 in, st->row_index, side, 1) != TF_OK) {
+                                 in, st->row_index, r, side, 1) != TF_OK) {
                     tf_batch_free(ob);
                     return TF_ERROR;
                 }
@@ -1111,7 +1137,7 @@ static int schema_process(tf_step *self, tf_batch *in, tf_batch **out,
 static int handle_finish_failure(schema_state *st, const char *rule, const char *column,
                                  const char *expected, const char *actual,
                                  tf_side_channels *side) {
-    if (emit_failure(st, rule, column, expected, actual, NULL, 0, side, 0) != TF_OK) {
+    if (emit_failure(st, rule, column, expected, actual, NULL, 0, 0, side, 0) != TF_OK) {
         return TF_ERROR;
     }
     if (st->action != SCHEMA_WARN) {

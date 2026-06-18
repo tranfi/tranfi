@@ -29,16 +29,24 @@ static int filter_emit_drop_audit(filter_state *st, const tf_batch *b, size_t ro
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "filter");
-    cJSON_AddStringToObject(obj, "event", "row_dropped");
-    cJSON_AddStringToObject(obj, "reason", reason ? reason : "predicate_false");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "expr", st->expr_text ? st->expr_text : "");
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "filter") != TF_OK ||
+        tf_json_add_string(obj, "event", "row_dropped") != TF_OK ||
+        tf_json_add_string(obj, "reason", reason ? reason : "predicate_false") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "expr", st->expr_text ? st->expr_text : "") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) {
+        goto done;
+    }
     cJSON *data = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (data) cJSON_AddItemToObject(obj, "data", data);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (data) {
+        if (tf_json_add_item(obj, "data", data) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;

@@ -33,18 +33,29 @@ static int emit_quarantine_record(quarantine_state *st, const tf_batch *b, size_
     if (!side || !side->errors) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "quarantine");
-    cJSON_AddStringToObject(obj, "op", "quarantine");
-    cJSON_AddStringToObject(obj, "event", "row_quarantined");
-    cJSON_AddStringToObject(obj, "reason", reason ? reason : "predicate_true");
-    cJSON_AddStringToObject(obj, "severity", "error");
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "quarantine");
-    cJSON_AddStringToObject(obj, "expr", st->expr_text ? st->expr_text : "");
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
-    if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "quarantine") != TF_OK ||
+        tf_json_add_string(obj, "op", "quarantine") != TF_OK ||
+        tf_json_add_string(obj, "event", "row_quarantined") != TF_OK ||
+        tf_json_add_string(obj, "reason", reason ? reason : "predicate_true") != TF_OK ||
+        tf_json_add_string(obj, "severity", "error") != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "quarantine") != TF_OK ||
+        tf_json_add_string(obj, "expr", st->expr_text ? st->expr_text : "") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) {
+        goto done;
+    }
+    if (st->message && st->message[0] &&
+        tf_json_add_string(obj, "message", st->message) != TF_OK) {
+        goto done;
+    }
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     return rc;
 }
