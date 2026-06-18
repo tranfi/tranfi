@@ -93,16 +93,23 @@ static char *read_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
 
     if (size <= 0) { fclose(f); return NULL; }
 
-    char *buf = malloc(size + 1);
+    size_t alloc_len;
+    if (tf_size_add((size_t)size, 1, &alloc_len) != TF_OK) { fclose(f); return NULL; }
+    char *buf = tf_mallocarray_checked(alloc_len, sizeof(char));
     if (!buf) { fclose(f); return NULL; }
 
-    size_t nread = fread(buf, 1, size, f);
+    size_t nread = fread(buf, 1, (size_t)size, f);
+    if (ferror(f)) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
     fclose(f);
     buf[nread] = '\0';
     return buf;
@@ -491,14 +498,29 @@ static int blocking_plan_can_use_native_spill(const tf_ir_plan *ir) {
     return first_blocking_node(ir) && !first_blocking_node_without_native_spill(ir);
 }
 
+static int set_json_item(cJSON *obj, const char *name, cJSON *item) {
+    if (!obj || !name || !item) {
+        cJSON_Delete(item);
+        return -1;
+    }
+    if (cJSON_GetObjectItemCaseSensitive(obj, name)) {
+        if (cJSON_ReplaceItemInObjectCaseSensitive(obj, name, item)) return 0;
+        cJSON_Delete(item);
+        return -1;
+    }
+    if (tf_json_add_item(obj, name, item) != TF_OK) {
+        cJSON_Delete(item);
+        return -1;
+    }
+    return 0;
+}
+
 static int set_json_string(cJSON *obj, const char *name, const char *value) {
-    cJSON_DeleteItemFromObjectCaseSensitive(obj, name);
-    return cJSON_AddStringToObject(obj, name, value) ? 0 : -1;
+    return set_json_item(obj, name, cJSON_CreateString(value ? value : ""));
 }
 
 static int set_json_number(cJSON *obj, const char *name, double value) {
-    cJSON_DeleteItemFromObjectCaseSensitive(obj, name);
-    return cJSON_AddNumberToObject(obj, name, value) ? 0 : -1;
+    return set_json_item(obj, name, cJSON_CreateNumber(value));
 }
 
 static int apply_native_spill_policy(tf_ir_plan *ir, const cli_memory_policy *policy) {

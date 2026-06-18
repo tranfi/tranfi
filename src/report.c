@@ -118,6 +118,17 @@ typedef struct {
   size_t  n_rows;
 } csv_table;
 
+static void csv_free(csv_table *t);
+
+static char *csv_field_copy(const char *start, size_t len) {
+  if (len > MAX_FIELD - 1) len = MAX_FIELD - 1;
+  char *field = tf_mallocarray_checked(len + 1, sizeof(char));
+  if (!field) return NULL;
+  if (len > 0) memcpy(field, start, len);
+  field[len] = '\0';
+  return field;
+}
+
 /* Find column index by name, -1 if not found */
 static int csv_col(const csv_table *t, const char *name) {
   for (size_t i = 0; i < t->n_cols; i++) {
@@ -127,9 +138,9 @@ static int csv_col(const csv_table *t, const char *name) {
   return -1;
 }
 
-/* Parse a simple CSV (no quoted fields with embedded commas needed for stats) */
+/* Parse the bounded stats CSV format, including quoted comma-containing fields. */
 static csv_table *csv_parse(const char *csv, size_t len) {
-  csv_table *t = calloc(1, sizeof(csv_table));
+  csv_table *t = tf_callocarray_checked(1, sizeof(csv_table));
   if (!t) return NULL;
 
   const char *p = csv;
@@ -140,13 +151,13 @@ static csv_table *csv_parse(const char *csv, size_t len) {
     const char *start = p;
     while (p < end && *p != ',' && *p != '\n' && *p != '\r') p++;
     size_t flen = (size_t)(p - start);
-    if (flen > MAX_FIELD - 1) flen = MAX_FIELD - 1;
     if (t->n_cols < MAX_COLS) {
-      t->headers[t->n_cols] = malloc(flen + 1);
-      if (t->headers[t->n_cols]) {
-        memcpy(t->headers[t->n_cols], start, flen);
-        t->headers[t->n_cols][flen] = '\0';
+      char *field = csv_field_copy(start, flen);
+      if (!field) {
+        csv_free(t);
+        return NULL;
       }
+      t->headers[t->n_cols] = field;
       t->n_cols++;
     }
     if (p < end && *p == ',') p++;
@@ -167,13 +178,13 @@ static csv_table *csv_parse(const char *csv, size_t len) {
         start = p;
         while (p < end && *p != '"') p++;
         size_t flen = (size_t)(p - start);
-        if (flen > MAX_FIELD - 1) flen = MAX_FIELD - 1;
         if (ci < MAX_COLS) {
-          t->cells[t->n_rows][ci] = malloc(flen + 1);
-          if (t->cells[t->n_rows][ci]) {
-            memcpy(t->cells[t->n_rows][ci], start, flen);
-            t->cells[t->n_rows][ci][flen] = '\0';
+          char *field = csv_field_copy(start, flen);
+          if (!field) {
+            csv_free(t);
+            return NULL;
           }
+          t->cells[t->n_rows][ci] = field;
         }
         if (p < end && *p == '"') p++; /* skip closing quote */
         if (p < end && *p == ',') p++;
@@ -182,13 +193,13 @@ static csv_table *csv_parse(const char *csv, size_t len) {
       }
       while (p < end && *p != ',' && *p != '\n' && *p != '\r') p++;
       size_t flen = (size_t)(p - start);
-      if (flen > MAX_FIELD - 1) flen = MAX_FIELD - 1;
       if (ci < MAX_COLS) {
-        t->cells[t->n_rows][ci] = malloc(flen + 1);
-        if (t->cells[t->n_rows][ci]) {
-          memcpy(t->cells[t->n_rows][ci], start, flen);
-          t->cells[t->n_rows][ci][flen] = '\0';
+        char *field = csv_field_copy(start, flen);
+        if (!field) {
+          csv_free(t);
+          return NULL;
         }
+        t->cells[t->n_rows][ci] = field;
       }
       if (p < end && *p == ',') p++;
       ci++;

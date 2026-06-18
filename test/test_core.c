@@ -10,6 +10,7 @@
 #include "recipes.h"
 #include "date_utils.h"
 #include "spill.h"
+#include "report.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -524,6 +525,21 @@ static void test_batch_schema_copy_helpers(void) {
     tf_batch_free(extra);
     tf_batch_free(clone);
     tf_batch_free(src);
+}
+
+static void test_report_format_stats_csv(void) {
+    const char stats[] =
+        "column,count,avg,min,max,stddev,median,p25,p75,distinct,hist,sample\n"
+        "age,3,25,20,30,5,25,20,30,3,\"20:30:0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1\",\"20,25,30\"\n";
+
+    char *report = tf_report_format(stats, sizeof(stats) - 1, 0);
+    assert(report != NULL);
+    assert(strstr(report, "1 columns") != NULL);
+    assert(strstr(report, "3 rows") != NULL);
+    assert(strstr(report, "age") != NULL);
+    assert(strstr(report, "min") != NULL);
+
+    free(report);
 }
 
 static void test_batch_col_index(void) {
@@ -12685,6 +12701,7 @@ int main(int argc, char **argv) {
     TEST(test_batch_set_get);
     TEST(test_batch_setters_report_failures);
     TEST(test_batch_schema_copy_helpers);
+    TEST(test_report_format_stats_csv);
     TEST(test_batch_col_index);
     TEST(test_batch_allocation_overflow_guards);
 
