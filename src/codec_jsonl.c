@@ -241,12 +241,9 @@ static int emit_jsonl_malformed(jsonl_decoder_state *st, const char *line, size_
     cJSON_AddStringToObject(obj, "raw", raw);
     if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
 
-    char *printed = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
     free(raw);
-    if (!printed) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, printed);
-    free(printed);
     return rc;
 }
 
@@ -327,12 +324,9 @@ static int emit_jsonl_record_size_diagnostic(jsonl_decoder_state *st,
     cJSON_AddStringToObject(obj, "raw", raw);
     if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
 
-    char *printed = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
     free(raw);
-    if (!printed) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, printed);
-    free(printed);
     return rc;
 }
 

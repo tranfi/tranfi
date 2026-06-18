@@ -306,11 +306,8 @@ static int emit_assert_audit(assert_state *st, const tf_batch *b, size_t row,
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->stats, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->stats, line);
-    free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
 }
@@ -332,11 +329,8 @@ static int emit_failure(assert_state *st, const tf_batch *b, size_t row,
         cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
         if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
     }
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, line);
-    free(line);
     return rc;
 }
 
@@ -362,11 +356,8 @@ static int emit_aggregate_failure(assert_state *st, tf_side_channels *side, doub
     cJSON_AddNumberToObject(obj, "non_null", (double)st->agg_non_null);
     cJSON_AddNumberToObject(obj, "missing", (double)st->agg_missing);
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, line);
-    free(line);
     return rc;
 }
 

@@ -135,6 +135,19 @@ static void test_buffer_line_and_side_error(void) {
     assert(memcmp(out, "alpha\n", 6) == 0);
     tf_buffer_free(&b);
 
+    tf_buffer json;
+    tf_buffer_init(&json);
+    cJSON *obj = cJSON_CreateObject();
+    assert(obj != NULL);
+    cJSON_AddStringToObject(obj, "kind", "line");
+    cJSON_AddNumberToObject(obj, "n", 2);
+    assert(tf_buffer_write_json_line(&json, obj) == TF_OK);
+    cJSON_Delete(obj);
+    n = tf_buffer_read(&json, out, sizeof(out));
+    assert(n == strlen("{\"kind\":\"line\",\"n\":2}\n"));
+    assert(memcmp(out, "{\"kind\":\"line\",\"n\":2}\n", n) == 0);
+    tf_buffer_free(&json);
+
     tf_buffer err;
     tf_buffer_init(&err);
     tf_side_channels side = {0};

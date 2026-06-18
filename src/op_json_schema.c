@@ -299,11 +299,8 @@ static int emit_json_schema_audit(json_schema_state *st, const tf_batch *b, size
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->stats, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->stats, line);
-    free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
 }

@@ -43,15 +43,6 @@ static tf_batch *make_text_batch(size_t capacity) {
     return b;
 }
 
-static int text_write_json_line(tf_buffer *buf, cJSON *obj) {
-    char *printed = cJSON_PrintUnformatted(obj);
-    if (!printed) return TF_ERROR;
-    int rc = tf_buffer_write_str(buf, printed);
-    if (rc == TF_OK) rc = tf_buffer_write_str(buf, "\n");
-    free(printed);
-    return rc;
-}
-
 static char *text_record_preview(text_decoder_state *st,
                                  const uint8_t *prefix, size_t prefix_len,
                                  const uint8_t *suffix, size_t suffix_len,
@@ -110,7 +101,7 @@ static int emit_text_record_size_diagnostic(text_decoder_state *st,
     cJSON_AddStringToObject(obj, "raw", raw);
     if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
 
-    int rc = text_write_json_line(side->errors, obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
     free(raw);
     return rc;

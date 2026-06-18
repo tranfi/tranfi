@@ -112,6 +112,7 @@ size_t tf_buffer_readable(const tf_buffer *b);
 void tf_buffer_compact(tf_buffer *b);
 TF_WARN_UNUSED int tf_buffer_write_str(tf_buffer *b, const char *s);
 TF_WARN_UNUSED int tf_buffer_write_line(tf_buffer *b, const char *s);
+TF_WARN_UNUSED int tf_buffer_write_json_line(tf_buffer *b, const cJSON *obj);
 void tf_buffer_free(tf_buffer *b);
 
 /* ---- Columnar batch ---- */

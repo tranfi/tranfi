@@ -53,11 +53,8 @@ static int across_write_error(tf_side_channels *side, const char *msg,
     cJSON_AddStringToObject(obj, "error", msg ? msg : "across error");
     if (column) cJSON_AddStringToObject(obj, "column", column);
     if (fn) cJSON_AddStringToObject(obj, "function", fn);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, line);
-    free(line);
     return rc;
 }
 

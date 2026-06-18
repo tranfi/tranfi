@@ -38,11 +38,8 @@ static int filter_emit_drop_audit(filter_state *st, const tf_batch *b, size_t ro
     cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
     cJSON *data = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (data) cJSON_AddItemToObject(obj, "data", data);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->stats, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->stats, line);
-    free(line);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
 }

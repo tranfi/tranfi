@@ -107,11 +107,8 @@ static int emit_validate_audit(validate_state *st, validate_rule *rule,
     else if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->stats, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->stats, line);
-    free(line);
     if (rc == TF_OK) {
         st->audit_emitted++;
         rule->audit_emitted++;
@@ -140,11 +137,8 @@ static int emit_validate_threshold_error(validate_state *st, tf_side_channels *s
     cJSON_AddNumberToObject(obj, "failure_rate", validate_failure_rate(st->failed_rows, st->checked_rows));
     cJSON_AddNumberToObject(obj, "max_failures", (double)st->max_failures);
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, line);
-    free(line);
     return rc;
 }
 
@@ -166,11 +160,8 @@ static int emit_validate_rate_event(validate_state *st, tf_side_channels *side,
     cJSON_AddNumberToObject(obj, "failure_rate", failure_rate);
     cJSON_AddNumberToObject(obj, threshold_name, threshold);
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, line);
-    free(line);
     return rc;
 }
 

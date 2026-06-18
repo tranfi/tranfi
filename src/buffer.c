@@ -4,6 +4,7 @@
  */
 
 #include "internal.h"
+#include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,6 +49,15 @@ int tf_buffer_write_str(tf_buffer *b, const char *s) {
 int tf_buffer_write_line(tf_buffer *b, const char *s) {
     int rc = tf_buffer_write_str(b, s);
     if (rc == TF_OK) rc = tf_buffer_write(b, (const uint8_t *)"\n", 1);
+    return rc;
+}
+
+int tf_buffer_write_json_line(tf_buffer *b, const cJSON *obj) {
+    if (!b || !obj) return TF_ERROR;
+    char *printed = cJSON_PrintUnformatted(obj);
+    if (!printed) return TF_ERROR;
+    int rc = tf_buffer_write_line(b, printed);
+    free(printed);
     return rc;
 }
 

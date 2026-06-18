@@ -578,15 +578,6 @@ static char *csv_raw_preview(const csv_decoder_state *st, const char *line, size
     return raw;
 }
 
-static int write_json_line(tf_buffer *buf, cJSON *obj) {
-    char *printed = cJSON_PrintUnformatted(obj);
-    if (!printed) return TF_ERROR;
-    int rc = tf_buffer_write_str(buf, printed);
-    if (rc == TF_OK) rc = tf_buffer_write_str(buf, "\n");
-    free(printed);
-    return rc;
-}
-
 static void csv_add_raw_payload(csv_decoder_state *st, cJSON *obj, const char *raw, int truncated) {
     if (st && st->audit_opts.include_row) {
         char raw_buf[256];
@@ -624,7 +615,7 @@ static int emit_csv_repair_audit(csv_decoder_state *st, const char *line, size_t
     cJSON_AddStringToObject(obj, "message", message ? message : "CSV row field count differs from header");
     cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
     csv_add_raw_payload(st, obj, raw, truncated);
-    int rc = write_json_line(side->stats, obj);
+    int rc = tf_buffer_write_json_line(side->stats, obj);
     cJSON_Delete(obj);
     free(raw);
     if (rc == TF_OK) st->audit_emitted++;
@@ -664,12 +655,9 @@ static int emit_csv_field_count_diagnostic(csv_decoder_state *st, const char *li
     cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
     csv_add_raw_payload(st, obj, raw, truncated);
 
-    char *printed = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
     free(raw);
-    if (!printed) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, printed);
-    free(printed);
     return rc;
 }
 
@@ -705,12 +693,9 @@ static int emit_csv_column_limit_diagnostic(csv_decoder_state *st, const char *l
     cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
     csv_add_raw_payload(st, obj, raw, truncated);
 
-    char *printed = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
     free(raw);
-    if (!printed) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, printed);
-    free(printed);
     return rc;
 }
 
@@ -744,12 +729,9 @@ static int emit_csv_record_size_diagnostic(csv_decoder_state *st, const char *re
     cJSON_AddNumberToObject(obj, "raw_bytes", (double)record_len);
     csv_add_raw_payload(st, obj, raw, truncated);
 
-    char *printed = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
     free(raw);
-    if (!printed) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, printed);
-    free(printed);
     return rc;
 }
 

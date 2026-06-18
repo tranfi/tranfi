@@ -154,12 +154,8 @@ static int tee_emit_row(tee_state *st, const tf_batch *in, size_t row,
         cJSON_AddItemToObject(obj, "data", data);
     }
 
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(buf, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_str(buf, line);
-    if (rc == TF_OK) rc = tf_buffer_write_str(buf, "\n");
-    free(line);
     return rc;
 }
 

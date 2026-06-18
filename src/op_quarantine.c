@@ -44,11 +44,8 @@ static int emit_quarantine_record(quarantine_state *st, const tf_batch *b, size_
     if (st->message && st->message[0]) cJSON_AddStringToObject(obj, "message", st->message);
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
     if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    char *line = cJSON_PrintUnformatted(obj);
+    int rc = tf_buffer_write_json_line(side->errors, obj);
     cJSON_Delete(obj);
-    if (!line) return TF_ERROR;
-    int rc = tf_buffer_write_line(side->errors, line);
-    free(line);
     return rc;
 }
 
