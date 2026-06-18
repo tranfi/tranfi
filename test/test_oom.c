@@ -341,6 +341,12 @@ int main(void) {
             640
         },
         {
+            "dsl_rank_key_builder_args",
+            "csv batch_size=1 | sort -score | head 3 | bottom-k 2 age | slice-min score n=2 with_ties=false | slice-max age 2 with_ties=false | unique city,name sorted=false max_keys=8 max_state_bytes=32768 | group-agg city sum:score:total count:*:rows sorted=false max_groups=8 max_state_bytes=32768 | frequency city max_values=2 max_state_bytes=32768 overflow=other other=OTHER audit audit_limit=2 | csv",
+            people,
+            920
+        },
+        {
             "csv_strict_good_rows",
             "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
             people,

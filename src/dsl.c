@@ -2150,7 +2150,10 @@ static int parse_unknown_option(const char *tok, cJSON *args,
         set_errorf(error, "%s: unknown must be error, other, or null", op_label);
         return -1;
     }
-    cJSON_AddStringToObject(args, "unknown", value);
+    if (tf_json_add_string(args, "unknown", value) != TF_OK) {
+        set_oom_error_if_unset(error);
+        return -1;
+    }
     return 1;
 }
 
@@ -2161,6 +2164,7 @@ static cJSON *build_unique_args(const token_list *tokens, char **error) {
      * [bloom_bytes=N] [bloom_hashes=N] */
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
+    if (!args || !cols) goto oom;
     int have_sorted = 0;
     int have_approx = 0;
     int have_mode = 0;
@@ -2170,22 +2174,22 @@ static cJSON *build_unique_args(const token_list *tokens, char **error) {
             const char *mode = tok + 5;
             if (strcmp(mode, "exact") != 0 && strcmp(mode, "approx") != 0) {
                 set_error(error, "unique mode must be exact or approx");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
             if (have_mode) {
                 set_error(error, "unique mode specified more than once");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
-            cJSON_AddStringToObject(args, "mode", mode);
+            if (tf_json_add_string(args, "mode", mode) != TF_OK) goto oom;
             have_mode = 1;
             continue;
         }
         if (strcmp(tok, "approx") == 0 || strcmp(tok, "--approx") == 0) {
             if (have_approx) {
                 set_error(error, "unique approx specified more than once");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
-            cJSON_AddBoolToObject(args, "approx", 1);
+            if (tf_json_add_bool(args, "approx", 1) != TF_OK) goto oom;
             have_approx = 1;
             continue;
         }
@@ -2193,77 +2197,77 @@ static cJSON *build_unique_args(const token_list *tokens, char **error) {
             int approx = 0;
             if (parse_bool_value(tok + 7, &approx) != 0) {
                 set_error(error, "unique approx must be true or false");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
             if (have_approx) {
                 set_error(error, "unique approx specified more than once");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
-            cJSON_AddBoolToObject(args, "approx", approx);
+            if (tf_json_add_bool(args, "approx", approx) != TF_OK) goto oom;
             have_approx = 1;
             continue;
         }
         size_t max_keys = 0;
         int opt = parse_positive_option(tok, "max_keys", &max_keys, error, "unique");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_keys", (double)max_keys);
+            if (tf_json_add_number(args, "max_keys", (double)max_keys) != TF_OK) goto oom;
             continue;
         }
         size_t max_state_bytes = 0;
         opt = parse_positive_option(tok, "max_state_bytes", &max_state_bytes, error, "unique");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes);
+            if (tf_json_add_number(args, "max_state_bytes", (double)max_state_bytes) != TF_OK) goto oom;
             continue;
         }
         size_t bloom_value = 0;
         opt = parse_positive_option(tok, "bloom_bytes", &bloom_value, error, "unique");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "bloom_bytes", (double)bloom_value);
+            if (tf_json_add_number(args, "bloom_bytes", (double)bloom_value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "bloom_hashes", &bloom_value, error, "unique");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "bloom_hashes", (double)bloom_value);
+            if (tf_json_add_number(args, "bloom_hashes", (double)bloom_value) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "spill_dir=", 10) == 0) {
             const char *dir = tok + 10;
             if (!dir[0]) {
                 set_error(error, "unique: spill_dir cannot be empty");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
-            cJSON_AddStringToObject(args, "spill_dir", dir);
+            if (tf_json_add_string(args, "spill_dir", dir) != TF_OK) goto oom;
             continue;
         }
         size_t spill_value = 0;
         opt = parse_positive_option(tok, "spill_memory_bytes", &spill_value, error, "unique");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "spill_memory_bytes", (double)spill_value);
+            if (tf_json_add_number(args, "spill_memory_bytes", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "spill_run_rows", &spill_value, error, "unique");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "spill_run_rows", (double)spill_value);
+            if (tf_json_add_number(args, "spill_run_rows", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "spill_output_rows", &spill_value, error, "unique");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "spill_output_rows", (double)spill_value);
+            if (tf_json_add_number(args, "spill_output_rows", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         if (strcmp(tok, "sorted") == 0 || strcmp(tok, "--sorted") == 0) {
             if (have_sorted) {
                 set_error(error, "unique sorted specified more than once");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
-            cJSON_AddBoolToObject(args, "sorted", 1);
+            if (tf_json_add_bool(args, "sorted", 1) != TF_OK) goto oom;
             have_sorted = 1;
             continue;
         }
@@ -2271,21 +2275,32 @@ static cJSON *build_unique_args(const token_list *tokens, char **error) {
             int sorted = 0;
             if (parse_bool_value(tok + 7, &sorted) != 0) {
                 set_error(error, "unique sorted must be true or false");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
             if (have_sorted) {
                 set_error(error, "unique sorted specified more than once");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
-            cJSON_AddBoolToObject(args, "sorted", sorted);
+            if (tf_json_add_bool(args, "sorted", sorted) != TF_OK) goto oom;
             have_sorted = 1;
             continue;
         }
-        cJSON_AddItemToArray(cols, cJSON_CreateString(tok));
+        if (dsl_add_string_array_item(cols, tok) != TF_OK) goto oom;
     }
-    if (cJSON_GetArraySize(cols) > 0) cJSON_AddItemToObject(args, "columns", cols);
-    else cJSON_Delete(cols);
+    if (cJSON_GetArraySize(cols) > 0) {
+        if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
+        cols = NULL;
+    } else {
+        cJSON_Delete(cols);
+        cols = NULL;
+    }
     return args;
+oom:
+    set_oom_error_if_unset(error);
+fail:
+    cJSON_Delete(cols);
+    cJSON_Delete(args);
+    return NULL;
 }
 
 static cJSON *build_sort_args(const token_list *tokens, char **error) {
@@ -2296,6 +2311,7 @@ static cJSON *build_sort_args(const token_list *tokens, char **error) {
     }
     cJSON *args = cJSON_CreateObject();
     cJSON *columns = cJSON_CreateArray();
+    if (!args || !columns) goto oom;
 
     for (size_t i = 1; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
@@ -2305,13 +2321,25 @@ static cJSON *build_sort_args(const token_list *tokens, char **error) {
             tok++;
         }
         cJSON *col = cJSON_CreateObject();
-        cJSON_AddStringToObject(col, "name", tok);
-        cJSON_AddBoolToObject(col, "desc", desc);
-        cJSON_AddItemToArray(columns, col);
+        if (!col ||
+            tf_json_add_string(col, "name", tok) != TF_OK ||
+            tf_json_add_bool(col, "desc", desc) != TF_OK) {
+            cJSON_Delete(col);
+            goto oom;
+        }
+        if (tf_json_add_array_item(columns, col) != TF_OK) {
+            col = NULL;
+            goto oom;
+        }
     }
 
-    cJSON_AddItemToObject(args, "columns", columns);
+    if (tf_json_add_item(args, "columns", columns) != TF_OK) { columns = NULL; goto oom; }
     return args;
+oom:
+    cJSON_Delete(columns);
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static int parse_count_token(const char *tok, long *out) {
@@ -2352,9 +2380,14 @@ static cJSON *build_top_args_with_default(const token_list *tokens, char **error
     }
 
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddNumberToObject(args, "n", n);
-    cJSON_AddStringToObject(args, "column", col);
-    cJSON_AddBoolToObject(args, "desc", desc);
+    if (!args ||
+        tf_json_add_number(args, "n", n) != TF_OK ||
+        tf_json_add_string(args, "column", col) != TF_OK ||
+        tf_json_add_bool(args, "desc", desc) != TF_OK) {
+        cJSON_Delete(args);
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     return args;
 }
 
@@ -2413,10 +2446,15 @@ static cJSON *build_slice_rank_args(const token_list *tokens, char **error,
     }
 
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddNumberToObject(args, "n", n);
-    cJSON_AddStringToObject(args, "column", column);
-    cJSON_AddBoolToObject(args, "desc", desc);
-    if (have_with_ties) cJSON_AddBoolToObject(args, "with_ties", with_ties);
+    if (!args ||
+        tf_json_add_number(args, "n", n) != TF_OK ||
+        tf_json_add_string(args, "column", column) != TF_OK ||
+        tf_json_add_bool(args, "desc", desc) != TF_OK ||
+        (have_with_ties && tf_json_add_bool(args, "with_ties", with_ties) != TF_OK)) {
+        cJSON_Delete(args);
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     return args;
 }
 
@@ -2701,13 +2739,8 @@ static cJSON *build_group_agg_args(const token_list *tokens, char **error) {
     cJSON *aggs = cJSON_CreateArray();
     if (!args || !group_by || !aggs) goto oom;
 
-    cJSON *group = cJSON_CreateString(tokens->items[1]);
-    if (!group || !cJSON_AddItemToArray(group_by, group)) {
-        cJSON_Delete(group);
-        goto oom;
-    }
-    group = NULL;
-    if (!cJSON_AddItemToObject(args, "group_by", group_by)) goto oom;
+    if (dsl_add_string_array_item(group_by, tokens->items[1]) != TF_OK) goto oom;
+    if (tf_json_add_item(args, "group_by", group_by) != TF_OK) { group_by = NULL; goto oom; }
     group_by = NULL;
 
     int have_sorted = 0;
@@ -2718,7 +2751,7 @@ static cJSON *build_group_agg_args(const token_list *tokens, char **error) {
                 set_error(error, "group-agg sorted specified more than once");
                 goto fail;
             }
-            if (!cJSON_AddBoolToObject(args, "sorted", 1)) goto oom;
+            if (tf_json_add_bool(args, "sorted", 1) != TF_OK) goto oom;
             have_sorted = 1;
             continue;
         }
@@ -2732,7 +2765,7 @@ static cJSON *build_group_agg_args(const token_list *tokens, char **error) {
                 set_error(error, "group-agg sorted specified more than once");
                 goto fail;
             }
-            if (!cJSON_AddBoolToObject(args, "sorted", sorted)) goto oom;
+            if (tf_json_add_bool(args, "sorted", sorted) != TF_OK) goto oom;
             have_sorted = 1;
             continue;
         }
@@ -2741,7 +2774,7 @@ static cJSON *build_group_agg_args(const token_list *tokens, char **error) {
         int opt = parse_positive_option(tok_s, "max_groups", &max_groups, error, "group-agg");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            if (!cJSON_AddNumberToObject(args, "max_groups", (double)max_groups)) goto oom;
+            if (tf_json_add_number(args, "max_groups", (double)max_groups) != TF_OK) goto oom;
             continue;
         }
 
@@ -2749,33 +2782,33 @@ static cJSON *build_group_agg_args(const token_list *tokens, char **error) {
         opt = parse_positive_option(tok_s, "max_state_bytes", &max_state_bytes, error, "group-agg");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            if (!cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes)) goto oom;
+            if (tf_json_add_number(args, "max_state_bytes", (double)max_state_bytes) != TF_OK) goto oom;
             continue;
         }
 
         if (strncmp(tok_s, "spill_dir=", 10) == 0) {
             const char *dir = tok_s + 10;
             if (!dir[0]) { set_error(error, "group-agg: spill_dir cannot be empty"); goto fail; }
-            if (!cJSON_AddStringToObject(args, "spill_dir", dir)) goto oom;
+            if (tf_json_add_string(args, "spill_dir", dir) != TF_OK) goto oom;
             continue;
         }
         size_t spill_value = 0;
         opt = parse_positive_option(tok_s, "spill_memory_bytes", &spill_value, error, "group-agg");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            if (!cJSON_AddNumberToObject(args, "spill_memory_bytes", (double)spill_value)) goto oom;
+            if (tf_json_add_number(args, "spill_memory_bytes", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok_s, "spill_run_rows", &spill_value, error, "group-agg");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            if (!cJSON_AddNumberToObject(args, "spill_run_rows", (double)spill_value)) goto oom;
+            if (tf_json_add_number(args, "spill_run_rows", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok_s, "spill_output_rows", &spill_value, error, "group-agg");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            if (!cJSON_AddNumberToObject(args, "spill_output_rows", (double)spill_value)) goto oom;
+            if (tf_json_add_number(args, "spill_output_rows", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
 
@@ -2798,22 +2831,26 @@ static cJSON *build_group_agg_args(const token_list *tokens, char **error) {
 
         cJSON *agg = cJSON_CreateObject();
         if (!agg ||
-            !cJSON_AddStringToObject(agg, "column", column) ||
-            !cJSON_AddStringToObject(agg, "func", func) ||
-            (name && !cJSON_AddStringToObject(agg, "name", name)) ||
-            !cJSON_AddItemToArray(aggs, agg)) {
+            tf_json_add_string(agg, "column", column) != TF_OK ||
+            tf_json_add_string(agg, "func", func) != TF_OK ||
+            (name && tf_json_add_string(agg, "name", name) != TF_OK)) {
             cJSON_Delete(agg);
+            free(tok);
+            goto oom;
+        }
+        if (tf_json_add_array_item(aggs, agg) != TF_OK) {
+            agg = NULL;
             free(tok);
             goto oom;
         }
         free(tok);
     }
-    if (!cJSON_AddItemToObject(args, "aggs", aggs)) goto oom;
+    if (tf_json_add_item(args, "aggs", aggs) != TF_OK) { aggs = NULL; goto oom; }
     aggs = NULL;
     return args;
 
 oom:
-    set_error(error, "out of memory building group-agg args");
+    set_oom_error_if_unset(error);
 fail:
     cJSON_Delete(group_by);
     cJSON_Delete(aggs);
@@ -2825,56 +2862,68 @@ static cJSON *build_frequency_args(const token_list *tokens, char **error) {
     /* frequency [col1,col2] [max_values=N] [max_state_bytes=N] [overflow=error|other] [other=name] [audit] [audit_limit=N] */
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
+    if (!args || !cols) goto oom;
     int has_max_values = 0;
     int overflow_other = 0;
     for (size_t i = 1; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         int audit_rc = add_audit_option_arg(args, tok, error, "frequency");
-        if (audit_rc < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (audit_rc < 0) goto fail;
         if (audit_rc > 0) continue;
         size_t max_values = 0;
         int opt = parse_positive_option(tok, "max_values", &max_values, error, "frequency");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
             has_max_values = 1;
-            cJSON_AddNumberToObject(args, "max_values", (double)max_values);
+            if (tf_json_add_number(args, "max_values", (double)max_values) != TF_OK) goto oom;
             continue;
         }
         size_t max_state_bytes = 0;
         opt = parse_positive_option(tok, "max_state_bytes", &max_state_bytes, error, "frequency");
-        if (opt < 0) { cJSON_Delete(cols); cJSON_Delete(args); return NULL; }
+        if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes);
+            if (tf_json_add_number(args, "max_state_bytes", (double)max_state_bytes) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "overflow=", 9) == 0) {
             const char *value = tok + 9;
             if (strcmp(value, "error") != 0 && strcmp(value, "other") != 0) {
                 set_error(error, "frequency: overflow must be error or other");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
             if (strcmp(value, "other") == 0) overflow_other = 1;
-            cJSON_AddStringToObject(args, "overflow", value);
+            if (tf_json_add_string(args, "overflow", value) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "other=", 6) == 0) {
             const char *value = tok + 6;
             if (!value[0]) {
                 set_error(error, "frequency: other label cannot be empty");
-                cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+                goto fail;
             }
-            cJSON_AddStringToObject(args, "other", value);
+            if (tf_json_add_string(args, "other", value) != TF_OK) goto oom;
             continue;
         }
-        cJSON_AddItemToArray(cols, cJSON_CreateString(tok));
+        if (dsl_add_string_array_item(cols, tok) != TF_OK) goto oom;
     }
     if (overflow_other && !has_max_values) {
         set_error(error, "frequency: overflow=other requires max_values");
-        cJSON_Delete(cols); cJSON_Delete(args); return NULL;
+        goto fail;
     }
-    if (cJSON_GetArraySize(cols) > 0) cJSON_AddItemToObject(args, "columns", cols);
-    else cJSON_Delete(cols);
+    if (cJSON_GetArraySize(cols) > 0) {
+        if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
+        cols = NULL;
+    } else {
+        cJSON_Delete(cols);
+        cols = NULL;
+    }
     return args;
+oom:
+    set_oom_error_if_unset(error);
+fail:
+    cJSON_Delete(cols);
+    cJSON_Delete(args);
+    return NULL;
 }
 
 static int valid_window_func(const char *s) {
@@ -4684,9 +4733,12 @@ static void rewrite_sort_head_to_bounded_topk(tf_ir_plan *plan) {
 
         cJSON *args = cJSON_CreateObject();
         if (!args) continue;
-        cJSON_AddNumberToObject(args, "n", n);
-        cJSON_AddStringToObject(args, "column", name_j->valuestring);
-        cJSON_AddBoolToObject(args, "desc", desc);
+        if (tf_json_add_number(args, "n", n) != TF_OK ||
+            tf_json_add_string(args, "column", name_j->valuestring) != TF_OK ||
+            tf_json_add_bool(args, "desc", desc) != TF_OK) {
+            cJSON_Delete(args);
+            continue;
+        }
 
         tf_ir_node rewritten;
         memset(&rewritten, 0, sizeof(rewritten));
@@ -4694,7 +4746,11 @@ static void rewrite_sort_head_to_bounded_topk(tf_ir_plan *plan) {
         if (n == 0) {
             cJSON_Delete(args);
             rewritten.args = cJSON_CreateObject();
-            cJSON_AddNumberToObject(rewritten.args, "n", 0);
+            if (!rewritten.args ||
+                tf_json_add_number(rewritten.args, "n", 0) != TF_OK) {
+                dsl_node_clear(&rewritten);
+                continue;
+            }
         } else {
             rewritten.args = args;
         }
