@@ -88,6 +88,10 @@ static void stack_free_file_col_names(char **names, size_t n) {
     free(names);
 }
 
+static int stack_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
+}
+
 /*
  * Add tag column to a batch. Returns a new batch with the tag column prepended.
  */
@@ -156,7 +160,10 @@ static int stack_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     *out = NULL;
 
     FILE *f = fopen(st->file_path, "rb");
-    if (!f) return TF_OK; /* silently skip if file not found */
+    if (!f) {
+        stack_write_error(side, "stack: cannot open file");
+        return TF_ERROR;
+    }
 
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return TF_ERROR; }
     long fsize = ftell(f);

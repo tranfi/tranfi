@@ -331,7 +331,7 @@ Cross-codec: `csv | ... | jsonl`. The `text` codec splits on newlines into a sin
 | `semi-join` / `anti-join` | `semi-join lookup.csv on city` / `anti-join lookup.csv on=city` / `semi-join lookup.csv on city sorted=true` | `WHERE EXISTS (...)` / `WHERE NOT EXISTS (...)` |
 | `intersect` / `setdiff` / `intersect-all` / `setdiff-all` / `union` / `union-all` | `intersect other.csv` / `setdiff old.csv columns=id max_lookup_bytes=1048576 max_output_keys=100000` / `intersect-all old.csv columns=id max_lookup_bytes=1048576 max_lookup_keys=100000` / `union other.csv max_output_keys=100000` / `union-all other.csv` | `INTERSECT` / `EXCEPT` / `INTERSECT ALL` / `EXCEPT ALL` / `UNION` / `UNION ALL` for all-column form |
 | DSL aliases | `mutate`, `summarise`/`summarize`, `distinct`, `arrange` | normalize to `derive`, `group-agg`, `unique`, `sort` in compiled IR |
-| `stack` | `stack other.csv` | `UNION ALL` |
+| `stack` | `stack other.csv` | `UNION ALL`; missing append files fail instead of silently skipping |
 | `json-extract` | `json-extract /user/id user_id type=int` / `json-extract payload $.city city` | native/WASM only |
 | `json-filter` | `json-filter /user/age >= 30 type=float` / `json-filter payload $.city == NY` | native/WASM only |
 | `json-schema` | `json-schema required=user types=user:object mode=filter audit audit_limit=1000 [audit_include_row=false] [audit_columns=_line] [audit_redact=_line]` | native/WASM only |

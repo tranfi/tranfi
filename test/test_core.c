@@ -8556,6 +8556,34 @@ static void test_pipeline_stack_preserves_long_cells(void) {
     free(long_cell);
 }
 
+static void test_pipeline_stack_missing_file_errors(void) {
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/tranfi_stack_missing_%ld.csv", (long)getpid());
+    remove(path);
+
+    char plan[512];
+    snprintf(plan, sizeof(plan),
+             "{\"steps\":["
+             "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+             "{\"op\":\"stack\",\"args\":{\"file\":\"%s\"}},"
+             "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+             "]}",
+             path);
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+    const char *input = "name,city\nAlice,NY\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)input, strlen(input)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_ERROR);
+
+    char errors[256];
+    size_t en = tf_pipeline_pull(p, TF_CHAN_ERRORS, (uint8_t *)errors, sizeof(errors) - 1);
+    assert(en > 0);
+    errors[en] = '\0';
+    assert(strstr(errors, "stack: cannot open file") != NULL);
+    tf_pipeline_free(p);
+}
+
 static void test_pipeline_datetime(void) {
     const char *plan =
         "{\"steps\":["
@@ -13155,6 +13183,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_schema_infer);
     TEST(test_pipeline_tee_side_channel);
     TEST(test_pipeline_stack_preserves_long_cells);
+    TEST(test_pipeline_stack_missing_file_errors);
     TEST(test_pipeline_datetime);
     TEST(test_pipeline_step_running_sum);
     TEST(test_pipeline_frequency);
