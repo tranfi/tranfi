@@ -72,6 +72,31 @@ class TestCompileToSql:
         sql = tf.compile_to_sql("csv | derive total=col('a')+col('b') | csv")
         assert '"total"' in sql
 
+    def test_cast_policy_lowering(self):
+        null_sql = tf.compile_to_sql('csv | cast val=int on_error=null | csv')
+        assert 'TRY_CAST("val" AS BIGINT)' in null_sql
+
+        fail_sql = tf.compile_to_sql('csv | cast val=int on_error=fail | csv')
+        assert 'CAST("val" AS BIGINT)' in fail_sql
+
+        coerce_sql = tf.compile_to_sql('csv | cast val=int | csv')
+        assert 'regexp_extract(CAST("val" AS VARCHAR)' in coerce_sql
+        assert 'COALESCE(TRY_CAST' in coerce_sql
+
+        bool_sql = tf.compile_to_sql('csv | cast flag=bool | csv')
+        assert 'CASE WHEN "flag" IS NULL THEN NULL' in bool_sql
+        assert "CAST(\"flag\" AS VARCHAR) = 'false'" in bool_sql
+
+    def test_window_count_lowering_skips_nulls(self):
+        sql = tf.compile_to_sql('csv | window val 2 count count2 | csv')
+        assert 'COUNT("val") OVER' in sql
+        assert '__tf_window_nn' in sql
+        assert 'RANGE BETWEEN 1 PRECEDING AND CURRENT ROW' in sql
+
+    def test_frequency_approx_rejected(self):
+        with pytest.raises(RuntimeError, match='mode=approx'):
+            tf.compile_to_sql('csv | frequency city mode=approx max_values=3 | csv')
+
     def test_invalid_dsl(self):
         with pytest.raises(RuntimeError):
             tf.compile_to_sql('not a valid pipeline')
@@ -158,6 +183,15 @@ class TestDuckDBEngine:
             assert len(lines) == 3  # header + 2 rows
         finally:
             os.unlink(tmp)
+
+    def test_file_input_quoted_path(self):
+        with tempfile.TemporaryDirectory(prefix="tranfi duckdb quote ' ") as tmp:
+            path = os.path.join(tmp, "input's.csv")
+            with open(path, 'wb') as handle:
+                handle.write(b'name,age\nAlice,30\nBob,20\n')
+
+            r = tf.pipeline('csv | select name | csv', engine='duckdb').run(input_file=path)
+            assert r.output_text == 'name\nAlice\nBob\n'
 
     def test_parity_filter_select(self):
         """Verify DuckDB and native engines produce same results."""
@@ -362,19 +396,24 @@ class TestParityColumnOps:
         assert_parity('csv | replace city NY NewYork | csv', data=CSV_CITIES)
 
     def test_cast(self):
-        """Cast to float: native keeps int representation, DuckDB adds .0."""
+        """Cast to float serializes with Tranfi round-trip CSV formatting."""
         data = b'name,val\nAlice,10\nBob,20\nCharlie,30\n'
-        dsl = 'csv | cast val=float | csv'
-        native = tf.pipeline(dsl).run(input=data)
-        duck = tf.pipeline(dsl, engine='duckdb').run(input=data)
-        n_lines = native.output_text.strip().split('\n')
-        d_lines = duck.output_text.strip().split('\n')
-        assert len(n_lines) == len(d_lines)
-        # Values should be numerically equal
-        for nl, dl in zip(n_lines[1:], d_lines[1:]):
-            n_val = float(nl.split(',')[1])
-            d_val = float(dl.split(',')[1])
-            assert abs(n_val - d_val) < 1e-6
+        assert_parity('csv | cast val=float | csv', data=data, ordered=True)
+
+    def test_cast_int_on_error_null_and_default_coerce(self):
+        data = b'val\nbad\n12x\n10\n'
+        assert_parity('csv batch_size=10 | cast val=int on_error=null | csv',
+                       data=data, ordered=True)
+        assert_parity('csv batch_size=10 | cast val=int | csv',
+                       data=data, ordered=True)
+
+    def test_cast_on_error_fail_raises(self):
+        data = b'val\nbad\n10\n'
+        dsl = 'csv batch_size=10 | cast val=int on_error=fail | csv'
+        with pytest.raises(Exception):
+            run_native_for_parity(dsl, data)
+        with pytest.raises(Exception):
+            tf.pipeline(dsl, engine='duckdb').run(input=data)
 
     def test_hash(self):
         """Hash all columns: DuckDB hash(*) not supported, test native only."""
@@ -465,6 +504,16 @@ class TestParityAggregation:
         dsl = 'csv | group-agg city sales:min:lo sales:max:hi | csv'
         assert_parity(dsl, data=CSV_SALES, float_cols={'lo', 'hi'})
 
+    def test_group_agg_null_first_csv_chunks(self):
+        data = b'city,sales\nA,\nA,\nB,2\nB,\nC,4\n'
+        dsl = (
+            'csv batch_size=2 | '
+            'group-agg city sales:sum:total sales:avg:avg_sales sales:min:lo '
+            'sales:max:hi sales:count:n count:*:rows | sort city | csv'
+        )
+        assert_parity(dsl, data=data, ordered=True,
+                       float_cols={'total', 'avg_sales', 'lo', 'hi', 'n', 'rows'})
+
     def test_group_agg_default_alias(self):
         dsl = 'csv | group-agg city sales:sum | csv'
         native = tf.pipeline(dsl).run(input=CSV_SALES)
@@ -502,6 +551,10 @@ class TestParityReshape:
         d_items = set(r.split(',')[1] for r in d_lines[1:] if r)
         assert n_items == d_items
 
+    def test_explode_preserves_empty_cells(self):
+        data = b'name,items\nAlice,a;b\nBob,\nCara,x\n'
+        assert_parity('csv | explode items ; | csv', data=data, ordered=True)
+
     def test_split(self):
         dsl = 'csv | split full_name " " first,last | select first,last,age | csv'
         assert_parity(dsl, data=CSV_NAMES)
@@ -520,15 +573,16 @@ class TestParityReshape:
         assert len(n_rows) == len(d_rows) == 4  # 2 names * 2 subjects
 
     def test_pivot(self):
-        dsl = 'csv | pivot metric value sum | csv'
-        native = run_native_for_parity(dsl, CSV_PIVOT)
-        duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_PIVOT)
-        n_lines = native.output_text.strip().split('\n')
-        d_lines = duck.output_text.strip().split('\n')
-        # Should have 3 data rows (ids 1, 2, 3) with revenue and cost columns
-        assert len(n_lines) == len(d_lines)
-        assert 'revenue' in n_lines[0] or 'cost' in n_lines[0]
-        assert 'revenue' in d_lines[0] or 'cost' in d_lines[0]
+        dsl = 'csv | pivot metric value sum | sort id | csv'
+        assert_parity(dsl, data=CSV_PIVOT, ordered=True)
+
+    def test_pivot_missing_cells(self):
+        data = b'id,metric,value\n1,revenue,100\n2,cost,80\n3,revenue,150\n3,cost,60\n'
+        assert_parity('csv | pivot metric value sum | sort id | csv', data=data, ordered=True)
+
+    def test_pivot_declared_category_order(self):
+        dsl = 'csv | pivot metric value sum categories=revenue,cost | sort id | csv'
+        assert_parity(dsl, data=CSV_PIVOT, ordered=True)
 
 
 class TestParitySequential:
@@ -549,6 +603,22 @@ class TestParitySequential:
     def test_window_sum(self):
         assert_parity('csv | window val 2 sum ws | csv',
                        data=CSV_NUMS, ordered=True, float_cols={'ws'})
+
+    def test_window_count_skips_nulls(self):
+        assert_parity('csv batch_size=1 | window val 2 count count2 | csv',
+                       data=b'val\n1\n\n3\n',
+                       ordered=True, float_cols={'count2'})
+
+    def test_window_sum_avg_skip_nulls(self):
+        assert_parity('csv batch_size=1 | window val 2 sum sum2 | window val 2 avg avg2 | csv',
+                       data=b'val\n1\n\n3\n5\n',
+                       ordered=True, float_cols={'sum2', 'avg2'})
+
+    def test_rolling_bool_null_policy_formatting(self):
+        assert_parity(
+            'csv batch_size=1 | rolling-any flag 2 any2 nulls=propagate | rolling-all flag 2 all2 nulls=false | csv',
+            data=b'flag\ntrue\n\nfalse\ntrue\n',
+            ordered=True)
 
     def test_lead(self):
         assert_parity('csv | lead val 1 next_val | csv',
@@ -596,26 +666,23 @@ class TestParityDateTime:
         assert native.output_text.strip().split('\n')[0] == 'id,date,value'
         assert duck.output_text.strip().split('\n')[0] == 'id,date,value'
 
+    def test_date_trunc_timestamp_no_timezone(self):
+        data = b'ts\n2024-03-15 12:34:56\n2024-03-15 13:01:02\n'
+        assert_parity('csv batch_size=1 | date-trunc ts hour ts_hour | csv',
+                       data=data, ordered=True)
+
+    def test_fractional_timestamp_formatting(self):
+        data = b'ts\n2024-03-15 12:34:56.123456\n2024-03-15 12:34:56.120000\n'
+        assert_parity('csv batch_size=1 | date-trunc ts second ts_second | csv',
+                       data=data, ordered=True)
+
 
 class TestParityFillNull:
     """Parity tests for null handling."""
 
     def test_fill_null(self):
         dsl = 'csv | fill-null age=0 city=unknown score=0 | csv'
-        native = tf.pipeline(dsl).run(input=CSV_NULLS)
-        duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_NULLS)
-        n_lines = native.output_text.strip().split('\n')
-        d_lines = duck.output_text.strip().split('\n')
-        assert len(n_lines) == len(d_lines)
-        # Both should have no empty fields for filled columns
-        for line in n_lines[1:]:
-            parts = line.split(',')
-            assert len(parts) >= 4
-            assert all(p != '' for p in parts), f'Native has empty field: {line}'
-        for line in d_lines[1:]:
-            parts = line.split(',')
-            assert len(parts) >= 4
-            assert all(p != '' for p in parts), f'DuckDB has empty field: {line}'
+        assert_parity(dsl, data=CSV_NULLS, ordered=True)
 
 
 class TestParityChained:

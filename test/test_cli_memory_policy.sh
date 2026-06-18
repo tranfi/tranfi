@@ -262,7 +262,8 @@ grep -q 'schema=data_dependent' "$tmp/explain" || fail "explain missing mutating
 if "$bin" --spill-dir "$tmp/spill" 'csv | pivot name age | csv' < "$input" > "$tmp/out" 2> "$tmp/err"; then
   fail "uncapped spill pivot succeeded"
 fi
-grep -q "native spill is not implemented yet for blocking step 'pivot'" "$tmp/err" || fail "missing uncapped spill pivot error"
+grep -q "native spill is unavailable for blocking step 'pivot' with the current arguments" "$tmp/err" || fail "missing uncapped spill pivot error"
+grep -q "capped unsorted pivot" "$tmp/err" || fail "uncapped spill pivot hint missing capped pivot support"
 cat > "$tmp/pivot.csv" <<'CSV'
 id,metric,value
 B,y,4

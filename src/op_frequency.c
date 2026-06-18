@@ -15,6 +15,7 @@
 typedef struct {
     char    **keys;
     size_t   *counts;
+    size_t   *errors;
     size_t    count;
     size_t    cap;
     size_t    key_bytes;
@@ -25,9 +26,11 @@ typedef struct {
     size_t  n_cols;
     size_t  max_values;  /* 0 = unlimited */
     size_t  max_state_bytes; /* 0 = unlimited */
+    int     approximate;
     int     overflow_other;
     char   *other_label;
     size_t  other_count;
+    size_t  approx_replacements;
     size_t  row_index;
     size_t  audit_limit;
     size_t  audit_emitted;
@@ -56,8 +59,8 @@ static int frequency_check_state_bytes(frequency_state *st, tf_side_channels *si
     if (retained <= st->max_state_bytes) return 0;
     char msg[208];
     snprintf(msg, sizeof(msg),
-             "frequency: max_state_bytes=%zu exceeded while tracking exact counts (%zu bytes retained)",
-             st->max_state_bytes, retained);
+             "frequency: max_state_bytes=%zu exceeded while tracking %s counts (%zu bytes retained)",
+             st->max_state_bytes, st->approximate ? "approximate" : "exact", retained);
     if (frequency_write_error(side, msg) != TF_OK) return -1;
     return -1;
 }
@@ -226,58 +229,52 @@ static int freq_find(const freq_map *map, const char *key, size_t *idx_out) {
     return 0;
 }
 
-static int freq_add(frequency_state *st, const char *key, const tf_batch *b, size_t row, size_t row_no, tf_side_channels *side) {
-    freq_map *map = &st->map;
-    if (st->overflow_other && st->other_label && strcmp(key, st->other_label) == 0) {
-        if (tf_size_add(st->other_count, 1, &st->other_count) != TF_OK) return -1;
-        return 0;
-    }
-    size_t idx = 0;
-    if (freq_find(map, key, &idx)) {
-        if (tf_size_add(map->counts[idx], 1, &map->counts[idx]) != TF_OK) return -1;
-        return 0;
-    }
-    if (st->max_values > 0 && map->count >= st->max_values) {
-        if (st->overflow_other) {
-            if (tf_size_add(st->other_count, 1, &st->other_count) != TF_OK) return -1;
-            if (emit_frequency_overflow_audit(st, key, b, row, row_no, side) != TF_OK) return -1;
-            return 0;
-        }
-        if (frequency_limit_error(st, side) != TF_OK) return -1;
+static int freq_map_reserve(freq_map *map, size_t need) {
+    if (need <= map->cap) return 0;
+    size_t new_cap = 0;
+    if (tf_size_grow_pow2(map->cap, need, 64, &new_cap) != TF_OK) return -1;
+
+    char **new_keys = tf_callocarray_checked(new_cap, sizeof(char *));
+    size_t *new_counts = tf_callocarray_checked(new_cap, sizeof(size_t));
+    size_t *new_errors = tf_callocarray_checked(new_cap, sizeof(size_t));
+    if (!new_keys || !new_counts || !new_errors) {
+        free(new_keys);
+        free(new_counts);
+        free(new_errors);
         return -1;
     }
-    if (map->count >= map->cap) {
-        size_t need = 0;
-        size_t new_cap = 0;
-        if (tf_size_add(map->count, 1, &need) != TF_OK ||
-            tf_size_grow_pow2(map->cap, need, 64, &new_cap) != TF_OK) {
-            return -1;
-        }
-        char **new_keys = tf_callocarray_checked(new_cap, sizeof(char *));
-        size_t *new_counts = tf_callocarray_checked(new_cap, sizeof(size_t));
-        if (!new_keys || !new_counts) {
+    if (map->count > 0) {
+        size_t key_bytes = 0;
+        size_t count_bytes = 0;
+        if (tf_size_mul(map->count, sizeof(char *), &key_bytes) != TF_OK ||
+            tf_size_mul(map->count, sizeof(size_t), &count_bytes) != TF_OK) {
             free(new_keys);
             free(new_counts);
+            free(new_errors);
             return -1;
         }
-        if (map->count > 0) {
-            size_t key_bytes = 0;
-            size_t count_bytes = 0;
-            if (tf_size_mul(map->count, sizeof(char *), &key_bytes) != TF_OK ||
-                tf_size_mul(map->count, sizeof(size_t), &count_bytes) != TF_OK) {
-                free(new_keys);
-                free(new_counts);
-                return -1;
-            }
-            memcpy(new_keys, map->keys, key_bytes);
-            memcpy(new_counts, map->counts, count_bytes);
-        }
-        free(map->keys);
-        free(map->counts);
-        map->keys = new_keys;
-        map->counts = new_counts;
-        map->cap = new_cap;
+        memcpy(new_keys, map->keys, key_bytes);
+        memcpy(new_counts, map->counts, count_bytes);
+        memcpy(new_errors, map->errors, count_bytes);
     }
+    free(map->keys);
+    free(map->counts);
+    free(map->errors);
+    map->keys = new_keys;
+    map->counts = new_counts;
+    map->errors = new_errors;
+    map->cap = new_cap;
+    return 0;
+}
+
+static int freq_map_add_entry(freq_map *map, const char *key,
+                              size_t count, size_t error) {
+    size_t need = 0;
+    if (tf_size_add(map->count, 1, &need) != TF_OK ||
+        freq_map_reserve(map, need) != 0) {
+        return -1;
+    }
+
     char *dup = strdup(key);
     if (!dup) return -1;
     size_t key_bytes_delta = 0;
@@ -289,8 +286,90 @@ static int freq_add(frequency_state *st, const char *key, const tf_batch *b, siz
     }
     map->keys[map->count] = dup;
     map->key_bytes = new_key_bytes;
-    map->counts[map->count] = 1;
+    map->counts[map->count] = count;
+    map->errors[map->count] = error;
     map->count++;
+    return 0;
+}
+
+static size_t freq_approx_victim(const freq_map *map) {
+    size_t victim = 0;
+    for (size_t i = 1; i < map->count; i++) {
+        if (map->counts[i] < map->counts[victim] ||
+            (map->counts[i] == map->counts[victim] &&
+             (map->errors[i] < map->errors[victim] ||
+              (map->errors[i] == map->errors[victim] &&
+               strcmp(map->keys[i], map->keys[victim]) < 0)))) {
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+static int freq_approx_replace(frequency_state *st, const char *key) {
+    freq_map *map = &st->map;
+    size_t victim = freq_approx_victim(map);
+    size_t old_count = map->counts[victim];
+    size_t new_count = 0;
+    size_t replacements = 0;
+    if (tf_size_add(old_count, 1, &new_count) != TF_OK ||
+        tf_size_add(st->approx_replacements, 1, &replacements) != TF_OK) {
+        return -1;
+    }
+
+    char *dup = strdup(key);
+    if (!dup) return -1;
+    size_t old_key_bytes = 0;
+    size_t new_key_bytes_delta = 0;
+    size_t new_key_bytes = 0;
+    if (tf_size_add(strlen(map->keys[victim]), 1, &old_key_bytes) != TF_OK ||
+        tf_size_add(strlen(dup), 1, &new_key_bytes_delta) != TF_OK ||
+        map->key_bytes < old_key_bytes ||
+        tf_size_add(map->key_bytes - old_key_bytes, new_key_bytes_delta, &new_key_bytes) != TF_OK) {
+        free(dup);
+        return -1;
+    }
+
+    free(map->keys[victim]);
+    map->keys[victim] = dup;
+    map->key_bytes = new_key_bytes;
+    map->counts[victim] = new_count;
+    map->errors[victim] = old_count;
+    st->approx_replacements = replacements;
+    return 0;
+}
+
+static int freq_add(frequency_state *st, const char *key, const tf_batch *b, size_t row, size_t row_no, tf_side_channels *side) {
+    freq_map *map = &st->map;
+    if (st->overflow_other && st->other_label && strcmp(key, st->other_label) == 0) {
+        if (tf_size_add(st->other_count, 1, &st->other_count) != TF_OK) return -1;
+        return 0;
+    }
+    size_t idx = 0;
+    if (freq_find(map, key, &idx)) {
+        if (tf_size_add(map->counts[idx], 1, &map->counts[idx]) != TF_OK) return -1;
+        return 0;
+    }
+    if (st->approximate) {
+        if (st->max_values == 0) return -1;
+        if (map->count < st->max_values) {
+            if (freq_map_add_entry(map, key, 1, 0) != 0) return -1;
+        } else {
+            if (freq_approx_replace(st, key) != 0) return -1;
+        }
+        if (frequency_check_state_bytes(st, side) != 0) return -1;
+        return 0;
+    }
+    if (st->max_values > 0 && map->count >= st->max_values) {
+        if (st->overflow_other) {
+            if (tf_size_add(st->other_count, 1, &st->other_count) != TF_OK) return -1;
+            if (emit_frequency_overflow_audit(st, key, b, row, row_no, side) != TF_OK) return -1;
+            return 0;
+        }
+        if (frequency_limit_error(st, side) != TF_OK) return -1;
+        return -1;
+    }
+    if (freq_map_add_entry(map, key, 1, 0) != 0) return -1;
     if (frequency_check_state_bytes(st, side) != 0) return -1;
     return 0;
 }
@@ -306,8 +385,18 @@ static int frequency_process(tf_step *self, tf_batch *in, tf_batch **out,
         n_keys = st->n_cols;
         col_indices = tf_mallocarray_checked(n_keys ? n_keys : 1, sizeof(int));
         if (!col_indices) return TF_ERROR;
-        for (size_t k = 0; k < n_keys; k++)
+        for (size_t k = 0; k < n_keys; k++) {
             col_indices[k] = tf_batch_col_index(in, st->cols[k]);
+            if (col_indices[k] < 0) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "frequency: column '%s' not found",
+                         st->cols[k] ? st->cols[k] : "");
+                int err_rc = frequency_write_error(side, msg);
+                free(col_indices);
+                if (err_rc != TF_OK) return TF_ERROR;
+                return TF_ERROR;
+            }
+        }
     } else {
         n_keys = in->n_cols;
         col_indices = tf_mallocarray_checked(n_keys ? n_keys : 1, sizeof(int));
@@ -349,38 +438,50 @@ static int frequency_flush(tf_step *self, tf_batch **out, tf_side_channels *side
 
     const char **keys = tf_mallocarray_checked(n, sizeof(char *));
     size_t *counts = tf_mallocarray_checked(n, sizeof(size_t));
+    size_t *errors = tf_mallocarray_checked(n, sizeof(size_t));
     size_t *indices = tf_mallocarray_checked(n, sizeof(size_t));
-    if (!keys || !counts || !indices) {
-        free(keys); free(counts); free(indices);
+    if (!keys || !counts || !errors || !indices) {
+        free(keys); free(counts); free(errors); free(indices);
         return TF_ERROR;
     }
     for (size_t i = 0; i < st->map.count; i++) {
         keys[i] = st->map.keys[i];
         counts[i] = st->map.counts[i];
+        errors[i] = st->map.errors[i];
     }
     if (st->other_count > 0) {
         keys[st->map.count] = st->other_label ? st->other_label : "__other__";
         counts[st->map.count] = st->other_count;
+        errors[st->map.count] = 0;
     }
     for (size_t i = 0; i < n; i++) indices[i] = i;
 
-    /* Simple sort by count desc, then value asc for deterministic ties. */
+    /* Simple sort by count desc, error asc, then value asc for deterministic ties. */
     for (size_t i = 0; i < n - 1; i++) {
         for (size_t j = i + 1; j < n; j++) {
             size_t a = indices[i], b = indices[j];
             if (counts[b] > counts[a] ||
-                (counts[b] == counts[a] && strcmp(keys[b], keys[a]) < 0)) {
+                (counts[b] == counts[a] &&
+                 (errors[b] < errors[a] ||
+                  (errors[b] == errors[a] && strcmp(keys[b], keys[a]) < 0)))) {
                 size_t tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
             }
         }
     }
 
-    tf_batch *ob = tf_batch_create(2, n);
-    if (!ob) { free(keys); free(counts); free(indices); return TF_ERROR; }
+    size_t out_cols = st->approximate ? 3u : 2u;
+    tf_batch *ob = tf_batch_create(out_cols, n);
+    if (!ob) { free(keys); free(counts); free(errors); free(indices); return TF_ERROR; }
     if (tf_batch_set_schema(ob, 0, "value", TF_TYPE_STRING) != TF_OK ||
         tf_batch_set_schema(ob, 1, "count", TF_TYPE_INT64) != TF_OK) {
         tf_batch_free(ob);
-        free(keys); free(counts); free(indices);
+        free(keys); free(counts); free(errors); free(indices);
+        return TF_ERROR;
+    }
+    if (st->approximate &&
+        tf_batch_set_schema(ob, 2, "error", TF_TYPE_INT64) != TF_OK) {
+        tf_batch_free(ob);
+        free(keys); free(counts); free(errors); free(indices);
         return TF_ERROR;
     }
 
@@ -389,17 +490,23 @@ static int frequency_flush(tf_step *self, tf_batch **out, tf_side_channels *side
             tf_batch_set_string(ob, i, 0, keys[indices[i]]) != TF_OK ||
             tf_batch_set_int64(ob, i, 1, (int64_t)counts[indices[i]]) != TF_OK) {
             tf_batch_free(ob);
-            free(keys); free(counts); free(indices);
+            free(keys); free(counts); free(errors); free(indices);
+            return TF_ERROR;
+        }
+        if (st->approximate &&
+            tf_batch_set_int64(ob, i, 2, (int64_t)errors[indices[i]]) != TF_OK) {
+            tf_batch_free(ob);
+            free(keys); free(counts); free(errors); free(indices);
             return TF_ERROR;
         }
         if (tf_batch_expose_row(ob, i) != TF_OK) {
             tf_batch_free(ob);
-            free(keys); free(counts); free(indices);
+            free(keys); free(counts); free(errors); free(indices);
             return TF_ERROR;
         }
     }
 
-    free(keys); free(counts); free(indices);
+    free(keys); free(counts); free(errors); free(indices);
     *out = ob;
     return TF_OK;
 }
@@ -410,6 +517,7 @@ static size_t frequency_retained_state_bytes(const frequency_state *st) {
     size_t slot_bytes = 0;
     size_t bytes = st->map.key_bytes;
     if (tf_size_add(sizeof(char *), sizeof(size_t), &slot_width) != TF_OK ||
+        tf_size_add(slot_width, sizeof(size_t), &slot_width) != TF_OK ||
         tf_size_mul(st->map.cap, slot_width, &slot_bytes) != TF_OK ||
         tf_size_add(bytes, slot_bytes, &bytes) != TF_OK) {
         return SIZE_MAX;
@@ -427,13 +535,20 @@ static size_t frequency_retained_state_bytes(const frequency_state *st) {
 static int frequency_append_stats(tf_step *self, tf_buffer *out) {
     if (!self || !self->state || !out) return TF_ERROR;
     frequency_state *st = self->state;
-    char buf[300];
+    char buf[420];
     snprintf(buf, sizeof(buf),
              ",\"tracked_values\":%zu,\"tracked_key_bytes\":%zu,"
              "\"overflow_count\":%zu,\"retained_state_bytes\":%zu,\"max_state_bytes\":%zu",
              st->map.count, st->map.key_bytes, st->other_count,
              frequency_retained_state_bytes(st), st->max_state_bytes);
-    return tf_buffer_write_str(out, buf);
+    if (tf_buffer_write_str(out, buf) != TF_OK) return TF_ERROR;
+    if (st->approximate) {
+        snprintf(buf, sizeof(buf),
+                 ",\"approximate\":true,\"approx_replacements\":%zu",
+                 st->approx_replacements);
+        if (tf_buffer_write_str(out, buf) != TF_OK) return TF_ERROR;
+    }
+    return TF_OK;
 }
 
 static void frequency_state_free(frequency_state *st) {
@@ -445,7 +560,7 @@ static void frequency_state_free(frequency_state *st) {
         free(st->cols);
         free(st->other_label);
         for (size_t i = 0; i < st->map.count; i++) free(st->map.keys[i]);
-        free(st->map.keys); free(st->map.counts);
+        free(st->map.keys); free(st->map.counts); free(st->map.errors);
         free(st);
     }
 }
@@ -474,6 +589,42 @@ tf_step *tf_frequency_create(const cJSON *args) {
                                                  &parsed_size, "frequency");
         if (has_max_state < 0) { frequency_state_free(st); return NULL; }
         if (has_max_state > 0) st->max_state_bytes = parsed_size;
+
+        int mode_approx = -1;
+        cJSON *mode = cJSON_GetObjectItemCaseSensitive(args, "mode");
+        if (mode) {
+            if (!cJSON_IsString(mode) || !mode->valuestring) {
+                tf_set_last_error("frequency: mode must be exact or approx");
+                frequency_state_free(st);
+                return NULL;
+            }
+            if (strcmp(mode->valuestring, "approx") == 0) {
+                mode_approx = 1;
+            } else if (strcmp(mode->valuestring, "exact") == 0) {
+                mode_approx = 0;
+            } else {
+                tf_set_last_error("frequency: mode must be exact or approx");
+                frequency_state_free(st);
+                return NULL;
+            }
+        }
+        cJSON *approx = cJSON_GetObjectItemCaseSensitive(args, "approx");
+        if (approx) {
+            if (!cJSON_IsBool(approx)) {
+                tf_set_last_error("frequency: approx must be true or false");
+                frequency_state_free(st);
+                return NULL;
+            }
+            int approx_value = cJSON_IsTrue(approx) ? 1 : 0;
+            if (mode_approx >= 0 && mode_approx != approx_value) {
+                tf_set_last_error("frequency: mode and approx conflict");
+                frequency_state_free(st);
+                return NULL;
+            }
+            st->approximate = approx_value;
+        } else if (mode_approx >= 0) {
+            st->approximate = mode_approx;
+        }
 
         cJSON *audit_j = cJSON_GetObjectItemCaseSensitive(args, "audit");
         st->audit = cJSON_IsTrue(audit_j) ? 1 : 0;
@@ -506,6 +657,18 @@ tf_step *tf_frequency_create(const cJSON *args) {
         }
         cJSON *other = cJSON_GetObjectItemCaseSensitive(args, "other");
         const char *other_label = cJSON_IsString(other) ? other->valuestring : "__other__";
+        if (st->approximate) {
+            if (st->max_values == 0) {
+                tf_set_last_error("frequency: mode=approx requires max_values");
+                frequency_state_free(st);
+                return NULL;
+            }
+            if (st->overflow_other) {
+                tf_set_last_error("frequency: mode=approx and overflow=other are mutually exclusive");
+                frequency_state_free(st);
+                return NULL;
+            }
+        }
         if (st->overflow_other) {
             if (st->max_values == 0) {
                 tf_set_last_error("frequency: overflow=other requires max_values");

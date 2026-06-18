@@ -5,7 +5,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 function(tranfi_apply_c_common target)
-    target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
+    target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L _XOPEN_SOURCE=700)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(${target} PRIVATE
             -Wall
@@ -206,6 +206,16 @@ if(BUILD_TESTING)
     tranfi_apply_executable_hardening(test_memory)
     tranfi_apply_debug_sanitizer(test_memory)
     add_test(NAME memory_tests COMMAND test_memory)
+
+    add_executable(test_wasm_api test/test_wasm_api.c src/wasm_api.c)
+    target_link_libraries(test_wasm_api tranfi_core)
+    target_include_directories(test_wasm_api PRIVATE src)
+    tranfi_apply_c_common(test_wasm_api)
+    target_compile_options(test_wasm_api PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
+    tranfi_apply_executable_hardening(test_wasm_api)
+    tranfi_apply_debug_sanitizer(test_wasm_api)
+    add_test(NAME wasm_api_tests COMMAND test_wasm_api)
+
     add_test(NAME cli_memory_policy COMMAND bash ${CMAKE_SOURCE_DIR}/test/test_cli_memory_policy.sh $<TARGET_FILE:tranfi_cli>)
 
     add_executable(test_oom test/test_oom.c)

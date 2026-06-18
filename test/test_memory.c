@@ -46,6 +46,27 @@
 #define STREAM_READABLE_LIMIT (1024 * 1024)
 #define STREAM_CAP_LIMIT      (1024 * 1024)
 
+static const char *test_tmp_root(void) {
+    const char *root = getenv("TRANFI_TEST_TMPDIR");
+    return (root && root[0]) ? root : "/tmp";
+}
+
+static void ensure_test_tmp_root(void) {
+    const char *root = test_tmp_root();
+    if (strcmp(root, "/tmp") == 0) return;
+    if (mkdir(root, 0700) != 0 && errno != EEXIST) {
+        assert(!"failed to create TRANFI_TEST_TMPDIR");
+    }
+}
+
+static void make_test_tmp_path(char *buf, size_t cap,
+                               const char *prefix, const char *suffix) {
+    ensure_test_tmp_root();
+    int n = snprintf(buf, cap, "%s/%s_%ld%s", test_tmp_root(), prefix,
+                     (long)getpid(), suffix ? suffix : "");
+    assert(n > 0 && (size_t)n < cap);
+}
+
 static int sanitizer_build(void) {
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__) || __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
     return 1;
@@ -891,7 +912,7 @@ static void test_low_cardinality_unique_drains_and_stays_small(void) {
 
 static void test_approx_unique_drains_and_stays_small(void) {
     const char *dsl = "csv | unique id mode=approx bloom_bytes=4096 bloom_hashes=3 | csv";
-    assert_contract_for_op(dsl, "unique", TF_MEM_KEY_STATE, TF_EMIT_PER_BATCH);
+    assert_contract_for_op(dsl, "unique", TF_MEM_BOUNDED_STATE, TF_EMIT_PER_BATCH);
     tf_pipeline *p = create_pipeline_from_dsl(dsl);
 
     const char *header = "id,score,group\n";
@@ -1023,13 +1044,14 @@ static void test_small_lookup_join_streams_left_side(void) {
     assert_contract_for_op("csv | join /tmp/tranfi_memory_lookup.csv on=group | csv", "join",
                            TF_MEM_KEY_STATE, TF_EMIT_PER_BATCH);
 
-    const char *lookup_path = "/tmp/tranfi_memory_lookup.csv";
+    char lookup_path[512];
+    make_test_tmp_path(lookup_path, sizeof(lookup_path), "tranfi_memory_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     write_lookup_rows(f, GROUP_CARDINALITY);
     fclose(f);
 
-    char dsl[256];
+    char dsl[1024];
     snprintf(dsl, sizeof(dsl), "csv | join %s on=group | csv", lookup_path);
     tf_pipeline *p = create_pipeline_from_dsl(dsl);
 
@@ -1075,13 +1097,14 @@ static void test_small_lookup_set_ops_stream_left_side(void) {
     assert_contract_for_op("csv | intersect /tmp/tranfi_memory_set_lookup.csv columns=group max_lookup_bytes=4096 max_lookup_keys=97 max_output_keys=97 | csv",
                            "intersect", TF_MEM_KEY_STATE, TF_EMIT_PER_BATCH);
 
-    const char *lookup_path = "/tmp/tranfi_memory_set_lookup.csv";
+    char lookup_path[512];
+    make_test_tmp_path(lookup_path, sizeof(lookup_path), "tranfi_memory_set_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     write_lookup_rows(f, GROUP_CARDINALITY);
     fclose(f);
 
-    char dsl[512];
+    char dsl[1024];
     snprintf(dsl, sizeof(dsl),
              "csv | intersect %s columns=group max_lookup_bytes=4096 max_lookup_keys=97 max_output_keys=97 | csv",
              lookup_path);
@@ -1128,7 +1151,8 @@ static void test_union_all_streams_appended_file(void) {
     assert_contract_for_op("csv | union-all /tmp/tranfi_memory_union_all.csv | csv", "union-all",
                            TF_MEM_BOUNDED_STATE, TF_EMIT_MIXED);
 
-    const char *file_path = "/tmp/tranfi_memory_union_all.csv";
+    char file_path[512];
+    make_test_tmp_path(file_path, sizeof(file_path), "tranfi_memory_union_all", ".csv");
     FILE *f = fopen(file_path, "w");
     assert(f != NULL);
     fprintf(f, "id,score,group\n");
@@ -1142,7 +1166,7 @@ static void test_union_all_streams_appended_file(void) {
     }
     fclose(f);
 
-    char dsl[512];
+    char dsl[1024];
     snprintf(dsl, sizeof(dsl), "csv | union-all %s | csv", file_path);
     tf_pipeline *p = create_pipeline_from_dsl(dsl);
 
@@ -1177,7 +1201,8 @@ static void test_stack_streams_appended_file(void) {
     assert_contract_for_op("csv | stack /tmp/tranfi_memory_stack.csv | csv", "stack",
                            TF_MEM_BOUNDED_STATE, TF_EMIT_MIXED);
 
-    const char *file_path = "/tmp/tranfi_memory_stack.csv";
+    char file_path[512];
+    make_test_tmp_path(file_path, sizeof(file_path), "tranfi_memory_stack", ".csv");
     FILE *f = fopen(file_path, "w");
     assert(f != NULL);
     fprintf(f, "id,score,group\n");
@@ -1191,7 +1216,7 @@ static void test_stack_streams_appended_file(void) {
     }
     fclose(f);
 
-    char dsl[512];
+    char dsl[1024];
     snprintf(dsl, sizeof(dsl), "csv | stack %s | csv", file_path);
     tf_pipeline *p = create_pipeline_from_dsl(dsl);
 
@@ -1253,8 +1278,8 @@ static void test_blocking_sort_contract_and_flush_latency(void) {
 }
 
 static void test_spill_sort_streams_flush_chunks_and_cleans_up(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_sort_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir), "tranfi_spill_sort", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
@@ -1309,8 +1334,8 @@ static void test_spill_sort_streams_flush_chunks_and_cleans_up(void) {
 
 
 static void test_spill_unique_streams_flush_chunks_and_cleans_up(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_unique_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir), "tranfi_spill_unique", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
@@ -1373,13 +1398,13 @@ static void test_spill_unique_streams_flush_chunks_and_cleans_up(void) {
 
 
 static void test_spill_group_agg_streams_flush_chunks_and_cleans_up(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_group_agg_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir), "tranfi_spill_group_agg", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
 
-    char json[1536];
+    char json[2048];
     snprintf(json, sizeof(json),
              "{\"steps\":["
              "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":64}},"
@@ -1438,14 +1463,15 @@ static void test_spill_group_agg_streams_flush_chunks_and_cleans_up(void) {
 
 
 static void test_spill_filtering_join_streams_flush_chunks_and_cleans_up(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_join_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir), "tranfi_spill_join", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
 
-    char lookup_path[256];
-    snprintf(lookup_path, sizeof(lookup_path), "/tmp/tranfi_spill_join_lookup_%ld.csv", (long)getpid());
+    char lookup_path[512];
+    make_test_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_spill_join_lookup", ".csv");
     FILE *lookup = fopen(lookup_path, "w");
     assert(lookup != NULL);
     fprintf(lookup, "id,label\n");
@@ -1454,7 +1480,7 @@ static void test_spill_filtering_join_streams_flush_chunks_and_cleans_up(void) {
     }
     fclose(lookup);
 
-    char json[1536];
+    char json[2048];
     snprintf(json, sizeof(json),
              "{\"steps\":["
              "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":64}},"
@@ -1512,14 +1538,16 @@ static void test_spill_filtering_join_streams_flush_chunks_and_cleans_up(void) {
 }
 
 static void test_spill_mutating_join_streams_flush_chunks_and_cleans_up(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_mutating_join_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_spill_mutating_join", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
 
-    char lookup_path[256];
-    snprintf(lookup_path, sizeof(lookup_path), "/tmp/tranfi_spill_mutating_join_lookup_%ld.csv", (long)getpid());
+    char lookup_path[512];
+    make_test_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_spill_mutating_join_lookup", ".csv");
     FILE *lookup = fopen(lookup_path, "w");
     assert(lookup != NULL);
     fprintf(lookup, "id,label,tag\n");
@@ -1528,7 +1556,7 @@ static void test_spill_mutating_join_streams_flush_chunks_and_cleans_up(void) {
     }
     fclose(lookup);
 
-    char json[1600];
+    char json[2048];
     snprintf(json, sizeof(json),
              "{\"steps\":["
              "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":64}},"
@@ -1589,14 +1617,16 @@ static void test_spill_mutating_join_streams_flush_chunks_and_cleans_up(void) {
 
 
 static void test_spill_mutating_join_tiny_runs_with_repeated_left_keys(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_mutating_join_stress_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_spill_mutating_join_stress", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
 
-    char lookup_path[256];
-    snprintf(lookup_path, sizeof(lookup_path), "/tmp/tranfi_spill_mutating_join_stress_lookup_%ld.csv", (long)getpid());
+    char lookup_path[512];
+    make_test_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_spill_mutating_join_stress_lookup", ".csv");
     FILE *lookup = fopen(lookup_path, "w");
     assert(lookup != NULL);
     fprintf(lookup, "id,label,tag\n");
@@ -1607,7 +1637,7 @@ static void test_spill_mutating_join_tiny_runs_with_repeated_left_keys(void) {
     }
     fclose(lookup);
 
-    char json[1600];
+    char json[2048];
     snprintf(json, sizeof(json),
              "{\"steps\":["
              "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":5}},"
@@ -1668,14 +1698,15 @@ static void test_spill_mutating_join_tiny_runs_with_repeated_left_keys(void) {
 }
 
 static void test_spill_set_ops_streams_flush_chunks_and_cleans_up(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_set_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir), "tranfi_spill_set", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
 
-    char lookup_path[256];
-    snprintf(lookup_path, sizeof(lookup_path), "/tmp/tranfi_spill_set_lookup_%ld.csv", (long)getpid());
+    char lookup_path[512];
+    make_test_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_spill_set_lookup", ".csv");
     FILE *lookup = fopen(lookup_path, "w");
     assert(lookup != NULL);
     fprintf(lookup, "id,label\n");
@@ -1684,7 +1715,7 @@ static void test_spill_set_ops_streams_flush_chunks_and_cleans_up(void) {
     }
     fclose(lookup);
 
-    char json[1536];
+    char json[2048];
     snprintf(json, sizeof(json),
              "{\"steps\":["
              "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":64}},"
@@ -1743,14 +1774,15 @@ static void test_spill_set_ops_streams_flush_chunks_and_cleans_up(void) {
 
 
 static void test_spill_union_streams_flush_chunks_and_cleans_up(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_spill_union_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir), "tranfi_spill_union", "");
     if (mkdir(spill_dir, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create spill dir");
     }
 
-    char lookup_path[256];
-    snprintf(lookup_path, sizeof(lookup_path), "/tmp/tranfi_spill_union_lookup_%ld.csv", (long)getpid());
+    char lookup_path[512];
+    make_test_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_spill_union_lookup", ".csv");
     FILE *lookup = fopen(lookup_path, "w");
     assert(lookup != NULL);
     fprintf(lookup, "id,score,group\n");
@@ -1761,7 +1793,7 @@ static void test_spill_union_streams_flush_chunks_and_cleans_up(void) {
     }
     fclose(lookup);
 
-    char json[1536];
+    char json[2048];
     snprintf(json, sizeof(json),
              "{\"steps\":["
              "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":64}},"
@@ -1853,8 +1885,9 @@ static void test_blocking_pivot_contract_and_flush_latency(void) {
 static void test_spill_pivot_streams_flush_chunks_and_cleans_up(void) {
     assert_contract_for_op("csv batch_size=1 | pivot metric value sum max_categories=2 spill_dir=/tmp/tranfi-spill | csv", "pivot",
                            TF_MEM_EXTERNAL, TF_EMIT_ON_FLUSH);
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_memory_pivot_spill_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_memory_pivot_spill", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
@@ -1913,8 +1946,9 @@ static void test_spill_pivot_streams_flush_chunks_and_cleans_up(void) {
 static void test_spill_pivot_high_category_tiny_runs_stays_bounded(void) {
     assert_contract_for_op("csv batch_size=7 | pivot metric value sum max_categories=17 spill_dir=/tmp/tranfi-spill | csv", "pivot",
                            TF_MEM_EXTERNAL, TF_EMIT_ON_FLUSH);
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_memory_pivot_spill_stress_%ld", (long)getpid());
+    char spill_dir[512];
+    make_test_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_memory_pivot_spill_stress", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 

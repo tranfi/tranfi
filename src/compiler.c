@@ -31,6 +31,11 @@ int tf_compile_native(const tf_ir_plan *plan,
     *out_encoder = NULL;
     if (error) *error = NULL;
 
+    if (!plan || plan->n_nodes == 0) {
+        set_error(error, "empty plan");
+        return TF_ERROR;
+    }
+
     /* Allocate steps array (max = n_nodes, since some are decoder/encoder) */
     tf_step **steps = calloc(plan->n_nodes, sizeof(tf_step *));
     if (!steps) {
@@ -78,15 +83,34 @@ int tf_compile_native(const tf_ir_plan *plan,
 
         switch (entry->kind) {
         case TF_OP_DECODER:
+            if (decoder) {
+                ((tf_decoder *)obj)->destroy((tf_decoder *)obj);
+                set_error(error, "multiple decoders");
+                goto fail;
+            }
             decoder = (tf_decoder *)obj;
             break;
         case TF_OP_ENCODER:
+            if (encoder) {
+                ((tf_encoder *)obj)->destroy((tf_encoder *)obj);
+                set_error(error, "multiple encoders");
+                goto fail;
+            }
             encoder = (tf_encoder *)obj;
             break;
         case TF_OP_TRANSFORM:
             steps[n_steps++] = (tf_step *)obj;
             break;
         }
+    }
+
+    if (!decoder) {
+        set_error(error, "plan missing decoder");
+        goto fail;
+    }
+    if (!encoder) {
+        set_error(error, "plan missing encoder");
+        goto fail;
     }
 
     *out_decoder = decoder;

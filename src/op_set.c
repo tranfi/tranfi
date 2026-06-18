@@ -672,13 +672,6 @@ fail:
     return TF_ERROR;
 }
 
-static void free_batch_array(tf_batch **batches, size_t n_batches) {
-    if (!batches) return;
-    for (size_t i = 0; i < n_batches; i++) tf_batch_free(batches[i]);
-    free(batches);
-}
-
-
 static int set_ensure_ordinals(uint64_t **ord, size_t *cap, size_t need) {
     if (*cap >= need) return TF_OK;
     size_t new_cap = 0;
@@ -1428,12 +1421,12 @@ static int set_spill_load_lookup_runs(set_state *st, tf_side_channels *side) {
             flushed = 1;
             rc = dec->flush(dec, &batches, &n_batches, side);
         }
-        if (rc != TF_OK) { free_batch_array(batches, n_batches); break; }
+        if (rc != TF_OK) { tf_batch_array_free(batches, n_batches); break; }
         for (size_t i = 0; i < n_batches; i++) {
             if (set_spill_process_lookup_batch(st, batches[i], side) != TF_OK) rc = TF_ERROR;
             tf_batch_free(batches[i]);
             if (rc != TF_OK) {
-                for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+                tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
                 break;
             }
         }
@@ -1786,7 +1779,10 @@ static int sorted_set_next_batch(set_state *st, tf_side_channels *side) {
             st->sorted_flushed = 1;
             rc = st->sorted_decoder->flush(st->sorted_decoder, &batches, &n_batches, side);
         }
-        if (rc != TF_OK) return TF_ERROR;
+        if (rc != TF_OK) {
+            tf_batch_array_free(batches, n_batches);
+            return TF_ERROR;
+        }
         st->sorted_batches = batches;
         st->sorted_n_batches = n_batches;
         st->sorted_batch_index = 0;
@@ -2149,8 +2145,8 @@ static int load_lookup(set_state *st, const tf_batch *left, tf_side_channels *si
     }
 
     for (size_t i = 0; i < total_batches; i++) all_batches[i] = NULL;
-    free_batch_array(batches, n_batches);
-    free_batch_array(flush_batches, n_flush);
+    tf_batch_array_free(batches, n_batches);
+    tf_batch_array_free(flush_batches, n_flush);
     free(all_batches);
     dec->destroy(dec);
     free(data);
@@ -2163,8 +2159,8 @@ fail:
         if (batches) for (size_t i = 0; i < n_batches; i++) batches[i] = NULL;
         if (flush_batches) for (size_t i = 0; i < n_flush; i++) flush_batches[i] = NULL;
     }
-    free_batch_array(batches, n_batches);
-    free_batch_array(flush_batches, n_flush);
+    tf_batch_array_free(batches, n_batches);
+    tf_batch_array_free(flush_batches, n_flush);
     if (dec) dec->destroy(dec);
     free(data);
     return TF_ERROR;
@@ -2373,12 +2369,12 @@ static int set_spill_load_union_file_runs(set_state *st, tf_side_channels *side)
             flushed = 1;
             rc = dec->flush(dec, &batches, &n_batches, side);
         }
-        if (rc != TF_OK) { free_batch_array(batches, n_batches); break; }
+        if (rc != TF_OK) { tf_batch_array_free(batches, n_batches); break; }
         for (size_t i = 0; i < n_batches; i++) {
             if (set_spill_process_union_file_batch(st, batches[i], side) != TF_OK) rc = TF_ERROR;
             tf_batch_free(batches[i]);
             if (rc != TF_OK) {
-                for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+                tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
                 break;
             }
         }
@@ -2952,7 +2948,10 @@ static int union_next_decoded_batch(set_state *st, tf_batch **out,
             st->sorted_flushed = 1;
             rc = st->sorted_decoder->flush(st->sorted_decoder, &batches, &n_batches, side);
         }
-        if (rc != TF_OK) return TF_ERROR;
+        if (rc != TF_OK) {
+            tf_batch_array_free(batches, n_batches);
+            return TF_ERROR;
+        }
         st->sorted_batches = batches;
         st->sorted_n_batches = n_batches;
         st->sorted_batch_index = 0;

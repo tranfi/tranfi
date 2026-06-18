@@ -124,6 +124,14 @@ def transform_stats(stats_text, op):
     raise AssertionError(f"missing step stats for {op}: {stats_text}")
 
 
+def full_transform_stats(stats_text, op):
+    for obj in stats_objects(stats_text):
+        for step in obj.get('steps', []):
+            if step.get('op') == op:
+                return step
+    raise AssertionError(f"missing step stats for {op}: {stats_text}")
+
+
 def run_spill_for_chunk_sizes(dsl, data, op, chunk_sizes):
     """Run one spill pipeline with several input chunk sizes and normalize volatile stats."""
     runs = []
@@ -612,6 +620,26 @@ def test_csv_wide_columns_and_max_columns_chunk_boundaries():
     for chunk_size in [1, 2, 7, len(over_cap)]:
         with pytest.raises(RuntimeError, match='csv record exceeds max_columns'):
             run_pipeline([tf.codec.csv(max_columns=3), tf.codec.csv_encode()], over_cap, chunk_size=chunk_size)
+
+
+def test_csv_typed_post_inference_materialization_chunk_boundaries():
+    data = (
+        b'id,score,d,ts,flag,name\n'
+        b'1,1.5,2024-01-01,2024-01-01T01:02:03.123456Z,true,Alice\n'
+        b'2,2.25,2024-01-02,2024-01-02,false,Bob\n'
+        b'bad,,bad,bad,maybe,Charlie\n'
+        b'4,4.5,2024-01-04,2024-01-04T05:06:07Z,true,Diana\n'
+    )
+    expected = [
+        'id,score,d,ts,flag,name',
+        '1,1.5,2024-01-01,2024-01-01T01:02:03.123456Z,true,Alice',
+        '2,2.25,2024-01-02,2024-01-02T00:00:00Z,false,Bob',
+        ',,,,maybe,Charlie',
+        '4,4.5,2024-01-04,2024-01-04T05:06:07Z,true,Diana',
+    ]
+    for chunk_size in chunk_parity_sizes(data):
+        out = run_pipeline('csv batch_size=2 | csv', data, chunk_size=chunk_size)
+        assert out.strip().splitlines() == expected
 
 
 @given(
@@ -1247,6 +1275,76 @@ def test_expr_parser_derive_string_fuzz_matches_python_oracle(rows, case):
     assert baseline_stats[0]['memory_class'] == 'row_local'
 
 
+def test_expr_parser_date_functions_chunk_boundaries_match_oracle():
+    """Row-local date/time expressions must not depend on input chunk boundaries."""
+    data = make_csv(
+        ['d', 'ts'],
+        [
+            ['2024-03-15', '2024-03-15T12:34:56.123456Z'],
+            ['2020-02-29', '2020-02-29T00:00:00.120000Z'],
+            ['1969-12-31', '1969-12-31T23:59:59.999999Z'],
+            ['bad', 'not-a-time'],
+        ],
+    )
+    dsl = (
+        "csv batch_size=2 | derive "
+        "dy=year(col(d)) "
+        "dm=month(col(d)) "
+        "dd=day(col(d)) "
+        "dw=weekday(col(d)) "
+        "de=epoch(col(d)) "
+        "ty=year(col(ts)) "
+        "th=hour(col(ts)) "
+        "ts_epoch=epoch(col(ts)) "
+        "month_start=date_trunc(col(d),'month') "
+        "minute_start=date_trunc(col(ts),'minute') "
+        "| select d,ts,dy,dm,dd,dw,de,ty,th,ts_epoch,month_start,minute_start | csv"
+    )
+    expected = make_csv(
+        ['d', 'ts', 'dy', 'dm', 'dd', 'dw', 'de', 'ty', 'th', 'ts_epoch', 'month_start', 'minute_start'],
+        [
+            ['2024-03-15', '2024-03-15T12:34:56.123456Z', '2024', '3', '15', '5', '1710460800', '2024', '12', '1710506096', '2024-03-01', '2024-03-15T12:34:00Z'],
+            ['2020-02-29', '2020-02-29T00:00:00.12Z', '2020', '2', '29', '6', '1582934400', '2020', '0', '1582934400', '2020-02-01', '2020-02-29T00:00:00Z'],
+            ['1969-12-31', '1969-12-31T23:59:59.999999Z', '1969', '12', '31', '3', '-86400', '1969', '23', '-1', '1969-12-01', '1969-12-31T23:59:00Z'],
+            ['', '', '', '', '', '', '', '', '', '', '', ''],
+        ],
+    ).decode('utf-8')
+    baseline_stats = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(dsl).run(input=data, chunk_size=chunk_size)
+        assert result.output_text == expected
+        stats = normalized_step_stats(result.stats_text)
+        if baseline_stats is None:
+            baseline_stats = stats
+        else:
+            assert stats == baseline_stats
+    assert [step['op'] for step in baseline_stats] == ['derive', 'select']
+    assert all(step['memory_class'] == 'row_local' for step in baseline_stats)
+
+    filter_dsl = (
+        "csv batch_size=2 | filter \"year(col(d))==2024 or epoch(col(ts))<0\" "
+        "| select d,ts | csv"
+    )
+    filter_expected = make_csv(
+        ['d', 'ts'],
+        [
+            ['2024-03-15', '2024-03-15T12:34:56.123456Z'],
+            ['1969-12-31', '1969-12-31T23:59:59.999999Z'],
+        ],
+    ).decode('utf-8')
+    baseline_filter_stats = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(filter_dsl).run(input=data, chunk_size=chunk_size)
+        assert result.output_text == filter_expected
+        stats = normalized_step_stats(result.stats_text)
+        if baseline_filter_stats is None:
+            baseline_filter_stats = stats
+        else:
+            assert stats == baseline_filter_stats
+    assert [step['op'] for step in baseline_filter_stats] == ['filter', 'select']
+    assert all(step['memory_class'] == 'row_local' for step in baseline_filter_stats)
+
+
 @given(
     prefix=st.text(alphabet=[' ', '\t', '\n'], min_size=0, max_size=2),
     expr=st.sampled_from([
@@ -1457,6 +1555,657 @@ def test_chunk_boundary_parity_key_state_capped_pipeline():
     assert frequency_stats['rows_out'] == 4
 
 
+def hll_allowed_error(cardinality):
+    """Conservative deterministic error envelope for stats distinct HLL estimates."""
+    if cardinality <= 64:
+        return max(2, int(cardinality * 0.08))
+    if cardinality <= 512:
+        return max(8, int(cardinality * 0.12))
+    return max(32, int(cardinality * 0.20))
+
+
+def stats_distinct_run(values, chunk_size):
+    data = make_csv(['id'], [[value] for value in values])
+    result = tf.pipeline('csv batch_size=17 | stats count,distinct | csv').run(
+        input=data,
+        chunk_size=chunk_size,
+    )
+    headers, rows = parse_csv_output(result.output_text)
+    assert headers == ['column', 'count', 'distinct']
+    assert len(rows) == 1
+    assert rows[0][0] == 'id'
+    stats = full_transform_stats(result.stats_text, 'stats')
+    return {
+        'output': result.output_text,
+        'count': int(rows[0][1]),
+        'distinct': int(rows[0][2]),
+        'stats': {
+            'memory_class': stats.get('memory_class'),
+            'emit_class': stats.get('emit_class'),
+            'schema_class': stats.get('schema_class'),
+            'rows_in': stats.get('rows_in'),
+            'rows_out': stats.get('rows_out'),
+        },
+    }
+
+
+def assert_stats_distinct_hll_invariant(values):
+    data = make_csv(['id'], [[value] for value in values])
+    expected_count = len(values)
+    expected_distinct = len(set(values))
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        current = stats_distinct_run(values, chunk_size)
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+    assert baseline['count'] == expected_count
+    assert abs(baseline['distinct'] - expected_distinct) <= hll_allowed_error(expected_distinct)
+    assert baseline['stats'] == {
+        'memory_class': 'bounded_state',
+        'emit_class': 'on_flush',
+        'schema_class': 'parametric',
+        'rows_in': expected_count,
+        'rows_out': 1,
+    }
+
+
+def test_stats_distinct_hll_known_cardinalities_chunk_boundaries():
+    """HLL distinct estimates should stay stable and bounded for known cardinalities."""
+    for cardinality in [1, 2, 3, 7, 16, 31, 64, 127, 256, 511, 1024, 2048, 4096, 8192]:
+        values = [f'k{i:05d}' for i in range(cardinality)]
+        values = values * 2 + values[:max(1, min(cardinality, 13))]
+        assert_stats_distinct_hll_invariant(values)
+
+
+@given(
+    values=st.lists(
+        st.text(alphabet=list('abcdef0123456789_-'), min_size=1, max_size=10),
+        min_size=1,
+        max_size=80,
+    )
+)
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_stats_distinct_hll_generated_duplicates_chunk_boundaries(values):
+    """Generated duplicate patterns should not change stats distinct across byte cuts."""
+    assert_stats_distinct_hll_invariant(values)
+
+
+@given(
+    cities=st.lists(st.sampled_from(['NY', 'LA', 'SF', 'SEA', 'CHI', 'DAL']), min_size=1, max_size=30)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_rowid_unsorted_chunk_boundaries_match_oracle(cities):
+    """Exact grouped rowid must count per key consistently across byte cuts."""
+    counts = {}
+    expected_rows = []
+    for idx, city in enumerate(cities, start=1):
+        counts[city] = counts.get(city, 0) + 1
+        expected_rows.append([str(idx), city, str(counts[city])])
+    data = make_csv(['id', 'city'], [[str(i + 1), city] for i, city in enumerate(cities)])
+    expected = make_csv(['id', 'city', 'city_row'], expected_rows).decode('utf-8')
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(
+            'csv batch_size=2 | rowid city result=city_row max_keys=8 | csv'
+        ).run(input=data, chunk_size=chunk_size)
+        stats = full_transform_stats(result.stats_text, 'rowid')
+        current = (
+            result.output_text,
+            stats.get('tracked_keys'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('tracked_keys') == len(set(cities))
+        assert stats.get('rows_in') == len(cities)
+        assert stats.get('rows_out') == len(cities)
+
+
+def adjacent_run_numbers(keys):
+    run = 0
+    prev = object()
+    out = []
+    for key in keys:
+        if key != prev:
+            run += 1
+            prev = key
+        out.append(run)
+    return out
+
+
+def adjacent_run_lengths(keys):
+    prev = object()
+    count = 0
+    out = []
+    for key in keys:
+        count = count + 1 if key == prev else 1
+        prev = key
+        out.append(count)
+    return out
+
+
+@given(n_rows=st.integers(min_value=1, max_value=30))
+@settings(max_examples=20, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_rowid_global_chunk_boundaries_match_oracle(n_rows):
+    """Global rowid must be O(1) bounded state and stable across byte cuts."""
+    data = make_csv(['id'], [[str(i + 1)] for i in range(n_rows)])
+    expected = make_csv(
+        ['id', 'row_n'],
+        [[str(i + 1), str(i + 1)] for i in range(n_rows)],
+    ).decode('utf-8')
+    plan = compile_dsl_plan('csv | rowid result=row_n | csv')
+    assert plan['steps'][1]['memory_class'] == 'bounded_state'
+    assert plan['steps'][1]['state_estimate'] == 'O(1)'
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline('csv batch_size=2 | rowid result=row_n | csv').run(
+            input=data,
+            chunk_size=chunk_size,
+        )
+        stats = full_transform_stats(result.stats_text, 'rowid')
+        current = (
+            result.output_text,
+            stats.get('memory_class'),
+            stats.get('state_estimate'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('memory_class') == 'bounded_state'
+        assert stats.get('state_estimate') == 'O(1)'
+        assert stats.get('rows_in') == n_rows
+        assert stats.get('rows_out') == n_rows
+
+
+@given(
+    cities=st.lists(st.sampled_from(['NY', 'LA', 'SF', 'SEA', 'CHI', 'DAL']), min_size=1, max_size=30)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_rowid_sorted_chunk_boundaries_match_run_oracle(cities):
+    """Sorted rowid must count within adjacent runs without key-state metadata."""
+    run_lengths = adjacent_run_lengths(cities)
+    data = make_csv(['id', 'city'], [[str(i + 1), city] for i, city in enumerate(cities)])
+    expected = make_csv(
+        ['id', 'city', 'run_row'],
+        [[str(i + 1), city, str(run_lengths[i])] for i, city in enumerate(cities)],
+    ).decode('utf-8')
+    plan = compile_dsl_plan('csv | rowid city result=run_row sorted=true | csv')
+    assert plan['steps'][1]['memory_class'] == 'bounded_state'
+    assert plan['steps'][1]['state_estimate'] == 'O(previous_key + counter)'
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(
+            'csv batch_size=2 | rowid city result=run_row sorted=true | csv'
+        ).run(input=data, chunk_size=chunk_size)
+        stats = full_transform_stats(result.stats_text, 'rowid')
+        current = (
+            result.output_text,
+            stats.get('memory_class'),
+            stats.get('state_estimate'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('memory_class') == 'bounded_state'
+        assert stats.get('state_estimate') == 'O(previous_key + counter)'
+        assert stats.get('rows_in') == len(cities)
+        assert stats.get('rows_out') == len(cities)
+
+
+@given(
+    cities=st.lists(st.sampled_from(['NY', 'LA', 'SF', 'SEA', 'CHI', 'DAL']), min_size=1, max_size=30)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_rleid_chunk_boundaries_match_run_oracle(cities):
+    """Run IDs must increment only when adjacent keys change across byte cuts."""
+    run_ids = adjacent_run_numbers(cities)
+    data = make_csv(['id', 'city'], [[str(i + 1), city] for i, city in enumerate(cities)])
+    expected = make_csv(
+        ['id', 'city', 'run_id'],
+        [[str(i + 1), city, str(run_ids[i])] for i, city in enumerate(cities)],
+    ).decode('utf-8')
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline('csv batch_size=2 | rleid city result=run_id | csv').run(
+            input=data,
+            chunk_size=chunk_size,
+        )
+        stats = full_transform_stats(result.stats_text, 'rleid')
+        current = (
+            result.output_text,
+            stats.get('memory_class'),
+            stats.get('state_estimate'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('memory_class') == 'bounded_state'
+        assert stats.get('state_estimate') == 'O(key_width)'
+        assert stats.get('rows_in') == len(cities)
+        assert stats.get('rows_out') == len(cities)
+
+
+def unique_first_rows(rows):
+    expected = []
+    seen = set()
+    for row in rows:
+        key = row[1]
+        if key in seen:
+            continue
+        seen.add(key)
+        expected.append(row)
+    return expected
+
+
+@given(
+    cities=st.lists(st.sampled_from(['NY', 'LA', 'SF', 'SEA', 'CHI', 'DAL']), min_size=1, max_size=30)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_unique_unsorted_chunk_boundaries_match_oracle(cities):
+    """Exact unique must keep the first row for each key across byte cuts."""
+    rows = [[str(i + 1), city, f'name{i + 1}'] for i, city in enumerate(cities)]
+    expected_rows = unique_first_rows(rows)
+    data = make_csv(['id', 'city', 'name'], rows)
+    expected = make_csv(['id', 'city', 'name'], expected_rows).decode('utf-8')
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline('csv batch_size=2 | unique city max_keys=8 | csv').run(
+            input=data,
+            chunk_size=chunk_size,
+        )
+        stats = full_transform_stats(result.stats_text, 'unique')
+        current = (
+            result.output_text,
+            stats.get('tracked_keys'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('tracked_keys') == len(expected_rows)
+        assert stats.get('rows_in') == len(rows)
+        assert stats.get('rows_out') == len(expected_rows)
+
+
+@given(
+    cities=st.lists(st.sampled_from(['NY', 'LA', 'SF', 'SEA', 'CHI', 'DAL']), min_size=1, max_size=30)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_dedup_unsorted_chunk_boundaries_match_oracle(cities):
+    """The dedup alias must preserve first-row unique semantics and stats."""
+    rows = [[str(i + 1), city, f'name{i + 1}'] for i, city in enumerate(cities)]
+    expected_rows = unique_first_rows(rows)
+    data = make_csv(['id', 'city', 'name'], rows)
+    expected = make_csv(['id', 'city', 'name'], expected_rows).decode('utf-8')
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline('csv batch_size=2 | dedup city max_keys=8 | csv').run(
+            input=data,
+            chunk_size=chunk_size,
+        )
+        stats = full_transform_stats(result.stats_text, 'dedup')
+        current = (
+            result.output_text,
+            stats.get('tracked_keys'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('tracked_keys') == len(expected_rows)
+        assert stats.get('rows_in') == len(rows)
+        assert stats.get('rows_out') == len(expected_rows)
+
+
+def unique_adjacent_first_rows(rows):
+    expected = []
+    prev = object()
+    for row in rows:
+        key = row[1]
+        if key != prev:
+            expected.append(row)
+            prev = key
+    return expected
+
+
+@given(
+    cities=st.lists(st.sampled_from(['NY', 'LA', 'SF', 'SEA', 'CHI', 'DAL']), min_size=1, max_size=30)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_unique_sorted_chunk_boundaries_match_run_oracle(cities):
+    """Sorted unique must collapse only adjacent duplicate runs across byte cuts."""
+    rows = [[str(i + 1), city, f'name{i + 1}'] for i, city in enumerate(cities)]
+    expected_rows = unique_adjacent_first_rows(rows)
+    data = make_csv(['id', 'city', 'name'], rows)
+    expected = make_csv(['id', 'city', 'name'], expected_rows).decode('utf-8')
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline('csv batch_size=2 | unique city sorted=true | csv').run(
+            input=data,
+            chunk_size=chunk_size,
+        )
+        stats = full_transform_stats(result.stats_text, 'unique')
+        current = (
+            result.output_text,
+            stats.get('memory_class'),
+            stats.get('state_estimate'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('memory_class') == 'bounded_state'
+        assert stats.get('state_estimate') == 'O(previous_key)'
+        assert stats.get('rows_in') == len(rows)
+        assert stats.get('rows_out') == len(expected_rows)
+
+
+@given(
+    rows=st.lists(
+        st.tuples(
+            st.sampled_from(['NY', 'LA', 'SF', 'SEA', 'CHI', 'DAL']),
+            st.integers(min_value=-20, max_value=20),
+        ),
+        min_size=1,
+        max_size=30,
+    )
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_group_agg_sorted_chunk_boundaries_match_run_oracle(rows):
+    """Sorted group-agg must aggregate adjacent key runs, not global distinct keys."""
+    expected_rows = []
+    current_key = None
+    current_sum = 0
+    current_count = 0
+    for city, amount in rows:
+        if current_key is not None and city != current_key:
+            expected_rows.append([current_key, str(current_sum), str(current_count)])
+            current_sum = 0
+            current_count = 0
+        current_key = city
+        current_sum += amount
+        current_count += 1
+    expected_rows.append([current_key, str(current_sum), str(current_count)])
+
+    data = make_csv(['city', 'amount'], [[city, str(amount)] for city, amount in rows])
+    expected = make_csv(['city', 'total', 'rows'], expected_rows).decode('utf-8')
+
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(
+            'csv batch_size=2 | group-agg city sum:amount:total count:*:rows sorted=true | csv'
+        ).run(input=data, chunk_size=chunk_size)
+        stats = full_transform_stats(result.stats_text, 'group-agg')
+        current = (
+            result.output_text,
+            stats.get('memory_class'),
+            stats.get('emit_class'),
+            stats.get('state_estimate'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('memory_class') == 'bounded_state'
+        assert stats.get('emit_class') == 'mixed'
+        assert stats.get('state_estimate') == 'O(current_group + aggregate_accumulators)'
+        assert stats.get('rows_in') == len(rows)
+        assert stats.get('rows_out') == len(expected_rows)
+
+
+@given(
+    values=st.lists(st.sampled_from(['A', 'B', 'C', 'D', 'E', 'F', 'G']), min_size=1, max_size=30),
+    max_values=st.integers(min_value=1, max_value=6),
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_frequency_approx_chunk_boundaries_match_counter_bounds(values, max_values):
+    """Approximate frequency must stay bounded and report valid counter error bounds."""
+    data = make_csv(['city'], [[value] for value in values])
+    truth = {value: values.count(value) for value in set(values)}
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(
+            f'csv batch_size=2 | frequency city mode=approx max_values={max_values} | csv'
+        ).run(input=data, chunk_size=chunk_size)
+        headers, rows = parse_csv_output(result.output_text)
+        stats = full_transform_stats(result.stats_text, 'frequency')
+        current = (
+            result.output_text,
+            stats.get('tracked_values'),
+            stats.get('approx_replacements'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert headers == ['value', 'count', 'error']
+        assert len(rows) <= max_values
+        assert stats.get('approximate') is True
+        assert stats.get('tracked_values') == len(rows)
+        assert sum(int(row[1]) for row in rows) == len(values)
+        for value, count_text, error_text in rows:
+            count = int(count_text)
+            error = int(error_text)
+            actual = truth[value]
+            assert error >= 0
+            assert count >= actual
+            assert count - error <= actual
+
+
+@given(
+    n_rows=st.integers(min_value=1, max_value=30),
+    n=st.integers(min_value=1, max_value=10),
+    seed=st.integers(min_value=0, max_value=1000),
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_sample_seeded_chunk_boundaries_match_subset_invariant(n_rows, n, seed):
+    """Seeded reservoir sampling must be deterministic across byte chunk cuts."""
+    values = list(range(n_rows))
+    data = make_csv(['id'], [[str(value)] for value in values])
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(f'csv batch_size=2 | sample {n} seed={seed} | csv').run(
+            input=data,
+            chunk_size=chunk_size,
+        )
+        stats = full_transform_stats(result.stats_text, 'sample')
+        current = (result.output_text, stats.get('rows_in'), stats.get('rows_out'))
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        headers, rows = parse_csv_output(result.output_text)
+        sampled = [int(row[0]) for row in rows]
+        assert headers == ['id']
+        assert len(sampled) == min(n, n_rows)
+        assert len(set(sampled)) == len(sampled)
+        assert all(value in values for value in sampled)
+        assert stats.get('rows_in') == n_rows
+        assert stats.get('rows_out') == min(n, n_rows)
+
+
+@given(
+    values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20),
+    delta=st.integers(min_value=-10, max_value=10),
+    tolerance=st.integers(min_value=0, max_value=10),
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_aggregate_assert_tolerance_chunk_boundaries_match_oracle(values, delta, tolerance):
+    """Aggregate assert tolerance must be chunk-invariant and match a Python oracle."""
+    total = sum(values)
+    threshold = total + delta
+    expected_pass = abs(delta) <= tolerance
+    data = make_csv(['amount'], [[str(value)] for value in values])
+    dsl = (
+        'csv batch_size=2 | assert aggregate=sum:amount op=== '
+        f'value={threshold} tolerance={tolerance} rel=false action=warn | csv'
+    )
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(dsl).run(input=data, chunk_size=chunk_size)
+        stats = full_transform_stats(result.stats_text, 'assert')
+        errors = [
+            json.loads(line)
+            for line in result.errors.decode('utf-8').splitlines()
+            if line.strip()
+        ]
+        current = (
+            result.output_text,
+            result.errors,
+            stats.get('aggregate_passed'),
+            stats.get('aggregate_value'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == make_csv(['amount'], [[str(value)] for value in values]).decode('utf-8')
+        assert stats.get('assert_mode') == 'aggregate'
+        assert stats.get('aggregate') == 'sum'
+        assert stats.get('aggregate_column') == 'amount'
+        assert stats.get('comparison') == '=='
+        assert stats.get('threshold') == threshold
+        assert stats.get('tolerance') == tolerance
+        assert stats.get('relative_tolerance') is False
+        assert stats.get('aggregate_rows') == len(values)
+        assert stats.get('aggregate_non_null') == len(values)
+        assert stats.get('aggregate_value') == total
+        assert stats.get('aggregate_passed') is expected_pass
+        assert len(errors) == (0 if expected_pass else 1)
+        if not expected_pass:
+            assert errors[0].get('reason') == 'aggregate_assert_failed'
+
+
+@given(
+    colors=st.lists(st.sampled_from(['red', 'blue', 'green', 'yellow']), min_size=1, max_size=24)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_onehot_declared_categories_chunk_boundaries_match_oracle(colors):
+    """Declared-category onehot must keep a stable schema and zero unknown=null rows."""
+    data = make_csv(['id', 'color'], [[str(i + 1), color] for i, color in enumerate(colors)])
+    expected = make_csv(
+        ['id', 'color', 'color_red', 'color_blue'],
+        [
+            [
+                str(i + 1),
+                color,
+                '1' if color == 'red' else '0',
+                '1' if color == 'blue' else '0',
+            ]
+            for i, color in enumerate(colors)
+        ],
+    ).decode('utf-8')
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(
+            'csv batch_size=2 | onehot color categories=red,blue unknown=null | csv'
+        ).run(input=data, chunk_size=chunk_size)
+        stats = full_transform_stats(result.stats_text, 'onehot')
+        current = (
+            result.output_text,
+            stats.get('tracked_categories'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('tracked_categories') == 2
+        assert stats.get('rows_in') == len(colors)
+        assert stats.get('rows_out') == len(colors)
+
+
+@given(
+    cities=st.lists(st.sampled_from(['Paris', 'London', 'Berlin', 'Rome']), min_size=1, max_size=24)
+)
+@settings(max_examples=35, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_label_encode_declared_categories_chunk_boundaries_match_oracle(cities):
+    """Declared-category label encoding must use stable labels for unknown=other."""
+    data = make_csv(['city'], [[city] for city in cities])
+    expected = make_csv(
+        ['city', 'city_id'],
+        [
+            [
+                city,
+                '0' if city == 'Paris' else ('1' if city == 'London' else '2'),
+            ]
+            for city in cities
+        ],
+    ).decode('utf-8')
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(
+            'csv batch_size=2 | label-encode city city_id categories=Paris,London unknown=other | csv'
+        ).run(input=data, chunk_size=chunk_size)
+        stats = full_transform_stats(result.stats_text, 'label-encode')
+        current = (
+            result.output_text,
+            stats.get('tracked_categories'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected
+        assert stats.get('tracked_categories') == 3
+        assert stats.get('rows_in') == len(cities)
+        assert stats.get('rows_out') == len(cities)
+
+
 def test_chunk_boundary_parity_jsonl_and_text_record_ops():
     """JSONL/text record parsers and row-local JSON ops must handle byte cuts inside records."""
     jsonl = (
@@ -1491,6 +2240,116 @@ pivot_metric = st.sampled_from(['a', 'b', 'c', 'd'])
 small_value = st.integers(min_value=-20, max_value=20)
 
 
+@st.composite
+def sorted_run_counts(draw, *, max_count=3):
+    counts = draw(st.lists(st.integers(min_value=0, max_value=max_count), min_size=5, max_size=5))
+    assume(sum(counts) > 0)
+    return counts
+
+
+def rows_from_counts(counts, prefix):
+    rows = []
+    for key, count in zip(['1', '2', '3', '4', '5'], counts):
+        for i in range(count):
+            rows.append([key, f'{prefix}{key}_{i}'])
+    return rows
+
+
+def grouped_by_first_col(rows):
+    groups = {}
+    order = []
+    for row in rows:
+        key = row[0]
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+    return order, groups
+
+
+def expected_sorted_join_rows(left_rows, lookup_rows, how):
+    _, lookup = grouped_by_first_col(lookup_rows)
+    out = []
+    for key, name in left_rows:
+        matches = lookup.get(key, [])
+        if how == 'semi':
+            if matches:
+                out.append([key, name])
+        elif how == 'anti':
+            if not matches:
+                out.append([key, name])
+        elif how == 'inner':
+            for _, label in matches:
+                out.append([key, name, label])
+        elif how == 'left':
+            if matches:
+                for _, label in matches:
+                    out.append([key, name, label])
+            else:
+                out.append([key, name, ''])
+    return out
+
+
+def expected_sorted_set_rows(left_rows, lookup_rows, op):
+    left_order, left = grouped_by_first_col(left_rows)
+    _, lookup = grouped_by_first_col(lookup_rows)
+    out = []
+    for key in left_order:
+        left_run = left[key]
+        lookup_count = len(lookup.get(key, []))
+        if op == 'intersect':
+            if lookup_count:
+                out.append(left_run[0])
+        elif op == 'setdiff':
+            if not lookup_count:
+                out.append(left_run[0])
+        elif op == 'intersect-all':
+            out.extend(left_run[:min(len(left_run), lookup_count)])
+        elif op == 'setdiff-all':
+            out.extend(left_run[min(len(left_run), lookup_count):])
+    return [list(row) for row in out]
+
+
+def expected_sorted_union_rows(left_rows, lookup_rows):
+    left_order, left = grouped_by_first_col(left_rows)
+    lookup_order, lookup = grouped_by_first_col(lookup_rows)
+    keys = sorted(set(left_order) | set(lookup_order), key=int)
+    out = []
+    for key in keys:
+        out.append(list(left[key][0] if key in left else lookup[key][0]))
+    return out
+
+
+def assert_sorted_file_chunk_invariant(dsl, data, op, expected_text, expected_stats):
+    baseline = None
+    for chunk_size in chunk_parity_sizes(data):
+        result = tf.pipeline(dsl).run(
+            input=data,
+            chunk_size=chunk_size,
+            allow_fs=True,
+            memory='64KB',
+        )
+        stats = full_transform_stats(result.stats_text, op)
+        current = (
+            result.output_text,
+            stats.get('execution_target'),
+            stats.get('memory_class'),
+            stats.get('emit_class'),
+            stats.get('schema_class'),
+            stats.get('state_estimate'),
+            stats.get('rows_in'),
+            stats.get('rows_out'),
+        )
+        if baseline is None:
+            baseline = current
+        else:
+            assert current == baseline
+
+        assert result.output_text == expected_text
+        for key, value in expected_stats.items():
+            assert stats.get(key) == value, f"{op} stat {key}: {stats}"
+
+
 def expected_pivot_text(rows):
     metrics = first_seen_order(metric for _, metric, _ in rows)
     groups = first_seen_order(group for group, _, _ in rows)
@@ -1501,6 +2360,102 @@ def expected_pivot_text(rows):
     for group in groups:
         out_rows.append([group] + [str(sums[(group, metric)]) if (group, metric) in sums else '' for metric in metrics])
     return make_csv(['id'] + metrics, out_rows).decode('utf-8')
+
+
+@given(
+    left_counts=sorted_run_counts(),
+    lookup_counts=sorted_run_counts(),
+)
+@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_sorted_join_chunk_boundaries_match_oracles(left_counts, lookup_counts):
+    """Sorted joins must stay bounded/current-run and byte-cut invariant."""
+    left_rows = rows_from_counts(left_counts, 'n')
+    lookup_rows = rows_from_counts(lookup_counts, 'l')
+    data = make_csv(['id', 'name'], left_rows)
+    lookup_path = write_temp_csv(['id', 'label'], lookup_rows)
+    try:
+        cases = [
+            ('semi', 'semi-join', 'semi-join', '', ['id', 'name'], 'stable', 'O(current_lookup_run)'),
+            ('anti', 'anti-join', 'anti-join', '', ['id', 'name'], 'stable', 'O(current_lookup_run)'),
+            ('inner', 'join', 'join', ' max_matches_per_row=3', ['id', 'name', 'label'],
+             'data_dependent', 'O(current_lookup_run + max_matches_per_row)'),
+            ('left', 'join', 'join', ' max_matches_per_row=3 --left', ['id', 'name', 'label'],
+             'data_dependent', 'O(current_lookup_run + max_matches_per_row)'),
+        ]
+        for how, op, dsl_op, extra, headers, schema_class, state_estimate in cases:
+            expected_rows = expected_sorted_join_rows(left_rows, lookup_rows, how)
+            expected = '' if not expected_rows else make_csv(headers, expected_rows).decode('utf-8')
+            assert_sorted_file_chunk_invariant(
+                f'csv batch_size=2 | {dsl_op} {lookup_path} on=id sorted=true{extra} | csv',
+                data,
+                op,
+                expected,
+                {
+                    'execution_target': 'native',
+                    'memory_class': 'bounded_state',
+                    'emit_class': 'per_batch',
+                    'schema_class': schema_class,
+                    'state_estimate': state_estimate,
+                    'rows_in': len(left_rows),
+                    'rows_out': len(expected_rows),
+                },
+            )
+    finally:
+        os.unlink(lookup_path)
+
+
+@given(
+    left_counts=sorted_run_counts(),
+    lookup_counts=sorted_run_counts(),
+)
+@settings(max_examples=15, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_sorted_set_union_chunk_boundaries_match_oracles(left_counts, lookup_counts):
+    """Sorted set/union modes must keep only adjacent/current-run state across byte cuts."""
+    left_rows = rows_from_counts(left_counts, 'n')
+    lookup_rows = rows_from_counts(lookup_counts, 'l')
+    data = make_csv(['id', 'name'], left_rows)
+    lookup_path = write_temp_csv(['id', 'name'], lookup_rows)
+    try:
+        for op in ['intersect', 'setdiff', 'intersect-all', 'setdiff-all']:
+            expected_rows = expected_sorted_set_rows(left_rows, lookup_rows, op)
+            expected = '' if not expected_rows else make_csv(['id', 'name'], expected_rows).decode('utf-8')
+            assert_sorted_file_chunk_invariant(
+                f'csv batch_size=2 | {op} {lookup_path} columns=id sorted=true | csv',
+                data,
+                op,
+                expected,
+                {
+                    'execution_target': 'native',
+                    'memory_class': 'bounded_state',
+                    'emit_class': 'per_batch',
+                    'schema_class': 'stable',
+                    'state_estimate': (
+                        'O(current_lookup_run + current_left_run)' if op.endswith('-all')
+                        else 'O(previous_left_key + current_lookup_key)'
+                    ),
+                    'rows_in': len(left_rows),
+                    'rows_out': len(expected_rows),
+                },
+            )
+
+        expected_rows = expected_sorted_union_rows(left_rows, lookup_rows)
+        assert_sorted_file_chunk_invariant(
+            f'csv batch_size=2 | union {lookup_path} columns=id sorted=true | csv',
+            data,
+            'union',
+            make_csv(['id', 'name'], expected_rows).decode('utf-8'),
+            {
+                'execution_target': 'native',
+                'memory_class': 'bounded_state',
+                'emit_class': 'mixed',
+                'schema_class': 'stable',
+                'state_estimate': 'O(previous_left_key + current_file_key)',
+                'rows_in': len(left_rows),
+                'rows_out': len(expected_rows),
+            },
+        )
+    finally:
+        os.unlink(lookup_path)
 
 
 @given(
@@ -1590,6 +2545,138 @@ def test_spill_mutating_join_chunk_boundaries_match_oracle(left_rows, lookup_map
         )
     finally:
         os.unlink(lookup_path)
+
+
+def test_spill_temporal_keys_chunk_boundaries_match_oracles():
+    """Date/timestamp spill keys must materialize and compare consistently across chunks."""
+    date_left = make_csv(
+        ['id', 'dt', 'name'],
+        [
+            ['1', '2024-03-01', 'alice'],
+            ['2', '2024-01-15', 'bob'],
+            ['3', '2024-03-01', 'carol'],
+            ['4', '2024-04-20', 'drew'],
+        ],
+    )
+    date_lookup_path = write_temp_csv(
+        ['dt', 'label'],
+        [
+            ['2024-03-01', 'x'],
+            ['2024-03-01', 'y'],
+            ['2024-02-01', 'z'],
+        ],
+    )
+    try:
+        assert_chunk_invariant(
+            f'csv batch_size=2 | join {date_lookup_path} on=dt max_matches_per_row=2 | csv',
+            date_left,
+            'join',
+            make_csv(
+                ['id', 'dt', 'name', 'label'],
+                [
+                    ['1', '2024-03-01', 'alice', 'x'],
+                    ['1', '2024-03-01', 'alice', 'y'],
+                    ['3', '2024-03-01', 'carol', 'x'],
+                    ['3', '2024-03-01', 'carol', 'y'],
+                ],
+            ).decode('utf-8'),
+            {
+                'execution_target': 'native_spill',
+                'memory_class': 'external',
+                'emit_class': 'on_flush',
+                'rows_in': 4,
+                'rows_out': 4,
+                'spill_output_rows': 4,
+                'spill_kept_rows': 4,
+            },
+        )
+    finally:
+        os.unlink(date_lookup_path)
+
+    date_set_left = make_csv(
+        ['dt', 'name'],
+        [
+            ['2024-03-01', 'alice'],
+            ['2024-01-15', 'bob'],
+            ['2024-03-01', 'carol'],
+            ['2024-04-20', 'drew'],
+        ],
+    )
+    date_set_lookup_path = write_temp_csv(
+        ['dt', 'name'],
+        [
+            ['2024-03-01', 'lookup-a'],
+            ['2024-05-10', 'lookup-b'],
+        ],
+    )
+    try:
+        assert_chunk_invariant(
+            f'csv batch_size=2 | intersect {date_set_lookup_path} columns=dt | csv',
+            date_set_left,
+            'intersect',
+            make_csv(['dt', 'name'], [['2024-03-01', 'alice']]).decode('utf-8'),
+            {
+                'execution_target': 'native_spill',
+                'memory_class': 'external',
+                'emit_class': 'on_flush',
+                'rows_in': 4,
+                'rows_out': 1,
+                'spill_output_rows': 1,
+                'spill_distinct_rows': 1,
+            },
+        )
+        assert_chunk_invariant(
+            f'csv batch_size=2 | setdiff {date_set_lookup_path} columns=dt | csv',
+            date_set_left,
+            'setdiff',
+            make_csv(
+                ['dt', 'name'],
+                [['2024-01-15', 'bob'], ['2024-04-20', 'drew']],
+            ).decode('utf-8'),
+            {
+                'execution_target': 'native_spill',
+                'memory_class': 'external',
+                'emit_class': 'on_flush',
+                'rows_in': 4,
+                'rows_out': 2,
+                'spill_output_rows': 2,
+                'spill_distinct_rows': 2,
+            },
+        )
+    finally:
+        os.unlink(date_set_lookup_path)
+
+    ts_left = make_csv(
+        ['ts', 'value'],
+        [
+            ['2024-03-01T12:00:00', '10'],
+            ['2024-03-01T12:00:01', '5'],
+            ['2024-03-01T12:00:00', '7'],
+            ['2024-03-02T09:30:00', '3'],
+        ],
+    )
+    assert_chunk_invariant(
+        'csv batch_size=2 | group-agg ts value:sum:total value:count:n | csv',
+        ts_left,
+        'group-agg',
+        make_csv(
+            ['ts', 'total', 'n'],
+            [
+                ['2024-03-01T12:00:00Z', '17', '2'],
+                ['2024-03-01T12:00:01Z', '5', '1'],
+                ['2024-03-02T09:30:00Z', '3', '1'],
+            ],
+        ).decode('utf-8'),
+        {
+            'execution_target': 'native_spill',
+            'memory_class': 'external',
+            'emit_class': 'on_flush',
+            'rows_in': 4,
+            'rows_out': 3,
+            'spill_output_rows': 3,
+            'spill_distinct_groups': 3,
+        },
+    )
 
 
 def expected_intersect_rows(left_rows, lookup_rows):

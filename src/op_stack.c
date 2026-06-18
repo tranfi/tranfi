@@ -33,9 +33,8 @@ typedef struct {
 
 static void stack_clear_pending(stack_state *st) {
     if (!st || !st->pending_batches) return;
-    for (size_t i = st->pending_batch_index; i < st->n_pending_batches; i++) {
-        if (st->pending_batches[i]) tf_batch_free(st->pending_batches[i]);
-    }
+    tf_batch_array_free_items(st->pending_batches + st->pending_batch_index,
+                              st->n_pending_batches - st->pending_batch_index);
     free(st->pending_batches);
     st->pending_batches = NULL;
     st->n_pending_batches = 0;
@@ -130,10 +129,7 @@ static int stack_next_decoded_file_batch(stack_state *st, tf_batch **out,
             stack_close_file_reader(st);
         }
         if (rc != TF_OK) {
-            if (batches) {
-                for (size_t i = 0; i < n_batches; i++) tf_batch_free(batches[i]);
-                free(batches);
-            }
+            tf_batch_array_free(batches, n_batches);
             stack_close_file_reader(st);
             st->file_done = 1;
             return TF_ERROR;

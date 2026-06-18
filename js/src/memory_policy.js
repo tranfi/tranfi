@@ -207,9 +207,11 @@ function estimateKeyStateStepBytes(step) {
   }
 
   if (op === 'frequency') {
+    const approx = args.mode === 'approx' || args.approx === true
+    const maxValues = positiveInt(args.max_values)
+    if (approx && maxValues === null) throw new Error("step 'frequency' mode=approx needs max_values for byte-bounded native execution")
     const maxStateBytes = positiveInt(args.max_state_bytes)
     if (maxStateBytes !== null) return maxStateBytes
-    const maxValues = positiveInt(args.max_values)
     if (maxValues === null) throw new Error("step 'frequency' needs max_values or max_state_bytes for byte-bounded native execution")
     const cappedValues = args.overflow === 'other' ? maxValues + 1 : maxValues
     return 1024 + cappedValues * (224 + arrayLen(args.columns) * 32)

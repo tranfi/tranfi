@@ -643,6 +643,113 @@ static int infer_schema_frequency(const tf_ir_node *node,
     return TF_OK;
 }
 
+static int schema_col_index(const tf_schema *schema, const char *name);
+
+static int infer_schema_pivot(const tf_ir_node *node,
+                              const tf_schema *in, tf_schema *out) {
+    if (!node || !node->args || !in || !in->known) {
+        registry_schema_unknown(out);
+        return TF_OK;
+    }
+
+    cJSON *cats = cJSON_GetObjectItemCaseSensitive(node->args, "categories");
+    if (!cats) {
+        registry_schema_unknown(out);
+        return TF_OK;
+    }
+    if (!cJSON_IsArray(cats)) {
+        registry_set_schema_error("pivot", "categories must be an array");
+        return TF_ERROR;
+    }
+
+    cJSON *name_j = cJSON_GetObjectItemCaseSensitive(node->args, "name_column");
+    cJSON *value_j = cJSON_GetObjectItemCaseSensitive(node->args, "value_column");
+    const char *name_col = cJSON_IsString(name_j) ? name_j->valuestring : NULL;
+    const char *value_col = cJSON_IsString(value_j) ? value_j->valuestring : NULL;
+    if (!name_col || !name_col[0] || !value_col || !value_col[0]) {
+        registry_set_schema_error("pivot", "missing name_column or value_column");
+        return TF_ERROR;
+    }
+
+    int name_idx = schema_col_index(in, name_col);
+    int value_idx = schema_col_index(in, value_col);
+    if (name_idx < 0 || value_idx < 0) {
+        registry_set_schema_error("pivot", "name_column or value_column not found");
+        return TF_ERROR;
+    }
+
+    int n_cats = cJSON_GetArraySize(cats);
+    if (n_cats <= 0) {
+        registry_set_schema_error("pivot", "categories cannot be empty");
+        return TF_ERROR;
+    }
+
+    size_t unique_cats = 0;
+    for (int i = 0; i < n_cats; i++) {
+        cJSON *cat = cJSON_GetArrayItem(cats, i);
+        if (!cJSON_IsString(cat) || !cat->valuestring || !cat->valuestring[0]) {
+            registry_set_schema_error("pivot", "categories must be non-empty strings");
+            return TF_ERROR;
+        }
+        int seen = 0;
+        for (int j = 0; j < i; j++) {
+            cJSON *prev = cJSON_GetArrayItem(cats, j);
+            if (cJSON_IsString(prev) && prev->valuestring &&
+                strcmp(prev->valuestring, cat->valuestring) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            size_t next_unique = 0;
+            if (tf_size_add(unique_cats, 1, &next_unique) != TF_OK) return TF_ERROR;
+            unique_cats = next_unique;
+        }
+    }
+
+    size_t n_pass = 0;
+    for (size_t c = 0; c < in->n_cols; c++) {
+        if ((int)c != name_idx && (int)c != value_idx) n_pass++;
+    }
+    size_t total = 0;
+    if (tf_size_add(n_pass, unique_cats, &total) != TF_OK ||
+        registry_schema_alloc_known(out, total) != TF_OK) {
+        return TF_ERROR;
+    }
+
+    size_t out_idx = 0;
+    for (size_t c = 0; c < in->n_cols; c++) {
+        if ((int)c == name_idx || (int)c == value_idx) continue;
+        if (registry_schema_set_col(out, out_idx++, in->col_names[c] ? in->col_names[c] : "",
+                                    in->col_types[c]) != TF_OK) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
+    }
+
+    cJSON *agg_j = cJSON_GetObjectItemCaseSensitive(node->args, "agg");
+    const char *agg = cJSON_IsString(agg_j) ? agg_j->valuestring : NULL;
+    tf_type pivot_type = (agg && strcmp(agg, "count") == 0) ? TF_TYPE_INT64 : TF_TYPE_FLOAT64;
+    for (int i = 0; i < n_cats; i++) {
+        cJSON *cat = cJSON_GetArrayItem(cats, i);
+        int seen = 0;
+        for (int j = 0; j < i; j++) {
+            cJSON *prev = cJSON_GetArrayItem(cats, j);
+            if (cJSON_IsString(prev) && prev->valuestring &&
+                strcmp(prev->valuestring, cat->valuestring) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (registry_schema_set_col(out, out_idx++, cat->valuestring, pivot_type) != TF_OK) {
+            tf_schema_free(out);
+            return TF_ERROR;
+        }
+    }
+    return TF_OK;
+}
+
 static int schema_col_index(const tf_schema *schema, const char *name) {
     if (!schema || !schema->known || !name) return -1;
     for (size_t i = 0; i < schema->n_cols; i++) {
@@ -2542,7 +2649,7 @@ static tf_op_entry builtin_ops[] = {
         .state_estimate = "O(input_rows + distinct_categories), O(current_group + categories) with categories+sorted=true, or external spill with categories/max_categories",
         .args = pivot_args,
         .n_args = 10,
-        .infer_schema = infer_schema_passthrough,  /* schema changes at runtime */
+        .infer_schema = infer_schema_pivot,
         .create_native = (void *(*)(const cJSON *))tf_pivot_create,
     },
     {
@@ -2661,7 +2768,7 @@ static tf_op_entry builtin_ops[] = {
         .name = "union-all",
         .kind = TF_OP_TRANSFORM,
         .tier = TF_TIER_CORE,
-        .caps = TF_CAP_STREAMING | TF_CAP_FS | TF_CAP_DETERMINISTIC,
+        .caps = TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_FS | TF_CAP_DETERMINISTIC,
         .memory_class = TF_MEM_BOUNDED_STATE,
         .emit_class = TF_EMIT_MIXED,
         .schema_class = TF_SCHEMA_STABLE,

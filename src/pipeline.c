@@ -339,11 +339,25 @@ static tf_pipeline *assemble_pipeline(tf_decoder *decoder, tf_step **steps,
                                       tf_step_run_stats *step_stats,
                                       size_t n_step_stats,
                                       tf_encoder *encoder) {
+    if (!decoder || !encoder) {
+        if (decoder) decoder->destroy(decoder);
+        if (encoder) encoder->destroy(encoder);
+        for (size_t i = 0; i < n_steps; i++) {
+            if (steps && steps[i]) steps[i]->destroy(steps[i]);
+        }
+        free(steps);
+        step_stats_free(step_stats, n_step_stats);
+        tf_set_last_error(!decoder ? "plan missing decoder" : "plan missing encoder");
+        return NULL;
+    }
+
     tf_pipeline *p = calloc(1, sizeof(tf_pipeline));
     if (!p) {
-        decoder->destroy(decoder);
-        encoder->destroy(encoder);
-        for (size_t i = 0; i < n_steps; i++) steps[i]->destroy(steps[i]);
+        if (decoder) decoder->destroy(decoder);
+        if (encoder) encoder->destroy(encoder);
+        for (size_t i = 0; i < n_steps; i++) {
+            if (steps && steps[i]) steps[i]->destroy(steps[i]);
+        }
         free(steps);
         step_stats_free(step_stats, n_step_stats);
         tf_set_last_error("out of memory");
@@ -447,32 +461,7 @@ tf_pipeline *tf_pipeline_create_from_ir_with_host_policy(const tf_ir_plan *plan,
 }
 
 tf_pipeline *tf_pipeline_create_from_ir(const tf_ir_plan *plan) {
-    if (!plan) {
-        tf_set_last_error("NULL IR plan");
-        return NULL;
-    }
-
-    char *error = NULL;
-    tf_step_run_stats *step_stats = NULL;
-    size_t n_step_stats = 0;
-    if (build_step_stats_from_plan(plan, &step_stats, &n_step_stats) != TF_OK) {
-        tf_set_last_error("out of memory");
-        return NULL;
-    }
-
-    tf_decoder *decoder = NULL;
-    tf_step **steps = NULL;
-    size_t n_steps = 0;
-    tf_encoder *encoder = NULL;
-
-    if (tf_compile_native(plan, &decoder, &steps, &n_steps, &encoder, &error) != TF_OK) {
-        tf_set_last_error(error ? error : "compilation failed");
-        free(error);
-        step_stats_free(step_stats, n_step_stats);
-        return NULL;
-    }
-
-    return assemble_pipeline(decoder, steps, n_steps, step_stats, n_step_stats, encoder);
+    return tf_pipeline_create_from_ir_with_host_policy(plan, NULL);
 }
 
 /* Public IR wrappers (thin forwarding to ir.h functions) */
@@ -645,6 +634,7 @@ int tf_pipeline_push(tf_pipeline *p, const uint8_t *data, size_t len) {
     tf_set_last_error(NULL);
     int rc = p->decoder->decode(p->decoder, data, len, &batches, &n_batches, &p->side);
     if (rc != TF_OK) {
+        tf_batch_array_free(batches, n_batches);
         return pipeline_fail(p, "decode error");
     }
 
@@ -653,17 +643,17 @@ int tf_pipeline_push(tf_pipeline *p, const uint8_t *data, size_t len) {
         rc = process_batch(p, batches[i]);
         tf_batch_free(batches[i]);
         if (rc != TF_OK) {
-            for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+            tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
             free(batches);
             return p->error ? TF_ERROR : pipeline_fail(p, "processing error");
         }
         if (pipeline_auto_drain_sinks(p) != TF_OK) {
-            for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+            tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
             free(batches);
             return TF_ERROR;
         }
         if (pipeline_report_progress(p, 0) != TF_OK) {
-            for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+            tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
             free(batches);
             return TF_ERROR;
         }
@@ -689,7 +679,10 @@ int tf_pipeline_finish_step(tf_pipeline *p) {
         tf_set_last_error(NULL);
         int rc = p->decoder->flush(p->decoder, &p->finish_batches,
                                    &p->finish_n_batches, &p->side);
-        if (rc != TF_OK) return pipeline_fail(p, "decode flush error");
+        if (rc != TF_OK) {
+            pipeline_clear_finish_batches(p);
+            return pipeline_fail(p, "decode flush error");
+        }
     }
 
     for (;;) {
@@ -872,23 +865,26 @@ int tf_pipeline_flush_input(tf_pipeline *p) {
     size_t n_batches = 0;
     tf_set_last_error(NULL);
     int rc = p->decoder->flush(p->decoder, &batches, &n_batches, &p->side);
-    if (rc != TF_OK) return pipeline_fail(p, "decode boundary flush error");
+    if (rc != TF_OK) {
+        tf_batch_array_free(batches, n_batches);
+        return pipeline_fail(p, "decode boundary flush error");
+    }
 
     for (size_t i = 0; i < n_batches; i++) {
         rc = process_batch(p, batches[i]);
         tf_batch_free(batches[i]);
         if (rc != TF_OK) {
-            for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+            tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
             free(batches);
             return p->error ? TF_ERROR : pipeline_fail(p, "processing error");
         }
         if (pipeline_auto_drain_sinks(p) != TF_OK) {
-            for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+            tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
             free(batches);
             return TF_ERROR;
         }
         if (pipeline_report_progress(p, 0) != TF_OK) {
-            for (size_t j = i + 1; j < n_batches; j++) tf_batch_free(batches[j]);
+            tf_batch_array_free_items(batches + i + 1, n_batches - i - 1);
             free(batches);
             return TF_ERROR;
         }

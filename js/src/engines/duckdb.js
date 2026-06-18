@@ -46,12 +46,12 @@ class DuckDBEngine {
       if (spillDir) await runSql(conn, `SET temp_directory = '${sqlString(spillDir)}'`)
 
       if (inputFile) {
-        sql = sql.replaceAll('input_data', `read_csv('${inputFile}')`)
+        sql = sql.replaceAll('input_data', `read_csv('${sqlString(inputFile)}')`)
       } else if (input) {
         const buf = typeof input === 'string' ? Buffer.from(input, 'utf-8') : input
         tmpPath = join(tmpdir(), `tranfi_${randomBytes(8).toString('hex')}.csv`)
         await writeFile(tmpPath, buf)
-        sql = sql.replaceAll('input_data', `read_csv('${tmpPath}')`)
+        sql = sql.replaceAll('input_data', `read_csv('${sqlString(tmpPath)}')`)
       } else {
         throw new Error('Either input or inputFile must be provided')
       }
@@ -105,7 +105,7 @@ function rowsToCsv(rows) {
     const vals = cols.map(c => {
       const v = row[c]
       if (v === null || v === undefined) return ''
-      const s = String(v)
+      const s = formatDuckValue(v)
       if (s.includes(',') || s.includes('"') || s.includes('\n')) {
         return '"' + s.replace(/"/g, '""') + '"'
       }
@@ -114,6 +114,19 @@ function rowsToCsv(rows) {
     lines.push(vals.join(','))
   }
   return lines.join('\n') + '\n'
+}
+
+function formatDuckValue(value) {
+  if (typeof value !== 'number') return String(value)
+  if (!Number.isFinite(value)) return String(value)
+  if (Number.isInteger(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER) {
+    return String(value)
+  }
+  let text = value.toPrecision(17)
+  if (!/[eE]/.test(text) && text.includes('.')) {
+    text = text.replace(/0+$/, '').replace(/\.$/, '')
+  }
+  return text
 }
 
 let _engine = null

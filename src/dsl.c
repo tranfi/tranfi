@@ -2910,17 +2910,58 @@ fail:
 }
 
 static cJSON *build_frequency_args(const token_list *tokens, char **error) {
-    /* frequency [col1,col2] [max_values=N] [max_state_bytes=N] [overflow=error|other] [other=name] [audit] [audit_limit=N] */
+    /* frequency [col1,col2] [mode=exact|approx] [approx=true|--approx]
+     * [max_values=N] [max_state_bytes=N] [overflow=error|other]
+     * [other=name] [audit] [audit_limit=N] */
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
     if (!args || !cols) goto oom;
     int has_max_values = 0;
     int overflow_other = 0;
+    int have_mode = 0;
+    int have_approx = 0;
     for (size_t i = 1; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         int audit_rc = add_audit_option_arg(args, tok, error, "frequency");
         if (audit_rc < 0) goto fail;
         if (audit_rc > 0) continue;
+        if (strncmp(tok, "mode=", 5) == 0) {
+            const char *mode = tok + 5;
+            if (strcmp(mode, "exact") != 0 && strcmp(mode, "approx") != 0) {
+                set_error(error, "frequency mode must be exact or approx");
+                goto fail;
+            }
+            if (have_mode) {
+                set_error(error, "frequency mode specified more than once");
+                goto fail;
+            }
+            if (tf_json_add_string(args, "mode", mode) != TF_OK) goto oom;
+            have_mode = 1;
+            continue;
+        }
+        if (strcmp(tok, "approx") == 0 || strcmp(tok, "--approx") == 0) {
+            if (have_approx) {
+                set_error(error, "frequency approx specified more than once");
+                goto fail;
+            }
+            if (tf_json_add_bool(args, "approx", 1) != TF_OK) goto oom;
+            have_approx = 1;
+            continue;
+        }
+        if (strncmp(tok, "approx=", 7) == 0) {
+            int approx = 0;
+            if (parse_bool_value(tok + 7, &approx) != 0) {
+                set_error(error, "frequency approx must be true or false");
+                goto fail;
+            }
+            if (have_approx) {
+                set_error(error, "frequency approx specified more than once");
+                goto fail;
+            }
+            if (tf_json_add_bool(args, "approx", approx) != TF_OK) goto oom;
+            have_approx = 1;
+            continue;
+        }
         size_t max_values = 0;
         int opt = parse_positive_option(tok, "max_values", &max_values, error, "frequency");
         if (opt < 0) goto fail;
@@ -3240,8 +3281,10 @@ static cJSON *build_json_flatten_args(const token_list *tokens, char **error) {
         set_error(error, "json-flatten requires fields=path:name[:type],...");
         cJSON_Delete(args); cJSON_Delete(fields); return NULL;
     }
-    if (tf_json_add_string(args, "column", column && column[0] ? column : "_line") != TF_OK ||
-        tf_json_add_item(args, "fields", fields) != TF_OK) {
+    if (tf_json_add_string(args, "column", column && column[0] ? column : "_line") != TF_OK) {
+        goto oom;
+    }
+    if (tf_json_add_item(args, "fields", fields) != TF_OK) {
         fields = NULL;
         goto oom;
     }
@@ -4831,8 +4874,10 @@ static cJSON *build_normalize_args(const token_list *tokens, char **error) {
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
     int cols_attached = 0;
-    if (!args || !cols ||
-        tf_json_add_item(args, "columns", cols) != TF_OK) {
+    if (!args || !cols) {
+        goto oom;
+    }
+    if (tf_json_add_item(args, "columns", cols) != TF_OK) {
         cols = NULL;
         goto oom;
     }

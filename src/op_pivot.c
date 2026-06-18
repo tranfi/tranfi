@@ -591,15 +591,6 @@ static int pivot_read_cell_value(FILE *f, pivot_spill_row *row, tf_type type, si
     }
 }
 
-static void pivot_spill_row_clear(pivot_spill_row *row, const tf_type *types, size_t n_cols) {
-    if (!row || !row->cells || !row->nulls) return;
-    for (size_t c = 0; c < n_cols; c++) {
-        if (!row->nulls[c] && types[c] == TF_TYPE_STRING) free(row->cells[c].str);
-        row->cells[c].str = NULL;
-        row->nulls[c] = 1;
-    }
-}
-
 static int pivot_spill_row_init(pivot_spill_row *row, size_t n_cols) {
     row->ordinal = 0;
     row->nulls = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(uint8_t));
@@ -615,15 +606,6 @@ static int pivot_spill_row_init(pivot_spill_row *row, size_t n_cols) {
     return TF_OK;
 }
 
-static void pivot_spill_row_free(pivot_spill_row *row, const tf_type *types, size_t n_cols) {
-    if (!row) return;
-    pivot_spill_row_clear(row, types, n_cols);
-    free(row->nulls);
-    free(row->cells);
-    row->nulls = NULL;
-    row->cells = NULL;
-}
-
 static size_t pivot_reader_cols(const pivot_state *st, int output_reader) {
     return output_reader ? (st->n_pt + st->n_names) : st->n_schema_cols;
 }
@@ -636,22 +618,38 @@ static tf_type pivot_output_col_type(const pivot_state *st, size_t c) {
     return st->agg == PIVOT_COUNT ? TF_TYPE_INT64 : TF_TYPE_FLOAT64;
 }
 
+static tf_type pivot_reader_col_type(const pivot_state *st, int output_reader, size_t c) {
+    return output_reader ? pivot_output_col_type(st, c) : st->schema_types[c];
+}
+
+static void pivot_spill_row_clear_reader(const pivot_state *st, pivot_spill_row *row,
+                                         int output_reader) {
+    if (!row || !row->cells || !row->nulls) return;
+    size_t n_cols = pivot_reader_cols(st, output_reader);
+    for (size_t c = 0; c < n_cols; c++) {
+        if (!row->nulls[c] && pivot_reader_col_type(st, output_reader, c) == TF_TYPE_STRING) {
+            free(row->cells[c].str);
+        }
+        row->cells[c].str = NULL;
+        row->nulls[c] = 1;
+    }
+}
+
+static void pivot_spill_row_free_reader(const pivot_state *st, pivot_spill_row *row,
+                                        int output_reader) {
+    if (!row) return;
+    pivot_spill_row_clear_reader(st, row, output_reader);
+    free(row->nulls);
+    free(row->cells);
+    row->nulls = NULL;
+    row->cells = NULL;
+}
+
 static int pivot_reader_advance(pivot_state *st, pivot_run_reader *reader, int output_reader) {
     if (!reader || !reader->file || reader->done) return 0;
     size_t n_cols = pivot_reader_cols(st, output_reader);
-    tf_type *tmp_types = NULL;
-    const tf_type *types = NULL;
-    if (output_reader) {
-        tmp_types = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(tf_type));
-        if (!tmp_types) return -1;
-        for (size_t c = 0; c < n_cols; c++) tmp_types[c] = pivot_output_col_type(st, c);
-        types = tmp_types;
-    } else {
-        types = st->schema_types;
-    }
-    pivot_spill_row_clear(&reader->row, types, n_cols);
+    pivot_spill_row_clear_reader(st, &reader->row, output_reader);
     if (fread(&reader->row.ordinal, sizeof(reader->row.ordinal), 1, reader->file) != 1) {
-        free(tmp_types);
         if (feof(reader->file)) {
             reader->done = 1;
             reader->has_row = 0;
@@ -663,18 +661,16 @@ static int pivot_reader_advance(pivot_state *st, pivot_run_reader *reader, int o
     for (size_t c = 0; c < n_cols; c++) {
         uint8_t is_null = 1;
         if (pivot_read_exact(reader->file, &is_null, sizeof(is_null)) != TF_OK) {
-            free(tmp_types);
             tf_set_last_error("pivot spill: corrupt run file");
             return -1;
         }
         reader->row.nulls[c] = is_null ? 1 : 0;
-        if (!reader->row.nulls[c] && pivot_read_cell_value(reader->file, &reader->row, types[c], c) != TF_OK) {
-            free(tmp_types);
+        tf_type type = pivot_reader_col_type(st, output_reader, c);
+        if (!reader->row.nulls[c] && pivot_read_cell_value(reader->file, &reader->row, type, c) != TF_OK) {
             tf_set_last_error("pivot spill: corrupt run file");
             return -1;
         }
     }
-    free(tmp_types);
     reader->has_row = 1;
     return 1;
 }
@@ -683,21 +679,10 @@ static void pivot_close_readers(pivot_state *st, int output_readers) {
     pivot_run_reader **readers = output_readers ? &st->out_readers : &st->readers;
     size_t *n_readers = output_readers ? &st->n_out_readers : &st->n_readers;
     if (!*readers) return;
-    size_t n_cols = pivot_reader_cols(st, output_readers);
-    tf_type *tmp_types = NULL;
-    const tf_type *types = NULL;
-    if (output_readers) {
-        tmp_types = tf_callocarray_checked(n_cols ? n_cols : 1, sizeof(tf_type));
-        if (tmp_types) for (size_t c = 0; c < n_cols; c++) tmp_types[c] = pivot_output_col_type(st, c);
-        types = tmp_types;
-    } else {
-        types = st->schema_types;
-    }
     for (size_t i = 0; i < *n_readers; i++) {
         if ((*readers)[i].file) fclose((*readers)[i].file);
-        if (types) pivot_spill_row_free(&(*readers)[i].row, types, n_cols);
+        pivot_spill_row_free_reader(st, &(*readers)[i].row, output_readers);
     }
-    free(tmp_types);
     free(*readers);
     *readers = NULL;
     *n_readers = 0;
@@ -1048,10 +1033,20 @@ static int pivot_open_readers(pivot_state *st, int output_readers) {
     size_t n_cols = pivot_reader_cols(st, output_readers);
     for (size_t i = 0; i < n_paths; i++) {
         (*readers)[i].file = fopen(paths[i], "rb");
-        if (!(*readers)[i].file) { tf_set_last_error("pivot spill: cannot reopen run file"); return TF_ERROR; }
-        if (pivot_spill_row_init(&(*readers)[i].row, n_cols) != TF_OK) return TF_ERROR;
+        if (!(*readers)[i].file) {
+            tf_set_last_error("pivot spill: cannot reopen run file");
+            pivot_close_readers(st, output_readers);
+            return TF_ERROR;
+        }
+        if (pivot_spill_row_init(&(*readers)[i].row, n_cols) != TF_OK) {
+            pivot_close_readers(st, output_readers);
+            return TF_ERROR;
+        }
         int rc = pivot_reader_advance(st, &(*readers)[i], output_readers);
-        if (rc < 0) return TF_ERROR;
+        if (rc < 0) {
+            pivot_close_readers(st, output_readers);
+            return TF_ERROR;
+        }
     }
     return TF_OK;
 }

@@ -8,8 +8,21 @@ PYTEST ?= $(PYTHON) -m pytest
 PACKAGE_TMPDIR ?= $(CURDIR)/build/tmp
 PACKAGE_ENV := TMPDIR="$(PACKAGE_TMPDIR)" TEMP="$(PACKAGE_TMPDIR)" TMP="$(PACKAGE_TMPDIR)" TRANFI_TEST_TMPDIR="$(PACKAGE_TMPDIR)/package-smoke" PIP_CACHE_DIR="$(PACKAGE_TMPDIR)/pip-cache" npm_config_cache="$(PACKAGE_TMPDIR)/npm-cache"
 PY_BUILD_ENV := $(PACKAGE_ENV)
+BUILD_TMPDIR ?= $(PACKAGE_TMPDIR)
+BUILD_ENV := TMPDIR="$(BUILD_TMPDIR)" TEMP="$(BUILD_TMPDIR)" TMP="$(BUILD_TMPDIR)"
+TEST_TMPDIR ?= $(BUILD_TMPDIR)/test
+TEST_MEMORY_ENV := $(BUILD_ENV) TRANFI_TEST_TMPDIR="$(TEST_TMPDIR)/memory"
+TEST_OOM_ENV := $(BUILD_ENV) TRANFI_TEST_TMPDIR="$(TEST_TMPDIR)/oom"
+TEST_PYTHON_ENV := $(BUILD_ENV) TRANFI_TEST_TMPDIR="$(TEST_TMPDIR)/python"
+TEST_NODE_ENV := $(BUILD_ENV) TRANFI_TEST_TMPDIR="$(TEST_TMPDIR)/node"
+NODE_GYP_NODEDIR ?= $(shell test -f /usr/local/include/node/common.gypi && printf /usr/local)
+NODE_BUILD_ENV := $(BUILD_ENV) npm_config_cache="$(BUILD_TMPDIR)/npm-cache"
+ifneq ($(NODE_GYP_NODEDIR),)
+NODE_BUILD_ENV += npm_config_nodedir="$(NODE_GYP_NODEDIR)"
+endif
 SANITIZER_RUN := $(shell if command -v setarch >/dev/null 2>&1 && setarch "$$(uname -m)" -R true >/dev/null 2>&1; then printf 'setarch %s -R' "$$(uname -m)"; fi)
-ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS=detect_leaks=0
+ASAN_OPTIONS ?= halt_on_error=1
+ASAN_RUN := $(SANITIZER_RUN) env ASAN_OPTIONS="$(ASAN_OPTIONS)"
 BENCH_ROWS ?= 1000000
 BENCH_SMOKE_ROWS ?= 10000
 
@@ -28,21 +41,21 @@ all: build test
 build: build-c build-node
 
 build-c:
-	@mkdir -p build
-	@cd build && cmake .. -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-	@cd build && make -j$$(nproc) 2>&1 | tail -1
+	@mkdir -p build "$(BUILD_TMPDIR)"
+	@cd build && env $(BUILD_ENV) cmake .. -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+	@cd build && env $(BUILD_ENV) make -j$$(nproc) 2>&1 | tail -1
 	@echo "  C core OK"
 
 build-debug:
-	@mkdir -p build-debug
-	@cd build-debug && cmake .. -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug > /dev/null 2>&1
-	@cd build-debug && make -j$$(nproc) 2>&1 | tail -1
+	@mkdir -p build-debug "$(BUILD_TMPDIR)"
+	@cd build-debug && env $(BUILD_ENV) cmake .. -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug > /dev/null 2>&1
+	@cd build-debug && env $(BUILD_ENV) make -j$$(nproc) 2>&1 | tail -1
 	@echo "  C core (Debug+ASan/UBSan) OK"
 
 build-tsan:
-	@mkdir -p build-tsan
-	@cd build-tsan && cmake .. -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug -DTRANFI_SANITIZER=thread > /dev/null 2>&1
-	@cd build-tsan && make -j$$(nproc) test_core 2>&1 | tail -1
+	@mkdir -p build-tsan "$(BUILD_TMPDIR)"
+	@cd build-tsan && env $(BUILD_ENV) cmake .. -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug -DTRANFI_SANITIZER=thread > /dev/null 2>&1
+	@cd build-tsan && env $(BUILD_ENV) make -j$$(nproc) test_core 2>&1 | tail -1
 	@echo "  C core (TSan) OK"
 
 sync-js-csrc:
@@ -64,7 +77,8 @@ sbom:
 	@$(PYTHON) scripts/generate-sbom.py --out build/tranfi-sbom.spdx.json
 
 build-node: build-c sync-js-csrc check-js-csrc-sync
-	@cd js && $(NPM) run build:native 2>&1 | tail -1
+	@mkdir -p "$(BUILD_TMPDIR)/npm-cache"
+	@cd js && env $(NODE_BUILD_ENV) $(NPM) run build:native 2>&1 | tail -1
 	@echo "  Node.js N-API OK"
 
 build-js: build-node build-wasm
@@ -84,64 +98,75 @@ wasm: build-wasm
 test: test-c test-python test-properties test-node test-packaging fuzz-smoke
 
 test-c: build-c
-	@cmake --build build --target test_memory test_core > /dev/null
-	@./build/test_memory
-	@./build/test_core
-	@bash test/test_cli_memory_policy.sh ./build/tranfi
+	@cmake --build build --target test_memory test_core test_wasm_api > /dev/null
+	@mkdir -p "$(TEST_TMPDIR)/memory"
+	@env $(TEST_MEMORY_ENV) ./build/test_memory
+	@env $(BUILD_ENV) ./build/test_core
+	@env $(BUILD_ENV) ./build/test_wasm_api
+	@env $(BUILD_ENV) bash test/test_cli_memory_policy.sh ./build/tranfi
 
 test-memory: build-c
 	@cmake --build build --target test_memory > /dev/null
-	@./build/test_memory
+	@mkdir -p "$(TEST_TMPDIR)/memory"
+	@env $(TEST_MEMORY_ENV) ./build/test_memory
 
 test-debug: build-debug
-	@$(ASAN_RUN) ./build-debug/test_core
-	@$(ASAN_RUN) ./build-debug/test_memory
-	@$(ASAN_RUN) bash test/test_cli_memory_policy.sh ./build-debug/tranfi
+	@mkdir -p "$(TEST_TMPDIR)/memory"
+	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_core
+	@$(ASAN_RUN) env $(TEST_MEMORY_ENV) ./build-debug/test_memory
+	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_wasm_api
+	@$(ASAN_RUN) env $(BUILD_ENV) bash test/test_cli_memory_policy.sh ./build-debug/tranfi
 
 test-tsan: build-tsan
-	@$(SANITIZER_RUN) env TSAN_OPTIONS=halt_on_error=1 ./build-tsan/test_core test_thread_local_last_error
+	@$(SANITIZER_RUN) env $(BUILD_ENV) TSAN_OPTIONS=halt_on_error=1 ./build-tsan/test_core test_thread_local_last_error
 
 test-oom: build-debug
-	@$(ASAN_RUN) ./build-debug/test_oom
+	@mkdir -p "$(TEST_TMPDIR)/oom"
+	@$(ASAN_RUN) env $(TEST_OOM_ENV) ./build-debug/test_oom
 
 test-spill-sec: build-debug
-	@$(ASAN_RUN) ./build-debug/test_core \
+	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_core \
 		test_spill_session_security_basics \
 		test_spill_session_cleanup_after_abort \
 		test_spill_sort_uses_private_session_dir
 
 test-depth-limits: build-debug
-	@$(ASAN_RUN) ./build-debug/test_core \
+	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_core \
 		test_expr_depth_limit \
 		test_selector_depth_limit \
 		test_json_path_depth_limit
 
 test-float-rt: build-debug
-	@$(ASAN_RUN) ./build-debug/test_core \
+	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_core \
 		test_pipeline_float_roundtrip_bits
 
 test-wide-csv: build-debug
-	@$(ASAN_RUN) ./build-debug/test_core \
+	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_core \
 		test_pipeline_csv_wide_columns \
 		test_pipeline_csv_max_columns
 
 test-python: build-c
-	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
+	@mkdir -p "$(TEST_TMPDIR)/python"
+	@env $(TEST_PYTHON_ENV) PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_python.py test/test_parity.py test/test_duckdb.py -v --tb=short
 
 test-node: build-node build-wasm
-	@$(NODE) test/test_node.js
+	@mkdir -p "$(TEST_TMPDIR)/node"
+	@env $(TEST_NODE_ENV) $(NODE) test/test_node.js
 
 test-parity: build-c
-	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
+	@mkdir -p "$(TEST_TMPDIR)/python"
+	@env $(TEST_PYTHON_ENV) PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_parity.py -v --tb=short
 
 test-duckdb: build-c
-	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
+	@mkdir -p "$(TEST_TMPDIR)/python"
+	@env $(TEST_PYTHON_ENV) PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_duckdb.py -v --tb=short
 
 test-properties: build-c
-	@PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
+	@mkdir -p "$(TEST_TMPDIR)/python"
+	@env $(TEST_PYTHON_ENV) PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
 		$(PYTEST) test/test_properties.py -v --tb=short
 
 test-packaging: sync-py-csrc sync-js-csrc check-csrc-sync sbom test-packaging-python test-packaging-node test-packaging-install
@@ -216,17 +241,19 @@ FUZZ_SMOKE_ARGS ?= -runs=256 -max_len=4096 -timeout=5
 FUZZ_NIGHTLY_ARGS ?= -runs=8192 -max_len=8192 -timeout=10
 FUZZ_WORK_DIR ?= corpus
 FUZZ_SEED_DIR ?= test/corpus
+FUZZ_TMPDIR ?= $(CURDIR)/build/tmp
 FUZZ_SRC = $(filter-out src/main.c,$(wildcard src/*.c))
+FUZZ_HEADERS = $(wildcard src/*.h)
 FUZZ_CFLAGS = -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
-	-D_POSIX_C_SOURCE=200809L -I src \
+	-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -I src \
 	-Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
 	-Wformat -Werror=format-security \
 	-Werror=unused-result \
 	-fno-common -fstack-protector-strong
 
-build/fuzz_%: test/fuzz_%.c
-	@mkdir -p build
-	$(FUZZ_CC) $(FUZZ_CFLAGS) $< $(FUZZ_SRC) -lm -o $@
+build/fuzz_%: test/fuzz_%.c $(FUZZ_SRC) $(FUZZ_HEADERS)
+	@mkdir -p build "$(FUZZ_TMPDIR)"
+	TMPDIR="$(FUZZ_TMPDIR)" $(FUZZ_CC) $(FUZZ_CFLAGS) $< $(FUZZ_SRC) -lm -o $@
 
 # --- Verify (full suite with sanitizers) ---
 

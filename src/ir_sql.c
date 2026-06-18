@@ -490,6 +490,92 @@ static int jbool(const cJSON *obj, const char *key, int def) {
   return def;
 }
 
+static const char *sql_type_for_cast(const char *tf_type) {
+  if (!tf_type) return "VARCHAR";
+  if (strcmp(tf_type, "int") == 0 || strcmp(tf_type, "int64") == 0) return "BIGINT";
+  if (strcmp(tf_type, "float") == 0 || strcmp(tf_type, "float64") == 0) return "DOUBLE";
+  if (strcmp(tf_type, "bool") == 0 || strcmp(tf_type, "boolean") == 0) return "BOOLEAN";
+  if (strcmp(tf_type, "string") == 0 || strcmp(tf_type, "str") == 0) return "VARCHAR";
+  if (strcmp(tf_type, "date") == 0) return "DATE";
+  if (strcmp(tf_type, "timestamp") == 0 || strcmp(tf_type, "datetime") == 0) return "TIMESTAMP";
+  return "VARCHAR";
+}
+
+static const char *cast_on_error_policy(const cJSON *args) {
+  const cJSON *j = args ? cJSON_GetObjectItemCaseSensitive(args, "on_error") : NULL;
+  if (!j) j = args ? cJSON_GetObjectItemCaseSensitive(args, "onError") : NULL;
+  if (!j || !cJSON_IsString(j) || !j->valuestring) return "coerce";
+  if (strcmp(j->valuestring, "null") == 0 || strcmp(j->valuestring, "nulling") == 0) return "null";
+  if (strcmp(j->valuestring, "fail") == 0 || strcmp(j->valuestring, "error") == 0 ||
+      strcmp(j->valuestring, "strict") == 0) return "fail";
+  return "coerce";
+}
+
+static int append_cast_expr(strbuf *sb, const char *column,
+                            const char *tf_type, const char *policy) {
+  if (!sb || !column) return TF_ERROR;
+  const char *sql_type = sql_type_for_cast(tf_type);
+  strbuf qcol;
+  sb_init(&qcol);
+  sql_quote_ident(&qcol, column);
+  if (qcol.failed) {
+    sb_free(&qcol);
+    return TF_ERROR;
+  }
+
+  if (strcmp(policy, "null") == 0) {
+    sb_append(sb, "TRY_CAST(");
+    sb_append(sb, qcol.data);
+    sb_appendf(sb, " AS %s)", sql_type);
+    sb_free(&qcol);
+    return sb->failed ? TF_ERROR : TF_OK;
+  }
+
+  if (strcmp(policy, "fail") == 0) {
+    sb_append(sb, "CAST(");
+    sb_append(sb, qcol.data);
+    sb_appendf(sb, " AS %s)", sql_type);
+    sb_free(&qcol);
+    return sb->failed ? TF_ERROR : TF_OK;
+  }
+
+  if (strcmp(sql_type, "BIGINT") == 0) {
+    sb_append(sb, "COALESCE(TRY_CAST(regexp_extract(CAST(");
+    sb_append(sb, qcol.data);
+    sb_append(sb, " AS VARCHAR), ");
+    sql_quote_str(sb, "^[[:space:]]*[+-]?[0-9]+");
+    sb_append(sb, ") AS BIGINT), 0)");
+  } else if (strcmp(sql_type, "DOUBLE") == 0) {
+    sb_append(sb, "COALESCE(TRY_CAST(regexp_extract(CAST(");
+    sb_append(sb, qcol.data);
+    sb_append(sb, " AS VARCHAR), ");
+    sql_quote_str(sb, "^[[:space:]]*[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?");
+    sb_append(sb, ") AS DOUBLE), 0.0)");
+  } else if (strcmp(sql_type, "BOOLEAN") == 0) {
+    sb_append(sb, "(CASE WHEN ");
+    sb_append(sb, qcol.data);
+    sb_append(sb, " IS NULL THEN NULL WHEN CAST(");
+    sb_append(sb, qcol.data);
+    sb_append(sb, " AS VARCHAR) = '' OR CAST(");
+    sb_append(sb, qcol.data);
+    sb_append(sb, " AS VARCHAR) = 'false' THEN FALSE ELSE TRUE END)");
+  } else if (strcmp(sql_type, "DATE") == 0) {
+    sb_append(sb, "COALESCE(TRY_CAST(");
+    sb_append(sb, qcol.data);
+    sb_append(sb, " AS DATE), DATE '1970-01-01')");
+  } else if (strcmp(sql_type, "TIMESTAMP") == 0) {
+    sb_append(sb, "COALESCE(TRY_CAST(");
+    sb_append(sb, qcol.data);
+    sb_append(sb, " AS TIMESTAMP), TIMESTAMP '1970-01-01 00:00:00')");
+  } else {
+    sb_append(sb, "CAST(");
+    sb_append(sb, qcol.data);
+    sb_appendf(sb, " AS %s)", sql_type);
+  }
+  sb_free(&qcol);
+  return sb->failed ? TF_ERROR : TF_OK;
+}
+
 static int append_frequency_key_expr(strbuf *sb, cJSON *cols) {
   if (!sb || !cJSON_IsArray(cols) || cJSON_GetArraySize(cols) <= 0) return TF_ERROR;
   int n = cJSON_GetArraySize(cols);
@@ -790,48 +876,23 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
   if (strcmp(op, "cast") == 0) {
     cJSON *mapping = cJSON_GetObjectItemCaseSensitive(args, "mapping");
     if (!mapping) { *error = strdup("cast: missing 'mapping'"); return -1; }
-    strbuf cols;
-    sb_init(&cols);
-    cJSON *item = NULL;
-    cJSON_ArrayForEach(item, mapping) {
-      if (!cJSON_IsString(item)) continue;
-      sb_append(&cols, ", CAST(");
-      sql_quote_ident(&cols, item->string);
-      /* Map tranfi types to SQL types */
-      const char *tf_type = item->valuestring;
-      const char *sql_type = "VARCHAR";
-      if (strcmp(tf_type, "int") == 0 || strcmp(tf_type, "int64") == 0) sql_type = "BIGINT";
-      else if (strcmp(tf_type, "float") == 0 || strcmp(tf_type, "float64") == 0) sql_type = "DOUBLE";
-      else if (strcmp(tf_type, "bool") == 0) sql_type = "BOOLEAN";
-      else if (strcmp(tf_type, "string") == 0) sql_type = "VARCHAR";
-      else if (strcmp(tf_type, "date") == 0) sql_type = "DATE";
-      else if (strcmp(tf_type, "timestamp") == 0) sql_type = "TIMESTAMP";
-      sb_appendf(&cols, " AS %s) AS ", sql_type);
-      sql_quote_ident(&cols, item->string);
-    }
-    /* Use COLUMNS(*) EXCLUDE + explicit casts — simpler: use REPLACE */
-    /* DuckDB REPLACE: SELECT * REPLACE (CAST(col AS type) AS col) */
+    const char *policy = cast_on_error_policy(args);
     strbuf rep;
     sb_init(&rep);
     int first = 1;
+    cJSON *item = NULL;
     cJSON_ArrayForEach(item, mapping) {
       if (!cJSON_IsString(item)) continue;
       if (!first) sb_append(&rep, ", ");
       first = 0;
-      const char *tf_type = item->valuestring;
-      const char *sql_type = "VARCHAR";
-      if (strcmp(tf_type, "int") == 0 || strcmp(tf_type, "int64") == 0) sql_type = "BIGINT";
-      else if (strcmp(tf_type, "float") == 0 || strcmp(tf_type, "float64") == 0) sql_type = "DOUBLE";
-      else if (strcmp(tf_type, "bool") == 0) sql_type = "BOOLEAN";
-      else if (strcmp(tf_type, "string") == 0) sql_type = "VARCHAR";
-      else if (strcmp(tf_type, "date") == 0) sql_type = "DATE";
-      else if (strcmp(tf_type, "timestamp") == 0) sql_type = "TIMESTAMP";
-      sb_append(&rep, "CAST(");
-      sql_quote_ident(&rep, item->string);
-      sb_appendf(&rep, " AS %s) AS ", sql_type);
+      if (append_cast_expr(&rep, item->string, item->valuestring, policy) != TF_OK) {
+        sb_free(&rep);
+        *error = strdup("sql: out of memory");
+        return -1;
+      }
+      sb_append(&rep, " AS ");
       sql_quote_ident(&rep, item->string);
     }
-    sb_free(&cols);
     sb_appendf(sb, "%s AS (SELECT * REPLACE (%s) FROM %s)", cte_name, rep.data, prev);
     sb_free(&rep);
     return 0;
@@ -845,28 +906,26 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     cJSON *max_v = cJSON_GetObjectItemCaseSensitive(args, "max");
     strbuf expr;
     sb_init(&expr);
-    sql_quote_ident(&expr, column);
     if (min_v && max_v) {
       strbuf tmp;
       sb_init(&tmp);
       sql_quote_ident(&tmp, column);
-      sb_init(&expr);
       sb_appendf(&expr, "GREATEST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", LEAST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", %s))", min_v->valuedouble, max_v->valuedouble, tmp.data);
       sb_free(&tmp);
     } else if (min_v) {
       strbuf tmp;
       sb_init(&tmp);
       sql_quote_ident(&tmp, column);
-      sb_init(&expr);
       sb_appendf(&expr, "GREATEST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", %s)", min_v->valuedouble, tmp.data);
       sb_free(&tmp);
     } else if (max_v) {
       strbuf tmp;
       sb_init(&tmp);
       sql_quote_ident(&tmp, column);
-      sb_init(&expr);
       sb_appendf(&expr, "LEAST(" TF_FLOAT64_ROUNDTRIP_FORMAT ", %s)", max_v->valuedouble, tmp.data);
       sb_free(&tmp);
+    } else {
+      sql_quote_ident(&expr, column);
     }
     strbuf qcol;
     sb_init(&qcol);
@@ -1029,6 +1088,16 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
 
   /* ---- frequency ---- */
   if (strcmp(op, "frequency") == 0) {
+    cJSON *mode = args ? cJSON_GetObjectItemCaseSensitive(args, "mode") : NULL;
+    if (cJSON_IsString(mode) && strcmp(mode->valuestring, "approx") == 0) {
+      *error = strdup("frequency: mode=approx is not supported by SQL lowering");
+      return -1;
+    }
+    cJSON *approx = args ? cJSON_GetObjectItemCaseSensitive(args, "approx") : NULL;
+    if (cJSON_IsTrue(approx)) {
+      *error = strdup("frequency: mode=approx is not supported by SQL lowering");
+      return -1;
+    }
     cJSON *overflow = args ? cJSON_GetObjectItemCaseSensitive(args, "overflow") : NULL;
     if (cJSON_IsString(overflow) && strcmp(overflow->valuestring, "other") == 0) {
       *error = strdup("frequency: overflow=other is not supported by SQL lowering");
@@ -1154,9 +1223,9 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     strbuf qcol;
     sb_init(&qcol);
     sql_quote_ident(&qcol, column);
-    sb_appendf(sb, "%s AS (SELECT * REPLACE (unnest(string_split(%s, ", cte_name, qcol.data);
+    sb_appendf(sb, "%s AS (SELECT * REPLACE (unnest(CASE WHEN %s IS NULL THEN list_value(NULL::VARCHAR) ELSE string_split(%s, ", cte_name, qcol.data, qcol.data);
     sql_quote_str(sb, delimiter);
-    sb_appendf(sb, ")) AS %s) FROM %s)", qcol.data, prev);
+    sb_appendf(sb, ") END) AS %s) FROM %s)", qcol.data, prev);
     sb_free(&qcol);
     return 0;
   }
@@ -1211,6 +1280,7 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     const char *name_col = jstr(args, "name_column");
     const char *val_col = jstr(args, "value_column");
     const char *agg = jstr(args, "agg");
+    cJSON *categories = args ? cJSON_GetObjectItemCaseSensitive(args, "categories") : NULL;
     if (!name_col || !val_col) { *error = strdup("pivot: missing args"); return -1; }
     if (!agg) agg = "first";
     const char *sql_agg = "FIRST";
@@ -1223,8 +1293,55 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     sb_init(&qn); sb_init(&qv);
     sql_quote_ident(&qn, name_col);
     sql_quote_ident(&qv, val_col);
-    sb_appendf(sb, "%s AS (PIVOT %s ON %s USING %s(%s))",
-               cte_name, prev, qn.data, sql_agg, qv.data);
+    if (qn.failed || qv.failed) {
+      sb_free(&qn); sb_free(&qv);
+      *error = strdup("sql: out of memory");
+      return -1;
+    }
+    if (categories) {
+      if (!cJSON_IsArray(categories) || cJSON_GetArraySize(categories) <= 0) {
+        sb_free(&qn); sb_free(&qv);
+        *error = strdup("pivot: SQL categories must be a non-empty array");
+        return -1;
+      }
+      strbuf cats;
+      sb_init(&cats);
+      int n = cJSON_GetArraySize(categories);
+      for (int i = 0; i < n; i++) {
+        cJSON *cat = cJSON_GetArrayItem(categories, i);
+        if (!cJSON_IsString(cat)) {
+          sb_free(&cats); sb_free(&qn); sb_free(&qv);
+          *error = strdup("pivot: SQL categories must be strings");
+          return -1;
+        }
+        if (i > 0) sb_append(&cats, ", ");
+        sql_quote_str(&cats, cat->valuestring);
+        if (cats.failed) {
+          sb_free(&cats); sb_free(&qn); sb_free(&qv);
+          *error = strdup("sql: out of memory");
+          return -1;
+        }
+      }
+      sb_appendf(sb, "%s AS (PIVOT %s ON %s IN (%s) USING %s(%s))",
+                 cte_name, prev, qn.data, cats.data, sql_agg, qv.data);
+      sb_free(&cats);
+    } else {
+      if (strcmp(prev, "input_data") == 0) {
+        sb_appendf(sb,
+                   "%s AS (PIVOT %s ON %s IN (SELECT %s FROM "
+                   "(SELECT %s, row_number() OVER () AS \"__tf_pivot_category_ordinal\" FROM %s) __tf_pivot_cats "
+                   "GROUP BY %s ORDER BY min(\"__tf_pivot_category_ordinal\")) USING %s(%s))",
+                   cte_name, prev, qn.data, qn.data, qn.data, prev, qn.data, sql_agg, qv.data);
+      } else {
+        sb_appendf(sb, "%s AS (PIVOT %s ON %s USING %s(%s))",
+                   cte_name, prev, qn.data, sql_agg, qv.data);
+      }
+    }
+    if (qn.failed || qv.failed || sb->failed) {
+      sb_free(&qn); sb_free(&qv);
+      *error = strdup("sql: out of memory");
+      return -1;
+    }
     sb_free(&qn); sb_free(&qv);
     return 0;
   }
@@ -1372,9 +1489,16 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     if (strcmp(func, "sum") == 0) sql_func = "SUM";
     else if (strcmp(func, "min") == 0) sql_func = "MIN";
     else if (strcmp(func, "max") == 0) sql_func = "MAX";
+    else if (strcmp(func, "count") == 0) sql_func = "COUNT";
     else if (strcmp(func, "avg") == 0 || strcmp(func, "mean") == 0) sql_func = "AVG";
-    sb_appendf(sb, "%s AS (SELECT *, %s(%s) OVER (ORDER BY _rn ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS %s FROM %s)",
-               cte_name, sql_func, qcol.data, preceding, qres.data, prev);
+    sb_appendf(sb, "%s AS (SELECT * EXCLUDE (__tf_window_nn), "
+                 "CASE WHEN %s IS NULL THEN NULL ELSE %s(%s) OVER "
+                 "(ORDER BY __tf_window_nn RANGE BETWEEN %d PRECEDING AND CURRENT ROW) END AS %s "
+                 "FROM (SELECT *, COUNT(%s) OVER "
+                 "(ORDER BY _rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+                 "AS __tf_window_nn FROM %s) __tf_window_src)",
+               cte_name, qcol.data, sql_func, qcol.data, preceding,
+               qres.data, qcol.data, prev);
     sb_free(&qcol); sb_free(&qres);
     return 0;
   }

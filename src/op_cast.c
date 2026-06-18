@@ -218,7 +218,8 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_ensure_capacity(ob, r + 1) != TF_OK) goto fail;
-        ob->n_rows = r + 1; /* audit row serialization needs this row visible */
+        /* Audit serialization reads the in-progress row after its changed cell is written. */
+        if (tf_batch_expose_row(ob, r) != TF_OK) goto fail;
         for (size_t c = 0; c < in->n_cols; c++) {
             if (tf_batch_is_null(in, r, c)) {
                 if (tf_batch_set_null(ob, r, c) != TF_OK) goto fail;

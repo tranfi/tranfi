@@ -847,3 +847,15 @@ void tf_batch_free(tf_batch *b) {
     tf_arena *arena = b->arena;
     tf_arena_free(arena);
 }
+
+void tf_batch_array_free_items(tf_batch **batches, size_t n_batches) {
+    if (!batches) return;
+    for (size_t i = 0; i < n_batches; i++) {
+        if (batches[i]) tf_batch_free(batches[i]);
+    }
+}
+
+void tf_batch_array_free(tf_batch **batches, size_t n_batches) {
+    tf_batch_array_free_items(batches, n_batches);
+    free(batches);
+}

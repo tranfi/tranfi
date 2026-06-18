@@ -952,7 +952,7 @@ static int add_row_strings(tf_batch *b, const csv_decoder_state *st,
 
     for (size_t i = 0; i < cols; i++) {
         if (csv_field_is_null(st, &fields[i])) {
-            b->nulls[i][row] = 1;
+            if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
         } else {
             if (tf_batch_set_string_len(b, row, i, fields[i].ptr, fields[i].len) != TF_OK)
                 return TF_ERROR;
@@ -960,7 +960,7 @@ static int add_row_strings(tf_batch *b, const csv_decoder_state *st,
     }
     /* Null-fill extra columns */
     for (size_t i = cols; i < n_cols; i++) {
-        b->nulls[i][row] = 1;
+        if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
     }
     if (tf_batch_expose_row(b, row) != TF_OK) return TF_ERROR;
     return TF_OK;
@@ -970,8 +970,7 @@ static int add_row_strings(tf_batch *b, const csv_decoder_state *st,
  * Add a row by parsing field slices directly into typed columns.
  * Used after types are frozen (all batches after the first).
  *
- * Writes directly to column arrays, bypassing tf_batch_set_*()
- * bounds/type checks for speed in this hot path.
+ * Uses checked batch setters so failed writes cannot expose a partial row.
  */
 static int add_row_typed(tf_batch *b, const csv_decoder_state *st,
                          const field_slice *fields, size_t n_fields,
@@ -981,27 +980,25 @@ static int add_row_typed(tf_batch *b, const csv_decoder_state *st,
 
     for (size_t i = 0; i < cols; i++) {
         if (csv_field_is_null(st, &fields[i])) {
-            b->nulls[i][row] = 1;
+            if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
             continue;
         }
         switch (types[i]) {
             case TF_TYPE_INT64: {
                 int64_t v;
                 if (fast_int64(fields[i].ptr, fields[i].len, &v)) {
-                    ((int64_t *)b->columns[i])[row] = v;
-                    b->nulls[i][row] = 0;
+                    if (tf_batch_set_int64(b, row, i, v) != TF_OK) return TF_ERROR;
                 } else {
-                    b->nulls[i][row] = 1;
+                    if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
                 }
                 break;
             }
             case TF_TYPE_FLOAT64: {
                 double v;
                 if (fast_double(fields[i].ptr, fields[i].len, &v)) {
-                    ((double *)b->columns[i])[row] = v;
-                    b->nulls[i][row] = 0;
+                    if (tf_batch_set_float64(b, row, i, v) != TF_OK) return TF_ERROR;
                 } else {
-                    b->nulls[i][row] = 1;
+                    if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
                 }
                 break;
             }
@@ -1013,38 +1010,36 @@ static int add_row_typed(tf_batch *b, const csv_decoder_state *st,
             case TF_TYPE_DATE: {
                 int32_t v;
                 if (fast_date(fields[i].ptr, fields[i].len, &v)) {
-                    ((int32_t *)b->columns[i])[row] = v;
-                    b->nulls[i][row] = 0;
+                    if (tf_batch_set_date(b, row, i, v) != TF_OK) return TF_ERROR;
                 } else {
-                    b->nulls[i][row] = 1;
+                    if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
                 }
                 break;
             }
             case TF_TYPE_TIMESTAMP: {
                 int64_t v;
                 if (fast_timestamp(fields[i].ptr, fields[i].len, &v)) {
-                    ((int64_t *)b->columns[i])[row] = v;
-                    b->nulls[i][row] = 0;
+                    if (tf_batch_set_timestamp(b, row, i, v) != TF_OK) return TF_ERROR;
                 } else {
                     /* Also try parsing a date-only string as timestamp at midnight */
                     int32_t dv;
                     if (fast_date(fields[i].ptr, fields[i].len, &dv)) {
-                        ((int64_t *)b->columns[i])[row] = (int64_t)dv * 86400LL * 1000000LL;
-                        b->nulls[i][row] = 0;
+                        v = (int64_t)dv * 86400LL * 1000000LL;
+                        if (tf_batch_set_timestamp(b, row, i, v) != TF_OK) return TF_ERROR;
                     } else {
-                        b->nulls[i][row] = 1;
+                        if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
                     }
                 }
                 break;
             }
             default:
-                b->nulls[i][row] = 1;
+                if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
                 break;
         }
     }
     /* Null-fill extra columns */
     for (size_t i = cols; i < n_cols; i++) {
-        b->nulls[i][row] = 1;
+        if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
     }
     if (tf_batch_expose_row(b, row) != TF_OK) return TF_ERROR;
     return TF_OK;
@@ -1070,12 +1065,18 @@ static tf_batch *convert_batch_types(csv_decoder_state *st) {
     for (size_t r = 0; r < src->n_rows; r++) {
         for (size_t c = 0; c < st->n_cols; c++) {
             if (src->nulls[c][r]) {
-                dst->nulls[c][r] = 1;
+                if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                    tf_batch_free(dst);
+                    return NULL;
+                }
                 continue;
             }
             const char *val = ((char **)src->columns[c])[r];
             if (!val) {
-                dst->nulls[c][r] = 1;
+                if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                    tf_batch_free(dst);
+                    return NULL;
+                }
                 continue;
             }
             size_t vlen = strlen(val);
@@ -1083,20 +1084,30 @@ static tf_batch *convert_batch_types(csv_decoder_state *st) {
                 case TF_TYPE_INT64: {
                     int64_t v;
                     if (fast_int64(val, vlen, &v)) {
-                        ((int64_t *)dst->columns[c])[r] = v;
-                        dst->nulls[c][r] = 0;
+                        if (tf_batch_set_int64(dst, r, c, v) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
                     } else {
-                        dst->nulls[c][r] = 1;
+                        if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
                     }
                     break;
                 }
                 case TF_TYPE_FLOAT64: {
                     double v;
                     if (fast_double(val, vlen, &v)) {
-                        ((double *)dst->columns[c])[r] = v;
-                        dst->nulls[c][r] = 0;
+                        if (tf_batch_set_float64(dst, r, c, v) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
                     } else {
-                        dst->nulls[c][r] = 1;
+                        if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
                     }
                     break;
                 }
@@ -1110,31 +1121,47 @@ static tf_batch *convert_batch_types(csv_decoder_state *st) {
                 case TF_TYPE_DATE: {
                     int32_t dv;
                     if (fast_date(val, vlen, &dv)) {
-                        ((int32_t *)dst->columns[c])[r] = dv;
-                        dst->nulls[c][r] = 0;
+                        if (tf_batch_set_date(dst, r, c, dv) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
                     } else {
-                        dst->nulls[c][r] = 1;
+                        if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
                     }
                     break;
                 }
                 case TF_TYPE_TIMESTAMP: {
                     int64_t tv;
                     if (fast_timestamp(val, vlen, &tv)) {
-                        ((int64_t *)dst->columns[c])[r] = tv;
-                        dst->nulls[c][r] = 0;
+                        if (tf_batch_set_timestamp(dst, r, c, tv) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
                     } else {
                         int32_t dv;
                         if (fast_date(val, vlen, &dv)) {
-                            ((int64_t *)dst->columns[c])[r] = (int64_t)dv * 86400LL * 1000000LL;
-                            dst->nulls[c][r] = 0;
+                            tv = (int64_t)dv * 86400LL * 1000000LL;
+                            if (tf_batch_set_timestamp(dst, r, c, tv) != TF_OK) {
+                                tf_batch_free(dst);
+                                return NULL;
+                            }
                         } else {
-                            dst->nulls[c][r] = 1;
+                            if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                                tf_batch_free(dst);
+                                return NULL;
+                            }
                         }
                     }
                     break;
                 }
                 default:
-                    dst->nulls[c][r] = 1;
+                    if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                        tf_batch_free(dst);
+                        return NULL;
+                    }
                     break;
             }
         }
@@ -1342,7 +1369,10 @@ static int process_line(csv_decoder_state *st, const char *line, size_t line_len
             tf_batch_free(st->batch);
             st->batch = NULL;
             st->types_frozen = 1;
-            if (emit_batch(final, out, n_out, out_cap) != TF_OK) return TF_ERROR;
+            if (emit_batch(final, out, n_out, out_cap) != TF_OK) {
+                tf_batch_free(final);
+                return TF_ERROR;
+            }
         } else {
             /* Already typed, emit directly (no conversion needed) */
             if (emit_batch(st->batch, out, n_out, out_cap) != TF_OK) return TF_ERROR;
@@ -1458,7 +1488,10 @@ static int csv_flush(tf_decoder *self, tf_batch ***out, size_t *n_out, tf_side_c
         tf_batch *schema_only = make_schema_only_batch(st);
         if (!schema_only) return TF_ERROR;
         st->types_frozen = 1;
-        if (emit_batch(schema_only, out, n_out, &out_cap) != TF_OK) return TF_ERROR;
+        if (emit_batch(schema_only, out, n_out, &out_cap) != TF_OK) {
+            tf_batch_free(schema_only);
+            return TF_ERROR;
+        }
     }
 
     /* Emit any remaining partial batch */
@@ -1473,7 +1506,10 @@ static int csv_flush(tf_decoder *self, tf_batch ***out, size_t *n_out, tf_side_c
             if (!final) return TF_ERROR;
             tf_batch_free(st->batch);
             st->batch = NULL;
-            if (emit_batch(final, out, n_out, &out_cap) != TF_OK) return TF_ERROR;
+            if (emit_batch(final, out, n_out, &out_cap) != TF_OK) {
+                tf_batch_free(final);
+                return TF_ERROR;
+            }
         } else {
             /* Already typed, emit directly */
             if (emit_batch(st->batch, out, n_out, &out_cap) != TF_OK) return TF_ERROR;

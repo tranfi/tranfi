@@ -11,11 +11,13 @@
 #include "tranfi.h"
 #include <assert.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t nmemb, size_t size);
@@ -36,6 +38,37 @@ static int oom_should_fail(void) {
         return 1;
     }
     return 0;
+}
+
+static const char *oom_tmp_root(void) {
+    const char *root = getenv("TRANFI_TEST_TMPDIR");
+    if (root && root[0]) return root;
+    root = getenv("TMPDIR");
+    return (root && root[0]) ? root : "/tmp";
+}
+
+static void ensure_oom_tmp_root(void) {
+    const char *root = oom_tmp_root();
+    if (strcmp(root, "/tmp") == 0) return;
+    if (mkdir(root, 0700) != 0 && errno != EEXIST) {
+        assert(!"failed to create OOM temp root");
+    }
+}
+
+static void make_oom_tmp_path(char *buf, size_t cap,
+                              const char *prefix, const char *suffix) {
+    ensure_oom_tmp_root();
+    int n = snprintf(buf, cap, "%s/%s_%ld%s", oom_tmp_root(), prefix,
+                     (long)getpid(), suffix ? suffix : "");
+    assert(n > 0 && (size_t)n < cap);
+}
+
+static void format_case_dsl(char *buf, size_t cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, cap, fmt, ap);
+    va_end(ap);
+    assert(n > 0 && (size_t)n < cap);
 }
 
 void *__wrap_malloc(size_t size) {
@@ -417,6 +450,12 @@ int main(void) {
         " Alice ,30,NY,10,a|b,1,4,red\n"
         "Bob,25,LA,20,c,2,5,blue\n"
         "Cara,35,NY,30,d|e,3,6,red\n";
+    const char *expr_people =
+        "id,name,age,city,score,flag\n"
+        "1,Alice,30,NY,10,true\n"
+        "2,Bob,25,,20,false\n"
+        "3,Cara,41,SF,30,true\n"
+        "4,Dan,18,LA,7,false\n";
     const char *sorted_people =
         "name,age,city,score,tags,x,y,color\n"
         "Bob,25,LA,20,c,2,5,blue\n"
@@ -460,6 +499,11 @@ int main(void) {
         "{\"user\":{\"name\":\"Alice\",\"age\":30}}\n"
         "{\"user\":{\"name\":\"Bob\",\"age\":\"bad\"}}\n"
         "{\"other\":true}\n";
+    const char *jsonl_malformed_rows =
+        "{\"name\":\"Alice\",\"age\":30}\n"
+        "not-json-record-long\n"
+        "[1,2]\n"
+        "{\"name\":\"Bob\",\"age\":25}\n";
     const char *audit_rows =
         "name,city,note,secret\n"
         "Alice,NY,NA,111\n"
@@ -470,8 +514,44 @@ int main(void) {
         "Alice,30,NY\n"
         "Bob,NA,LA\n"
         "Cara,35,SF # trailing note\n";
+    const char *typed_csv_rows =
+        "id,score,d,ts,flag,name\n"
+        "1,1.5,2024-01-01,2024-01-01T01:02:03.123456Z,true,Alice\n"
+        "2,2.25,2024-01-02,2024-01-02,false,Bob\n"
+        "bad,,bad,bad,maybe,Charlie\n"
+        "4,4.5,2024-01-04,2024-01-04T05:06:07Z,true,Diana\n";
 
-    const char *union_lookup_path = "/tmp/tranfi_oom_union_lookup.csv";
+    run_case_no_silent_output_oom(
+        "derive_cran_expression_helpers",
+        "csv batch_size=1 nulls= | derive "
+        "band=case_when(col(score)<10,'low',col(score)<25,'mid','high') "
+        "city2=coalesce(col(city),'unknown') "
+        "code=case_match(col(city),'NY','east','LA','west','other') "
+        "ok=if_all(between(col(age),18,45),inrange(col(score),7,30)) "
+        "any=if_any(contains(col(name),'a'),contains(col(city),'N')) | csv",
+        expr_people,
+        900);
+    run_case_no_silent_output_oom(
+        "filter_cran_predicate_helpers",
+        "csv batch_size=1 nulls= | filter "
+        "\"if_any(between(col(age),20,35),contains(col(city),'S'))\" | csv",
+        expr_people,
+        700);
+    run_case_no_silent_output_oom(
+        "validate_cran_expression_helpers",
+        "csv batch_size=1 nulls= | validate "
+        "\"if_all(between(col(age),18,45),coalesce(col(flag),false))\" | csv",
+        expr_people,
+        900);
+    run_case_no_silent_output_oom(
+        "csv_typed_post_inference_materialization",
+        "csv batch_size=2 | csv",
+        typed_csv_rows,
+        220);
+
+    char union_lookup_path[512];
+    make_oom_tmp_path(union_lookup_path, sizeof(union_lookup_path),
+                      "tranfi_oom_union_lookup", ".csv");
     FILE *union_lookup = fopen(union_lookup_path, "wb");
     assert(union_lookup);
     fputs("name,age,city,score,tags,x,y,color\n"
@@ -479,12 +559,16 @@ int main(void) {
           "Dup,99,NY,99,q,9,9,red\n",
           union_lookup);
     assert(fclose(union_lookup) == 0);
-    const char *sorted_lookup_path = "/tmp/tranfi_oom_sorted_lookup.csv";
+    char sorted_lookup_path[512];
+    make_oom_tmp_path(sorted_lookup_path, sizeof(sorted_lookup_path),
+                      "tranfi_oom_sorted_lookup", ".csv");
     FILE *sorted_lookup = fopen(sorted_lookup_path, "wb");
     assert(sorted_lookup);
     fputs("city\nLA\nNY\n", sorted_lookup);
     assert(fclose(sorted_lookup) == 0);
-    const char *join_lookup_path = "/tmp/tranfi_oom_join_lookup.csv";
+    char join_lookup_path[512];
+    make_oom_tmp_path(join_lookup_path, sizeof(join_lookup_path),
+                      "tranfi_oom_join_lookup", ".csv");
     FILE *join_lookup = fopen(join_lookup_path, "wb");
     assert(join_lookup);
     fputs("city,pop,region\n"
@@ -506,7 +590,9 @@ int main(void) {
         join_silent_dsl,
         "city,name\nNY,Alice\nSF,Cara\n",
         520);
-    const char *join_sorted_lookup_path = "/tmp/tranfi_oom_join_sorted_lookup.csv";
+    char join_sorted_lookup_path[512];
+    make_oom_tmp_path(join_sorted_lookup_path, sizeof(join_sorted_lookup_path),
+                      "tranfi_oom_join_sorted_lookup", ".csv");
     FILE *join_sorted_lookup = fopen(join_sorted_lookup_path, "wb");
     assert(join_sorted_lookup);
     fputs("city,pop,region\n"
@@ -554,12 +640,16 @@ int main(void) {
         sorted_silent_dsl,
         sorted_people_unmatched,
         620);
-    const char *bag_lookup_path = "/tmp/tranfi_oom_bag_lookup.csv";
+    char bag_lookup_path[512];
+    make_oom_tmp_path(bag_lookup_path, sizeof(bag_lookup_path),
+                      "tranfi_oom_bag_lookup", ".csv");
     FILE *bag_lookup = fopen(bag_lookup_path, "wb");
     assert(bag_lookup);
     fputs("city\nNY\n", bag_lookup);
     assert(fclose(bag_lookup) == 0);
-    const char *spill_bag_lookup_path = "/tmp/tranfi_oom_spill_bag_lookup.csv";
+    char spill_bag_lookup_path[512];
+    make_oom_tmp_path(spill_bag_lookup_path, sizeof(spill_bag_lookup_path),
+                      "tranfi_oom_spill_bag_lookup", ".csv");
     FILE *spill_bag_lookup = fopen(spill_bag_lookup_path, "wb");
     assert(spill_bag_lookup);
     fputs("city\nNY\nNY\nLA\n", spill_bag_lookup);
@@ -696,7 +786,9 @@ int main(void) {
         "csv batch_size=1 | pivot metric value sum categories=x,y,z sorted=true | csv",
         pivot_silent_rows,
         520);
-    const char *sorted_union_lookup_path = "/tmp/tranfi_oom_sorted_union_lookup.csv";
+    char sorted_union_lookup_path[512];
+    make_oom_tmp_path(sorted_union_lookup_path, sizeof(sorted_union_lookup_path),
+                      "tranfi_oom_sorted_union_lookup", ".csv");
     FILE *sorted_union_lookup = fopen(sorted_union_lookup_path, "wb");
     assert(sorted_union_lookup);
     fputs("name,age,city,score,tags,x,y,color\n"
@@ -714,7 +806,9 @@ int main(void) {
         sorted_silent_dsl,
         sorted_people,
         620);
-    const char *stack_path = "/tmp/tranfi_oom_stack.csv";
+    char stack_path[512];
+    make_oom_tmp_path(stack_path, sizeof(stack_path),
+                      "tranfi_oom_stack", ".csv");
     FILE *stack_file = fopen(stack_path, "wb");
     assert(stack_file);
     fputs("name,age,city,score,tags,x,y,color\n", stack_file);
@@ -819,18 +913,36 @@ int main(void) {
         json_schema_side_rows,
         520);
     run_case_no_silent_channel_oom(
+        "jsonl_malformed_warn_side_channel_materialization",
+        "jsonl batch_size=1 on_error=warn max_error_bytes=8 | csv",
+        jsonl_malformed_rows,
+        560);
+    run_case_no_silent_channel_oom(
+        "jsonl_malformed_quarantine_side_channel_materialization",
+        "jsonl batch_size=1 on_error=quarantine max_error_bytes=8 | csv",
+        jsonl_malformed_rows,
+        560);
+    run_case_no_silent_channel_oom(
         "frequency_overflow_side_channel_materialization",
         "csv batch_size=1 | frequency city max_values=1 overflow=other "
         "audit audit_limit=2 | csv",
         people,
         560);
     run_case_no_silent_channel_oom(
+        "cast_audit_side_channel_materialization",
+        "csv batch_size=1 | cast age=int on_error=null audit audit_limit=3 "
+        "audit_columns=name,age audit_redact=age | csv",
+        people,
+        620);
+    run_case_no_silent_channel_oom(
         "normalize_audit_side_channel_materialization",
         "csv batch_size=1 | normalize score zscore audit audit_limit=2 "
         "audit_columns=name,score audit_hash_columns=score | csv",
         people,
         620);
-    const char *rules_path = "/tmp/tranfi_oom_rules.json";
+    char rules_path[512];
+    make_oom_tmp_path(rules_path, sizeof(rules_path),
+                      "tranfi_oom_rules", ".json");
     FILE *rules_file = fopen(rules_path, "wb");
     assert(rules_file);
     fputs("{\"name\":\"quality_file\",\"audit\":true,\"audit_limit\":3,"
@@ -841,7 +953,9 @@ int main(void) {
           "]}",
           rules_file);
     assert(fclose(rules_file) == 0);
-    const char *spill_root = "/tmp/tranfi_oom_spill_root";
+    char spill_root[512];
+    make_oom_tmp_path(spill_root, sizeof(spill_root),
+                      "tranfi_oom_spill_root", "");
     remove(spill_root);
     if (mkdir(spill_root, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create OOM spill root");
@@ -1010,6 +1124,182 @@ int main(void) {
         sorted_people,
         360);
 
+    char validate_rules_file_dsl[1024];
+    format_case_dsl(validate_rules_file_dsl, sizeof(validate_rules_file_dsl),
+                    "csv batch_size=1 | validate rules_file=%s | csv",
+                    rules_path);
+    char stack_file_dsl[1024];
+    format_case_dsl(stack_file_dsl, sizeof(stack_file_dsl),
+                    "csv batch_size=1 | stack %s --tag src | csv",
+                    stack_path);
+    char spill_unique_case_dsl[1024];
+    format_case_dsl(spill_unique_case_dsl, sizeof(spill_unique_case_dsl),
+                    "csv batch_size=1 | unique city spill_dir=%s "
+                    "spill_run_rows=2 spill_output_rows=2 | csv",
+                    spill_root);
+    char spill_group_agg_case_dsl[1024];
+    format_case_dsl(spill_group_agg_case_dsl, sizeof(spill_group_agg_case_dsl),
+                    "csv batch_size=1 | group-agg city sum:score:total "
+                    "count:*:rows spill_dir=%s spill_run_rows=2 "
+                    "spill_output_rows=2 | csv",
+                    spill_root);
+    char spill_pivot_case_dsl[1024];
+    format_case_dsl(spill_pivot_case_dsl, sizeof(spill_pivot_case_dsl),
+                    "csv batch_size=1 | pivot color score sum categories=red,blue "
+                    "max_categories=4 sorted=false spill_dir=%s "
+                    "spill_memory_bytes=4096 spill_run_rows=2 "
+                    "spill_output_rows=2 | csv",
+                    spill_root);
+    char spill_filtering_join_case_dsl[1024];
+    format_case_dsl(spill_filtering_join_case_dsl,
+                    sizeof(spill_filtering_join_case_dsl),
+                    "csv batch_size=1 | semi-join %s on city spill_dir=%s "
+                    "spill_run_rows=2 spill_output_rows=2 | csv",
+                    join_lookup_path, spill_root);
+    char spill_anti_join_case_dsl[1024];
+    format_case_dsl(spill_anti_join_case_dsl, sizeof(spill_anti_join_case_dsl),
+                    "csv batch_size=1 | anti-join %s on city spill_dir=%s "
+                    "spill_run_rows=2 spill_output_rows=2 | csv",
+                    join_lookup_path, spill_root);
+    char spill_mutating_join_case_dsl[1280];
+    format_case_dsl(spill_mutating_join_case_dsl,
+                    sizeof(spill_mutating_join_case_dsl),
+                    "csv batch_size=1 | join %s on city max_matches_per_row=2 "
+                    "spill_dir=%s spill_memory_bytes=4096 spill_run_rows=2 "
+                    "spill_output_rows=2 | csv",
+                    join_lookup_path, spill_root);
+    char hash_mutating_join_case_dsl[1280];
+    format_case_dsl(hash_mutating_join_case_dsl,
+                    sizeof(hash_mutating_join_case_dsl),
+                    "csv batch_size=1 | join %s on city max_lookup_rows=8 "
+                    "max_lookup_keys=8 max_lookup_bytes=4096 "
+                    "max_state_bytes=32768 max_matches_per_row=2 "
+                    "max_output_rows=16 | csv",
+                    join_lookup_path);
+    char hash_filtering_join_case_dsl[1024];
+    format_case_dsl(hash_filtering_join_case_dsl,
+                    sizeof(hash_filtering_join_case_dsl),
+                    "csv batch_size=1 | semi-join %s on city max_lookup_rows=8 "
+                    "max_lookup_keys=8 max_lookup_bytes=4096 | csv",
+                    join_lookup_path);
+    char hash_left_join_nulls_case_dsl[1280];
+    format_case_dsl(hash_left_join_nulls_case_dsl,
+                    sizeof(hash_left_join_nulls_case_dsl),
+                    "csv batch_size=1 | join %s on city --left max_lookup_rows=8 "
+                    "max_lookup_keys=8 max_lookup_bytes=4096 "
+                    "max_matches_per_row=2 max_output_rows=16 | csv",
+                    join_lookup_path);
+    char sorted_mutating_join_case_dsl[1024];
+    format_case_dsl(sorted_mutating_join_case_dsl,
+                    sizeof(sorted_mutating_join_case_dsl),
+                    "csv batch_size=1 | join %s on city sorted=true "
+                    "max_matches_per_row=2 max_output_rows=16 | csv",
+                    join_sorted_lookup_path);
+    char sorted_left_join_nulls_case_dsl[1024];
+    format_case_dsl(sorted_left_join_nulls_case_dsl,
+                    sizeof(sorted_left_join_nulls_case_dsl),
+                    "csv batch_size=1 | join %s on city --left sorted=true "
+                    "max_matches_per_row=2 max_output_rows=16 | csv",
+                    join_sorted_lookup_path);
+    char sorted_filtering_joins_case_dsl[1024];
+    format_case_dsl(sorted_filtering_joins_case_dsl,
+                    sizeof(sorted_filtering_joins_case_dsl),
+                    "csv batch_size=1 | semi-join %s on city sorted=true | csv",
+                    join_sorted_lookup_path);
+    char sorted_anti_join_case_dsl[1024];
+    format_case_dsl(sorted_anti_join_case_dsl,
+                    sizeof(sorted_anti_join_case_dsl),
+                    "csv batch_size=1 | anti-join %s on city sorted=true | csv",
+                    join_sorted_lookup_path);
+    char hash_set_schema_capture_case_dsl[1280];
+    format_case_dsl(hash_set_schema_capture_case_dsl,
+                    sizeof(hash_set_schema_capture_case_dsl),
+                    "csv batch_size=1 | intersect %s columns=city "
+                    "max_lookup_rows=8 max_lookup_keys=8 "
+                    "max_lookup_bytes=4096 max_output_keys=8 "
+                    "max_state_bytes=32768 | csv",
+                    union_lookup_path);
+    char sorted_set_schema_capture_case_dsl[1024];
+    format_case_dsl(sorted_set_schema_capture_case_dsl,
+                    sizeof(sorted_set_schema_capture_case_dsl),
+                    "csv batch_size=1 | intersect %s columns=city sorted=true | csv",
+                    sorted_lookup_path);
+    char hash_bag_set_modes_case_dsl[1280];
+    format_case_dsl(hash_bag_set_modes_case_dsl,
+                    sizeof(hash_bag_set_modes_case_dsl),
+                    "csv batch_size=1 | intersect-all %s columns=city "
+                    "max_lookup_keys=8 max_lookup_bytes=4096 | "
+                    "setdiff-all %s columns=city max_lookup_keys=8 "
+                    "max_lookup_bytes=4096 | csv",
+                    bag_lookup_path, bag_lookup_path);
+    char hash_setdiff_mode_case_dsl[1024];
+    format_case_dsl(hash_setdiff_mode_case_dsl,
+                    sizeof(hash_setdiff_mode_case_dsl),
+                    "csv batch_size=1 | setdiff %s columns=city "
+                    "max_lookup_keys=8 max_output_keys=8 | csv",
+                    union_lookup_path);
+    char sorted_bag_set_modes_case_dsl[1280];
+    format_case_dsl(sorted_bag_set_modes_case_dsl,
+                    sizeof(sorted_bag_set_modes_case_dsl),
+                    "csv batch_size=1 | intersect-all %s columns=city sorted=true | "
+                    "setdiff-all %s columns=city sorted=true | csv",
+                    sorted_lookup_path, sorted_lookup_path);
+    char sorted_setdiff_mode_case_dsl[1024];
+    format_case_dsl(sorted_setdiff_mode_case_dsl,
+                    sizeof(sorted_setdiff_mode_case_dsl),
+                    "csv batch_size=1 | setdiff %s columns=city sorted=true | csv",
+                    sorted_lookup_path);
+    char spill_set_schema_capture_case_dsl[1280];
+    format_case_dsl(spill_set_schema_capture_case_dsl,
+                    sizeof(spill_set_schema_capture_case_dsl),
+                    "csv batch_size=1 | intersect %s columns=city spill_dir=%s "
+                    "spill_memory_bytes=4096 spill_run_rows=16 "
+                    "spill_output_rows=16 | csv",
+                    union_lookup_path, spill_root);
+    char spill_setdiff_schema_capture_case_dsl[1280];
+    format_case_dsl(spill_setdiff_schema_capture_case_dsl,
+                    sizeof(spill_setdiff_schema_capture_case_dsl),
+                    "csv batch_size=1 | setdiff %s columns=city spill_dir=%s "
+                    "spill_run_rows=16 spill_output_rows=16 | csv",
+                    union_lookup_path, spill_root);
+    char spill_bag_set_schema_capture_case_dsl[1280];
+    format_case_dsl(spill_bag_set_schema_capture_case_dsl,
+                    sizeof(spill_bag_set_schema_capture_case_dsl),
+                    "csv batch_size=1 | intersect-all %s columns=city "
+                    "spill_dir=%s spill_run_rows=16 spill_output_rows=16 | csv",
+                    bag_lookup_path, spill_root);
+    char spill_bag_setdiff_schema_capture_case_dsl[1280];
+    format_case_dsl(spill_bag_setdiff_schema_capture_case_dsl,
+                    sizeof(spill_bag_setdiff_schema_capture_case_dsl),
+                    "csv batch_size=1 | setdiff-all %s columns=city "
+                    "spill_dir=%s spill_run_rows=16 spill_output_rows=16 | csv",
+                    bag_lookup_path, spill_root);
+    char union_schema_capture_case_dsl[1024];
+    format_case_dsl(union_schema_capture_case_dsl,
+                    sizeof(union_schema_capture_case_dsl),
+                    "csv batch_size=1 | union %s columns=city max_output_keys=8 | csv",
+                    union_lookup_path);
+    char union_all_append_case_dsl[1024];
+    format_case_dsl(union_all_append_case_dsl, sizeof(union_all_append_case_dsl),
+                    "csv batch_size=1 | union-all %s | csv",
+                    union_lookup_path);
+    char sorted_union_schema_capture_case_dsl[1024];
+    format_case_dsl(sorted_union_schema_capture_case_dsl,
+                    sizeof(sorted_union_schema_capture_case_dsl),
+                    "csv batch_size=1 | union %s columns=city sorted=true | csv",
+                    sorted_union_lookup_path);
+    char spill_union_schema_capture_case_dsl[1280];
+    format_case_dsl(spill_union_schema_capture_case_dsl,
+                    sizeof(spill_union_schema_capture_case_dsl),
+                    "csv batch_size=1 | union %s columns=city spill_dir=%s "
+                    "spill_run_rows=16 spill_output_rows=16 | csv",
+                    union_lookup_path, spill_root);
+    char sql_join_rowid_window_dsl[1024];
+    format_case_dsl(sql_join_rowid_window_dsl, sizeof(sql_join_rowid_window_dsl),
+                    "csv | join %s on city --left | rowid city | "
+                    "rolling-mean score 2 mean2 | csv",
+                    join_lookup_path);
+
     const oom_case cases[] = {
         {
             "row_local_audit_select",
@@ -1174,6 +1464,12 @@ int main(void) {
             300
         },
         {
+            "key_state_frequency_approx",
+            "csv batch_size=1 | frequency city mode=approx max_values=3 | csv",
+            people,
+            300
+        },
+        {
             "category_ops",
             "csv batch_size=1 | frequency city max_values=8 | onehot color max_categories=8 | label-encode city city_id max_categories=8 | csv",
             people,
@@ -1229,7 +1525,7 @@ int main(void) {
         },
         {
             "validate_rules_file",
-            "csv batch_size=1 | validate rules_file=/tmp/tranfi_oom_rules.json | csv",
+            validate_rules_file_dsl,
             selector_people,
             560
         },
@@ -1307,7 +1603,7 @@ int main(void) {
         },
         {
             "stack_file",
-            "csv batch_size=1 | stack /tmp/tranfi_oom_stack.csv --tag src | csv",
+            stack_file_dsl,
             people,
             460
         },
@@ -1361,163 +1657,163 @@ int main(void) {
         },
         {
             "spill_unique",
-            "csv batch_size=1 | unique city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=2 spill_output_rows=2 | csv",
+            spill_unique_case_dsl,
             people,
             520
         },
         {
             "spill_group_agg",
-            "csv batch_size=1 | group-agg city sum:score:total count:*:rows spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=2 spill_output_rows=2 | csv",
+            spill_group_agg_case_dsl,
             people,
             560
         },
         {
             "spill_pivot",
-            "csv batch_size=1 | pivot color score sum categories=red,blue max_categories=4 sorted=false spill_dir=/tmp/tranfi_oom_spill_root spill_memory_bytes=4096 spill_run_rows=2 spill_output_rows=2 | csv",
+            spill_pivot_case_dsl,
             people,
             640
         },
         {
             "spill_filtering_join",
-            "csv batch_size=1 | semi-join /tmp/tranfi_oom_join_lookup.csv on city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=2 spill_output_rows=2 | csv",
+            spill_filtering_join_case_dsl,
             people,
             560
         },
         {
             "spill_anti_join",
-            "csv batch_size=1 | anti-join /tmp/tranfi_oom_join_lookup.csv on city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=2 spill_output_rows=2 | csv",
+            spill_anti_join_case_dsl,
             people,
             560
         },
         {
             "spill_mutating_join",
-            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city max_matches_per_row=2 spill_dir=/tmp/tranfi_oom_spill_root spill_memory_bytes=4096 spill_run_rows=2 spill_output_rows=2 | csv",
+            spill_mutating_join_case_dsl,
             people,
             680
         },
         {
             "hash_mutating_join",
-            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_state_bytes=32768 max_matches_per_row=2 max_output_rows=16 | csv",
+            hash_mutating_join_case_dsl,
             people,
             580
         },
         {
             "hash_filtering_join",
-            "csv batch_size=1 | semi-join /tmp/tranfi_oom_join_lookup.csv on city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 | csv",
+            hash_filtering_join_case_dsl,
             people,
             460
         },
         {
             "hash_left_join_nulls",
-            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city --left max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_matches_per_row=2 max_output_rows=16 | csv",
+            hash_left_join_nulls_case_dsl,
             people,
             560
         },
         {
             "sorted_mutating_join",
-            "csv batch_size=1 | join /tmp/tranfi_oom_join_sorted_lookup.csv on city sorted=true max_matches_per_row=2 max_output_rows=16 | csv",
+            sorted_mutating_join_case_dsl,
             sorted_people,
             560
         },
         {
             "sorted_left_join_nulls",
-            "csv batch_size=1 | join /tmp/tranfi_oom_join_sorted_lookup.csv on city --left sorted=true max_matches_per_row=2 max_output_rows=16 | csv",
+            sorted_left_join_nulls_case_dsl,
             sorted_people_unmatched,
             600
         },
         {
             "sorted_filtering_joins",
-            "csv batch_size=1 | semi-join /tmp/tranfi_oom_join_sorted_lookup.csv on city sorted=true | csv",
+            sorted_filtering_joins_case_dsl,
             sorted_people,
             420
         },
         {
             "sorted_anti_join",
-            "csv batch_size=1 | anti-join /tmp/tranfi_oom_join_sorted_lookup.csv on city sorted=true | csv",
+            sorted_anti_join_case_dsl,
             sorted_people_unmatched,
             420
         },
         {
             "hash_set_schema_capture",
-            "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_output_keys=8 max_state_bytes=32768 | csv",
+            hash_set_schema_capture_case_dsl,
             people,
             420
         },
         {
             "sorted_set_schema_capture",
-            "csv batch_size=1 | intersect /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | csv",
+            sorted_set_schema_capture_case_dsl,
             sorted_people,
             340
         },
         {
             "hash_bag_set_modes",
-            "csv batch_size=1 | intersect-all /tmp/tranfi_oom_bag_lookup.csv columns=city max_lookup_keys=8 max_lookup_bytes=4096 | setdiff-all /tmp/tranfi_oom_bag_lookup.csv columns=city max_lookup_keys=8 max_lookup_bytes=4096 | csv",
+            hash_bag_set_modes_case_dsl,
             people,
             420
         },
         {
             "hash_setdiff_mode",
-            "csv batch_size=1 | setdiff /tmp/tranfi_oom_union_lookup.csv columns=city max_lookup_keys=8 max_output_keys=8 | csv",
+            hash_setdiff_mode_case_dsl,
             people,
             340
         },
         {
             "sorted_bag_set_modes",
-            "csv batch_size=1 | intersect-all /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | setdiff-all /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | csv",
+            sorted_bag_set_modes_case_dsl,
             sorted_people,
             420
         },
         {
             "sorted_setdiff_mode",
-            "csv batch_size=1 | setdiff /tmp/tranfi_oom_sorted_lookup.csv columns=city sorted=true | csv",
+            sorted_setdiff_mode_case_dsl,
             sorted_people,
             340
         },
         {
             "spill_set_schema_capture",
-            "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_memory_bytes=4096 spill_run_rows=16 spill_output_rows=16 | csv",
+            spill_set_schema_capture_case_dsl,
             people,
             420
         },
         {
             "spill_setdiff_schema_capture",
-            "csv batch_size=1 | setdiff /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            spill_setdiff_schema_capture_case_dsl,
             people,
             380
         },
         {
             "spill_bag_set_schema_capture",
-            "csv batch_size=1 | intersect-all /tmp/tranfi_oom_bag_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            spill_bag_set_schema_capture_case_dsl,
             people,
             420
         },
         {
             "spill_bag_setdiff_schema_capture",
-            "csv batch_size=1 | setdiff-all /tmp/tranfi_oom_bag_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            spill_bag_setdiff_schema_capture_case_dsl,
             people,
             420
         },
         {
             "union_schema_capture",
-            "csv batch_size=1 | union /tmp/tranfi_oom_union_lookup.csv columns=city max_output_keys=8 | csv",
+            union_schema_capture_case_dsl,
             people,
             320
         },
         {
             "union_all_append",
-            "csv batch_size=1 | union-all /tmp/tranfi_oom_union_lookup.csv | csv",
+            union_all_append_case_dsl,
             people,
             360
         },
         {
             "sorted_union_schema_capture",
-            "csv batch_size=1 | union /tmp/tranfi_oom_sorted_union_lookup.csv columns=city sorted=true | csv",
+            sorted_union_schema_capture_case_dsl,
             sorted_people,
             420
         },
         {
             "spill_union_schema_capture",
-            "csv batch_size=1 | union /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            spill_union_schema_capture_case_dsl,
             people,
             380
         },
@@ -1640,7 +1936,7 @@ int main(void) {
         },
         {
             "sql_join_rowid_window",
-            "csv | join /tmp/tranfi_oom_join_lookup.csv on city --left | rowid city | rolling-mean score 2 mean2 | csv",
+            sql_join_rowid_window_dsl,
             1,
             360
         },

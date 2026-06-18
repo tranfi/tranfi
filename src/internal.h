@@ -235,6 +235,8 @@ TF_WARN_UNUSED int tf_batch_append_row_with_null_extra(tf_batch *dst,
                                                        size_t n_extra);
 
 void tf_batch_free(tf_batch *b);
+void tf_batch_array_free_items(tf_batch **batches, size_t n_batches);
+void tf_batch_array_free(tf_batch **batches, size_t n_batches);
 
 /* ---- Audit / side-channel row serialization helpers ---- */
 

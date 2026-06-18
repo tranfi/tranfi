@@ -132,22 +132,43 @@ static int path_is_under_root(const char *root, const char *path) {
     return strcmp(root, path) == 0 || (strncmp(root, path, n) == 0 && path[n] == '/');
 }
 
+static int copy_path_checked(const char *src, char *out, size_t out_sz) {
+    if (!src || !out || out_sz == 0) return TF_ERROR;
+    size_t n = strlen(src);
+    if (n + 1 > out_sz) return TF_ERROR;
+    memcpy(out, src, n + 1);
+    return TF_OK;
+}
+
+static int canonicalize_existing_path(const char *path, char *out, size_t out_sz) {
+#ifdef _WIN32
+    return normalize_path_lexical(path, out, out_sz);
+#else
+    char *resolved = realpath(path, NULL);
+    if (!resolved) return TF_ERROR;
+    int rc = copy_path_checked(resolved, out, out_sz);
+    free(resolved);
+    return rc;
+#endif
+}
+
 static int resolve_workspace_path(const char *workspace_root, const char *logical,
                                   char *out, size_t out_sz) {
     char root[TF_POLICY_PATH_MAX];
     char joined[TF_POLICY_PATH_MAX];
-    char normalized[TF_POLICY_PATH_MAX];
-    if (normalize_path_lexical(workspace_root, root, sizeof(root)) != TF_OK) return TF_ERROR;
+    char candidate[TF_POLICY_PATH_MAX];
+    char resolved[TF_POLICY_PATH_MAX];
+    if (canonicalize_existing_path(workspace_root, root, sizeof(root)) != TF_OK) return TF_ERROR;
     if (path_is_absolute(logical)) {
-        if (normalize_path_lexical(logical, normalized, sizeof(normalized)) != TF_OK) return TF_ERROR;
+        if (normalize_path_lexical(logical, candidate, sizeof(candidate)) != TF_OK) return TF_ERROR;
     } else {
         int n = snprintf(joined, sizeof(joined), "%s/%s", root, logical);
         if (n < 0 || (size_t)n >= sizeof(joined)) return TF_ERROR;
-        if (normalize_path_lexical(joined, normalized, sizeof(normalized)) != TF_OK) return TF_ERROR;
+        if (normalize_path_lexical(joined, candidate, sizeof(candidate)) != TF_OK) return TF_ERROR;
     }
-    if (!path_is_under_root(root, normalized)) return TF_ERROR;
-    if (strlen(normalized) + 1 > out_sz) return TF_ERROR;
-    strcpy(out, normalized);
+    if (canonicalize_existing_path(candidate, resolved, sizeof(resolved)) != TF_OK) return TF_ERROR;
+    if (!path_is_under_root(root, resolved)) return TF_ERROR;
+    if (copy_path_checked(resolved, out, out_sz) != TF_OK) return TF_ERROR;
     return TF_OK;
 }
 
@@ -219,6 +240,12 @@ static int node_string_arg_nonempty(const tf_ir_node *node, const char *name) {
     return cJSON_IsString(item) && item->valuestring && item->valuestring[0] != '\0';
 }
 
+static int node_string_arg_equals(const tf_ir_node *node, const char *name, const char *value) {
+    cJSON *item = node && node->args ? cJSON_GetObjectItemCaseSensitive(node->args, name) : NULL;
+    return cJSON_IsString(item) && item->valuestring && value &&
+           strcmp(item->valuestring, value) == 0;
+}
+
 static int node_op_is_unique(const tf_ir_node *node) {
     return node && node->op &&
            (strcmp(node->op, "unique") == 0 || strcmp(node->op, "dedup") == 0);
@@ -226,6 +253,18 @@ static int node_op_is_unique(const tf_ir_node *node) {
 
 static int node_op_is_group_agg(const tf_ir_node *node) {
     return node && node->op && strcmp(node->op, "group-agg") == 0;
+}
+
+static int node_array_arg_missing_or_empty(const tf_ir_node *node, const char *name) {
+    cJSON *item = node && node->args ? cJSON_GetObjectItemCaseSensitive(node->args, name) : NULL;
+    if (!item) return 1;
+    if (!cJSON_IsArray(item)) return 0;
+    return cJSON_GetArraySize(item) <= 0;
+}
+
+static int node_number_arg_positive(const tf_ir_node *node, const char *name) {
+    cJSON *item = node && node->args ? cJSON_GetObjectItemCaseSensitive(node->args, name) : NULL;
+    return cJSON_IsNumber(item) && item->valuedouble > 0.0;
 }
 
 static int node_op_is_row_set_spillable(const tf_ir_node *node) {
@@ -279,11 +318,23 @@ static void apply_dynamic_contract(tf_ir_node *node) {
                                  TF_SCHEMA_PARAMETRIC : TF_SCHEMA_DATA_DEPENDENT;
             node->state_estimate = "O(spill_run_rows * columns + categories) RAM + O(input_rows + output_rows) spill";
         } else if (node_bool_arg_true(node, "sorted") && node_array_arg_nonempty(node, "categories")) {
+            node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC;
             node->memory_class = TF_MEM_BOUNDED_STATE;
             node->emit_class = TF_EMIT_MIXED;
             node->schema_class = TF_SCHEMA_PARAMETRIC;
             node->state_estimate = "O(current_group + categories)";
+        } else if (node_array_arg_nonempty(node, "categories")) {
+            node->schema_class = TF_SCHEMA_PARAMETRIC;
         }
+    }
+    if (strcmp(node->op, "rowid") == 0 &&
+        (node_array_arg_missing_or_empty(node, "columns") || node_bool_arg_true(node, "sorted"))) {
+        node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC;
+        node->memory_class = TF_MEM_BOUNDED_STATE;
+        node->emit_class = TF_EMIT_PER_BATCH;
+        node->schema_class = TF_SCHEMA_PARAMETRIC;
+        node->state_estimate = node_array_arg_missing_or_empty(node, "columns") ?
+            "O(1)" : "O(previous_key + counter)";
     }
     if (node_op_is_unique(node)) {
         if (node_string_arg_nonempty(node, "spill_dir")) {
@@ -293,6 +344,12 @@ static void apply_dynamic_contract(tf_ir_node *node) {
             node->emit_class = TF_EMIT_ON_FLUSH;
             node->schema_class = TF_SCHEMA_STABLE;
             node->state_estimate = "O(spill_run_rows * columns) RAM + O(input_rows) spill";
+        } else if (node_string_arg_equals(node, "mode", "approx") || node_bool_arg_true(node, "approx")) {
+            node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC;
+            node->memory_class = TF_MEM_BOUNDED_STATE;
+            node->emit_class = TF_EMIT_PER_BATCH;
+            node->schema_class = TF_SCHEMA_STABLE;
+            node->state_estimate = "O(bloom_bytes)";
         } else if (node_bool_arg_true(node, "sorted")) {
             node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC;
             node->memory_class = TF_MEM_BOUNDED_STATE;
@@ -318,7 +375,9 @@ static void apply_dynamic_contract(tf_ir_node *node) {
         }
     }
     if (node_op_is_sorted_set_bounded(node)) {
-        node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_BROWSER_SAFE | TF_CAP_DETERMINISTIC;
+        node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_DETERMINISTIC;
+        if (node->caps & (TF_CAP_FS | TF_CAP_NET)) node->caps &= ~TF_CAP_BROWSER_SAFE;
+        else node->caps |= TF_CAP_BROWSER_SAFE;
         node->memory_class = TF_MEM_BOUNDED_STATE;
         node->emit_class = strcmp(node->op, "union") == 0 ? TF_EMIT_MIXED : TF_EMIT_PER_BATCH;
         node->schema_class = TF_SCHEMA_STABLE;
@@ -327,6 +386,19 @@ static void apply_dynamic_contract(tf_ir_node *node) {
             : ((strcmp(node->op, "intersect-all") == 0 || strcmp(node->op, "setdiff-all") == 0)
                 ? "O(current_lookup_run + current_left_run)"
                 : "O(previous_left_key + current_lookup_key)");
+    }
+    if (node_op_is_join_spillable(node) && node_bool_arg_true(node, "sorted") &&
+        !node_string_arg_nonempty(node, "spill_dir")) {
+        int filtering = node_op_is_filtering_join(node);
+        node->caps |= TF_CAP_STREAMING | TF_CAP_BOUNDED_MEMORY | TF_CAP_DETERMINISTIC;
+        if (node->caps & (TF_CAP_FS | TF_CAP_NET)) node->caps &= ~TF_CAP_BROWSER_SAFE;
+        else node->caps |= TF_CAP_BROWSER_SAFE;
+        node->memory_class = TF_MEM_BOUNDED_STATE;
+        node->emit_class = TF_EMIT_PER_BATCH;
+        node->schema_class = filtering ? TF_SCHEMA_STABLE : TF_SCHEMA_DATA_DEPENDENT;
+        node->state_estimate = filtering
+            ? "O(current_lookup_run)"
+            : "O(current_lookup_run + max_matches_per_row)";
     }
     if (node_op_is_join_spillable(node) && node_string_arg_nonempty(node, "spill_dir")) {
         int filtering = node_op_is_filtering_join(node);
@@ -450,6 +522,13 @@ static int tf_ir_validate_impl(tf_ir_plan *plan, const tf_host_policy *policy) {
                 set_plan_error(plan, "op 'assert' requires expr or aggregate");
                 return TF_ERROR;
             }
+        }
+        if (node_op_is_join_spillable(node) && !node_op_is_filtering_join(node) &&
+            (node_bool_arg_true(node, "sorted") || node_string_arg_nonempty(node, "spill_dir")) &&
+            !node_number_arg_positive(node, "max_matches_per_row")) {
+            set_plan_error(plan,
+                           "op 'join' sorted=true or spill_dir for inner/left joins requires max_matches_per_row");
+            return TF_ERROR;
         }
         if (enforce_host_policy(plan, node, policy) != TF_OK) {
             return TF_ERROR;

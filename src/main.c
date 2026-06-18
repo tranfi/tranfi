@@ -498,6 +498,14 @@ static int blocking_plan_can_use_native_spill(const tf_ir_plan *ir) {
     return first_blocking_node(ir) && !first_blocking_node_without_native_spill(ir);
 }
 
+static const char *native_spill_support_summary(void) {
+    return "native spill currently supports sort, capped unsorted pivot "
+           "(categories=... or max_categories=N), unsorted unique/dedup, "
+           "unsorted group-agg, capped unsorted inner/left joins, unsorted "
+           "semi/anti filtering joins, unsorted intersect/setdiff/"
+           "intersect-all/setdiff-all, and duplicate-eliminating union";
+}
+
 static int set_json_item(cJSON *obj, const char *name, cJSON *item) {
     if (!obj || !name || !item) {
         cJSON_Delete(item);
@@ -553,16 +561,18 @@ static int validate_memory_policy(const tf_ir_plan *ir, const cli_memory_policy 
                     "error: --spill-dir was requested, but native spill is not implemented yet for key-state step '%s'\n",
                     unsupported_key->op);
             fprintf(stderr,
-                    "hint: native spill currently supports sort, unsorted unique/dedup, unsorted group-agg, unsorted capped inner/left joins, unsorted semi/anti filtering joins, unsorted intersect/setdiff/intersect-all/setdiff-all, and duplicate-eliminating union; use op-specific caps or an external engine for this plan\n");
+                    "hint: %s; use op-specific caps or an external engine for this plan\n",
+                    native_spill_support_summary());
             return 1;
         }
         const tf_ir_node *unsupported = first_blocking_node_without_native_spill(ir);
         if (unsupported) {
             fprintf(stderr,
-                    "error: --spill-dir was requested, but native spill is not implemented yet for blocking step '%s'\n",
+                    "error: --spill-dir was requested, but native spill is unavailable for blocking step '%s' with the current arguments\n",
                     unsupported->op);
             fprintf(stderr,
-                    "hint: native spill currently supports sort, unsorted unique/dedup, unsorted group-agg, unsorted capped inner/left joins, unsorted semi/anti filtering joins, unsorted intersect/setdiff/intersect-all/setdiff-all, and duplicate-eliminating union; use --allow-blocking only for known-small data or an external engine for this plan\n");
+                    "hint: %s; use --allow-blocking only for known-small data or an external engine for this plan\n",
+                    native_spill_support_summary());
             return 1;
         }
     }
@@ -576,7 +586,7 @@ static int validate_memory_policy(const tf_ir_plan *ir, const cli_memory_policy 
                 blocking->op,
                 blocking->state_estimate ? blocking->state_estimate : "unknown");
         fprintf(stderr,
-                "hint: rewrite to a bounded op, choose an external engine, or wait for native spill support\n");
+                "hint: rewrite to a bounded op, choose an external engine, or use --spill-dir when the step has a native spill mode and required caps\n");
         return 1;
     }
 
@@ -674,7 +684,7 @@ static void print_explain(const tf_ir_plan *ir, const cli_memory_policy *policy)
     }
     if (first_blocking_node(ir)) {
         if (policy->spill_dir && policy->engine == CLI_ENGINE_NATIVE && blocking_plan_can_use_native_spill(ir))
-            printf("note: blocking sort step will use native spill files\n");
+            printf("note: blocking step will use native spill files\n");
         else if (policy->engine == CLI_ENGINE_NATIVE && !policy->allow_blocking)
             printf("warning: blocking native step present; default execution will reject it unless --allow-blocking is set\n");
         else

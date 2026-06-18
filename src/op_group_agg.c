@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
+#include <ctype.h>
 
 #define GROUP_AGG_DEFAULT_RUN_ROWS 8192
 #define GROUP_AGG_DEFAULT_OUTPUT_ROWS 1024
@@ -471,8 +472,69 @@ static int agg_counts_rows(const agg_spec *agg) {
            (!agg->column || agg->column[0] == '\0' || strcmp(agg->column, "*") == 0);
 }
 
-static void group_accum_add_row(group_accum *a, const group_agg_state *st,
-                                const tf_batch *in, size_t row, int *agg_indices) {
+static int group_agg_parse_numeric_string(const char *s, double *out) {
+    if (!s) return 0;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (!*s) return 0;
+    errno = 0;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s || errno == ERANGE) return 0;
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return 0;
+    *out = v;
+    return 1;
+}
+
+static void group_agg_numeric_type_error(const group_agg_state *st, size_t agg_idx) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "group-agg: aggregate column '%s' must be numeric",
+             st->aggs[agg_idx].column ? st->aggs[agg_idx].column : "");
+    tf_set_last_error(msg);
+}
+
+static int group_agg_batch_numeric_value(const group_agg_state *st, size_t agg_idx,
+                                         const tf_batch *in, size_t row, size_t col,
+                                         double *out) {
+    switch (in->col_types[col]) {
+        case TF_TYPE_INT64:
+            *out = (double)tf_batch_get_int64(in, row, col);
+            return 1;
+        case TF_TYPE_FLOAT64:
+            *out = tf_batch_get_float64(in, row, col);
+            return 1;
+        case TF_TYPE_STRING:
+            if (group_agg_parse_numeric_string(tf_batch_get_string(in, row, col), out)) return 1;
+            group_agg_numeric_type_error(st, agg_idx);
+            return -1;
+        default:
+            group_agg_numeric_type_error(st, agg_idx);
+            return -1;
+    }
+}
+
+static int group_agg_spill_numeric_value(const group_agg_state *st, size_t agg_idx,
+                                         const group_spill_row *row,
+                                         size_t col, double *out) {
+    switch (st->schema_types[col]) {
+        case TF_TYPE_INT64:
+            *out = (double)row->cells[col].i64;
+            return 1;
+        case TF_TYPE_FLOAT64:
+            *out = row->cells[col].f64;
+            return 1;
+        case TF_TYPE_STRING:
+            if (group_agg_parse_numeric_string(row->cells[col].str, out)) return 1;
+            group_agg_numeric_type_error(st, agg_idx);
+            return -1;
+        default:
+            group_agg_numeric_type_error(st, agg_idx);
+            return -1;
+    }
+}
+
+static int group_accum_add_row(group_accum *a, const group_agg_state *st,
+                               const tf_batch *in, size_t row, int *agg_indices) {
     for (size_t k = 0; k < st->n_aggs; k++) {
         int ci = agg_indices[k];
         if (st->aggs[k].func == AGG_COUNT) {
@@ -482,14 +544,15 @@ static void group_accum_add_row(group_accum *a, const group_agg_state *st,
             continue;
         }
         if (ci < 0 || tf_batch_is_null(in, row, ci)) continue;
-        double v = 0;
-        if (in->col_types[ci] == TF_TYPE_INT64) v = (double)tf_batch_get_int64(in, row, ci);
-        else if (in->col_types[ci] == TF_TYPE_FLOAT64) v = tf_batch_get_float64(in, row, ci);
+        double v = 0.0;
+        int numeric_rc = group_agg_batch_numeric_value(st, k, in, row, (size_t)ci, &v);
+        if (numeric_rc < 0) return TF_ERROR;
         a->sums[k] += v;
         if (v < a->mins[k]) a->mins[k] = v;
         if (v > a->maxs[k]) a->maxs[k] = v;
         a->counts[k]++;
     }
+    return TF_OK;
 }
 
 static int group_agg_set_aggregate_cell(group_agg_state *st, tf_batch *ob,
@@ -1162,7 +1225,7 @@ static int copy_spill_group_key_values(tf_batch *keys, const group_agg_state *st
     return tf_batch_expose_row(keys, 0);
 }
 
-static void group_accum_add_spill_row(group_accum *a, const group_agg_state *st, const group_spill_row *row) {
+static int group_accum_add_spill_row(group_accum *a, const group_agg_state *st, const group_spill_row *row) {
     for (size_t k = 0; k < st->n_aggs; k++) {
         int ci = st->agg_indices[k];
         if (st->aggs[k].func == AGG_COUNT) {
@@ -1173,14 +1236,15 @@ static void group_accum_add_spill_row(group_accum *a, const group_agg_state *st,
         }
         if (ci < 0 || row->nulls[(size_t)ci]) continue;
         size_t c = (size_t)ci;
-        double v = 0;
-        if (st->schema_types[c] == TF_TYPE_INT64) v = (double)row->cells[c].i64;
-        else if (st->schema_types[c] == TF_TYPE_FLOAT64) v = row->cells[c].f64;
+        double v = 0.0;
+        int numeric_rc = group_agg_spill_numeric_value(st, k, row, c, &v);
+        if (numeric_rc < 0) return TF_ERROR;
         a->sums[k] += v;
         if (v < a->mins[k]) a->mins[k] = v;
         if (v > a->maxs[k]) a->maxs[k] = v;
         a->counts[k]++;
     }
+    return TF_OK;
 }
 
 static int group_agg_append_spill_group(group_agg_state *st, const tf_batch *key_batch,
@@ -1295,7 +1359,7 @@ static int group_agg_produce_output_runs(group_agg_state *st) {
         }
         free(key);
 
-        group_accum_add_spill_row(&accum, st, &reader->row);
+        if (group_accum_add_spill_row(&accum, st, &reader->row) != TF_OK) goto fail;
         int rc = group_agg_reader_advance(st, reader, 0);
         if (rc < 0) goto fail;
     }
@@ -1464,7 +1528,7 @@ static int group_agg_process_sorted(tf_step *self, tf_batch *in, tf_batch **out,
             key = NULL;
         }
 
-        group_accum_add_row(&st->sorted_accum, st, in, r, agg_indices);
+        if (group_accum_add_row(&st->sorted_accum, st, in, r, agg_indices) != TF_OK) goto fail;
     }
 
     free(group_indices);
@@ -1593,7 +1657,11 @@ static int group_agg_process(tf_step *self, tf_batch *in, tf_batch **out,
         int gi = find_or_add_group(st, key, in, r, group_indices, side);
         free(key);
         if (gi < 0) { free(group_indices); free(agg_indices); return TF_ERROR; }
-        group_accum_add_row(&st->map.accums[gi], st, in, r, agg_indices);
+        if (group_accum_add_row(&st->map.accums[gi], st, in, r, agg_indices) != TF_OK) {
+            free(group_indices);
+            free(agg_indices);
+            return TF_ERROR;
+        }
     }
 
     free(group_indices);

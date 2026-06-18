@@ -1180,6 +1180,21 @@ def test_native_memory_policy():
     with pytest.raises(RuntimeError, match='max_state_bytes=1024'):
         tf.pipeline([tf.codec.csv(), tf.ops.frequency(['city'], max_state_bytes=1024), tf.codec.csv_encode()]).run(input=b'city\nNY\n')
 
+    approx_freq = tf.pipeline([
+        tf.codec.csv(batch_size=2),
+        tf.ops.frequency(['city'], mode='approx', max_values=3),
+        tf.codec.csv_encode(),
+    ])
+    approx_freq_result = approx_freq.run(
+        input=b'city\nA\nA\nA\nA\nA\nA\nB\nB\nB\nB\nC\nC\nC\nD\nE\nF\nG\nA\nB\nA\n',
+        memory='64KB',
+    )
+    assert 'value,count,error' in approx_freq_result.output_text
+    assert 'A,8,0' in approx_freq_result.output_text
+    assert '"approximate":true' in approx_freq_result.stats_text
+    with pytest.raises(RuntimeError, match='estimated native key-state memory'):
+        approx_freq.run(input=b'city\nA\nB\n', memory='1KB')
+
     rowid_byte_capped = tf.pipeline([tf.codec.csv(), tf.ops.rowid(['name'], max_state_bytes=2048), tf.codec.csv_encode()])
     rowid_result = rowid_byte_capped.run(input=b'name\nAlice\nBob\n', memory='64KB')
     assert 'Alice,1' in rowid_result.output_text
@@ -2880,6 +2895,23 @@ def test_ops_frequency():
     assert '"overflow_count":3' in overflow_result.stats_text
     assert '"retained_state_bytes":' in overflow_result.stats_text
 
+    approx_data = bytes([10]).join([
+        b'city',
+        b'A', b'A', b'A', b'A', b'A', b'A',
+        b'B', b'B', b'B', b'B',
+        b'C', b'C', b'C',
+        b'D', b'E', b'F', b'G', b'A', b'B', b'A', b''
+    ])
+    approx_result = tf.pipeline([
+        tf.codec.csv(batch_size=2),
+        tf.ops.frequency(['city'], mode='approx', max_values=3),
+        tf.codec.csv_encode(),
+    ]).run(input=approx_data)
+    assert 'value,count,error' in approx_result.output_text
+    assert 'A,8,0' in approx_result.output_text
+    assert '"tracked_values":3' in approx_result.stats_text
+    assert '"approximate":true' in approx_result.stats_text
+
     privacy_result = tf.pipeline([
         tf.codec.csv(batch_size=1),
         tf.ops.frequency(['city'], max_values=1, overflow='other', audit=True, audit_limit=1,
@@ -2916,6 +2948,8 @@ def test_key_state_cap_helpers_and_errors():
     assert tf.ops.rowid(['city'], max_state_bytes=2048)['args']['max_state_bytes'] == 2048
     assert tf.ops.frequency(['city'], max_values=4)['args']['max_values'] == 4
     assert tf.ops.frequency(['city'], max_state_bytes=4096)['args']['max_state_bytes'] == 4096
+    assert tf.ops.frequency(['city'], mode='approx', max_values=4)['args']['mode'] == 'approx'
+    assert tf.ops.frequency(['city'], approx=True, max_values=4)['args']['approx'] is True
     assert tf.ops.onehot('city', max_state_bytes=4096)['args']['max_state_bytes'] == 4096
     assert tf.ops.label_encode('city', max_state_bytes=4096)['args']['max_state_bytes'] == 4096
     assert tf.ops.intersect('lookup.csv', max_state_bytes=4096)['args']['max_state_bytes'] == 4096
@@ -3005,6 +3039,20 @@ def test_key_state_cap_helpers_and_errors():
         tf.pipeline([
             tf.codec.csv(),
             tf.ops.frequency(['city'], max_state_bytes=1024),
+            tf.codec.csv_encode(),
+        ]).run(input=b'city\nNY\n')
+
+    with pytest.raises(RuntimeError, match='mode=approx'):
+        tf.pipeline([
+            tf.codec.csv(),
+            tf.ops.frequency(['city'], mode='approx', max_state_bytes=4096),
+            tf.codec.csv_encode(),
+        ]).run(input=b'city\nNY\nLA\n')
+
+    with pytest.raises(RuntimeError, match="frequency: column 'missing' not found"):
+        tf.pipeline([
+            tf.codec.csv(),
+            tf.ops.frequency(['missing']),
             tf.codec.csv_encode(),
         ]).run(input=b'city\nNY\n')
 
@@ -3978,6 +4026,12 @@ def test_compile_dsl():
     assert join_spill_plan['steps'][1]['memory_class'] == 'external'
     assert join_spill_plan['steps'][1]['emit_class'] == 'on_flush'
     assert join_spill_plan['steps'][1]['schema_class'] == 'data_dependent'
+
+    declared_pivot_plan = json.loads(tf.compile_dsl('csv | pivot metric value sum categories=x,y | csv'))
+    assert declared_pivot_plan['steps'][1]['op'] == 'pivot'
+    assert declared_pivot_plan['steps'][1]['memory_class'] == 'blocking'
+    assert declared_pivot_plan['steps'][1]['emit_class'] == 'on_flush'
+    assert declared_pivot_plan['steps'][1]['schema_class'] == 'parametric'
 
     rank_plan = json.loads(tf.compile_dsl('csv | slice-min score n=2 with_ties=false | csv'))
     assert rank_plan['steps'][1]['op'] == 'slice-min'

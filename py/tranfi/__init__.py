@@ -969,10 +969,11 @@ class ops:
 
     @staticmethod
     def frequency(columns=None, max_values=None, overflow=None, other=None, max_state_bytes=None,
+                  mode=None, approx=None,
                   audit=False, audit_limit=None, audit_include_row=None, audit_columns=None,
                   audit_redact=None, audit_hash_columns=None, audit_max_bytes=None,
                   audit_max_cell_bytes=None):
-        """Value counts. Example: tf.ops.frequency(['city'], max_values=10000, overflow='other')"""
+        """Value counts. Use mode='approx' for bounded heavy hitters."""
         args = {}
         if columns is not None:
             args['columns'] = columns
@@ -980,6 +981,10 @@ class ops:
             args['max_values'] = max_values
         if max_state_bytes is not None:
             args['max_state_bytes'] = max_state_bytes
+        if mode is not None:
+            args['mode'] = mode
+        if approx is not None:
+            args['approx'] = bool(approx)
         if overflow is not None:
             args['overflow'] = overflow
         if other is not None:

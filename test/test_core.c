@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <dirent.h>
+#include <fcntl.h>
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -28,6 +29,46 @@ static int tests_run = 0;
 static int tests_passed = 0;
 static int test_filter_count = 0;
 static const char **test_filters = NULL;
+
+static const char *core_tmp_root(void) {
+    const char *root = getenv("TRANFI_TEST_TMPDIR");
+    if (root && root[0]) return root;
+    root = getenv("TMPDIR");
+    return (root && root[0]) ? root : "/tmp";
+}
+
+static void ensure_core_tmp_root(void) {
+    const char *root = core_tmp_root();
+    if (strcmp(root, "/tmp") == 0) return;
+    if (mkdir(root, 0700) != 0 && errno != EEXIST) {
+        assert(!"failed to create core test temp root");
+    }
+}
+
+static void make_core_tmp_path(char *buf, size_t cap,
+                               const char *prefix, const char *suffix) {
+    ensure_core_tmp_root();
+    int n = snprintf(buf, cap, "%s/%s_%ld%s", core_tmp_root(), prefix,
+                     (long)getpid(), suffix ? suffix : "");
+    assert(n > 0 && (size_t)n < cap);
+}
+
+static void make_core_tmp_template(char *buf, size_t cap, const char *prefix) {
+    ensure_core_tmp_root();
+    int n = snprintf(buf, cap, "%s/%s_XXXXXX", core_tmp_root(), prefix);
+    assert(n > 0 && (size_t)n < cap);
+}
+
+static FILE *core_tmpfile(void) {
+    char path[512];
+    make_core_tmp_path(path, sizeof(path), "tranfi_core_tmpfile", ".tmp");
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return NULL;
+    unlink(path);
+    FILE *f = fdopen(fd, "w+b");
+    if (!f) close(fd);
+    return f;
+}
 
 static int test_should_run(const char *name) {
     if (test_filter_count == 0) return 1;
@@ -1114,8 +1155,8 @@ static void test_pipeline_file_runner(void) {
         "{\"op\":\"codec.csv.encode\",\"args\":{}}"
         "]}";
 
-    FILE *in = tmpfile();
-    FILE *out = tmpfile();
+    FILE *in = core_tmpfile();
+    FILE *out = core_tmpfile();
     assert(in != NULL);
     assert(out != NULL);
     fputs("name,age\nAlice,30\nBob,25\nCarol,40\n", in);
@@ -2470,6 +2511,62 @@ static void test_pipeline_group_agg_null_semantics_sorted(void) {
     assert(n > 0);
     out[n] = '\0';
     assert(strstr((char *)out, "C,,,0,1,,") != NULL);
+    tf_pipeline_free(p);
+}
+
+static void test_pipeline_group_agg_csv_null_first_numeric_strings(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"group-agg\",\"args\":{\"group_by\":[\"city\"],\"aggs\":["
+        "{\"column\":\"sales\",\"func\":\"sum\",\"name\":\"total\"},"
+        "{\"column\":\"sales\",\"func\":\"avg\",\"name\":\"avg_sales\"},"
+        "{\"column\":\"sales\",\"func\":\"min\",\"name\":\"lo\"},"
+        "{\"column\":\"sales\",\"func\":\"max\",\"name\":\"hi\"},"
+        "{\"column\":\"sales\",\"func\":\"count\",\"name\":\"n\"},"
+        "{\"column\":\"*\",\"func\":\"count\",\"name\":\"rows\"}]}} ,"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+
+    const char *csv =
+        "city,sales\n"
+        "A,\n"
+        "A,\n"
+        "B,2\n"
+        "B,\n"
+        "C,4\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+
+    uint8_t out[4096];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strstr((const char *)out, "city,total,avg_sales,lo,hi,n,rows") != NULL);
+    assert(strstr((const char *)out, "A,,,,,0,2") != NULL);
+    assert(strstr((const char *)out, "B,2,2,2,2,1,2") != NULL);
+    assert(strstr((const char *)out, "C,4,4,4,4,1,1") != NULL);
+    tf_pipeline_free(p);
+}
+
+static void test_pipeline_group_agg_rejects_nonnumeric_strings(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"group-agg\",\"args\":{\"group_by\":[\"city\"],\"aggs\":["
+        "{\"column\":\"sales\",\"func\":\"sum\",\"name\":\"total\"}]}} ,"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+    const char *csv = "city,sales\nA,bad\nA,2\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_ERROR);
+    assert(tf_pipeline_error(p) != NULL);
+    assert(strstr(tf_pipeline_error(p), "group-agg: aggregate column 'sales' must be numeric") != NULL);
     tf_pipeline_free(p);
 }
 
@@ -3916,6 +4013,22 @@ static void test_registry_capabilities(void) {
     assert(!(csv_dec->caps & TF_CAP_NET));
 }
 
+static void test_registry_capability_invariants(void) {
+    size_t count = tf_op_registry_count();
+    for (size_t i = 0; i < count; i++) {
+        const tf_op_entry *e = tf_op_registry_get(i);
+        assert(e != NULL);
+        assert(!((e->caps & TF_CAP_FS) && (e->caps & TF_CAP_BROWSER_SAFE)));
+        assert(!((e->caps & TF_CAP_NET) && (e->caps & TF_CAP_BROWSER_SAFE)));
+        if (e->memory_class == TF_MEM_BOUNDED_STATE) {
+            assert((e->caps & TF_CAP_BOUNDED_MEMORY) != 0);
+        }
+        if (e->memory_class == TF_MEM_EXTERNAL) {
+            assert((e->caps & (TF_CAP_FS | TF_CAP_NET)) != 0);
+        }
+    }
+}
+
 
 static void assert_contract(const char *name, tf_memory_class mem,
                             tf_emit_class emit, tf_schema_class schema) {
@@ -4013,6 +4126,8 @@ static void test_registry_contract_metadata(void) {
     assert_contract("rolling-all", TF_MEM_BOUNDED_STATE, TF_EMIT_PER_BATCH,
                     TF_SCHEMA_PARAMETRIC);
     assert_contract("onehot", TF_MEM_KEY_STATE, TF_EMIT_PER_BATCH,
+                    TF_SCHEMA_DATA_DEPENDENT);
+    assert_contract("pivot", TF_MEM_BLOCKING, TF_EMIT_ON_FLUSH,
                     TF_SCHEMA_DATA_DEPENDENT);
     assert_contract("sort", TF_MEM_BLOCKING, TF_EMIT_ON_FLUSH,
                     TF_SCHEMA_STABLE);
@@ -4316,8 +4431,60 @@ static void test_ir_validate_dynamic_pivot_contract_metadata(void) {
     assert(plan->nodes[1].memory_class == TF_MEM_BOUNDED_STATE);
     assert(plan->nodes[1].emit_class == TF_EMIT_MIXED);
     assert(plan->nodes[1].schema_class == TF_SCHEMA_PARAMETRIC);
+    assert((plan->nodes[1].caps & TF_CAP_STREAMING) != 0);
+    assert((plan->nodes[1].caps & TF_CAP_BOUNDED_MEMORY) != 0);
     assert(strcmp(plan->nodes[1].state_estimate, "O(current_group + categories)") == 0);
     tf_ir_plan_free(plan);
+
+    const char *declared_blocking_json =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"pivot\",\"args\":{\"name_column\":\"metric\",\"value_column\":\"value\",\"agg\":\"sum\",\"categories\":[\"x\",\"y\"]}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    plan = tf_ir_from_json(declared_blocking_json, strlen(declared_blocking_json), &error);
+    assert(plan != NULL);
+    assert(tf_ir_validate(plan) == TF_OK);
+    assert(plan->nodes[1].memory_class == TF_MEM_BLOCKING);
+    assert(plan->nodes[1].emit_class == TF_EMIT_ON_FLUSH);
+    assert(plan->nodes[1].schema_class == TF_SCHEMA_PARAMETRIC);
+    tf_ir_plan_free(plan);
+
+    char *dsl_error = NULL;
+    tf_ir_plan *dsl_plan = tf_dsl_parse("csv | unique city mode=approx bloom_bytes=4096 bloom_hashes=3 | csv",
+                                        strlen("csv | unique city mode=approx bloom_bytes=4096 bloom_hashes=3 | csv"),
+                                        &dsl_error);
+    assert(dsl_plan != NULL);
+    assert(dsl_error == NULL);
+    assert(tf_ir_validate(dsl_plan) == TF_OK);
+    assert(dsl_plan->nodes[1].memory_class == TF_MEM_BOUNDED_STATE);
+    assert(dsl_plan->nodes[1].emit_class == TF_EMIT_PER_BATCH);
+    assert((dsl_plan->nodes[1].caps & TF_CAP_BOUNDED_MEMORY) != 0);
+    assert(strcmp(dsl_plan->nodes[1].state_estimate, "O(bloom_bytes)") == 0);
+    tf_ir_plan_free(dsl_plan);
+
+    dsl_plan = tf_dsl_parse("csv | join lookup.csv on id sorted=true max_matches_per_row=1 | csv",
+                            strlen("csv | join lookup.csv on id sorted=true max_matches_per_row=1 | csv"),
+                            &dsl_error);
+    assert(dsl_plan != NULL);
+    assert(dsl_error == NULL);
+    assert(tf_ir_validate(dsl_plan) == TF_OK);
+    assert(dsl_plan->nodes[1].memory_class == TF_MEM_BOUNDED_STATE);
+    assert((dsl_plan->nodes[1].caps & TF_CAP_FS) != 0);
+    assert((dsl_plan->nodes[1].caps & TF_CAP_BROWSER_SAFE) == 0);
+    assert(strcmp(dsl_plan->nodes[1].state_estimate, "O(current_lookup_run + max_matches_per_row)") == 0);
+    tf_ir_plan_free(dsl_plan);
+
+    dsl_plan = tf_dsl_parse("csv | intersect lookup.csv columns=id sorted=true | csv",
+                            strlen("csv | intersect lookup.csv columns=id sorted=true | csv"),
+                            &dsl_error);
+    assert(dsl_plan != NULL);
+    assert(dsl_error == NULL);
+    assert(tf_ir_validate(dsl_plan) == TF_OK);
+    assert(dsl_plan->nodes[1].memory_class == TF_MEM_BOUNDED_STATE);
+    assert((dsl_plan->nodes[1].caps & TF_CAP_FS) != 0);
+    assert((dsl_plan->nodes[1].caps & TF_CAP_BROWSER_SAFE) == 0);
+    tf_ir_plan_free(dsl_plan);
 }
 
 
@@ -4368,8 +4535,8 @@ static void test_ir_validate_host_policy_denies_rules_file_and_spill(void) {
 }
 
 static void test_ir_validate_host_policy_workspace_resolver(void) {
-    char root[256];
-    snprintf(root, sizeof(root), "/tmp/tranfi_policy_%ld", (long)getpid());
+    char root[512];
+    make_core_tmp_path(root, sizeof(root), "tranfi_policy", "");
     rmdir(root);
     assert(mkdir(root, 0700) == 0);
 
@@ -4415,6 +4582,58 @@ static void test_ir_validate_host_policy_workspace_resolver(void) {
     assert(p == NULL);
     assert(tf_last_error() != NULL);
     assert(strstr(tf_last_error(), "host path resolver") != NULL);
+
+#ifndef _WIN32
+    char outside_path[512];
+    make_core_tmp_path(outside_path, sizeof(outside_path), "tranfi_policy_outside", ".csv");
+    unlink(outside_path);
+    f = fopen(outside_path, "wb");
+    assert(f != NULL);
+    fputs("name\noutside\n", f);
+    fclose(f);
+
+    char link_path[512];
+    snprintf(link_path, sizeof(link_path), "%s/outside.csv", root);
+    unlink(link_path);
+    assert(symlink(outside_path, link_path) == 0);
+    const char *symlink_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"stack\",\"args\":{\"file\":\"outside.csv\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create_with_host_policy(symlink_plan, strlen(symlink_plan), &policy);
+    assert(p == NULL);
+    assert(tf_last_error() != NULL);
+    assert(strstr(tf_last_error(), "host path resolver") != NULL);
+    unlink(link_path);
+    unlink(outside_path);
+#endif
+
+    char dot_path[128];
+    snprintf(dot_path, sizeof(dot_path), "tranfi_workspace_dot_%ld.csv", (long)getpid());
+    unlink(dot_path);
+    f = fopen(dot_path, "wb");
+    assert(f != NULL);
+    fputs("name\nfrom_file\n", f);
+    fclose(f);
+    char dot_plan[512];
+    int pn = snprintf(dot_plan, sizeof(dot_plan),
+                      "{\"steps\":["
+                      "{\"op\":\"codec.csv.decode\",\"args\":{}},"
+                      "{\"op\":\"stack\",\"args\":{\"file\":\"%s\"}},"
+                      "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+                      "]}",
+                      dot_path);
+    assert(pn > 0 && (size_t)pn < sizeof(dot_plan));
+    tf_host_policy dot_policy = {0};
+    dot_policy.allow_blocking = true;
+    dot_policy.allow_fs = true;
+    dot_policy.workspace_root = ".";
+    p = tf_pipeline_create_with_host_policy(dot_plan, strlen(dot_plan), &dot_policy);
+    assert(p != NULL);
+    tf_pipeline_free(p);
+    unlink(dot_path);
 
     unlink(rules_path);
     assert(rmdir(root) == 0);
@@ -4593,6 +4812,65 @@ static void test_ir_schema_group_agg_preserves_key_types(void) {
     tf_schema_free(&out);
     tf_schema_free(&in);
     cJSON_Delete(args);
+}
+
+static void test_ir_schema_pivot_declared_categories(void) {
+    tf_schema in = {0};
+    in.known = true;
+    in.n_cols = 3;
+    in.col_names = calloc(3, sizeof(char *));
+    in.col_types = calloc(3, sizeof(tf_type));
+    assert(in.col_names != NULL);
+    assert(in.col_types != NULL);
+    in.col_names[0] = strdup("id");
+    in.col_names[1] = strdup("metric");
+    in.col_names[2] = strdup("value");
+    assert(in.col_names[0] && in.col_names[1] && in.col_names[2]);
+    in.col_types[0] = TF_TYPE_INT64;
+    in.col_types[1] = TF_TYPE_STRING;
+    in.col_types[2] = TF_TYPE_FLOAT64;
+
+    cJSON *args = cJSON_CreateObject();
+    assert(args != NULL);
+    assert(cJSON_AddStringToObject(args, "name_column", "metric") != NULL);
+    assert(cJSON_AddStringToObject(args, "value_column", "value") != NULL);
+    assert(cJSON_AddStringToObject(args, "agg", "sum") != NULL);
+    cJSON *cats = cJSON_AddArrayToObject(args, "categories");
+    assert(cats != NULL);
+    assert(cJSON_AddItemToArray(cats, cJSON_CreateString("x")));
+    assert(cJSON_AddItemToArray(cats, cJSON_CreateString("y")));
+
+    tf_ir_node node = {0};
+    node.op = "pivot";
+    node.args = args;
+    const tf_op_entry *entry = tf_op_registry_find("pivot");
+    assert(entry != NULL);
+    tf_schema out = {0};
+    int rc = entry->infer_schema(&node, &in, &out);
+    assert(rc == TF_OK);
+    assert(out.known);
+    assert(out.n_cols == 3);
+    assert(strcmp(out.col_names[0], "id") == 0);
+    assert(strcmp(out.col_names[1], "x") == 0);
+    assert(strcmp(out.col_names[2], "y") == 0);
+    assert(out.col_types[0] == TF_TYPE_INT64);
+    assert(out.col_types[1] == TF_TYPE_FLOAT64);
+    assert(out.col_types[2] == TF_TYPE_FLOAT64);
+    tf_schema_free(&out);
+    cJSON_Delete(args);
+
+    cJSON *dynamic_args = cJSON_CreateObject();
+    assert(dynamic_args != NULL);
+    assert(cJSON_AddStringToObject(dynamic_args, "name_column", "metric") != NULL);
+    assert(cJSON_AddStringToObject(dynamic_args, "value_column", "value") != NULL);
+    assert(cJSON_AddNumberToObject(dynamic_args, "max_categories", 2) != NULL);
+    node.args = dynamic_args;
+    rc = entry->infer_schema(&node, &in, &out);
+    assert(rc == TF_OK);
+    assert(!out.known);
+    tf_schema_free(&out);
+    cJSON_Delete(dynamic_args);
+    tf_schema_free(&in);
 }
 
 /* ================================================================
@@ -4795,7 +5073,9 @@ static void test_compile_to_sql_supported_matrix(void) {
         {"validate-expression", "csv | validate \"col('age') > 0\" | csv", "\"_valid\""},
         {"trim-explicit", "csv | trim name,city | csv", "trim(\"name\")"},
         {"fill-null", "csv | fill-null age=0 | csv", "COALESCE"},
-        {"cast", "csv | cast age=int | csv", "CAST(\"age\" AS BIGINT)"},
+        {"cast", "csv | cast age=int | csv", "regexp_extract(CAST(\"age\" AS VARCHAR)"},
+        {"cast-null", "csv | cast age=int on_error=null | csv", "TRY_CAST(\"age\" AS BIGINT)"},
+        {"cast-fail", "csv | cast age=int on_error=fail | csv", "CAST(\"age\" AS BIGINT)"},
         {"clip", "csv | clip score min=0 max=100 | csv", "GREATEST"},
         {"replace", "csv | replace name Alice Alicia | csv", "replace(\"name\""},
         {"hash-columns", "csv | hash name,age | csv", "hash(\"name\", \"age\")"},
@@ -4826,14 +5106,16 @@ static void test_compile_to_sql_supported_matrix(void) {
         {"explode", "csv | explode tags ; | csv", "string_split"},
         {"split", "csv | split name \" \" first,last | csv", "string_split"},
         {"unpivot", "csv | unpivot jan,feb | csv", "UNPIVOT"},
-        {"pivot", "csv | pivot metric value sum | csv", "PIVOT"},
+        {"pivot", "csv | pivot metric value sum | csv", "__tf_pivot_category_ordinal"},
+        {"pivot-categories", "csv | pivot metric value sum categories=revenue,cost | csv", "IN ('revenue', 'cost')"},
         {"step", "csv | step price running-sum cumsum | csv", "UNBOUNDED PRECEDING"},
         {"lead", "csv | lead price 1 next_price | csv", "LEAD"},
         {"lag", "csv | lag price 1 prev_price | csv", "LAG"},
         {"shift-lead", "csv | shift price 1 next_price type=lead | csv", "LEAD"},
         {"rowid", "csv | rowid | csv", "ROW_NUMBER()"},
         {"rleid", "csv | rleid city result=run | csv", "__tf_rleid_changed"},
-        {"window", "csv | window price 3 avg ma3 | csv", "ROWS BETWEEN 2 PRECEDING"},
+        {"window", "csv | window price 3 avg ma3 | csv", "RANGE BETWEEN 2 PRECEDING"},
+        {"window-count", "csv | window price 3 count n3 | csv", "COUNT(\"price\") OVER"},
         {"rolling-any", "csv | rolling-any flag 3 any3 | csv", "BOOL_OR"},
         {"datetime", "csv | datetime date year,month | csv", "EXTRACT(year"},
         {"date-trunc", "csv | date-trunc date month date_month | csv", "date_trunc('month'"},
@@ -4857,6 +5139,7 @@ static void test_compile_to_sql_rejected_matrix(void) {
         {"unique-approx", "csv | unique city mode=approx | csv", "approximate mode"},
         {"frequency-all", "csv | frequency | csv", "requires explicit columns"},
         {"frequency-overflow", "csv | frequency city max_values=2 overflow=other | csv", "overflow=other"},
+        {"frequency-approx", "csv | frequency city mode=approx max_values=2 | csv", "mode=approx"},
         {"selected-key-set", "csv | intersect other.csv columns=id | csv", "all-column set operations"},
         {"stats", "csv | stats count | csv", "native report shape"},
         {"scan", "csv | scan count | csv", "unsupported op"},
@@ -4907,6 +5190,30 @@ static void test_pipeline_create_from_ir(void) {
     assert(strstr((char *)out, "x,y") != NULL);
 
     tf_pipeline_free(p);
+    tf_ir_plan_free(plan);
+
+    const char *malformed_json =
+        "{\"steps\":["
+        "{\"op\":\"head\",\"args\":{\"n\":1}}"
+        "]}";
+    plan = tf_ir_from_json(malformed_json, strlen(malformed_json), &error);
+    assert(plan != NULL);
+    p = tf_pipeline_create_from_ir(plan);
+    assert(p == NULL);
+    assert(tf_last_error() != NULL);
+    assert(strstr(tf_last_error(), "decoder") != NULL);
+    tf_ir_plan_free(plan);
+
+    const char *missing_encoder_json =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{}}"
+        "]}";
+    plan = tf_ir_from_json(missing_encoder_json, strlen(missing_encoder_json), &error);
+    assert(plan != NULL);
+    p = tf_pipeline_create_from_ir(plan);
+    assert(p == NULL);
+    assert(tf_last_error() != NULL);
+    assert(strstr(tf_last_error(), "encoder") != NULL);
     tf_ir_plan_free(plan);
 }
 
@@ -7216,8 +7523,9 @@ static void test_pipeline_validate_rules(void) {
     assert(strcmp(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(rules, 1), "expr")->valuestring, "col(age)<25") == 0);
     tf_ir_plan_free(parsed);
 
-    char rules_path[256];
-    snprintf(rules_path, sizeof(rules_path), "/tmp/tranfi_validate_rules_%ld.json", (long)getpid());
+    char rules_path[512];
+    make_core_tmp_path(rules_path, sizeof(rules_path),
+                       "tranfi_validate_rules", ".json");
     FILE *rf = fopen(rules_path, "wb");
     assert(rf != NULL);
     fputs("{\"name\":\"quality_file\",\"audit\":true,\"audit_limit\":4,\"warn_failure_rate\":0.25,\"rules\":["
@@ -8514,7 +8822,8 @@ static void test_pipeline_tee_side_channel(void) {
 }
 
 static void test_pipeline_stack_preserves_long_cells(void) {
-    const char *path = "/tmp/tranfi_stack_long_cell.csv";
+    char path[512];
+    make_core_tmp_path(path, sizeof(path), "tranfi_stack_long_cell", ".csv");
     char *long_cell = malloc(5001);
     assert(long_cell != NULL);
     memset(long_cell, 'x', 5000);
@@ -8557,8 +8866,8 @@ static void test_pipeline_stack_preserves_long_cells(void) {
 }
 
 static void test_pipeline_stack_missing_file_errors(void) {
-    char path[256];
-    snprintf(path, sizeof(path), "/tmp/tranfi_stack_missing_%ld.csv", (long)getpid());
+    char path[512];
+    make_core_tmp_path(path, sizeof(path), "tranfi_stack_missing", ".csv");
     remove(path);
 
     char plan[512];
@@ -8677,6 +8986,14 @@ static void test_pipeline_frequency(void) {
     assert(p == NULL);
     const char *err = tf_last_error();
     assert(err && strstr(err, "frequency: column names must be non-empty strings") != NULL);
+
+    const char *missing_col_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"frequency\",\"args\":{\"columns\":[\"missing\"]}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    assert_push_cap_error(missing_col_plan, "city\nNY\n", "frequency: column 'missing' not found");
 }
 
 
@@ -8721,6 +9038,63 @@ static void test_pipeline_frequency_overflow_other(void) {
     assert(strstr((char *)stats, "\"overflow_count\":3") != NULL);
     assert(strstr((char *)stats, "\"retained_state_bytes\":") != NULL);
     tf_pipeline_free(p);
+}
+
+static void test_pipeline_frequency_approx(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"frequency\",\"args\":{\"columns\":[\"city\"],\"mode\":\"approx\",\"max_values\":3}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+    const char *csv =
+        "city\n"
+        "A\nA\nA\nA\nA\nA\n"
+        "B\nB\nB\nB\n"
+        "C\nC\nC\n"
+        "D\nE\nF\nG\nA\nB\nA\n";
+    size_t first = 21;
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, first) == TF_OK);
+    assert(tf_pipeline_push(p, (const uint8_t *)csv + first, strlen(csv) - first) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    uint8_t out[2048];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = 0;
+    assert(strstr((char *)out, "value,count,error") != NULL);
+    assert(strstr((char *)out, "A,8,0") != NULL);
+    assert(strstr((char *)out, "B,6,5") != NULL);
+    assert(strstr((char *)out, "G,6,5") != NULL);
+
+    uint8_t stats[2048];
+    n = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(n > 0);
+    stats[n] = 0;
+    assert(strstr((char *)stats, "\"op\":\"frequency\"") != NULL);
+    assert(strstr((char *)stats, "\"tracked_values\":3") != NULL);
+    assert(strstr((char *)stats, "\"approximate\":true") != NULL);
+    assert(strstr((char *)stats, "\"approx_replacements\":") != NULL);
+    tf_pipeline_free(p);
+
+    assert_pipeline_create_fails_with(
+        "{\"steps\":[{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"frequency\",\"args\":{\"columns\":[\"city\"],\"mode\":\"approx\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}]}",
+        "mode=approx requires max_values");
+
+    assert_pipeline_create_fails_with(
+        "{\"steps\":[{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"frequency\",\"args\":{\"columns\":[\"city\"],\"mode\":\"approx\",\"max_values\":2,\"overflow\":\"other\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}]}",
+        "mode=approx and overflow=other");
+
+    assert_pipeline_create_fails_with(
+        "{\"steps\":[{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"frequency\",\"args\":{\"columns\":[\"city\"],\"mode\":\"exact\",\"approx\":true,\"max_values\":2}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}]}",
+        "mode and approx conflict");
 }
 static void test_pipeline_top(void) {
     const char *plan =
@@ -9350,6 +9724,20 @@ static void test_dsl_compatibility_forms(void) {
     assert(cJSON_IsNumber(max_values) && (int)max_values->valuedouble == 3);
     tf_ir_plan_free(plan);
 
+    plan = tf_dsl_parse("csv | frequency city mode=approx max_values=3 | csv", strlen("csv | frequency city mode=approx max_values=3 | csv"), &error);
+    assert(plan != NULL);
+    cJSON *freq_mode = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "mode");
+    max_values = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "max_values");
+    assert(cJSON_IsString(freq_mode) && strcmp(freq_mode->valuestring, "approx") == 0);
+    assert(cJSON_IsNumber(max_values) && (int)max_values->valuedouble == 3);
+    tf_ir_plan_free(plan);
+
+    plan = tf_dsl_parse("csv | frequency city --approx max_values=3 | csv", strlen("csv | frequency city --approx max_values=3 | csv"), &error);
+    assert(plan != NULL);
+    cJSON *freq_approx = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "approx");
+    assert(cJSON_IsBool(freq_approx) && cJSON_IsTrue(freq_approx));
+    tf_ir_plan_free(plan);
+
     plan = tf_dsl_parse("csv | frequency city max_state_bytes=4096 | csv", strlen("csv | frequency city max_state_bytes=4096 | csv"), &error);
     assert(plan != NULL);
     cJSON *freq_max_state_bytes = cJSON_GetObjectItemCaseSensitive(plan->nodes[1].args, "max_state_bytes");
@@ -9677,7 +10065,8 @@ static int dir_has_prefix(const char *dir, const char *prefix) {
 }
 
 static void test_spill_session_security_basics(void) {
-    char tmpl[] = "/tmp/tranfi_spill_sec_XXXXXX";
+    char tmpl[512];
+    make_core_tmp_template(tmpl, sizeof(tmpl), "tranfi_spill_sec");
     char *root = mkdtemp(tmpl);
     assert(root != NULL);
 
@@ -9721,7 +10110,8 @@ static void test_spill_session_security_basics(void) {
 
 
 static void test_spill_session_cleanup_after_abort(void) {
-    char tmpl[] = "/tmp/tranfi_spill_abort_XXXXXX";
+    char tmpl[512];
+    make_core_tmp_template(tmpl, sizeof(tmpl), "tranfi_spill_abort");
     char *root = mkdtemp(tmpl);
     assert(root != NULL);
 
@@ -9759,7 +10149,8 @@ static void test_spill_session_cleanup_after_abort(void) {
 }
 
 static void test_spill_sort_uses_private_session_dir(void) {
-    char tmpl[] = "/tmp/tranfi_spill_symlink_XXXXXX";
+    char tmpl[512];
+    make_core_tmp_template(tmpl, sizeof(tmpl), "tranfi_spill_symlink");
     char *spill_dir = mkdtemp(tmpl);
     assert(spill_dir != NULL);
 
@@ -9810,8 +10201,9 @@ static void test_spill_sort_uses_private_session_dir(void) {
 }
 
 static void test_spill_sort_typed_multi_key_null_ordering(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_typed_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_typed", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
@@ -9877,8 +10269,9 @@ static void test_spill_sort_typed_multi_key_null_ordering(void) {
 }
 
 static void test_spill_sort_stable_equal_keys(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_sort_stable_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_sort_stable", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
@@ -9942,8 +10335,9 @@ static void test_spill_sort_stable_equal_keys(void) {
 
 
 static void test_spill_unique_preserves_first_row_order(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_unique_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_unique", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
@@ -10008,8 +10402,9 @@ static void test_spill_unique_preserves_first_row_order(void) {
 
 
 static void test_spill_group_agg_preserves_first_group_order(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_group_agg_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_group_agg", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
@@ -10152,8 +10547,9 @@ static void test_pipeline_pivot_sum(void) {
 
 
 static void test_pipeline_pivot_spill_preserves_group_and_category_order(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_pivot_spill_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_pivot_spill", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
@@ -10300,7 +10696,9 @@ static void test_dsl_pivot(void) {
 
 static void test_pipeline_join_inner(void) {
     /* Write temp lookup file */
-    const char *lookup_path = "/tmp/tranfi_test_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,city\n1,London\n2,Paris\n3,Tokyo\n");
@@ -10333,7 +10731,9 @@ static void test_pipeline_join_inner(void) {
 }
 
 static void test_pipeline_join_left(void) {
-    const char *lookup_path = "/tmp/tranfi_test_lookup2.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_lookup2", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,city\n1,London\n2,Paris\n");
@@ -10365,7 +10765,9 @@ static void test_pipeline_join_left(void) {
 }
 
 static void test_pipeline_filtering_joins(void) {
-    const char *lookup_path = "/tmp/tranfi_test_filtering_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_filtering_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,val\n1,a\n1,b\n3,c\n");
@@ -10414,7 +10816,9 @@ static void test_pipeline_filtering_joins(void) {
     tf_pipeline_free(p);
     remove(lookup_path);
 
-    const char *empty_path = "/tmp/tranfi_test_filtering_empty_lookup.csv";
+    char empty_path[512];
+    make_core_tmp_path(empty_path, sizeof(empty_path),
+                       "tranfi_test_filtering_empty_lookup", ".csv");
     f = fopen(empty_path, "w");
     assert(f != NULL);
     fprintf(f, "id,val\n");
@@ -10441,12 +10845,15 @@ static void test_pipeline_filtering_joins(void) {
 
 
 static void test_pipeline_filtering_join_spill_preserves_left_order(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_join_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_join", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
-    const char *lookup_path = "/tmp/tranfi_test_spill_filtering_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_spill_filtering_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,val\n3,c\n1,a\n1,a2\n5,e\n9,z\n");
@@ -10549,12 +10956,15 @@ static void test_pipeline_filtering_join_spill_preserves_left_order(void) {
 }
 
 static void test_pipeline_mutating_join_spill_preserves_left_and_match_order(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_mutating_join_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_mutating_join", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
-    const char *lookup_path = "/tmp/tranfi_test_spill_mutating_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_spill_mutating_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,city,rank\n3,CHI,30\n1,LA,10\n1,SF,11\n5,SEA,50\n9,NY,90\n");
@@ -10673,7 +11083,9 @@ static void test_pipeline_join_typed_keys(void) {
     uint8_t out[1024];
     size_t n;
 
-    const char *typed_lookup = "/tmp/tranfi_test_join_typed_lookup.csv";
+    char typed_lookup[512];
+    make_core_tmp_path(typed_lookup, sizeof(typed_lookup),
+                       "tranfi_test_join_typed_lookup", ".csv");
     FILE *f = fopen(typed_lookup, "w");
     assert(f != NULL);
     fprintf(f, "id,val\n1,string-one\nx,other\n");
@@ -10688,7 +11100,9 @@ static void test_pipeline_join_typed_keys(void) {
     assert_push_cap_error(plan, "id\n1\n", "join key types differ");
     remove(typed_lookup);
 
-    const char *sentinel_lookup = "/tmp/tranfi_test_join_sentinel_lookup.csv";
+    char sentinel_lookup[512];
+    make_core_tmp_path(sentinel_lookup, sizeof(sentinel_lookup),
+                       "tranfi_test_join_sentinel_lookup", ".csv");
     f = fopen(sentinel_lookup, "w");
     assert(f != NULL);
     fprintf(f, "id,val\n\\N,sentinel\nx,other\n");
@@ -10716,7 +11130,9 @@ static void test_pipeline_join_typed_keys(void) {
 
 
 static void test_pipeline_join_caps(void) {
-    const char *lookup_path = "/tmp/tranfi_test_join_caps.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_join_caps", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,val\n1,a\n2,b\n");
@@ -10771,7 +11187,9 @@ static void test_pipeline_join_caps(void) {
 }
 
 static void test_pipeline_join_output_caps(void) {
-    const char *lookup_path = "/tmp/tranfi_test_join_output_caps.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_join_output_caps", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,val\n1,a\n1,b\n");
@@ -10828,7 +11246,9 @@ static void test_pipeline_join_output_caps(void) {
 
 
 static void test_pipeline_join_sorted_mode(void) {
-    const char *lookup_path = "/tmp/tranfi_test_sorted_join_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_sorted_join_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,city\n1,London\n2,Paris\n2,Lyon\n4,Rome\n");
@@ -10921,7 +11341,9 @@ static void test_pipeline_join_sorted_mode(void) {
         "]}", lookup_path);
     assert_push_cap_error(plan, "id,name\n2,Bob\n1,Alice\n", "left side is not sorted");
 
-    const char *bad_lookup = "/tmp/tranfi_test_sorted_join_bad_lookup.csv";
+    char bad_lookup[512];
+    make_core_tmp_path(bad_lookup, sizeof(bad_lookup),
+                       "tranfi_test_sorted_join_bad_lookup", ".csv");
     f = fopen(bad_lookup, "w");
     assert(f != NULL);
     fprintf(f, "id,city\n2,Paris\n1,London\n");
@@ -10939,7 +11361,9 @@ static void test_pipeline_join_sorted_mode(void) {
 }
 
 static void test_pipeline_set_ops(void) {
-    const char *lookup_path = "/tmp/tranfi_test_set_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_set_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,name\n1,Alice\n3,Charlie\n");
@@ -11076,12 +11500,15 @@ static void test_pipeline_set_ops(void) {
 }
 
 static void test_pipeline_set_ops_spill_preserves_left_order(void) {
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_set_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_set", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
-    const char *lookup_path = "/tmp/tranfi_test_spill_set_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_spill_set_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,label\n3,c\n1,a\n1,a2\n9,z\n");
@@ -11276,7 +11703,9 @@ static void test_pipeline_set_ops_spill_preserves_left_order(void) {
 
 
 static void test_pipeline_union_ops(void) {
-    const char *lookup_path = "/tmp/tranfi_test_union_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_union_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,name\n2,Bob\n3,Charlie\n1,Alice\n");
@@ -11427,12 +11856,15 @@ static void test_pipeline_union_ops(void) {
     assert(tf_last_error() && strstr(tf_last_error(), "max_output_keys=2") != NULL);
     tf_pipeline_free(p);
 
-    char spill_dir[256];
-    snprintf(spill_dir, sizeof(spill_dir), "/tmp/tranfi_core_spill_union_%ld", (long)getpid());
+    char spill_dir[512];
+    make_core_tmp_path(spill_dir, sizeof(spill_dir),
+                       "tranfi_core_spill_union", "");
     rmdir(spill_dir);
     assert(mkdir(spill_dir, 0700) == 0);
 
-    const char *spill_lookup_path = "/tmp/tranfi_test_spill_union_lookup.csv";
+    char spill_lookup_path[512];
+    make_core_tmp_path(spill_lookup_path, sizeof(spill_lookup_path),
+                       "tranfi_test_spill_union_lookup", ".csv");
     f = fopen(spill_lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,name,score\n2,B_file,200\n5,E,50\n3,C_file,300\n5,E2,51\n6,F,60\n");
@@ -11499,7 +11931,9 @@ static void test_pipeline_union_ops(void) {
 }
 
 static void test_pipeline_set_ops_columns_and_caps(void) {
-    const char *lookup_path = "/tmp/tranfi_test_set_lookup_cols.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_set_lookup_cols", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,label\n1,x\n3,y\n");
@@ -11538,7 +11972,9 @@ static void test_pipeline_set_ops_columns_and_caps(void) {
 }
 
 static void test_pipeline_set_ops_sorted_mode(void) {
-    const char *lookup_path = "/tmp/tranfi_test_set_sorted_lookup.csv";
+    char lookup_path[512];
+    make_core_tmp_path(lookup_path, sizeof(lookup_path),
+                       "tranfi_test_set_sorted_lookup", ".csv");
     FILE *f = fopen(lookup_path, "w");
     assert(f != NULL);
     fprintf(f, "id,label\n1,x\n3,y\n5,z\n");
@@ -11651,7 +12087,9 @@ static void test_pipeline_set_ops_sorted_mode(void) {
     assert_push_cap_error(plan, "id,name\n2,Bob\n1,Alice\n",
                           "intersect-all: left side is not sorted");
 
-    const char *typed_lookup = "/tmp/tranfi_test_set_sorted_typed_lookup.csv";
+    char typed_lookup[512];
+    make_core_tmp_path(typed_lookup, sizeof(typed_lookup),
+                       "tranfi_test_set_sorted_typed_lookup", ".csv");
     f = fopen(typed_lookup, "w");
     assert(f != NULL);
     fprintf(f, "id,name\n2,Bob\n10,Jane\n");
@@ -11682,7 +12120,9 @@ static void test_pipeline_set_ops_sorted_mode(void) {
         "]}", lookup_path);
     assert_push_cap_error(plan, "id,name\n2,Bob\n1,Alice\n", "left side is not sorted");
 
-    const char *bad_lookup = "/tmp/tranfi_test_set_sorted_bad_lookup.csv";
+    char bad_lookup[512];
+    make_core_tmp_path(bad_lookup, sizeof(bad_lookup),
+                       "tranfi_test_set_sorted_bad_lookup", ".csv");
     f = fopen(bad_lookup, "w");
     assert(f != NULL);
     fprintf(f, "id,label\n3,y\n1,x\n");
@@ -11916,6 +12356,48 @@ static void test_compile_dsl(void) {
     assert(strstr(json, "\"state_bytes_estimate\":null") != NULL);
     assert(strstr(json, "\"state_bytes_reason\":\"step 'unique' needs max_keys") != NULL);
     tf_string_free(json);
+
+    json = tf_compile_dsl("csv | rowid city result=run_row sorted=true | csv",
+                          strlen("csv | rowid city result=run_row sorted=true | csv"), &error);
+    assert(json != NULL);
+    assert(strstr(json, "\"op\":\"rowid\"") != NULL);
+    assert(strstr(json, "\"memory_class\":\"bounded_state\"") != NULL);
+    assert(strstr(json, "\"state_estimate\":\"O(previous_key + counter)\"") != NULL);
+    tf_string_free(json);
+
+    json = tf_compile_dsl("csv | semi-join lookup.csv on id sorted=true | csv",
+                          strlen("csv | semi-join lookup.csv on id sorted=true | csv"), &error);
+    assert(json != NULL);
+    assert(strstr(json, "\"op\":\"semi-join\"") != NULL);
+    assert(strstr(json, "\"memory_class\":\"bounded_state\"") != NULL);
+    assert(strstr(json, "\"schema_class\":\"stable\"") != NULL);
+    assert(strstr(json, "\"state_estimate\":\"O(current_lookup_run)\"") != NULL);
+    tf_string_free(json);
+
+    json = tf_compile_dsl("csv | join lookup.csv on id sorted=true max_matches_per_row=2 | csv",
+                          strlen("csv | join lookup.csv on id sorted=true max_matches_per_row=2 | csv"), &error);
+    assert(json != NULL);
+    assert(strstr(json, "\"op\":\"join\"") != NULL);
+    assert(strstr(json, "\"memory_class\":\"bounded_state\"") != NULL);
+    assert(strstr(json, "\"schema_class\":\"data_dependent\"") != NULL);
+    assert(strstr(json, "\"state_estimate\":\"O(current_lookup_run + max_matches_per_row)\"") != NULL);
+    tf_string_free(json);
+
+    json = tf_compile_dsl("csv | join lookup.csv on id sorted=true | csv",
+                          strlen("csv | join lookup.csv on id sorted=true | csv"), &error);
+    assert(json == NULL);
+    assert(error != NULL);
+    assert(strstr(error, "requires max_matches_per_row") != NULL);
+    free(error);
+    error = NULL;
+
+    json = tf_compile_dsl("csv | join lookup.csv on id spill_dir=/tmp/tranfi-spill | csv",
+                          strlen("csv | join lookup.csv on id spill_dir=/tmp/tranfi-spill | csv"), &error);
+    assert(json == NULL);
+    assert(error != NULL);
+    assert(strstr(error, "requires max_matches_per_row") != NULL);
+    free(error);
+    error = NULL;
 
     json = tf_compile_dsl("csv | summarise city count:*:rows | select starts_with(score) | csv",
                           strlen("csv | summarise city count:*:rows | select starts_with(score) | csv"),
@@ -13019,6 +13501,8 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_group_agg_sorted_streams_runs);
     TEST(test_pipeline_group_agg_null_semantics_unsorted);
     TEST(test_pipeline_group_agg_null_semantics_sorted);
+    TEST(test_pipeline_group_agg_csv_null_first_numeric_strings);
+    TEST(test_pipeline_group_agg_rejects_nonnumeric_strings);
 
     printf("\nPipeline (Text):\n");
     TEST(test_pipeline_text_passthrough);
@@ -13042,6 +13526,7 @@ int main(int argc, char **argv) {
     TEST(test_registry_find_all_ops);
     TEST(test_registry_op_kinds);
     TEST(test_registry_capabilities);
+    TEST(test_registry_capability_invariants);
     TEST(test_registry_contract_metadata);
     TEST(test_registry_count_and_iterate);
 
@@ -13074,6 +13559,7 @@ int main(int argc, char **argv) {
     TEST(test_ir_schema_select_known);
     TEST(test_ir_schema_rename_known);
     TEST(test_ir_schema_group_agg_preserves_key_types);
+    TEST(test_ir_schema_pivot_declared_categories);
 
     printf("\nCompiler:\n");
     TEST(test_compile_native_valid);
@@ -13188,6 +13674,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_step_running_sum);
     TEST(test_pipeline_frequency);
     TEST(test_pipeline_frequency_overflow_other);
+    TEST(test_pipeline_frequency_approx);
     TEST(test_pipeline_top);
     TEST(test_pipeline_bottom_k);
     TEST(test_pipeline_slice_min_string);

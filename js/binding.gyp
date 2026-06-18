@@ -96,6 +96,7 @@
         "-std=c11",
         "-Wall",
         "-D_POSIX_C_SOURCE=200809L",
+        "-D_XOPEN_SOURCE=700",
         "-D_FORTIFY_SOURCE=3",
         "-Werror=implicit-function-declaration",
         "-Werror=incompatible-pointer-types",

@@ -183,6 +183,7 @@ def audit_repo_hardening() -> list[str]:
     text = cmake.read_text(encoding='utf-8')
     required = [
         '_POSIX_C_SOURCE=200809L',
+        '_XOPEN_SOURCE=700',
         'Werror=implicit-function-declaration',
         'Wformat',
         'Werror=format-security',

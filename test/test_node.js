@@ -15,6 +15,15 @@ const { gzipSync } = require('zlib')
 
 const fixturesDir = join(__dirname, 'fixtures')
 
+if (!process.env.TMPDIR && !process.env.TEMP && !process.env.TMP) {
+  process.env.TMPDIR = join(__dirname, '..', 'build', 'tmp', 'test-node')
+}
+require('fs').mkdirSync(tmpdir(), { recursive: true })
+
+function testTmpPath(name) {
+  return join(tmpdir(), `${name}-${process.pid}`)
+}
+
 let tests = 0
 let passed = 0
 
@@ -2797,6 +2806,25 @@ await test('frequency', async () => {
   assert(overflowResult.statsText.includes('"tracked_key_bytes":6'), 'overflow frequency stats should report serialized key bytes')
   assert(overflowResult.statsText.includes('"overflow_count":3'), 'overflow frequency stats should report overflow count')
   assert(overflowResult.statsText.includes('"retained_state_bytes":'), 'overflow frequency stats should report retained state bytes')
+
+  const approxData = [
+    'city',
+    'A', 'A', 'A', 'A', 'A', 'A',
+    'B', 'B', 'B', 'B',
+    'C', 'C', 'C',
+    'D', 'E', 'F', 'G', 'A', 'B', 'A',
+    ''
+  ].join(nl)
+  const approxPipeline = pipeline([
+    codec.csv({ batchSize: 2 }),
+    ops.frequency(['city'], { mode: 'approx', maxValues: 3 }),
+    codec.csvEncode(),
+  ])
+  const approxResult = await approxPipeline.run({ input: approxData })
+  assert(approxResult.outputText.includes('value,count,error'), 'approx frequency should expose error column')
+  assert(approxResult.outputText.includes('A,8,0'), 'approx frequency should retain exact heavy hitter')
+  assert(approxResult.statsText.includes('"approximate":true'), 'approx frequency stats should mark approximate mode')
+  assert(approxResult.statsText.includes('"tracked_values":3'), 'approx frequency stats should report retained counters')
 })
 await test('key-state caps', async () => {
   assert(ops.unique(['city'], { sorted: true }).args.sorted === true, 'unique helper should set sorted')
@@ -2814,6 +2842,8 @@ await test('key-state caps', async () => {
   assert(ops.rowid(['city'], { maxStateBytes: 2048 }).args.max_state_bytes === 2048, 'rowid helper should set max_state_bytes')
   assert(ops.frequency(['city'], { maxValues: 4 }).args.max_values === 4, 'frequency helper should set max_values')
   assert(ops.frequency(['city'], { maxStateBytes: 4096 }).args.max_state_bytes === 4096, 'frequency helper should set max_state_bytes')
+  assert(ops.frequency(['city'], { mode: 'approx', maxValues: 4 }).args.mode === 'approx', 'frequency helper should set approx mode')
+  assert(ops.frequency(['city'], { approx: true, maxValues: 4 }).args.approx === true, 'frequency helper should set approx flag')
   assert(ops.onehot('city', { maxStateBytes: 4096 }).args.max_state_bytes === 4096, 'onehot helper should set max_state_bytes')
   assert(ops.labelEncode('city', { maxStateBytes: 4096 }).args.max_state_bytes === 4096, 'labelEncode helper should set max_state_bytes')
   assert(ops.intersect('lookup.csv', { maxStateBytes: 4096 }).args.max_state_bytes === 4096, 'intersect helper should set max_state_bytes')
@@ -2907,6 +2937,8 @@ await test('key-state caps', async () => {
   )
   await expectCapError(ops.frequency(['city'], { maxValues: 1 }), 'city\nNY\nLA\n', 'max_values=1')
   await expectCapError(ops.frequency(['city'], { maxStateBytes: 1024 }), 'city\nNY\n', 'max_state_bytes=1024')
+  await expectCapError(ops.frequency(['city'], { mode: 'approx', maxStateBytes: 4096 }), 'city\nNY\nLA\n', 'mode=approx')
+  await expectCapError(ops.frequency(['missing']), 'city\nNY\n', "frequency: column 'missing' not found")
   await expectCapError(ops.rowid(['city'], { maxStateBytes: 1024 }), 'city\nNY\n', 'max_state_bytes=1024')
   await expectCapError(ops.onehot('city', { maxCategories: 1 }), 'city\nNY\nLA\n', 'max_categories=1')
   await expectCapError(ops.labelEncode('city', { maxCategories: 1 }), 'city\nNY\nLA\n', 'max_categories=1')
@@ -3016,7 +3048,7 @@ await test('category policy ops', async () => {
 
 await test('join lookup caps', async () => {
   const { writeFileSync, unlinkSync } = require('fs')
-  const lookup = '/tmp/tranfi-node-join-caps.csv'
+  const lookup = testTmpPath('tranfi-node-join-caps.csv')
   writeFileSync(lookup, 'id,val\n1,a\n2,b\n')
 
   async function expectJoinCapError(step, expected) {
@@ -3041,7 +3073,7 @@ await test('join lookup caps', async () => {
 
 await test('join output caps', async () => {
   const { writeFileSync, unlinkSync } = require('fs')
-  const lookup = '/tmp/tranfi-node-join-output-caps.csv'
+  const lookup = testTmpPath('tranfi-node-join-output-caps.csv')
   writeFileSync(lookup, 'id,val\n1,a\n1,b\n')
 
   async function expectJoinCapError(step, expected) {
@@ -3080,7 +3112,7 @@ await test('join output caps', async () => {
 
 await test('join typed keys', async () => {
   const { writeFileSync, unlinkSync } = require('fs')
-  const typedLookup = '/tmp/tranfi-node-join-typed-lookup.csv'
+  const typedLookup = testTmpPath('tranfi-node-join-typed-lookup.csv')
   writeFileSync(typedLookup, 'id,val\n1,string-one\nx,other\n')
   let mismatchFailed = false
   try {
@@ -3092,7 +3124,7 @@ await test('join typed keys', async () => {
   }
   assert(mismatchFailed, 'join should reject mismatched typed key columns')
 
-  const sentinelLookup = '/tmp/tranfi-node-join-sentinel-lookup.csv'
+  const sentinelLookup = testTmpPath('tranfi-node-join-sentinel-lookup.csv')
   writeFileSync(sentinelLookup, 'id,val\n\\N,sentinel\nx,other\n')
   try {
     const result = await pipeline([
@@ -3109,8 +3141,8 @@ await test('join typed keys', async () => {
 
 await test('filtering joins', async () => {
   const { writeFileSync, unlinkSync } = require('fs')
-  const lookup = '/tmp/tranfi-node-filtering-join.csv'
-  const empty = '/tmp/tranfi-node-filtering-empty-join.csv'
+  const lookup = testTmpPath('tranfi-node-filtering-join.csv')
+  const empty = testTmpPath('tranfi-node-filtering-empty-join.csv')
   writeFileSync(lookup, 'id,val\n1,a\n1,b\n3,c\n')
   writeFileSync(empty, 'id,val\n')
   const input = 'id,name\n1,Alice\n2,Bob\n3,Charlie\n'
@@ -3144,7 +3176,7 @@ await test('filtering joins', async () => {
 
 await test('sorted join mode', async () => {
   const { writeFileSync, unlinkSync } = require('fs')
-  const lookup = '/tmp/tranfi-node-sorted-join.csv'
+  const lookup = testTmpPath('tranfi-node-sorted-join.csv')
   writeFileSync(lookup, 'id,val\n1,a\n2,b\n2,c\n4,d\n')
   const input = 'id,name\n1,Alice\n2,Bob\n2,Beth\n3,Cara\n4,Dave\n'
 
@@ -3199,8 +3231,9 @@ await test('sorted join mode', async () => {
 
 await test('set ops', async () => {
   const { writeFileSync, unlinkSync } = require('fs')
-  const lookup = '/tmp/tranfi-node-set-lookup.csv'
-  const keyLookup = '/tmp/tranfi-node-set-key-lookup.csv'
+  const lookup = testTmpPath('tranfi-node-set-lookup.csv')
+  const keyLookup = testTmpPath('tranfi-node-set-key-lookup.csv')
+  const sortedLookup = testTmpPath('tranfi-node-set-sorted-lookup.csv')
   writeFileSync(lookup, 'id,name\n1,Alice\n3,Charlie\n')
   writeFileSync(keyLookup, 'id,label\n1,x\n3,y\n')
   const input = 'id,name\n1,Alice\n2,Bob\n1,Alice\n3,Charlie\n3,Other\n'
@@ -3374,7 +3407,6 @@ await test('set ops', async () => {
     ]).run({ input: 'id,name\n1,Alice\n2,Bob\n3,Charlie\n3,Other\n', memory: '64KB', allowFs: true })
     assert(byId.outputText.trim() === 'id,name\n1,Alice\n3,Charlie', 'intersect columns should dedupe by selected key')
 
-    const sortedLookup = '/tmp/tranfi-node-set-sorted-lookup.csv'
     writeFileSync(sortedLookup, 'id,label\n1,x\n3,y\n5,z\n')
     const sortedInput = 'id,name\n1,Alice\n1,Alicia\n2,Bob\n3,Charlie\n3,Other\n4,Dana\n5,Eve\n'
     const sortedInter = await pipeline([
@@ -3444,7 +3476,7 @@ await test('set ops', async () => {
   } finally {
     unlinkSync(lookup)
     unlinkSync(keyLookup)
-    try { unlinkSync('/tmp/tranfi-node-set-sorted-lookup.csv') } catch {}
+    try { unlinkSync(sortedLookup) } catch {}
   }
 })
 
@@ -4028,6 +4060,12 @@ await test('compileDsl', async () => {
   assert(joinSpillPlan.steps[1].emit_class === 'on_flush', 'join spill should flush')
   assert(joinSpillPlan.steps[1].schema_class === 'data_dependent', 'join spill schema should be data-dependent')
 
+  const declaredPivotPlan = JSON.parse(await compileDsl('csv | pivot metric value sum categories=x,y | csv'))
+  assert(declaredPivotPlan.steps[1].op === 'pivot', 'declared pivot should parse')
+  assert(declaredPivotPlan.steps[1].memory_class === 'blocking', 'declared unsorted pivot should stay blocking')
+  assert(declaredPivotPlan.steps[1].emit_class === 'on_flush', 'declared unsorted pivot should flush')
+  assert(declaredPivotPlan.steps[1].schema_class === 'parametric', 'declared pivot schema should be parametric')
+
   const rankPlan = JSON.parse(await compileDsl('csv | slice-min score n=2 with_ties=false | csv'))
   assert(rankPlan.steps[1].op === 'slice-min', 'slice-min with_ties=false should parse')
   assert(rankPlan.steps[1].args.with_ties === false, 'slice-min should preserve with_ties=false')
@@ -4042,7 +4080,7 @@ await test('saveRecipe + loadRecipe', async () => {
     ops.head(1),
     codec.csvEncode(),
   ]
-  const path = '/tmp/tranfi_test_recipe.tranfi'
+  const path = testTmpPath('tranfi_test_recipe.tranfi')
   await saveRecipe(steps, path)
   const p = await loadRecipe(path)
   const result = await p.run({ input: 'x\n1\n2\n3\n' })
@@ -4123,8 +4161,8 @@ console.log('\nServer:')
 const { startServer } = require('../js/src/server.js')
 const { writeFileSync, mkdirSync, rmSync, existsSync } = require('fs')
 
-const testDataDir = '/tmp/tranfi-test-serve'
-const testAppDir = '/tmp/tranfi-test-serve-app'
+const testDataDir = testTmpPath('tranfi-test-serve')
+const testAppDir = testTmpPath('tranfi-test-serve-app')
 
 // Set up test data and a minimal app shell so API tests do not depend on a generated app/dist.
 if (existsSync(testDataDir)) rmSync(testDataDir, { recursive: true })
@@ -4325,6 +4363,29 @@ await test('compileToSql date expressions', async () => {
   assert(sql.includes(`date_trunc('month', "d")`), 'date_trunc should lower to SQL date_trunc')
 })
 
+await test('compileToSql cast policies', async () => {
+  const nullSql = await compileToSql('csv | cast val=int on_error=null | csv')
+  assert(nullSql.includes('TRY_CAST("val" AS BIGINT)'), 'cast on_error=null should lower through TRY_CAST')
+
+  const failSql = await compileToSql('csv | cast val=int on_error=fail | csv')
+  assert(failSql.includes('CAST("val" AS BIGINT)'), 'cast on_error=fail should use strict CAST')
+
+  const coerceSql = await compileToSql('csv | cast val=int | csv')
+  assert(coerceSql.includes('regexp_extract(CAST("val" AS VARCHAR)'), 'default int cast should preserve native prefix coercion')
+  assert(coerceSql.includes('COALESCE(TRY_CAST'), 'default int cast should coerce failures to zero')
+
+  const boolSql = await compileToSql('csv | cast flag=bool | csv')
+  assert(boolSql.includes('CASE WHEN "flag" IS NULL THEN NULL'), 'default bool cast should keep nulls')
+  assert(boolSql.includes(`CAST("flag" AS VARCHAR) = 'false'`), 'default bool cast should preserve false string handling')
+})
+
+await test('compileToSql window count skips nulls', async () => {
+  const sql = await compileToSql('csv | window val 2 count count2 | csv')
+  assert(sql.includes('COUNT("val") OVER'), 'window count should lower to COUNT(column)')
+  assert(sql.includes('__tf_window_nn'), 'window should index non-null rows for native null semantics')
+  assert(sql.includes('RANGE BETWEEN 1 PRECEDING AND CURRENT ROW'), 'window should use logical non-null frame size')
+})
+
 await test('compileToSql if_any and if_all', async () => {
   const anySql = await compileToSql('csv | filter "if_any(col(\'a\') > 0, col(\'b\') > 0)" | csv')
   assert(anySql.includes(' OR '), 'if_any should lower to OR')
@@ -4423,6 +4484,11 @@ await test('compileToSql group-agg count star', async () => {
   assert(sql.includes('COUNT("amount") AS "n"'), 'count:column should lower to COUNT(column)')
 })
 
+await test('compileToSql pivot declared categories', async () => {
+  const sql = await compileToSql('csv | pivot metric value sum categories=revenue,cost | csv')
+  assert(sql.includes('IN (\'revenue\', \'cost\')'), 'declared pivot categories should lower as an ordered IN list')
+})
+
 await test('compileToSql rowid', async () => {
   const sql = await compileToSql('csv | rowid city,status result=within_key | csv')
   assert(sql.includes('ROW_NUMBER() OVER'), 'rowid should use row_number window function')
@@ -4443,7 +4509,8 @@ await test('compileToSql rolling aliases', async () => {
   const sql = await compileToSql('csv | rolling-sum val 3 sum3 | rolling-mean val 3 mean3 | csv')
   assert(sql.includes('SUM("val") OVER'), 'rolling-sum should lower to SUM window')
   assert(sql.includes('AVG("val") OVER'), 'rolling-mean should lower to AVG window')
-  assert(sql.includes('ROWS BETWEEN 2 PRECEDING AND CURRENT ROW'), 'rolling aliases should use trailing window frame')
+  assert(sql.includes('__tf_window_nn'), 'numeric rolling aliases should index non-null rows')
+  assert(sql.includes('RANGE BETWEEN 2 PRECEDING AND CURRENT ROW'), 'numeric rolling aliases should use native non-null frame size')
   assert(sql.includes('"sum3"'), 'rolling-sum should name result')
   assert(sql.includes('"mean3"'), 'rolling-mean should name result')
 
@@ -4503,6 +4570,19 @@ if (hasDuckDB) {
   console.log('\nDuckDB Engine:')
 
   const csvData = 'name,age,score\nAlice,30,85\nBob,20,92\nCharlie,35,78\nDiana,22,95\nEve,28,88\n'
+
+  await test('duckdb file input quoted path', async () => {
+    const dir = await mkdtemp(join(tmpdir(), `tranfi-duckdb-quote-${process.pid}-`))
+    const file = join(dir, "input's.csv")
+    try {
+      await writeFile(file, 'name,age\nAlice,30\nBob,20\n')
+      const result = await pipeline('csv | select name | csv', { engine: 'duckdb' })
+        .run({ inputFile: file })
+      assert(result.outputText === 'name\nAlice\nBob\n', 'quoted path file input should run')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 
   await test('duckdb filter', async () => {
     const r = await pipeline('csv | filter "col(\'age\') > 25" | csv', { engine: 'duckdb' })
@@ -4579,6 +4659,33 @@ if (hasDuckDB) {
       .run({ input: csvData })
     assert(r.outputText.includes('age_x2'), 'should have derived column')
     assert(r.outputText.includes('60'), 'Alice 30*2=60')
+  })
+
+  await test('duckdb fill-null numeric formatting parity', async () => {
+    const data = 'name,age,city,score\nAlice,30,NY,95.5\nBob,,LA,87.0\nCharlie,35,,92.3\nDiana,28,SF,\n'
+    const dsl = 'csv | fill-null age=0 city=unknown score=0 | csv'
+    const native = await pipeline(dsl).run({ input: data })
+    const duck = await pipeline(dsl, { engine: 'duckdb' }).run({ input: data })
+    assert(duck.outputText === native.outputText,
+      `DuckDB fill-null parity failed\nnative=${native.outputText}\nduck=${duck.outputText}`)
+  })
+
+  await test('duckdb pivot declared category order parity', async () => {
+    const data = 'id,metric,value\n1,revenue,100\n1,cost,40\n2,revenue,200\n2,cost,80\n3,revenue,150\n3,cost,60\n'
+    const dsl = 'csv | pivot metric value sum categories=revenue,cost | sort id | csv'
+    const native = await pipeline(dsl).run({ input: data, allowBlocking: true })
+    const duck = await pipeline(dsl, { engine: 'duckdb' }).run({ input: data })
+    assert(duck.outputText === native.outputText,
+      `DuckDB pivot parity failed\nnative=${native.outputText}\nduck=${duck.outputText}`)
+  })
+
+  await test('duckdb dynamic pivot direct input order parity', async () => {
+    const data = 'id,metric,value\n1,revenue,100\n1,cost,40\n2,revenue,200\n2,cost,80\n3,revenue,150\n3,cost,60\n'
+    const dsl = 'csv | pivot metric value sum | sort id | csv'
+    const native = await pipeline(dsl).run({ input: data, allowBlocking: true })
+    const duck = await pipeline(dsl, { engine: 'duckdb' }).run({ input: data })
+    assert(duck.outputText === native.outputText,
+      `DuckDB dynamic pivot parity failed\nnative=${native.outputText}\nduck=${duck.outputText}`)
   })
 
   await test('duckdb rename', async () => {
@@ -5257,6 +5364,9 @@ if (createTranfi) {
     assert(slicePlan.steps[2].op === 'slice-tail', 'wasm compileDsl should normalize slice_tail')
     assert(slicePlan.steps[2].memory_class === 'bounded_state', 'wasm slice-tail memory metadata')
     assert(slicePlan.steps[2].emit_class === 'on_flush', 'wasm slice-tail emit metadata')
+    const declaredPivotPlan = JSON.parse(tf.compileDsl('csv | pivot metric value sum categories=x,y | csv'))
+    assert(declaredPivotPlan.steps[1].memory_class === 'blocking', 'wasm declared unsorted pivot should stay blocking')
+    assert(declaredPivotPlan.steps[1].schema_class === 'parametric', 'wasm declared pivot schema metadata')
     const rankPlan = JSON.parse(tf.compileDsl('csv | slice-min score n=2 with_ties=false | csv'))
     assert(rankPlan.steps[1].args.with_ties === false, 'wasm slice-min should preserve with_ties=false')
     let rejectedTies = false

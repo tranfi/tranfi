@@ -259,10 +259,13 @@ def estimate_key_state_step_bytes(step: Dict[str, Any]) -> int:
         return 2048 + max_groups * (384 + n_group * 64 + n_aggs * 96)
 
     if op == 'frequency':
+        approx = _arg(step, 'mode') == 'approx' or _arg(step, 'approx') is True
+        max_values = _positive_int(_arg(step, 'max_values'))
+        if approx and max_values is None:
+            raise RuntimeError("step 'frequency' mode=approx needs max_values for byte-bounded native execution")
         max_state_bytes = _positive_int(_arg(step, 'max_state_bytes'))
         if max_state_bytes is not None:
             return max_state_bytes
-        max_values = _positive_int(_arg(step, 'max_values'))
         if max_values is None:
             raise RuntimeError("step 'frequency' needs max_values or max_state_bytes for byte-bounded native execution")
         n_cols = _array_len(_arg(step, 'columns'))

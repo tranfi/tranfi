@@ -609,11 +609,13 @@ const ops = {
     return { op: 'group-agg', args }
   },
 
-  frequency(columns, { maxValues, maxStateBytes, overflow, other, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
+  frequency(columns, { maxValues, maxStateBytes, mode, approx, overflow, other, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = {}
     if (columns) args.columns = columns
     if (maxValues !== undefined) args.max_values = maxValues
     if (maxStateBytes !== undefined) args.max_state_bytes = maxStateBytes
+    if (mode !== undefined) args.mode = mode
+    if (approx !== undefined) args.approx = !!approx
     if (overflow !== undefined) args.overflow = overflow
     if (other !== undefined) args.other = other
     if (audit) args.audit = true
