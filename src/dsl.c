@@ -3686,16 +3686,19 @@ static cJSON *build_grep_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
+    if (!args) goto oom;
     size_t idx = 1;
     while (idx < tokens->count && tokens->items[idx][0] == '-' && tokens->items[idx][1] != '\0') {
         const char *flag = tokens->items[idx];
         if (strcmp(flag, "-v") == 0) {
-            cJSON_AddBoolToObject(args, "invert", 1);
+            if (dsl_set_bool_arg(args, "invert", 1) != TF_OK) goto oom;
         } else if (strcmp(flag, "-r") == 0 || strcmp(flag, "--regex") == 0) {
-            cJSON_AddBoolToObject(args, "regex", 1);
+            if (dsl_set_bool_arg(args, "regex", 1) != TF_OK) goto oom;
         } else if (strcmp(flag, "-rv") == 0 || strcmp(flag, "-vr") == 0) {
-            cJSON_AddBoolToObject(args, "invert", 1);
-            cJSON_AddBoolToObject(args, "regex", 1);
+            if (dsl_set_bool_arg(args, "invert", 1) != TF_OK ||
+                dsl_set_bool_arg(args, "regex", 1) != TF_OK) {
+                goto oom;
+            }
         } else {
             break; /* not a flag, must be pattern */
         }
@@ -3706,12 +3709,16 @@ static cJSON *build_grep_args(const token_list *tokens, char **error) {
         set_error(error, "grep requires a pattern argument");
         return NULL;
     }
-    cJSON_AddStringToObject(args, "pattern", tokens->items[idx]);
+    if (tf_json_add_string(args, "pattern", tokens->items[idx]) != TF_OK) goto oom;
     /* Optional column name after pattern */
     if (idx + 1 < tokens->count) {
-        cJSON_AddStringToObject(args, "column", tokens->items[idx + 1]);
+        if (tf_json_add_string(args, "column", tokens->items[idx + 1]) != TF_OK) goto oom;
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_pivot_args(const token_list *tokens, char **error) {
@@ -3723,15 +3730,18 @@ static cJSON *build_pivot_args(const token_list *tokens, char **error) {
     cJSON *args = cJSON_CreateObject();
     cJSON *cats = NULL;
     int agg_set = 0;
-    cJSON_AddStringToObject(args, "name_column", tokens->items[1]);
-    cJSON_AddStringToObject(args, "value_column", tokens->items[2]);
+    if (!args ||
+        tf_json_add_string(args, "name_column", tokens->items[1]) != TF_OK ||
+        tf_json_add_string(args, "value_column", tokens->items[2]) != TF_OK) {
+        goto oom;
+    }
     for (size_t i = 3; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         size_t max_categories = 0;
         int opt = parse_positive_option(tok, "max_categories", &max_categories, error, "pivot");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_categories", (double)max_categories);
+            if (tf_json_add_number(args, "max_categories", (double)max_categories) != TF_OK) goto oom;
             continue;
         }
         opt = parse_categories_option(tok, &cats, error, "pivot");
@@ -3740,21 +3750,21 @@ static cJSON *build_pivot_args(const token_list *tokens, char **error) {
         size_t spill_num = 0;
         opt = parse_positive_option(tok, "spill_memory_bytes", &spill_num, error, "pivot");
         if (opt < 0) goto fail;
-        if (opt > 0) { cJSON_AddNumberToObject(args, "spill_memory_bytes", (double)spill_num); continue; }
+        if (opt > 0) { if (tf_json_add_number(args, "spill_memory_bytes", (double)spill_num) != TF_OK) goto oom; continue; }
         opt = parse_positive_option(tok, "spill_run_rows", &spill_num, error, "pivot");
         if (opt < 0) goto fail;
-        if (opt > 0) { cJSON_AddNumberToObject(args, "spill_run_rows", (double)spill_num); continue; }
+        if (opt > 0) { if (tf_json_add_number(args, "spill_run_rows", (double)spill_num) != TF_OK) goto oom; continue; }
         opt = parse_positive_option(tok, "spill_output_rows", &spill_num, error, "pivot");
         if (opt < 0) goto fail;
-        if (opt > 0) { cJSON_AddNumberToObject(args, "spill_output_rows", (double)spill_num); continue; }
+        if (opt > 0) { if (tf_json_add_number(args, "spill_output_rows", (double)spill_num) != TF_OK) goto oom; continue; }
         if (strncmp(tok, "spill_dir=", 10) == 0) {
             const char *dir = tok + 10;
             if (!dir[0]) { set_error(error, "pivot spill_dir cannot be empty"); goto fail; }
-            cJSON_AddStringToObject(args, "spill_dir", dir);
+            if (tf_json_add_string(args, "spill_dir", dir) != TF_OK) goto oom;
             continue;
         }
         if (strcmp(tok, "sorted") == 0 || strcmp(tok, "--sorted") == 0) {
-            cJSON_AddBoolToObject(args, "sorted", 1);
+            if (tf_json_add_bool(args, "sorted", 1) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "sorted=", 7) == 0) {
@@ -3763,11 +3773,11 @@ static cJSON *build_pivot_args(const token_list *tokens, char **error) {
                 set_error(error, "pivot sorted must be true or false");
                 goto fail;
             }
-            cJSON_AddBoolToObject(args, "sorted", sorted);
+            if (tf_json_add_bool(args, "sorted", sorted) != TF_OK) goto oom;
             continue;
         }
         if (!agg_set) {
-            cJSON_AddStringToObject(args, "agg", tok);
+            if (tf_json_add_string(args, "agg", tok) != TF_OK) goto oom;
             agg_set = 1;
             continue;
         }
@@ -3775,10 +3785,12 @@ static cJSON *build_pivot_args(const token_list *tokens, char **error) {
         goto fail;
     }
     if (cats) {
-        cJSON_AddItemToObject(args, "categories", cats);
+        if (tf_json_add_item(args, "categories", cats) != TF_OK) { cats = NULL; goto oom; }
         cats = NULL;
     }
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     if (cats) cJSON_Delete(cats);
     cJSON_Delete(args);
@@ -3815,24 +3827,27 @@ static cJSON *build_join_args(const token_list *tokens, char **error) {
     }
 
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "file", tokens->items[1]);
-    cJSON_AddStringToObject(args, "on", on);
+    if (!args ||
+        tf_json_add_string(args, "file", tokens->items[1]) != TF_OK ||
+        tf_json_add_string(args, "on", on) != TF_OK) {
+        goto oom;
+    }
     for (size_t i = opt_start; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         if (strcmp(tok, "--left") == 0) {
-            cJSON_AddStringToObject(args, "how", "left");
+            if (tf_json_add_string(args, "how", "left") != TF_OK) goto oom;
             continue;
         }
         if (strcmp(tok, "--semi") == 0) {
-            cJSON_AddStringToObject(args, "how", "semi");
+            if (tf_json_add_string(args, "how", "semi") != TF_OK) goto oom;
             continue;
         }
         if (strcmp(tok, "--anti") == 0) {
-            cJSON_AddStringToObject(args, "how", "anti");
+            if (tf_json_add_string(args, "how", "anti") != TF_OK) goto oom;
             continue;
         }
         if (strcmp(tok, "sorted") == 0 || strcmp(tok, "--sorted") == 0) {
-            cJSON_AddBoolToObject(args, "sorted", 1);
+            if (tf_json_add_bool(args, "sorted", 1) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "sorted=", 7) == 0) {
@@ -3842,49 +3857,49 @@ static cJSON *build_join_args(const token_list *tokens, char **error) {
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddBoolToObject(args, "sorted", sorted);
+            if (tf_json_add_bool(args, "sorted", sorted) != TF_OK) goto oom;
             continue;
         }
         size_t max_lookup_rows = 0;
         int opt = parse_positive_option(tok, "max_lookup_rows", &max_lookup_rows, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_lookup_rows", (double)max_lookup_rows);
+            if (tf_json_add_number(args, "max_lookup_rows", (double)max_lookup_rows) != TF_OK) goto oom;
             continue;
         }
         size_t max_lookup_keys = 0;
         opt = parse_positive_option(tok, "max_lookup_keys", &max_lookup_keys, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_lookup_keys", (double)max_lookup_keys);
+            if (tf_json_add_number(args, "max_lookup_keys", (double)max_lookup_keys) != TF_OK) goto oom;
             continue;
         }
         size_t max_lookup_bytes = 0;
         opt = parse_positive_option(tok, "max_lookup_bytes", &max_lookup_bytes, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_lookup_bytes", (double)max_lookup_bytes);
+            if (tf_json_add_number(args, "max_lookup_bytes", (double)max_lookup_bytes) != TF_OK) goto oom;
             continue;
         }
         size_t max_state_bytes = 0;
         opt = parse_positive_option(tok, "max_state_bytes", &max_state_bytes, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes);
+            if (tf_json_add_number(args, "max_state_bytes", (double)max_state_bytes) != TF_OK) goto oom;
             continue;
         }
         size_t max_matches_per_row = 0;
         opt = parse_positive_option(tok, "max_matches_per_row", &max_matches_per_row, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_matches_per_row", (double)max_matches_per_row);
+            if (tf_json_add_number(args, "max_matches_per_row", (double)max_matches_per_row) != TF_OK) goto oom;
             continue;
         }
         size_t max_output_rows = 0;
         opt = parse_positive_option(tok, "max_output_rows", &max_output_rows, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_output_rows", (double)max_output_rows);
+            if (tf_json_add_number(args, "max_output_rows", (double)max_output_rows) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "spill_dir=", 10) == 0) {
@@ -3894,26 +3909,26 @@ static cJSON *build_join_args(const token_list *tokens, char **error) {
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "spill_dir", value_s);
+            if (tf_json_add_string(args, "spill_dir", value_s) != TF_OK) goto oom;
             continue;
         }
         size_t spill_value = 0;
         opt = parse_positive_option(tok, "spill_memory_bytes", &spill_value, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "spill_memory_bytes", (double)spill_value);
+            if (tf_json_add_number(args, "spill_memory_bytes", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "spill_run_rows", &spill_value, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "spill_run_rows", (double)spill_value);
+            if (tf_json_add_number(args, "spill_run_rows", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "spill_output_rows", &spill_value, error, "join");
         if (opt < 0) { cJSON_Delete(args); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "spill_output_rows", (double)spill_value);
+            if (tf_json_add_number(args, "spill_output_rows", (double)spill_value) != TF_OK) goto oom;
             continue;
         }
         set_errorf(error, "join: unexpected argument '%s'", tok);
@@ -3921,6 +3936,10 @@ static cJSON *build_join_args(const token_list *tokens, char **error) {
         return NULL;
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_stack_args(const token_list *tokens, char **error) {
@@ -3930,14 +3949,18 @@ static cJSON *build_stack_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "file", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "file", tokens->items[1]) != TF_OK) goto oom;
     for (size_t i = 2; i < tokens->count; i++) {
         if (strcmp(tokens->items[i], "--tag") == 0 && i + 1 < tokens->count) {
-            cJSON_AddStringToObject(args, "tag", tokens->items[i + 1]);
+            if (tf_json_add_string(args, "tag", tokens->items[i + 1]) != TF_OK) goto oom;
             i++;
         }
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static int add_comma_columns(cJSON *cols, const char *spec, char **error, const char *op_label) {
@@ -3992,21 +4015,23 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
     }
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
-    if (!args || !cols) { cJSON_Delete(args); cJSON_Delete(cols); return NULL; }
-    cJSON_AddStringToObject(args, "file", tokens->items[1]);
+    if (!args || !cols ||
+        tf_json_add_string(args, "file", tokens->items[1]) != TF_OK) {
+        goto oom;
+    }
 
     for (size_t i = 2; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         size_t value = 0;
         int opt = parse_positive_option(tok, "max_lookup_rows", &value, error, op_label);
         if (opt < 0) goto fail;
-        if (opt > 0) { cJSON_AddNumberToObject(args, "max_lookup_rows", (double)value); continue; }
+        if (opt > 0) { if (tf_json_add_number(args, "max_lookup_rows", (double)value) != TF_OK) goto oom; continue; }
         opt = parse_positive_option(tok, "max_lookup_keys", &value, error, op_label);
         if (opt < 0) goto fail;
-        if (opt > 0) { cJSON_AddNumberToObject(args, "max_lookup_keys", (double)value); continue; }
+        if (opt > 0) { if (tf_json_add_number(args, "max_lookup_keys", (double)value) != TF_OK) goto oom; continue; }
         opt = parse_positive_option(tok, "max_lookup_bytes", &value, error, op_label);
         if (opt < 0) goto fail;
-        if (opt > 0) { cJSON_AddNumberToObject(args, "max_lookup_bytes", (double)value); continue; }
+        if (opt > 0) { if (tf_json_add_number(args, "max_lookup_bytes", (double)value) != TF_OK) goto oom; continue; }
         opt = parse_positive_option(tok, "max_output_keys", &value, error, op_label);
         if (opt < 0) goto fail;
         if (opt > 0) {
@@ -4014,7 +4039,7 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
                 set_errorf(error, "%s: max_output_keys is only valid for duplicate-eliminating set ops", op_label);
                 goto fail;
             }
-            cJSON_AddNumberToObject(args, "max_output_keys", (double)value);
+            if (tf_json_add_number(args, "max_output_keys", (double)value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "max_state_bytes", &value, error, op_label);
@@ -4024,7 +4049,7 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
                 set_errorf(error, "%s: max_state_bytes is only valid for duplicate-eliminating or bag-count set ops", op_label);
                 goto fail;
             }
-            cJSON_AddNumberToObject(args, "max_state_bytes", (double)value);
+            if (tf_json_add_number(args, "max_state_bytes", (double)value) != TF_OK) goto oom;
             continue;
         }
 
@@ -4038,7 +4063,7 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
                 set_errorf(error, "%s: spill_dir is only valid for duplicate-eliminating or bag-count set ops", op_label);
                 goto fail;
             }
-            cJSON_AddStringToObject(args, "spill_dir", value_s);
+            if (tf_json_add_string(args, "spill_dir", value_s) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "spill_memory_bytes", &value, error, op_label);
@@ -4048,7 +4073,7 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
                 set_errorf(error, "%s: spill_memory_bytes is only valid for duplicate-eliminating or bag-count set ops", op_label);
                 goto fail;
             }
-            cJSON_AddNumberToObject(args, "spill_memory_bytes", (double)value);
+            if (tf_json_add_number(args, "spill_memory_bytes", (double)value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "spill_run_rows", &value, error, op_label);
@@ -4058,7 +4083,7 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
                 set_errorf(error, "%s: spill_run_rows is only valid for duplicate-eliminating or bag-count set ops", op_label);
                 goto fail;
             }
-            cJSON_AddNumberToObject(args, "spill_run_rows", (double)value);
+            if (tf_json_add_number(args, "spill_run_rows", (double)value) != TF_OK) goto oom;
             continue;
         }
         opt = parse_positive_option(tok, "spill_output_rows", &value, error, op_label);
@@ -4068,12 +4093,12 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
                 set_errorf(error, "%s: spill_output_rows is only valid for duplicate-eliminating or bag-count set ops", op_label);
                 goto fail;
             }
-            cJSON_AddNumberToObject(args, "spill_output_rows", (double)value);
+            if (tf_json_add_number(args, "spill_output_rows", (double)value) != TF_OK) goto oom;
             continue;
         }
 
         if (strcmp(tok, "sorted") == 0 || strcmp(tok, "--sorted") == 0) {
-            cJSON_AddBoolToObject(args, "sorted", 1);
+            if (tf_json_add_bool(args, "sorted", 1) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "sorted=", 7) == 0) {
@@ -4082,7 +4107,7 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
                 set_errorf(error, "%s: sorted must be true or false", op_label);
                 goto fail;
             }
-            cJSON_AddBoolToObject(args, "sorted", sorted);
+            if (tf_json_add_bool(args, "sorted", sorted) != TF_OK) goto oom;
             continue;
         }
 
@@ -4095,16 +4120,20 @@ static cJSON *build_set_file_args(const token_list *tokens, char **error, const 
             continue;
         }
         if (cJSON_GetArraySize(cols) == 0) {
-            cJSON_AddItemToArray(cols, cJSON_CreateString(tok));
+            if (dsl_add_string_array_item(cols, tok) != TF_OK) goto oom;
             continue;
         }
         set_errorf(error, "%s: unexpected argument '%s'", op_label, tok);
         goto fail;
     }
 
-    if (cJSON_GetArraySize(cols) > 0) cJSON_AddItemToObject(args, "columns", cols);
+    if (cJSON_GetArraySize(cols) > 0) {
+        if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
+    }
     else cJSON_Delete(cols);
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     cJSON_Delete(cols);
     cJSON_Delete(args);
@@ -4127,7 +4156,7 @@ static cJSON *build_rowid_args(const token_list *tokens, char **error) {
     /* rowid [col1,col2] [result=name|as=name] [sorted=true|--sorted] [max_keys=N] [max_state_bytes=N] */
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
-    if (!args || !cols) { cJSON_Delete(args); cJSON_Delete(cols); return NULL; }
+    if (!args || !cols) goto oom;
 
     int have_result = 0;
     int have_sorted = 0;
@@ -4137,7 +4166,7 @@ static cJSON *build_rowid_args(const token_list *tokens, char **error) {
         int opt = parse_positive_option(tok, "max_keys", &max_keys, error, "rowid");
         if (opt < 0) { cJSON_Delete(args); cJSON_Delete(cols); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_keys", (double)max_keys);
+            if (tf_json_add_number(args, "max_keys", (double)max_keys) != TF_OK) goto oom;
             continue;
         }
 
@@ -4145,7 +4174,7 @@ static cJSON *build_rowid_args(const token_list *tokens, char **error) {
         opt = parse_positive_option(tok, "max_state_bytes", &max_state_bytes, error, "rowid");
         if (opt < 0) { cJSON_Delete(args); cJSON_Delete(cols); return NULL; }
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes);
+            if (tf_json_add_number(args, "max_state_bytes", (double)max_state_bytes) != TF_OK) goto oom;
             continue;
         }
 
@@ -4154,7 +4183,7 @@ static cJSON *build_rowid_args(const token_list *tokens, char **error) {
                 set_error(error, "rowid sorted specified more than once");
                 cJSON_Delete(args); cJSON_Delete(cols); return NULL;
             }
-            cJSON_AddBoolToObject(args, "sorted", 1);
+            if (tf_json_add_bool(args, "sorted", 1) != TF_OK) goto oom;
             have_sorted = 1;
             continue;
         }
@@ -4168,7 +4197,7 @@ static cJSON *build_rowid_args(const token_list *tokens, char **error) {
                 set_error(error, "rowid sorted specified more than once");
                 cJSON_Delete(args); cJSON_Delete(cols); return NULL;
             }
-            cJSON_AddBoolToObject(args, "sorted", sorted);
+            if (tf_json_add_bool(args, "sorted", sorted) != TF_OK) goto oom;
             have_sorted = 1;
             continue;
         }
@@ -4181,7 +4210,7 @@ static cJSON *build_rowid_args(const token_list *tokens, char **error) {
                 set_error(error, "rowid result specified more than once or empty");
                 cJSON_Delete(args); cJSON_Delete(cols); return NULL;
             }
-            cJSON_AddStringToObject(args, "result", result);
+            if (tf_json_add_string(args, "result", result) != TF_OK) goto oom;
             have_result = 1;
             continue;
         }
@@ -4193,9 +4222,16 @@ static cJSON *build_rowid_args(const token_list *tokens, char **error) {
         }
     }
 
-    if (cJSON_GetArraySize(cols) > 0) cJSON_AddItemToObject(args, "columns", cols);
+    if (cJSON_GetArraySize(cols) > 0) {
+        if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
+    }
     else cJSON_Delete(cols);
     return args;
+oom:
+    cJSON_Delete(cols);
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_rleid_args(const token_list *tokens, char **error) {
@@ -4206,7 +4242,7 @@ static cJSON *build_rleid_args(const token_list *tokens, char **error) {
     }
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
-    if (!args || !cols) { cJSON_Delete(args); cJSON_Delete(cols); return NULL; }
+    if (!args || !cols) goto oom;
 
     int result_set = 0;
     for (size_t i = 1; i < tokens->count; i++) {
@@ -4227,7 +4263,7 @@ static cJSON *build_rleid_args(const token_list *tokens, char **error) {
                 cJSON_Delete(cols);
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "result", result);
+            if (tf_json_add_string(args, "result", result) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
@@ -4243,8 +4279,13 @@ static cJSON *build_rleid_args(const token_list *tokens, char **error) {
         cJSON_Delete(cols);
         return NULL;
     }
-    cJSON_AddItemToObject(args, "columns", cols);
+    if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
     return args;
+oom:
+    cJSON_Delete(cols);
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static int parse_positive_offset(const char *s, long *out);
@@ -4261,8 +4302,7 @@ static cJSON *build_sample_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    if (!args) return NULL;
-    cJSON_AddNumberToObject(args, "n", n);
+    if (!args || tf_json_add_number(args, "n", n) != TF_OK) goto oom;
     int seed_set = 0;
     for (size_t i = 2; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
@@ -4274,7 +4314,7 @@ static cJSON *build_sample_args(const token_list *tokens, char **error) {
             }
             const char *value = tok + 5;
             if (strcmp(value, "random") == 0) {
-                cJSON_AddStringToObject(args, "seed", "random");
+                if (tf_json_add_string(args, "seed", "random") != TF_OK) goto oom;
             } else {
                 char *end = NULL;
                 long seed = strtol(value, &end, 10);
@@ -4283,7 +4323,7 @@ static cJSON *build_sample_args(const token_list *tokens, char **error) {
                     cJSON_Delete(args);
                     return NULL;
                 }
-                cJSON_AddNumberToObject(args, "seed", seed);
+                if (tf_json_add_number(args, "seed", seed) != TF_OK) goto oom;
             }
             seed_set = 1;
             continue;
@@ -4293,6 +4333,10 @@ static cJSON *build_sample_args(const token_list *tokens, char **error) {
         return NULL;
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static int parse_positive_offset(const char *s, long *out) {
@@ -4314,7 +4358,10 @@ static int add_shift_type(cJSON *args, const char *type, const char *op_name,
         set_errorf(error, "%s type specified more than once", op_name);
         return -1;
     }
-    if (!prev) cJSON_AddStringToObject(args, "type", type);
+    if (!prev && tf_json_add_string(args, "type", type) != TF_OK) {
+        set_oom_error_if_unset(error);
+        return -1;
+    }
     return 0;
 }
 
@@ -4329,7 +4376,7 @@ static cJSON *build_shift_like_args(const token_list *tokens, char **error,
     }
 
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     int have_offset = 0;
     int have_result = 0;
 
@@ -4351,7 +4398,7 @@ static cJSON *build_shift_like_args(const token_list *tokens, char **error,
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddNumberToObject(args, "offset", off);
+            if (tf_json_add_number(args, "offset", off) != TF_OK) goto oom;
             have_offset = 1;
             continue;
         }
@@ -4365,7 +4412,7 @@ static cJSON *build_shift_like_args(const token_list *tokens, char **error,
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "result", val);
+            if (tf_json_add_string(args, "result", val) != TF_OK) goto oom;
             have_result = 1;
             continue;
         }
@@ -4399,13 +4446,13 @@ static cJSON *build_shift_like_args(const token_list *tokens, char **error,
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddNumberToObject(args, "offset", off);
+            if (tf_json_add_number(args, "offset", off) != TF_OK) goto oom;
             have_offset = 1;
             continue;
         }
 
         if (!have_result) {
-            cJSON_AddStringToObject(args, "result", tok);
+            if (tf_json_add_string(args, "result", tok) != TF_OK) goto oom;
             have_result = 1;
             continue;
         }
@@ -4416,6 +4463,10 @@ static cJSON *build_shift_like_args(const token_list *tokens, char **error,
     }
 
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_date_trunc_args(const token_list *tokens, char **error) {
@@ -4429,8 +4480,11 @@ static cJSON *build_date_trunc_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
-    cJSON_AddStringToObject(args, "trunc", tokens->items[2]);
+    if (!args ||
+        tf_json_add_string(args, "column", tokens->items[1]) != TF_OK ||
+        tf_json_add_string(args, "trunc", tokens->items[2]) != TF_OK) {
+        goto oom;
+    }
     int result_set = 0;
     for (size_t i = 3; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
@@ -4441,12 +4495,12 @@ static cJSON *build_date_trunc_args(const token_list *tokens, char **error) {
             const char *value = tok + (tok[0] == 'a' ? 3 : 7);
             if (!*value) { set_error(error, "date-trunc result cannot be empty"); goto fail; }
             if (result_set) { set_error(error, "date-trunc duplicate result argument"); goto fail; }
-            cJSON_AddStringToObject(args, "result", value);
+            if (tf_json_add_string(args, "result", value) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
         if (!result_set) {
-            cJSON_AddStringToObject(args, "result", tok);
+            if (tf_json_add_string(args, "result", tok) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
@@ -4454,6 +4508,8 @@ static cJSON *build_date_trunc_args(const token_list *tokens, char **error) {
         goto fail;
     }
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     cJSON_Delete(args);
     return NULL;
@@ -4467,25 +4523,25 @@ static cJSON *build_onehot_args(const token_list *tokens, char **error) {
     }
     cJSON *args = cJSON_CreateObject();
     cJSON *cats = NULL;
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     for (size_t i = 2; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         if (strcmp(tok, "--drop") == 0) {
-            cJSON_AddBoolToObject(args, "drop", 1);
+            if (tf_json_add_bool(args, "drop", 1) != TF_OK) goto oom;
             continue;
         }
         size_t max_categories = 0;
         int opt = parse_positive_option(tok, "max_categories", &max_categories, error, "onehot");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_categories", (double)max_categories);
+            if (tf_json_add_number(args, "max_categories", (double)max_categories) != TF_OK) goto oom;
             continue;
         }
         size_t max_state_bytes = 0;
         opt = parse_positive_option(tok, "max_state_bytes", &max_state_bytes, error, "onehot");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes);
+            if (tf_json_add_number(args, "max_state_bytes", (double)max_state_bytes) != TF_OK) goto oom;
             continue;
         }
         opt = parse_unknown_option(tok, args, error, "onehot");
@@ -4498,10 +4554,12 @@ static cJSON *build_onehot_args(const token_list *tokens, char **error) {
         goto fail;
     }
     if (cats) {
-        cJSON_AddItemToObject(args, "categories", cats);
+        if (tf_json_add_item(args, "categories", cats) != TF_OK) { cats = NULL; goto oom; }
         cats = NULL;
     }
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     if (cats) cJSON_Delete(cats);
     cJSON_Delete(args);
@@ -4517,21 +4575,21 @@ static cJSON *build_label_encode_args(const token_list *tokens, char **error) {
     cJSON *args = cJSON_CreateObject();
     cJSON *cats = NULL;
     int result_set = 0;
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     for (size_t i = 2; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         size_t max_categories = 0;
         int opt = parse_positive_option(tok, "max_categories", &max_categories, error, "label-encode");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_categories", (double)max_categories);
+            if (tf_json_add_number(args, "max_categories", (double)max_categories) != TF_OK) goto oom;
             continue;
         }
         size_t max_state_bytes = 0;
         opt = parse_positive_option(tok, "max_state_bytes", &max_state_bytes, error, "label-encode");
         if (opt < 0) goto fail;
         if (opt > 0) {
-            cJSON_AddNumberToObject(args, "max_state_bytes", (double)max_state_bytes);
+            if (tf_json_add_number(args, "max_state_bytes", (double)max_state_bytes) != TF_OK) goto oom;
             continue;
         }
         opt = parse_unknown_option(tok, args, error, "label-encode");
@@ -4541,7 +4599,7 @@ static cJSON *build_label_encode_args(const token_list *tokens, char **error) {
         if (opt < 0) goto fail;
         if (opt > 0) continue;
         if (!result_set) {
-            cJSON_AddStringToObject(args, "result", tok);
+            if (tf_json_add_string(args, "result", tok) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
@@ -4549,10 +4607,12 @@ static cJSON *build_label_encode_args(const token_list *tokens, char **error) {
         goto fail;
     }
     if (cats) {
-        cJSON_AddItemToObject(args, "categories", cats);
+        if (tf_json_add_item(args, "categories", cats) != TF_OK) { cats = NULL; goto oom; }
         cats = NULL;
     }
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     if (cats) cJSON_Delete(cats);
     cJSON_Delete(args);
@@ -4566,7 +4626,7 @@ static cJSON *build_ewma_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     int alpha_set = 0;
     int result_set = 0;
     for (size_t i = 2; i < tokens->count; i++) {
@@ -4576,7 +4636,7 @@ static cJSON *build_ewma_args(const token_list *tokens, char **error) {
         if (strncmp(tokens->items[i], "result=", 7) == 0 || strncmp(tokens->items[i], "as=", 3) == 0) {
             const char *value = tokens->items[i] + (tokens->items[i][0] == 'a' ? 3 : 7);
             if (!*value) { set_error(error, "ewma result cannot be empty"); goto fail; }
-            cJSON_AddStringToObject(args, "result", value);
+            if (tf_json_add_string(args, "result", value) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
@@ -4584,12 +4644,12 @@ static cJSON *build_ewma_args(const token_list *tokens, char **error) {
             double alpha = 0.0;
             if (parse_finite_number_token(tokens->items[i], "ewma alpha", &alpha, error) != TF_OK) goto fail;
             if (alpha < 0.0 || alpha > 1.0) { set_error(error, "ewma alpha must be between 0 and 1"); goto fail; }
-            cJSON_AddNumberToObject(args, "alpha", alpha);
+            if (tf_json_add_number(args, "alpha", alpha) != TF_OK) goto oom;
             alpha_set = 1;
             continue;
         }
         if (!result_set) {
-            cJSON_AddStringToObject(args, "result", tokens->items[i]);
+            if (tf_json_add_string(args, "result", tokens->items[i]) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
@@ -4598,6 +4658,8 @@ static cJSON *build_ewma_args(const token_list *tokens, char **error) {
     }
     if (!alpha_set) { set_error(error, "ewma requires alpha"); goto fail; }
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     cJSON_Delete(args);
     return NULL;
@@ -4610,19 +4672,23 @@ static cJSON *build_diff_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     if (tokens->count >= 3) {
         char *end;
         long order = strtol(tokens->items[2], &end, 10);
         if (*end == '\0') {
-            cJSON_AddNumberToObject(args, "order", order);
+            if (tf_json_add_number(args, "order", order) != TF_OK) goto oom;
             if (tokens->count >= 4)
-                cJSON_AddStringToObject(args, "result", tokens->items[3]);
+                if (tf_json_add_string(args, "result", tokens->items[3]) != TF_OK) goto oom;
         } else {
-            cJSON_AddStringToObject(args, "result", tokens->items[2]);
+            if (tf_json_add_string(args, "result", tokens->items[2]) != TF_OK) goto oom;
         }
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_anomaly_args(const token_list *tokens, char **error) {
@@ -4632,7 +4698,7 @@ static cJSON *build_anomaly_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     int threshold_set = 0;
     int result_set = 0;
     for (size_t i = 2; i < tokens->count; i++) {
@@ -4642,7 +4708,7 @@ static cJSON *build_anomaly_args(const token_list *tokens, char **error) {
         if (strncmp(tokens->items[i], "result=", 7) == 0 || strncmp(tokens->items[i], "as=", 3) == 0) {
             const char *value = tokens->items[i] + (tokens->items[i][0] == 'a' ? 3 : 7);
             if (!*value) { set_error(error, "anomaly result cannot be empty"); goto fail; }
-            cJSON_AddStringToObject(args, "result", value);
+            if (tf_json_add_string(args, "result", value) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
@@ -4655,12 +4721,12 @@ static cJSON *build_anomaly_args(const token_list *tokens, char **error) {
         if (end && end != tokens->items[i] && *end == '\0') {
             if (threshold_set) { set_error(error, "anomaly threshold specified more than once"); goto fail; }
             if (!isfinite(threshold) || threshold < 0.0) { set_error(error, "anomaly threshold must be non-negative and finite"); goto fail; }
-            cJSON_AddNumberToObject(args, "threshold", threshold);
+            if (tf_json_add_number(args, "threshold", threshold) != TF_OK) goto oom;
             threshold_set = 1;
             continue;
         }
         if (!result_set) {
-            cJSON_AddStringToObject(args, "result", tokens->items[i]);
+            if (tf_json_add_string(args, "result", tokens->items[i]) != TF_OK) goto oom;
             result_set = 1;
             continue;
         }
@@ -4668,6 +4734,8 @@ static cJSON *build_anomaly_args(const token_list *tokens, char **error) {
         goto fail;
     }
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     cJSON_Delete(args);
     return NULL;
@@ -4675,27 +4743,31 @@ fail:
 
 static cJSON *build_split_data_args(const token_list *tokens, char **error) {
     /* split-data [ratio] [--seed N] [result_name] */
-    (void)error;
     cJSON *args = cJSON_CreateObject();
+    if (!args) goto oom;
     size_t idx = 1;
     if (idx < tokens->count) {
         char *end;
         double ratio = strtod(tokens->items[idx], &end);
         if (*end == '\0') {
-            cJSON_AddNumberToObject(args, "ratio", ratio);
+            if (tf_json_add_number(args, "ratio", ratio) != TF_OK) goto oom;
             idx++;
         }
     }
     while (idx < tokens->count) {
         if (strcmp(tokens->items[idx], "--seed") == 0 && idx + 1 < tokens->count) {
-            cJSON_AddNumberToObject(args, "seed", atoi(tokens->items[idx + 1]));
+            if (tf_json_add_number(args, "seed", atoi(tokens->items[idx + 1])) != TF_OK) goto oom;
             idx += 2;
         } else {
-            cJSON_AddStringToObject(args, "result", tokens->items[idx]);
+            if (tf_json_add_string(args, "result", tokens->items[idx]) != TF_OK) goto oom;
             idx++;
         }
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static int valid_interpolate_method(const char *s) {
@@ -4709,7 +4781,7 @@ static cJSON *build_interpolate_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     int method_set = 0;
     for (size_t i = 2; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
@@ -4723,13 +4795,13 @@ static cJSON *build_interpolate_args(const token_list *tokens, char **error) {
                 goto fail;
             }
             if (method_set) { set_error(error, "interpolate method specified more than once"); goto fail; }
-            cJSON_AddStringToObject(args, "method", method);
+            if (tf_json_add_string(args, "method", method) != TF_OK) goto oom;
             method_set = 1;
             continue;
         }
         if (valid_interpolate_method(tok)) {
             if (method_set) { set_error(error, "interpolate method specified more than once"); goto fail; }
-            cJSON_AddStringToObject(args, "method", tok);
+            if (tf_json_add_string(args, "method", tok) != TF_OK) goto oom;
             method_set = 1;
             continue;
         }
@@ -4737,6 +4809,8 @@ static cJSON *build_interpolate_args(const token_list *tokens, char **error) {
         goto fail;
     }
     return args;
+oom:
+    set_oom_error_if_unset(error);
 fail:
     cJSON_Delete(args);
     return NULL;
@@ -4751,7 +4825,13 @@ static cJSON *build_normalize_args(const token_list *tokens, char **error) {
     }
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
-    cJSON_AddItemToObject(args, "columns", cols);
+    int cols_attached = 0;
+    if (!args || !cols ||
+        tf_json_add_item(args, "columns", cols) != TF_OK) {
+        cols = NULL;
+        goto oom;
+    }
+    cols_attached = 1;
 
     const char *method = NULL;
     for (size_t i = 1; i < tokens->count; i++) {
@@ -4786,8 +4866,13 @@ static cJSON *build_normalize_args(const token_list *tokens, char **error) {
         set_error(error, "normalize requires column names");
         return NULL;
     }
-    if (method) cJSON_AddStringToObject(args, "method", method);
+    if (method && tf_json_add_string(args, "method", method) != TF_OK) goto oom;
     return args;
+oom:
+    if (!cols_attached) cJSON_Delete(cols);
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_acf_args(const token_list *tokens, char **error) {
@@ -4797,7 +4882,7 @@ static cJSON *build_acf_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    cJSON_AddStringToObject(args, "column", tokens->items[1]);
+    if (!args || tf_json_add_string(args, "column", tokens->items[1]) != TF_OK) goto oom;
     int saw_lags = 0;
     for (size_t i = 2; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
@@ -4816,10 +4901,14 @@ static cJSON *build_acf_args(const token_list *tokens, char **error) {
             cJSON_Delete(args);
             return NULL;
         }
-        cJSON_AddNumberToObject(args, "lags", (double)lags);
+        if (tf_json_add_number(args, "lags", (double)lags) != TF_OK) goto oom;
         saw_lags = 1;
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 /* ---- Main parser ---- */

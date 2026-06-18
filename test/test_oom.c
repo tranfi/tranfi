@@ -580,10 +580,16 @@ int main(void) {
             620
         },
         {
+            "dsl_key_sequence_builder_args",
+            "csv batch_size=1 | grep -rv NOPE name | rowid city result=city_row sorted=false max_keys=8 max_state_bytes=32768 | rleid city result=city_run | shift age offset=1 result=age_prev type=lag | onehot color --drop categories=red,blue,green unknown=other max_categories=4 max_state_bytes=32768 | label-encode city city_id categories=NY,LA,SF unknown=null max_categories=4 max_state_bytes=32768 | ewma score 0.5 score_ewma missing=null on_type_error=null | anomaly score 2 score_anom missing=null on_type_error=null | diff score 1 score_diff | split-data 0.67 --seed 11 split_id | sample 3 seed=7 | csv",
+            people,
+            980
+        },
+        {
             "stack_file",
             "csv batch_size=1 | stack /tmp/tranfi_oom_stack.csv --tag src | csv",
             people,
-            420
+            460
         },
         {
             "flush_report_stats",
@@ -647,9 +653,9 @@ int main(void) {
         },
         {
             "spill_pivot",
-            "csv batch_size=1 | pivot color score sum max_categories=4 spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=2 spill_output_rows=2 | csv",
+            "csv batch_size=1 | pivot color score sum categories=red,blue max_categories=4 sorted=false spill_dir=/tmp/tranfi_oom_spill_root spill_memory_bytes=4096 spill_run_rows=2 spill_output_rows=2 | csv",
             people,
-            560
+            640
         },
         {
             "spill_filtering_join",
@@ -665,15 +671,15 @@ int main(void) {
         },
         {
             "spill_mutating_join",
-            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city max_matches_per_row=2 spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=2 spill_output_rows=2 | csv",
+            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city max_matches_per_row=2 spill_dir=/tmp/tranfi_oom_spill_root spill_memory_bytes=4096 spill_run_rows=2 spill_output_rows=2 | csv",
             people,
-            620
+            680
         },
         {
             "hash_mutating_join",
-            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_matches_per_row=2 max_output_rows=16 | csv",
+            "csv batch_size=1 | join /tmp/tranfi_oom_join_lookup.csv on city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_state_bytes=32768 max_matches_per_row=2 max_output_rows=16 | csv",
             people,
-            520
+            580
         },
         {
             "hash_filtering_join",
@@ -713,9 +719,9 @@ int main(void) {
         },
         {
             "hash_set_schema_capture",
-            "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city max_lookup_keys=8 max_output_keys=8 | csv",
+            "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city max_lookup_rows=8 max_lookup_keys=8 max_lookup_bytes=4096 max_output_keys=8 max_state_bytes=32768 | csv",
             people,
-            340
+            420
         },
         {
             "sorted_set_schema_capture",
@@ -749,9 +755,9 @@ int main(void) {
         },
         {
             "spill_set_schema_capture",
-            "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_run_rows=16 spill_output_rows=16 | csv",
+            "csv batch_size=1 | intersect /tmp/tranfi_oom_union_lookup.csv columns=city spill_dir=/tmp/tranfi_oom_spill_root spill_memory_bytes=4096 spill_run_rows=16 spill_output_rows=16 | csv",
             people,
-            380
+            420
         },
         {
             "spill_setdiff_schema_capture",
