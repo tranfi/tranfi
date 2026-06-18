@@ -615,6 +615,41 @@ int main(void) {
         union_all_silent_dsl,
         people,
         520);
+    run_case_no_silent_output_oom(
+        "flush_latent_blocking_materialization",
+        "csv batch_size=1 | top 2 score | tail 2 | sample 2 seed=1 | "
+        "normalize score | acf score 2 | csv",
+        people,
+        430);
+    run_case_no_silent_output_oom(
+        "blocking_data_prep_materialization",
+        "csv batch_size=1 | interpolate x linear | normalize x audit audit_limit=2 | "
+        "acf y 2 | csv",
+        series,
+        620);
+    run_case_no_silent_output_oom(
+        "data_prep_policy_modes_materialization",
+        "csv batch_size=1 | interpolate missing forward missing=null | "
+        "interpolate name forward on_type_error=null | normalize missing2 missing=null | "
+        "normalize name on_type_error=null | csv",
+        people,
+        700);
+    run_case_no_silent_output_oom(
+        "normalize_zscore_audit_materialization",
+        "csv batch_size=1 | normalize score zscore audit audit_limit=2 "
+        "audit_columns=name,score audit_hash_columns=score | csv",
+        people,
+        620);
+    run_case_no_silent_output_oom(
+        "scan_profile_materialization",
+        "csv batch_size=1 | scan | csv",
+        people,
+        430);
+    run_case_no_silent_output_oom(
+        "stats_distinct_hist_sample_materialization",
+        "csv batch_size=1 | stats distinct,hist,sample | csv",
+        people,
+        520);
     const char *rules_path = "/tmp/tranfi_oom_rules.json";
     FILE *rules_file = fopen(rules_path, "wb");
     assert(rules_file);
