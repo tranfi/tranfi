@@ -578,18 +578,22 @@ static char *csv_raw_preview(const csv_decoder_state *st, const char *line, size
     return raw;
 }
 
-static void csv_add_raw_payload(csv_decoder_state *st, cJSON *obj, const char *raw, int truncated) {
+static int csv_add_raw_payload(csv_decoder_state *st, cJSON *obj, const char *raw, int truncated) {
     if (st && st->audit_opts.include_row) {
         char raw_buf[256];
         const char *safe_raw = tf_audit_format_string_for_column(&st->audit_opts, "raw", raw, raw_buf, sizeof(raw_buf));
         if (st->audit_opts.max_bytes > 0 && safe_raw && strlen(safe_raw) > st->audit_opts.max_bytes) {
-            cJSON_AddBoolToObject(obj, "_audit_truncated", 1);
-            cJSON_AddNumberToObject(obj, "max_bytes", (double)st->audit_opts.max_bytes);
+            if (tf_json_add_bool(obj, "_audit_truncated", 1) != TF_OK ||
+                tf_json_add_number(obj, "max_bytes", (double)st->audit_opts.max_bytes) != TF_OK) {
+                return TF_ERROR;
+            }
         } else {
-            cJSON_AddStringToObject(obj, "raw", safe_raw ? safe_raw : "");
+            if (tf_json_add_string(obj, "raw", safe_raw ? safe_raw : "") != TF_OK)
+                return TF_ERROR;
         }
     }
-    if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
+    if (truncated && tf_json_add_bool(obj, "truncated", 1) != TF_OK) return TF_ERROR;
+    return TF_OK;
 }
 
 static int emit_csv_repair_audit(csv_decoder_state *st, const char *line, size_t line_len,
@@ -601,21 +605,25 @@ static int emit_csv_repair_audit(csv_decoder_state *st, const char *line, size_t
     if (!raw) return TF_ERROR;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) { free(raw); return TF_ERROR; }
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "codec.csv.decode");
-    cJSON_AddStringToObject(obj, "event", "row_repaired");
-    cJSON_AddStringToObject(obj, "reason", "csv_field_count");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "mode", csv_mode_name(st->mode));
-    cJSON_AddStringToObject(obj, "action", "repair");
-    cJSON_AddNumberToObject(obj, "line", (double)line_no);
-    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
-    cJSON_AddNumberToObject(obj, "expected_fields", (double)st->n_cols);
-    cJSON_AddNumberToObject(obj, "actual_fields", (double)n_fields);
-    cJSON_AddStringToObject(obj, "message", message ? message : "CSV row field count differs from header");
-    cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
-    csv_add_raw_payload(st, obj, raw, truncated);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "codec.csv.decode") != TF_OK ||
+        tf_json_add_string(obj, "event", "row_repaired") != TF_OK ||
+        tf_json_add_string(obj, "reason", "csv_field_count") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "mode", csv_mode_name(st->mode)) != TF_OK ||
+        tf_json_add_string(obj, "action", "repair") != TF_OK ||
+        tf_json_add_number(obj, "line", (double)line_no) != TF_OK ||
+        tf_json_add_number(obj, "byte_offset", (double)byte_offset) != TF_OK ||
+        tf_json_add_number(obj, "expected_fields", (double)st->n_cols) != TF_OK ||
+        tf_json_add_number(obj, "actual_fields", (double)n_fields) != TF_OK ||
+        tf_json_add_string(obj, "message", message ? message : "CSV row field count differs from header") != TF_OK ||
+        tf_json_add_number(obj, "raw_bytes", (double)line_len) != TF_OK ||
+        csv_add_raw_payload(st, obj, raw, truncated) != TF_OK) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     free(raw);
     if (rc == TF_OK) st->audit_emitted++;
@@ -642,20 +650,23 @@ static int emit_csv_field_count_diagnostic(csv_decoder_state *st, const char *li
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) { free(raw); return TF_ERROR; }
-    cJSON_AddStringToObject(obj, "type", "csv_field_count");
-    cJSON_AddStringToObject(obj, "op", "codec.csv.decode");
-    cJSON_AddStringToObject(obj, "mode", csv_mode_name(st->mode));
-    cJSON_AddStringToObject(obj, "action", action);
-    cJSON_AddStringToObject(obj, "severity", severity);
-    cJSON_AddNumberToObject(obj, "line", (double)line_no);
-    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
-    cJSON_AddNumberToObject(obj, "expected_fields", (double)st->n_cols);
-    cJSON_AddNumberToObject(obj, "actual_fields", (double)n_fields);
-    cJSON_AddStringToObject(obj, "message", message ? message : "CSV row field count differs from header");
-    cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
-    csv_add_raw_payload(st, obj, raw, truncated);
-
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "csv_field_count") != TF_OK ||
+        tf_json_add_string(obj, "op", "codec.csv.decode") != TF_OK ||
+        tf_json_add_string(obj, "mode", csv_mode_name(st->mode)) != TF_OK ||
+        tf_json_add_string(obj, "action", action) != TF_OK ||
+        tf_json_add_string(obj, "severity", severity) != TF_OK ||
+        tf_json_add_number(obj, "line", (double)line_no) != TF_OK ||
+        tf_json_add_number(obj, "byte_offset", (double)byte_offset) != TF_OK ||
+        tf_json_add_number(obj, "expected_fields", (double)st->n_cols) != TF_OK ||
+        tf_json_add_number(obj, "actual_fields", (double)n_fields) != TF_OK ||
+        tf_json_add_string(obj, "message", message ? message : "CSV row field count differs from header") != TF_OK ||
+        tf_json_add_number(obj, "raw_bytes", (double)line_len) != TF_OK ||
+        csv_add_raw_payload(st, obj, raw, truncated) != TF_OK) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     free(raw);
     return rc;
@@ -680,20 +691,23 @@ static int emit_csv_column_limit_diagnostic(csv_decoder_state *st, const char *l
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) { free(raw); return TF_ERROR; }
-    cJSON_AddStringToObject(obj, "type", "csv_too_many_columns");
-    cJSON_AddStringToObject(obj, "op", "codec.csv.decode");
-    cJSON_AddStringToObject(obj, "mode", csv_mode_name(st->mode));
-    cJSON_AddStringToObject(obj, "action", "fail");
-    cJSON_AddStringToObject(obj, "severity", "error");
-    cJSON_AddNumberToObject(obj, "line", (double)line_no);
-    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
-    cJSON_AddNumberToObject(obj, "max_columns", (double)st->max_columns);
-    cJSON_AddNumberToObject(obj, "actual_fields", (double)n_fields);
-    cJSON_AddStringToObject(obj, "message", "CSV record exceeds max_columns");
-    cJSON_AddNumberToObject(obj, "raw_bytes", (double)line_len);
-    csv_add_raw_payload(st, obj, raw, truncated);
-
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "csv_too_many_columns") != TF_OK ||
+        tf_json_add_string(obj, "op", "codec.csv.decode") != TF_OK ||
+        tf_json_add_string(obj, "mode", csv_mode_name(st->mode)) != TF_OK ||
+        tf_json_add_string(obj, "action", "fail") != TF_OK ||
+        tf_json_add_string(obj, "severity", "error") != TF_OK ||
+        tf_json_add_number(obj, "line", (double)line_no) != TF_OK ||
+        tf_json_add_number(obj, "byte_offset", (double)byte_offset) != TF_OK ||
+        tf_json_add_number(obj, "max_columns", (double)st->max_columns) != TF_OK ||
+        tf_json_add_number(obj, "actual_fields", (double)n_fields) != TF_OK ||
+        tf_json_add_string(obj, "message", "CSV record exceeds max_columns") != TF_OK ||
+        tf_json_add_number(obj, "raw_bytes", (double)line_len) != TF_OK ||
+        csv_add_raw_payload(st, obj, raw, truncated) != TF_OK) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     free(raw);
     return rc;
@@ -717,19 +731,22 @@ static int emit_csv_record_size_diagnostic(csv_decoder_state *st, const char *re
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) { free(raw); return TF_ERROR; }
-    cJSON_AddStringToObject(obj, "type", "csv_record_too_large");
-    cJSON_AddStringToObject(obj, "op", "codec.csv.decode");
-    cJSON_AddStringToObject(obj, "action", "fail");
-    cJSON_AddStringToObject(obj, "severity", "error");
-    cJSON_AddNumberToObject(obj, "line", (double)line_no);
-    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
-    cJSON_AddNumberToObject(obj, "max_record_bytes", (double)st->max_record_bytes);
-    cJSON_AddNumberToObject(obj, "observed_bytes", (double)record_len);
-    cJSON_AddStringToObject(obj, "message", "CSV record exceeds max_record_bytes");
-    cJSON_AddNumberToObject(obj, "raw_bytes", (double)record_len);
-    csv_add_raw_payload(st, obj, raw, truncated);
-
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "csv_record_too_large") != TF_OK ||
+        tf_json_add_string(obj, "op", "codec.csv.decode") != TF_OK ||
+        tf_json_add_string(obj, "action", "fail") != TF_OK ||
+        tf_json_add_string(obj, "severity", "error") != TF_OK ||
+        tf_json_add_number(obj, "line", (double)line_no) != TF_OK ||
+        tf_json_add_number(obj, "byte_offset", (double)byte_offset) != TF_OK ||
+        tf_json_add_number(obj, "max_record_bytes", (double)st->max_record_bytes) != TF_OK ||
+        tf_json_add_number(obj, "observed_bytes", (double)record_len) != TF_OK ||
+        tf_json_add_string(obj, "message", "CSV record exceeds max_record_bytes") != TF_OK ||
+        tf_json_add_number(obj, "raw_bytes", (double)record_len) != TF_OK ||
+        csv_add_raw_payload(st, obj, raw, truncated) != TF_OK) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     free(raw);
     return rc;

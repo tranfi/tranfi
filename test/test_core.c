@@ -93,7 +93,7 @@ static void test_buffer_basic(void) {
     assert(tf_buffer_write(&b, (const uint8_t *)data, 11) == TF_OK);
     assert(tf_buffer_readable(&b) == 11);
 
-    uint8_t out[32];
+    uint8_t out[128];
     size_t n = tf_buffer_read(&b, out, sizeof(out));
     assert(n == 11);
     assert(memcmp(out, data, 11) == 0);
@@ -129,7 +129,7 @@ static void test_buffer_line_and_side_error(void) {
     tf_buffer_init(&b);
     assert(tf_buffer_write_line(&b, "alpha") == TF_OK);
     assert(tf_buffer_readable(&b) == 6);
-    uint8_t out[32];
+    uint8_t out[128];
     size_t n = tf_buffer_read(&b, out, sizeof(out));
     assert(n == 6);
     assert(memcmp(out, "alpha\n", 6) == 0);
@@ -139,13 +139,21 @@ static void test_buffer_line_and_side_error(void) {
     tf_buffer_init(&json);
     cJSON *obj = cJSON_CreateObject();
     assert(obj != NULL);
-    cJSON_AddStringToObject(obj, "kind", "line");
-    cJSON_AddNumberToObject(obj, "n", 2);
+    assert(tf_json_add_string(obj, "kind", "line") == TF_OK);
+    assert(tf_json_add_number(obj, "n", 2) == TF_OK);
+    assert(tf_json_add_bool(obj, "ok", 1) == TF_OK);
+    assert(tf_json_add_null(obj, "empty") == TF_OK);
+    assert(tf_json_add_item(obj, "nested", cJSON_CreateString("x")) == TF_OK);
     assert(tf_buffer_write_json_line(&json, obj) == TF_OK);
     cJSON_Delete(obj);
     n = tf_buffer_read(&json, out, sizeof(out));
-    assert(n == strlen("{\"kind\":\"line\",\"n\":2}\n"));
-    assert(memcmp(out, "{\"kind\":\"line\",\"n\":2}\n", n) == 0);
+    assert(n > 0 && n < sizeof(out));
+    assert(out[n - 1] == '\n');
+    out[n] = '\0';
+    assert(strstr((const char *)out, "\"kind\":\"line\"") != NULL);
+    assert(strstr((const char *)out, "\"ok\":true") != NULL);
+    assert(strstr((const char *)out, "\"empty\":null") != NULL);
+    assert(strstr((const char *)out, "\"nested\":\"x\"") != NULL);
     tf_buffer_free(&json);
 
     tf_buffer err;

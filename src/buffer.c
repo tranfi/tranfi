@@ -67,6 +67,34 @@ int tf_side_write_error(tf_side_channels *side, const char *msg) {
     return tf_buffer_write_line(side->errors, msg);
 }
 
+int tf_json_add_string(cJSON *obj, const char *name, const char *value) {
+    return cJSON_AddStringToObject(obj, name, value ? value : "") ? TF_OK : TF_ERROR;
+}
+
+int tf_json_add_number(cJSON *obj, const char *name, double value) {
+    return cJSON_AddNumberToObject(obj, name, value) ? TF_OK : TF_ERROR;
+}
+
+int tf_json_add_bool(cJSON *obj, const char *name, int value) {
+    return cJSON_AddBoolToObject(obj, name, value ? 1 : 0) ? TF_OK : TF_ERROR;
+}
+
+int tf_json_add_null(cJSON *obj, const char *name) {
+    return cJSON_AddNullToObject(obj, name) ? TF_OK : TF_ERROR;
+}
+
+int tf_json_add_item(cJSON *obj, const char *name, cJSON *item) {
+    if (!obj || !name || !item) {
+        cJSON_Delete(item);
+        return TF_ERROR;
+    }
+    if (!cJSON_AddItemToObject(obj, name, item)) {
+        cJSON_Delete(item);
+        return TF_ERROR;
+    }
+    return TF_OK;
+}
+
 size_t tf_buffer_read(tf_buffer *b, uint8_t *out, size_t len) {
     size_t avail = b->len - b->read_pos;
     if (len > avail) len = avail;

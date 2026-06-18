@@ -114,6 +114,11 @@ TF_WARN_UNUSED int tf_buffer_write_str(tf_buffer *b, const char *s);
 TF_WARN_UNUSED int tf_buffer_write_line(tf_buffer *b, const char *s);
 TF_WARN_UNUSED int tf_buffer_write_json_line(tf_buffer *b, const cJSON *obj);
 void tf_buffer_free(tf_buffer *b);
+TF_WARN_UNUSED int tf_json_add_string(cJSON *obj, const char *name, const char *value);
+TF_WARN_UNUSED int tf_json_add_number(cJSON *obj, const char *name, double value);
+TF_WARN_UNUSED int tf_json_add_bool(cJSON *obj, const char *name, int value);
+TF_WARN_UNUSED int tf_json_add_null(cJSON *obj, const char *name);
+TF_WARN_UNUSED int tf_json_add_item(cJSON *obj, const char *name, cJSON *item);
 
 /* ---- Columnar batch ---- */
 /* (tf_type is defined in ir.h, included above) */

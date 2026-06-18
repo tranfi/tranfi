@@ -88,20 +88,23 @@ static int emit_text_record_size_diagnostic(text_decoder_state *st,
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) { free(raw); return TF_ERROR; }
-    cJSON_AddStringToObject(obj, "type", "text_record_too_large");
-    cJSON_AddStringToObject(obj, "op", "codec.text.decode");
-    cJSON_AddStringToObject(obj, "action", "fail");
-    cJSON_AddStringToObject(obj, "severity", "error");
-    cJSON_AddNumberToObject(obj, "line", (double)line_no);
-    cJSON_AddNumberToObject(obj, "byte_offset", (double)byte_offset);
-    cJSON_AddNumberToObject(obj, "max_record_bytes", (double)st->max_record_bytes);
-    cJSON_AddNumberToObject(obj, "observed_bytes", (double)observed_len);
-    cJSON_AddStringToObject(obj, "message", "Text record exceeds max_record_bytes");
-    cJSON_AddNumberToObject(obj, "raw_bytes", (double)observed_len);
-    cJSON_AddStringToObject(obj, "raw", raw);
-    if (truncated) cJSON_AddBoolToObject(obj, "truncated", 1);
-
-    int rc = tf_buffer_write_json_line(side->errors, obj);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "text_record_too_large") != TF_OK ||
+        tf_json_add_string(obj, "op", "codec.text.decode") != TF_OK ||
+        tf_json_add_string(obj, "action", "fail") != TF_OK ||
+        tf_json_add_string(obj, "severity", "error") != TF_OK ||
+        tf_json_add_number(obj, "line", (double)line_no) != TF_OK ||
+        tf_json_add_number(obj, "byte_offset", (double)byte_offset) != TF_OK ||
+        tf_json_add_number(obj, "max_record_bytes", (double)st->max_record_bytes) != TF_OK ||
+        tf_json_add_number(obj, "observed_bytes", (double)observed_len) != TF_OK ||
+        tf_json_add_string(obj, "message", "Text record exceeds max_record_bytes") != TF_OK ||
+        tf_json_add_number(obj, "raw_bytes", (double)observed_len) != TF_OK ||
+        tf_json_add_string(obj, "raw", raw) != TF_OK ||
+        (truncated && tf_json_add_bool(obj, "truncated", 1) != TF_OK)) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->errors, obj);
+done:
     cJSON_Delete(obj);
     free(raw);
     return rc;
