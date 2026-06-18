@@ -154,6 +154,9 @@ static int json_extract_process(tf_step *self, tf_batch *in, tf_batch **out,
                         tf_batch_free(ob);
                         return TF_ERROR;
                     }
+                } else if (cJSON_ParseHadAllocationFailure()) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
                 }
             }
         }

@@ -164,6 +164,7 @@ static int json_flatten_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (can_parse && !tf_batch_is_null(in, r, (size_t)ci)) {
             const char *json = tf_batch_get_string(in, r, (size_t)ci);
             if (json && json[0] != '\0') root = cJSON_Parse(json);
+            if (!root && cJSON_ParseHadAllocationFailure()) goto fail;
         }
         if (root) {
             for (size_t i = 0; i < st->n_fields; i++) {

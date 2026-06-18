@@ -254,6 +254,10 @@ static int json_filter_process(tf_step *self, tf_batch *in, tf_batch **out,
             if (json && json[0] != '\0') {
                 root = cJSON_Parse(json);
                 if (root) val = tf_json_path_resolve(root, st->path);
+                else if (cJSON_ParseHadAllocationFailure()) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
             }
         }
         int keep = eval_filter(st, val);

@@ -237,6 +237,134 @@ static void run_case_no_silent_output_oom(const char *name, const char *dsl,
                                          run_capture_once);
 }
 
+typedef struct oom_channel_capture {
+    char bytes[65536];
+    int truncated;
+} oom_channel_capture;
+
+typedef struct oom_all_channel_capture {
+    oom_channel_capture channels[TF_NUM_CHANNELS];
+} oom_all_channel_capture;
+
+static void init_all_channel_capture(oom_all_channel_capture *out) {
+    for (int chan = 0; chan < TF_NUM_CHANNELS; chan++) {
+        out->channels[chan].bytes[0] = '\0';
+        out->channels[chan].truncated = 0;
+    }
+}
+
+static void capture_pipeline_channels(tf_pipeline *p, oom_all_channel_capture *out) {
+    for (int chan = 0; chan < TF_NUM_CHANNELS; chan++) {
+        size_t off = 0;
+        while (off + 1 < sizeof(out->channels[chan].bytes)) {
+            size_t n = tf_pipeline_pull(
+                p, chan, (uint8_t *)out->channels[chan].bytes + off,
+                sizeof(out->channels[chan].bytes) - off - 1);
+            if (n == 0) break;
+            off += n;
+        }
+        out->channels[chan].bytes[off] = '\0';
+        uint8_t scratch[1];
+        if (tf_pipeline_pull(p, chan, scratch, sizeof(scratch)) > 0) {
+            out->channels[chan].truncated = 1;
+        }
+    }
+}
+
+static int run_capture_all_channels_once(const char *dsl, const char *input,
+                                         oom_all_channel_capture *out) {
+    init_all_channel_capture(out);
+
+    char *error = NULL;
+    char *json = tf_compile_dsl(dsl, strlen(dsl), &error);
+    if (!json) {
+        free(error);
+        return TF_ERROR;
+    }
+
+    tf_pipeline *p = tf_pipeline_create(json, strlen(json));
+    tf_string_free(json);
+    free(error);
+    if (!p) return TF_ERROR;
+
+    int rc = TF_OK;
+    size_t len = strlen(input);
+    size_t cuts[] = {1, 4, 9, 17, len};
+    size_t off = 0;
+    for (size_t i = 0; i < sizeof(cuts) / sizeof(cuts[0]) && off < len; i++) {
+        size_t n = cuts[i];
+        if (n > len - off) n = len - off;
+        if (tf_pipeline_push(p, (const uint8_t *)input + off, n) != TF_OK) {
+            rc = TF_ERROR;
+            break;
+        }
+        off += n;
+    }
+    if (rc == TF_OK && off < len &&
+        tf_pipeline_push(p, (const uint8_t *)input + off, len - off) != TF_OK) {
+        rc = TF_ERROR;
+    }
+    if (rc == TF_OK && tf_pipeline_finish(p) != TF_OK) rc = TF_ERROR;
+
+    capture_pipeline_channels(p, out);
+    tf_pipeline_free(p);
+    return rc;
+}
+
+static int all_channel_captures_equal(const oom_all_channel_capture *a,
+                                      const oom_all_channel_capture *b,
+                                      int *diff_channel) {
+    for (int chan = 0; chan < TF_NUM_CHANNELS; chan++) {
+        if (a->channels[chan].truncated != b->channels[chan].truncated ||
+            strcmp(a->channels[chan].bytes, b->channels[chan].bytes) != 0) {
+            *diff_channel = chan;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void run_case_no_silent_channel_oom(const char *name, const char *dsl,
+                                           const char *input,
+                                           size_t max_fail_points) {
+    oom_all_channel_capture baseline;
+    oom_enabled = 1;
+    oom_fail_at = (size_t)-1;
+    oom_alloc_count = 0;
+    oom_failed = 0;
+    int rc = run_capture_all_channels_once(dsl, input, &baseline);
+    oom_enabled = 0;
+    assert(rc == TF_OK);
+    assert(!oom_failed);
+    size_t allocs = oom_alloc_count;
+    size_t limit = allocs;
+    if (max_fail_points > 0 && limit > max_fail_points) limit = max_fail_points;
+    assert(limit > 0);
+
+    for (size_t fail_at = 1; fail_at <= limit; fail_at++) {
+        oom_all_channel_capture got;
+        oom_enabled = 1;
+        oom_fail_at = fail_at;
+        oom_alloc_count = 0;
+        oom_failed = 0;
+        rc = run_capture_all_channels_once(dsl, input, &got);
+        oom_enabled = 0;
+
+        if (oom_failed && rc == TF_OK) {
+            int diff_channel = -1;
+            if (!all_channel_captures_equal(&got, &baseline, &diff_channel)) {
+                fprintf(stderr, "%s: silent channel drift at allocation %zu channel %d\n",
+                        name, fail_at, diff_channel);
+                fprintf(stderr, "baseline:\n%s\ngot:\n%s\n",
+                        baseline.channels[diff_channel].bytes,
+                        got.channels[diff_channel].bytes);
+                assert(!"OOM allocation failure changed successful channel output");
+            }
+        }
+        assert(oom_failed);
+    }
+}
+
 static void run_json_no_silent_output_oom(const char *name, const char *json,
                                           const char *input,
                                           size_t max_fail_points) {
@@ -328,6 +456,10 @@ int main(void) {
         "a,b,c\n"
         "1,2\n"
         "3,4,5,6\n";
+    const char *json_schema_side_rows =
+        "{\"user\":{\"name\":\"Alice\",\"age\":30}}\n"
+        "{\"user\":{\"name\":\"Bob\",\"age\":\"bad\"}}\n"
+        "{\"other\":true}\n";
     const char *audit_rows =
         "name,city,note,secret\n"
         "Alice,NY,NA,111\n"
@@ -650,6 +782,54 @@ int main(void) {
         "csv batch_size=1 | stats distinct,hist,sample | csv",
         people,
         520);
+    run_case_no_silent_channel_oom(
+        "filter_audit_side_channel_materialization",
+        "csv batch_size=1 | filter \"col(age) >= 30\" audit audit_limit=2 | csv",
+        people,
+        360);
+    run_case_no_silent_channel_oom(
+        "quality_side_channel_materialization",
+        "csv batch_size=1 | validate \"col(age) > 25\" audit audit_limit=2 | "
+        "assert \"col(score) >= 20\" action=warn audit audit_limit=2 | "
+        "schema name:string age:int city:string values=city:NY,LA "
+        "mode=warn audit audit_limit=2 | csv",
+        people,
+        760);
+    run_case_no_silent_channel_oom(
+        "tee_samples_side_channel_materialization",
+        "csv batch_size=1 | tee \"col(score) >= 10\" channel=samples "
+        "columns=name,city limit=2 audit_columns=name | csv",
+        people,
+        520);
+    run_case_no_silent_channel_oom(
+        "quarantine_errors_side_channel_materialization",
+        "csv batch_size=1 | quarantine \"col(city) == 'SF'\" name=sf_rows "
+        "message=blocked audit audit_limit=2 | csv",
+        people,
+        440);
+    run_case_no_silent_channel_oom(
+        "csv_repair_audit_side_channel_materialization",
+        "csv batch_size=1 mode=repair max_error_bytes=8 audit audit_limit=2 | csv",
+        repair_rows,
+        420);
+    run_case_no_silent_channel_oom(
+        "json_schema_audit_side_channel_materialization",
+        "text | json-schema required=user types=user:object mode=filter "
+        "audit audit_limit=2 | csv",
+        json_schema_side_rows,
+        520);
+    run_case_no_silent_channel_oom(
+        "frequency_overflow_side_channel_materialization",
+        "csv batch_size=1 | frequency city max_values=1 overflow=other "
+        "audit audit_limit=2 | csv",
+        people,
+        560);
+    run_case_no_silent_channel_oom(
+        "normalize_audit_side_channel_materialization",
+        "csv batch_size=1 | normalize score zscore audit audit_limit=2 "
+        "audit_columns=name,score audit_hash_columns=score | csv",
+        people,
+        620);
     const char *rules_path = "/tmp/tranfi_oom_rules.json";
     FILE *rules_file = fopen(rules_path, "wb");
     assert(rules_file);

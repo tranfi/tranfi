@@ -359,6 +359,9 @@ static int json_schema_process(tf_step *self, tf_batch *in, tf_batch **out,
                 if (root) {
                     valid = validate_against_schema(st->schema, root);
                     actual = valid ? "valid" : "schema_mismatch";
+                } else if (cJSON_ParseHadAllocationFailure()) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
                 } else {
                     actual = "invalid_json";
                 }

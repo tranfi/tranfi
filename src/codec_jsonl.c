@@ -484,6 +484,9 @@ static int process_jsonl_line(jsonl_decoder_state *st, const char *line, size_t 
 
     /* Parse JSON */
     cJSON *obj = cJSON_ParseWithLength(line, len);
+    if (!obj && cJSON_ParseHadAllocationFailure()) {
+        return TF_ERROR;
+    }
     if (!obj || !cJSON_IsObject(obj)) {
         const char *reason = obj ? "JSONL record is not an object" : "invalid JSON";
         cJSON_Delete(obj);

@@ -102,10 +102,25 @@ typedef struct {
 #endif
 
 static CJSON_THREAD_LOCAL error global_error = { NULL, 0 };
+static CJSON_THREAD_LOCAL cJSON_bool global_parse_tracking = false;
+static CJSON_THREAD_LOCAL cJSON_bool global_parse_allocation_failed = false;
+
+static void cJSON_mark_parse_allocation_failure(void)
+{
+    if (global_parse_tracking)
+    {
+        global_parse_allocation_failed = true;
+    }
+}
 
 CJSON_PUBLIC(const char *) cJSON_GetErrorPtr(void)
 {
     return (const char*) (global_error.json + global_error.position);
+}
+
+CJSON_PUBLIC(cJSON_bool) cJSON_ParseHadAllocationFailure(void)
+{
+    return global_parse_allocation_failed;
 }
 
 CJSON_PUBLIC(char *) cJSON_GetStringValue(const cJSON * const item)
@@ -211,6 +226,7 @@ static unsigned char* cJSON_strdup(const unsigned char* string, const internal_h
     copy = (unsigned char*)hooks->allocate(length);
     if (copy == NULL)
     {
+        cJSON_mark_parse_allocation_failure();
         return NULL;
     }
     memcpy(copy, string, length);
@@ -256,6 +272,10 @@ static cJSON *cJSON_New_Item(const internal_hooks * const hooks)
     if (node)
     {
         memset(node, '\0', sizeof(cJSON));
+    }
+    else
+    {
+        cJSON_mark_parse_allocation_failure();
     }
 
     return node;
@@ -369,6 +389,7 @@ loop_end:
     number_c_string = (unsigned char *) input_buffer->hooks.allocate(number_string_length + 1);
     if (number_c_string == NULL)
     {
+        cJSON_mark_parse_allocation_failure();
         return false; /* allocation failure */
     }
 
@@ -870,6 +891,7 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
         output = (unsigned char*)input_buffer->hooks.allocate(allocation_length + sizeof(""));
         if (output == NULL)
         {
+            cJSON_mark_parse_allocation_failure();
             goto fail; /* allocation failure */
         }
     }
@@ -1159,6 +1181,8 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
     /* reset error position */
     global_error.json = NULL;
     global_error.position = 0;
+    global_parse_allocation_failed = false;
+    global_parse_tracking = true;
 
     if (value == NULL || 0 == buffer_length)
     {
@@ -1196,9 +1220,11 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
         *return_parse_end = (const char*)buffer_at_offset(&buffer);
     }
 
+    global_parse_tracking = false;
     return item;
 
 fail:
+    global_parse_tracking = false;
     if (item != NULL)
     {
         cJSON_Delete(item);

@@ -975,11 +975,16 @@ static int dsl_parse_positive_size(const char *text, const char *name, size_t *o
 }
 
 static int dsl_set_object_item(cJSON *obj, const char *key, cJSON *item) {
-    if (!obj || !key || !item) return TF_ERROR;
-    if (!cJSON_ReplaceItemInObject(obj, key, item)) {
-        return tf_json_add_item(obj, key, item);
+    if (!obj || !key || !item) {
+        cJSON_Delete(item);
+        return TF_ERROR;
     }
-    return TF_OK;
+    if (cJSON_GetObjectItem(obj, key)) {
+        if (cJSON_ReplaceItemInObject(obj, key, item)) return TF_OK;
+        cJSON_Delete(item);
+        return TF_ERROR;
+    }
+    return tf_json_add_item(obj, key, item);
 }
 
 static int dsl_set_string_arg(cJSON *obj, const char *key, const char *value) {
