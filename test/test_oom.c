@@ -323,6 +323,12 @@ int main(void) {
             360
         },
         {
+            "dsl_codec_validate_audit_args",
+            "csv batch_size=1 audit audit_limit=2 | validate rule=adult:col(age)>=18 audit audit_columns=name,city audit_hash_columns=name max_failure_rate=1 warn_failure_rate=0.5 name=quality_gate message=ok | csv",
+            people,
+            560
+        },
+        {
             "csv_strict_good_rows",
             "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
             people,

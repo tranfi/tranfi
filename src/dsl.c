@@ -52,6 +52,10 @@ static void set_errorf(char **error, const char *fmt, ...) {
     }
 }
 
+static void set_oom_error_if_unset(char **error) {
+    if (error && !*error) set_error(error, "out of memory");
+}
+
 static int dsl_parse_positive_size(const char *text, const char *name, size_t *out, char **error);
 static int add_audit_csv_arg(cJSON *args, const char *key, const char *spec);
 static char *trimmed_token_copy(const char *start, size_t len);
@@ -163,7 +167,7 @@ static int split_stages(const char *text, size_t len, token_list *out) {
             while (s < e && isspace((unsigned char)text[s])) s++;
             while (e > s && isspace((unsigned char)text[e - 1])) e--;
             if (s == e) return -1; /* empty stage */
-            tl_push(out, text + s, e - s);
+            if (tl_push(out, text + s, e - s) != 0) return -1;
             start = i + 1;
         }
     }
@@ -172,7 +176,7 @@ static int split_stages(const char *text, size_t len, token_list *out) {
     size_t s = start, e = len;
     while (s < e && isspace((unsigned char)text[s])) s++;
     while (e > s && isspace((unsigned char)text[e - 1])) e--;
-    if (s < e) tl_push(out, text + s, e - s);
+    if (s < e && tl_push(out, text + s, e - s) != 0) return -1;
 
     return (out->count > 0) ? 0 : -1;
 }
@@ -346,13 +350,14 @@ static char *resolve_codec(const char *name, int is_first, int is_last) {
 static cJSON *build_codec_args(const token_list *tokens) {
     /* tokens[0] is op name, rest are key=value pairs */
     cJSON *args = cJSON_CreateObject();
+    if (!args) return NULL;
     for (size_t i = 1; i < tokens->count; i++) {
         if (strcmp(tokens->items[i], "audit") == 0) {
-            cJSON_AddBoolToObject(args, "audit", 1);
+            if (tf_json_add_bool(args, "audit", 1) != TF_OK) goto fail;
             continue;
         }
         if (strcmp(tokens->items[i], "audit=false") == 0) {
-            cJSON_AddBoolToObject(args, "audit", 0);
+            if (tf_json_add_bool(args, "audit", 0) != TF_OK) goto fail;
             continue;
         }
         if (strncmp(tokens->items[i], "audit-limit=", 12) == 0) {
@@ -364,8 +369,13 @@ static cJSON *build_codec_args(const token_list *tokens) {
                 *eq = '\0';
                 char *end = NULL;
                 long num = strtol(eq + 1, &end, 10);
-                if (*end == '\0' && end != eq + 1) cJSON_AddNumberToObject(args, copy, num);
-                else cJSON_AddStringToObject(args, copy, eq + 1);
+                int rc = (*end == '\0' && end != eq + 1)
+                    ? tf_json_add_number(args, copy, (double)num)
+                    : tf_json_add_string(args, copy, eq + 1);
+                if (rc != TF_OK) {
+                    free(copy);
+                    goto fail;
+                }
             }
             free(copy);
             continue;
@@ -376,22 +386,27 @@ static cJSON *build_codec_args(const token_list *tokens) {
             const char *key = tokens->items[i];
             const char *val = eq + 1;
             /* Try to detect booleans and ints */
+            int rc = TF_OK;
             if (strcmp(val, "true") == 0 || strcmp(val, "false") == 0) {
-                cJSON_AddBoolToObject(args, key, strcmp(val, "true") == 0);
+                rc = tf_json_add_bool(args, key, strcmp(val, "true") == 0);
             } else {
                 /* Check if integer */
                 char *end;
                 long num = strtol(val, &end, 10);
                 if (*end == '\0' && end != val) {
-                    cJSON_AddNumberToObject(args, key, num);
+                    rc = tf_json_add_number(args, key, (double)num);
                 } else {
-                    cJSON_AddStringToObject(args, key, val);
+                    rc = tf_json_add_string(args, key, val);
                 }
             }
             *eq = '='; /* restore */
+            if (rc != TF_OK) goto fail;
         }
     }
     return args;
+fail:
+    cJSON_Delete(args);
+    return NULL;
 }
 
 static int add_audit_option_arg(cJSON *args, const char *tok, char **error, const char *op_name);
@@ -402,7 +417,7 @@ static cJSON *ensure_validate_rules_array(cJSON *args) {
     if (arr) return cJSON_IsArray(arr) ? arr : NULL;
     arr = cJSON_CreateArray();
     if (!arr) return NULL;
-    cJSON_AddItemToObject(args, "rules", arr);
+    if (tf_json_add_item(args, "rules", arr) != TF_OK) return NULL;
     return arr;
 }
 
@@ -426,10 +441,14 @@ static int add_validate_rule_spec(cJSON *args, const char *spec, char **error) {
     if (!name) return TF_ERROR;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) { free(name); return TF_ERROR; }
-    cJSON_AddStringToObject(obj, "name", name);
-    cJSON_AddStringToObject(obj, "expr", colon + 1);
+    if (tf_json_add_string(obj, "name", name) != TF_OK ||
+        tf_json_add_string(obj, "expr", colon + 1) != TF_OK) {
+        cJSON_Delete(obj);
+        free(name);
+        return TF_ERROR;
+    }
     free(name);
-    cJSON_AddItemToArray(arr, obj);
+    if (tf_json_add_array_item(arr, obj) != TF_OK) return TF_ERROR;
     return TF_OK;
 }
 
@@ -440,8 +459,7 @@ static int add_validate_failure_rate_arg(cJSON *args, const char *key, const cha
         set_errorf(error, "validate: %s must be between 0 and 1", key);
         return TF_ERROR;
     }
-    cJSON_AddNumberToObject(args, key, rate);
-    return TF_OK;
+    return tf_json_add_number(args, key, rate);
 }
 
 static int is_validate_rules_file_token(const char *tok) {
@@ -461,7 +479,12 @@ static cJSON *build_expr_audit_args(const token_list *tokens, char **error, cons
                                    is_validate_rules_file_token(tokens->items[1]);
     cJSON *args = cJSON_CreateObject();
     if (!args) return NULL;
-    if (!validate_rules_mode && !validate_rules_file_mode) cJSON_AddStringToObject(args, "expr", tokens->items[1]);
+    if (!validate_rules_mode && !validate_rules_file_mode &&
+        tf_json_add_string(args, "expr", tokens->items[1]) != TF_OK) {
+        cJSON_Delete(args);
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     for (size_t i = (validate_rules_mode || validate_rules_file_mode) ? 1u : 2u; i < tokens->count; i++) {
         const char *tok = tokens->items[i];
         int audit_rc = add_audit_option_arg(args, tok, error, op_name);
@@ -470,6 +493,7 @@ static cJSON *build_expr_audit_args(const token_list *tokens, char **error, cons
         if (strcmp(op_name, "validate") == 0 && strncmp(tok, "rule=", 5) == 0) {
             if (add_validate_rule_spec(args, tok + 5, error) != TF_OK) {
                 cJSON_Delete(args);
+                set_oom_error_if_unset(error);
                 return NULL;
             }
         } else if (strcmp(op_name, "validate") == 0 && is_validate_rules_file_token(tok)) {
@@ -479,7 +503,11 @@ static cJSON *build_expr_audit_args(const token_list *tokens, char **error, cons
                 set_error(error, "validate: rules_file must be a non-empty string");
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "rules_file", path);
+            if (tf_json_add_string(args, "rules_file", path) != TF_OK) {
+                cJSON_Delete(args);
+                set_oom_error_if_unset(error);
+                return NULL;
+            }
         } else if (strcmp(op_name, "validate") == 0 &&
             (strncmp(tok, "max_failures=", 13) == 0 || strncmp(tok, "max-failures=", 13) == 0)) {
             const char *value = tok + 13;
@@ -490,23 +518,37 @@ static cJSON *build_expr_audit_args(const token_list *tokens, char **error, cons
                 set_error(error, "validate: max_failures must be a non-negative integer");
                 return NULL;
             }
-            cJSON_AddNumberToObject(args, "max_failures", (double)n);
+            if (tf_json_add_number(args, "max_failures", (double)n) != TF_OK) {
+                cJSON_Delete(args);
+                set_oom_error_if_unset(error);
+                return NULL;
+            }
         } else if (strcmp(op_name, "validate") == 0 &&
             (strncmp(tok, "max_failure_rate=", 17) == 0 || strncmp(tok, "max-failure-rate=", 17) == 0)) {
             if (add_validate_failure_rate_arg(args, "max_failure_rate", tok + 17, error) != TF_OK) {
                 cJSON_Delete(args);
+                set_oom_error_if_unset(error);
                 return NULL;
             }
         } else if (strcmp(op_name, "validate") == 0 &&
             (strncmp(tok, "warn_failure_rate=", 18) == 0 || strncmp(tok, "warn-failure-rate=", 18) == 0)) {
             if (add_validate_failure_rate_arg(args, "warn_failure_rate", tok + 18, error) != TF_OK) {
                 cJSON_Delete(args);
+                set_oom_error_if_unset(error);
                 return NULL;
             }
         } else if (strncmp(tok, "name=", 5) == 0) {
-            cJSON_AddStringToObject(args, "name", tok + 5);
+            if (tf_json_add_string(args, "name", tok + 5) != TF_OK) {
+                cJSON_Delete(args);
+                set_oom_error_if_unset(error);
+                return NULL;
+            }
         } else if (strncmp(tok, "message=", 8) == 0) {
-            cJSON_AddStringToObject(args, "message", tok + 8);
+            if (tf_json_add_string(args, "message", tok + 8) != TF_OK) {
+                cJSON_Delete(args);
+                set_oom_error_if_unset(error);
+                return NULL;
+            }
         } else {
             cJSON_Delete(args);
             set_errorf(error, "%s: unexpected argument '%s'", op_name, tok);
@@ -894,7 +936,7 @@ static int dsl_parse_positive_size(const char *text, const char *name, size_t *o
 static int dsl_set_object_item(cJSON *obj, const char *key, cJSON *item) {
     if (!obj || !key || !item) return TF_ERROR;
     if (!cJSON_ReplaceItemInObject(obj, key, item)) {
-        cJSON_AddItemToObject(obj, key, item);
+        return tf_json_add_item(obj, key, item);
     }
     return TF_OK;
 }
@@ -907,7 +949,13 @@ static int dsl_add_csv_list(cJSON *arr, const char *text) {
         while (*tok == ' ' || *tok == '	') tok++;
         size_t len = strlen(tok);
         while (len > 0 && (tok[len - 1] == ' ' || tok[len - 1] == '	')) tok[--len] = '\0';
-        if (len > 0) cJSON_AddItemToArray(arr, cJSON_CreateString(tok));
+        if (len > 0) {
+            cJSON *item = cJSON_CreateString(tok);
+            if (!item || tf_json_add_array_item(arr, item) != TF_OK) {
+                free(copy);
+                return TF_ERROR;
+            }
+        }
         tok = strtok(NULL, ",");
     }
     free(copy);
@@ -1012,7 +1060,13 @@ static int add_csv_strings(cJSON *arr, const char *text) {
     if (!copy) return TF_ERROR;
     char *tok = strtok(copy, ",");
     while (tok) {
-        if (*tok) cJSON_AddItemToArray(arr, cJSON_CreateString(tok));
+        if (*tok) {
+            cJSON *item = cJSON_CreateString(tok);
+            if (!item || tf_json_add_array_item(arr, item) != TF_OK) {
+                free(copy);
+                return TF_ERROR;
+            }
+        }
         tok = strtok(NULL, ",");
     }
     free(copy);
@@ -1423,18 +1477,21 @@ static int add_audit_csv_arg(cJSON *args, const char *key, const char *spec) {
     return dsl_set_object_item(args, key, arr);
 }
 
+static int audit_add_result(int rc, char **error) {
+    if (rc == TF_OK) return 1;
+    set_oom_error_if_unset(error);
+    return -1;
+}
+
 static int add_audit_option_arg(cJSON *args, const char *tok, char **error, const char *op_name) {
     if (strcmp(tok, "audit") == 0) {
-        cJSON_AddBoolToObject(args, "audit", 1);
-        return 1;
+        return audit_add_result(tf_json_add_bool(args, "audit", 1), error);
     }
     if (strcmp(tok, "audit=false") == 0) {
-        cJSON_AddBoolToObject(args, "audit", 0);
-        return 1;
+        return audit_add_result(tf_json_add_bool(args, "audit", 0), error);
     }
     if (strcmp(tok, "audit=true") == 0) {
-        cJSON_AddBoolToObject(args, "audit", 1);
-        return 1;
+        return audit_add_result(tf_json_add_bool(args, "audit", 1), error);
     }
     if (strncmp(tok, "audit_limit=", 12) == 0 || strncmp(tok, "audit-limit=", 12) == 0) {
         const char *value = tok + 12;
@@ -1444,8 +1501,7 @@ static int add_audit_option_arg(cJSON *args, const char *tok, char **error, cons
             set_errorf(error, "%s: audit_limit must be a positive integer", op_name);
             return -1;
         }
-        cJSON_AddNumberToObject(args, "audit_limit", (double)n);
-        return 1;
+        return audit_add_result(tf_json_add_number(args, "audit_limit", (double)n), error);
     }
     if (!audit_privacy_option_token(tok)) return 0;
     if (!audit_privacy_supported(op_name)) {
@@ -1459,8 +1515,7 @@ static int add_audit_option_arg(cJSON *args, const char *tok, char **error, cons
             set_errorf(error, "%s: audit_include_row must be true or false", op_name);
             return -1;
         }
-        cJSON_AddBoolToObject(args, "audit_include_row", strcmp(value, "true") == 0);
-        return 1;
+        return audit_add_result(tf_json_add_bool(args, "audit_include_row", strcmp(value, "true") == 0), error);
     }
     if (strncmp(tok, "audit_columns=", 14) == 0 || strncmp(tok, "audit-columns=", 14) == 0) {
         const char *value = strchr(tok, '=');
@@ -1494,8 +1549,7 @@ static int add_audit_option_arg(cJSON *args, const char *tok, char **error, cons
             set_errorf(error, "%s: audit_max_bytes must be a non-negative integer", op_name);
             return -1;
         }
-        cJSON_AddNumberToObject(args, "audit_max_bytes", (double)n);
-        return 1;
+        return audit_add_result(tf_json_add_number(args, "audit_max_bytes", (double)n), error);
     }
     if (strncmp(tok, "audit_max_cell_bytes=", 21) == 0 || strncmp(tok, "audit-max-cell-bytes=", 21) == 0) {
         const char *value = strchr(tok, '=');
@@ -1505,8 +1559,7 @@ static int add_audit_option_arg(cJSON *args, const char *tok, char **error, cons
             set_errorf(error, "%s: audit_max_cell_bytes must be a non-negative integer", op_name);
             return -1;
         }
-        cJSON_AddNumberToObject(args, "audit_max_cell_bytes", (double)n);
-        return 1;
+        return audit_add_result(tf_json_add_number(args, "audit_max_cell_bytes", (double)n), error);
     }
     return 0;
 }
@@ -4497,7 +4550,7 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
         /* Tokenize this stage */
         token_list tokens;
         if (tokenize_stage(stages.items[i], &tokens) != 0 || tokens.count == 0) {
-            set_errorf(error, "empty stage at position %zu", "");
+            set_errorf(error, "empty stage at position %zu", i);
             tl_free(&tokens);
             goto fail;
         }
@@ -4517,6 +4570,7 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
         /* Check if it's a codec (starts with "codec." or resolved from shorthand) */
         if (strncmp(op_name, "codec.", 6) == 0) {
             args = build_codec_args(&tokens);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "filter") == 0) {
             args = build_expr_audit_args(&tokens, error, "filter");
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
@@ -4558,6 +4612,7 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "dedup") == 0) {
             args = build_unique_args(&tokens, error);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "validate") == 0) {
             args = build_expr_audit_args(&tokens, error, "validate");
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
@@ -4583,6 +4638,7 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "trim") == 0) {
             args = build_unique_args(&tokens, error);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "fill-null") == 0) {
             args = build_mapping_args_with_audit(&tokens, error, "fill-null");
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
@@ -4597,11 +4653,13 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "hash") == 0) {
             args = build_unique_args(&tokens, error);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "bin") == 0) {
             args = build_bin_args(&tokens, error);
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "fill-down") == 0) {
             args = build_unique_args(&tokens, error);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "step") == 0) {
             args = build_step_args(&tokens, error);
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
@@ -4667,6 +4725,7 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "flatten") == 0) {
             args = build_flatten_args(&tokens, error);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "grep") == 0) {
             args = build_grep_args(&tokens, error);
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
@@ -4726,6 +4785,7 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "split-data") == 0) {
             args = build_split_data_args(&tokens, error);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         } else if (strcmp(op_name, "interpolate") == 0) {
             args = build_interpolate_args(&tokens, error);
             if (!args) { free(resolved); tl_free(&tokens); goto fail; }
@@ -4738,6 +4798,7 @@ tf_ir_plan *tf_dsl_parse(const char *text, size_t len, char **error) {
         } else {
             /* Unknown op — pass through with codec-style args, let validation catch it */
             args = build_codec_args(&tokens);
+            if (!args) { set_oom_error_if_unset(error); free(resolved); tl_free(&tokens); goto fail; }
         }
 
         if (tf_ir_plan_add_node(plan, node_op_name, args) != 0) {
