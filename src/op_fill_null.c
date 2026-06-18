@@ -66,28 +66,27 @@ static int fill_null_process(tf_step *self, tf_batch *in, tf_batch **out,
         tf_batch_free(ob);
         return TF_ERROR;
     }
+    size_t *changed_cols = tf_callocarray_checked(st->n > 0 ? st->n : 1, sizeof(size_t));
+    if (!changed_cols) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
+            free(changed_cols);
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (tf_batch_expose_row(ob, r) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
-
-    /* Fill nulls */
-    for (size_t k = 0; k < st->n; k++) {
-        int ci = tf_batch_col_index(ob, st->col_names[k]);
-        if (ci < 0) continue;
-        for (size_t r = 0; r < ob->n_rows; r++) {
-            if (!tf_batch_is_null(ob, r, (size_t)ci)) continue;
+        size_t changed_count = 0;
+        for (size_t k = 0; k < st->n; k++) {
+            int ci = tf_batch_col_index(in, st->col_names[k]);
+            if (ci < 0 || !ob->nulls[ci] || !ob->nulls[ci][r]) continue;
             const char *def = st->defaults[k];
             int changed = 0;
-            switch (ob->col_types[ci]) {
+            switch (in->col_types[ci]) {
                 case TF_TYPE_STRING:
                     if (tf_batch_set_string(ob, r, (size_t)ci, def) != TF_OK) {
+                        free(changed_cols);
                         tf_batch_free(ob);
                         return TF_ERROR;
                     }
@@ -98,6 +97,7 @@ static int fill_null_process(tf_step *self, tf_batch *in, tf_batch **out,
                     int64_t v = strtoll(def, &end, 10);
                     if (*end == '\0') {
                         if (tf_batch_set_int64(ob, r, (size_t)ci, v) != TF_OK) {
+                            free(changed_cols);
                             tf_batch_free(ob);
                             return TF_ERROR;
                         }
@@ -110,6 +110,7 @@ static int fill_null_process(tf_step *self, tf_batch *in, tf_batch **out,
                     double v = strtod(def, &end);
                     if (*end == '\0') {
                         if (tf_batch_set_float64(ob, r, (size_t)ci, v) != TF_OK) {
+                            free(changed_cols);
                             tf_batch_free(ob);
                             return TF_ERROR;
                         }
@@ -119,6 +120,7 @@ static int fill_null_process(tf_step *self, tf_batch *in, tf_batch **out,
                 }
                 case TF_TYPE_BOOL:
                     if (tf_batch_set_bool(ob, r, (size_t)ci, strcmp(def, "true") == 0) != TF_OK) {
+                        free(changed_cols);
                         tf_batch_free(ob);
                         return TF_ERROR;
                     }
@@ -129,6 +131,7 @@ static int fill_null_process(tf_step *self, tf_batch *in, tf_batch **out,
                     int32_t v = (int32_t)strtol(def, &end, 10);
                     if (*end == '\0') {
                         if (tf_batch_set_date(ob, r, (size_t)ci, v) != TF_OK) {
+                            free(changed_cols);
                             tf_batch_free(ob);
                             return TF_ERROR;
                         }
@@ -141,6 +144,7 @@ static int fill_null_process(tf_step *self, tf_batch *in, tf_batch **out,
                     int64_t v = strtoll(def, &end, 10);
                     if (*end == '\0') {
                         if (tf_batch_set_timestamp(ob, r, (size_t)ci, v) != TF_OK) {
+                            free(changed_cols);
                             tf_batch_free(ob);
                             return TF_ERROR;
                         }
@@ -151,21 +155,37 @@ static int fill_null_process(tf_step *self, tf_batch *in, tf_batch **out,
                 default:
                     break;
             }
+            if (changed) changed_cols[changed_count++] = (size_t)ci;
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            free(changed_cols);
+            tf_batch_free(ob);
+            return TF_ERROR;
+        }
+        if (changed_count > 0) {
             size_t row_no = 0;
-            if (changed &&
-                (tf_size_add(row_base, r, &row_no) != TF_OK ||
-                 tf_size_add(row_no, 1, &row_no) != TF_OK ||
-                 emit_fill_null_audit(st, ob, r, (size_t)ci, row_no, side) != TF_OK)) {
+            if (tf_size_add(row_base, r, &row_no) != TF_OK ||
+                tf_size_add(row_no, 1, &row_no) != TF_OK) {
+                free(changed_cols);
                 tf_batch_free(ob);
                 return TF_ERROR;
+            }
+            for (size_t i = 0; i < changed_count; i++) {
+                if (emit_fill_null_audit(st, ob, r, changed_cols[i], row_no, side) != TF_OK) {
+                    free(changed_cols);
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
             }
         }
     }
 
     if (tf_size_add(st->row_index, in->n_rows, &st->row_index) != TF_OK) {
+        free(changed_cols);
         tf_batch_free(ob);
         return TF_ERROR;
     }
+    free(changed_cols);
     *out = ob;
     return TF_OK;
 }

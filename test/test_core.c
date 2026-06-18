@@ -6966,6 +6966,28 @@ static void test_pipeline_fill_null_audit_side_channel(void) {
     assert(strstr((char *)stats, "\"after\":\"MISSING\"") != NULL);
     assert(strstr((char *)stats, "\"row\":3") == NULL);
     tf_pipeline_free(p);
+
+    const char *finalized_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"nulls\":\"NA\"}},"
+        "{\"op\":\"fill-null\",\"args\":{\"mapping\":{\"note\":\"MISSING\",\"city\":\"NY\"},\"audit\":true,\"audit_limit\":2}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create(finalized_plan, strlen(finalized_plan));
+    assert(p != NULL);
+    const char *single = "name,note,city\nA,NA,NA\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)single, strlen(single)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    stats_n = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(stats_n > 0);
+    stats[stats_n] = '\0';
+    assert(strstr((char *)stats,
+                  "\"column\":\"note\",\"row\":1,\"before\":null,\"after\":\"MISSING\","
+                  "\"data\":{\"name\":\"A\",\"note\":\"MISSING\",\"city\":\"NY\"}") != NULL);
+    assert(strstr((char *)stats,
+                  "\"column\":\"city\",\"row\":1,\"before\":null,\"after\":\"NY\","
+                  "\"data\":{\"name\":\"A\",\"note\":\"MISSING\",\"city\":\"NY\"}") != NULL);
+    tf_pipeline_free(p);
 }
 
 

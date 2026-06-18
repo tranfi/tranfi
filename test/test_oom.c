@@ -1595,9 +1595,9 @@ int main(void) {
         },
         {
             "audit_privacy_producers",
-            "csv batch_size=1 nulls=NA | fill-null note=SECRET audit audit_columns=note audit_redact=note | cast secret=int on_error=null audit audit_columns=secret audit_redact=secret | frequency city max_values=1 overflow=other audit audit_limit=1 audit_columns=city audit_redact=city | csv",
+            "csv batch_size=1 nulls=NA | fill-null note=SECRET audit audit_columns=note audit_redact=note | replace secret bad GOOD audit audit_columns=secret audit_redact=secret | cast secret=int on_error=null audit audit_columns=secret audit_redact=secret | frequency city max_values=1 overflow=other audit audit_limit=1 audit_columns=city audit_redact=city | csv",
             audit_rows,
-            620
+            760
         },
         {
             "aggregate_assert_grep_passthrough",

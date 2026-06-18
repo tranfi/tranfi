@@ -29,31 +29,23 @@ static int clip_process(tf_step *self, tf_batch *in, tf_batch **out,
         tf_batch_free(ob);
         return TF_ERROR;
     }
+    int ci = tf_batch_col_index(in, st->column);
     for (size_t r = 0; r < in->n_rows; r++) {
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
-        if (tf_batch_expose_row(ob, r) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-    }
-
-    int ci = tf_batch_col_index(ob, st->column);
-    if (ci >= 0) {
-        for (size_t r = 0; r < ob->n_rows; r++) {
-            if (tf_batch_is_null(ob, r, ci)) continue;
-            if (ob->col_types[ci] == TF_TYPE_INT64) {
-                int64_t v = tf_batch_get_int64(ob, r, ci);
+        if (ci >= 0 && !tf_batch_is_null(in, r, (size_t)ci)) {
+            if (in->col_types[ci] == TF_TYPE_INT64) {
+                int64_t v = tf_batch_get_int64(in, r, (size_t)ci);
                 if (st->has_min && v < (int64_t)st->min_val) v = (int64_t)st->min_val;
                 if (st->has_max && v > (int64_t)st->max_val) v = (int64_t)st->max_val;
                 if (tf_batch_set_int64(ob, r, (size_t)ci, v) != TF_OK) {
                     tf_batch_free(ob);
                     return TF_ERROR;
                 }
-            } else if (ob->col_types[ci] == TF_TYPE_FLOAT64) {
-                double v = tf_batch_get_float64(ob, r, ci);
+            } else if (in->col_types[ci] == TF_TYPE_FLOAT64) {
+                double v = tf_batch_get_float64(in, r, (size_t)ci);
                 if (st->has_min && v < st->min_val) v = st->min_val;
                 if (st->has_max && v > st->max_val) v = st->max_val;
                 if (tf_batch_set_float64(ob, r, (size_t)ci, v) != TF_OK) {
@@ -61,6 +53,10 @@ static int clip_process(tf_step *self, tf_batch *in, tf_batch **out,
                     return TF_ERROR;
                 }
             }
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) {
+            tf_batch_free(ob);
+            return TF_ERROR;
         }
     }
 

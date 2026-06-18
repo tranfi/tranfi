@@ -114,6 +114,88 @@ done:
     return rc;
 }
 
+static int replace_build_regex(replace_state *st, const char *val,
+                               char **out_buf, int *out_replaced) {
+    *out_buf = NULL;
+    *out_replaced = 0;
+    size_t buf_cap = 0;
+    size_t buf_len = 0;
+    char *buf = NULL;
+    const char *p = val;
+    regmatch_t match;
+    while (regexec(&st->compiled, p, 1, &match, 0) == 0 && match.rm_so >= 0) {
+        *out_replaced = 1;
+        size_t prefix = (size_t)match.rm_so;
+        size_t match_len = (size_t)(match.rm_eo - match.rm_so);
+        if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, prefix) != TF_OK) {
+            free(buf);
+            return TF_ERROR;
+        }
+        for (const char *rp = st->replacement; *rp; rp++) {
+            if (*rp == '&') {
+                if (replace_append_bytes(&buf, &buf_cap, &buf_len,
+                                         p + match.rm_so, match_len) != TF_OK) {
+                    free(buf);
+                    return TF_ERROR;
+                }
+            } else if (replace_append_char(&buf, &buf_cap, &buf_len, *rp) != TF_OK) {
+                free(buf);
+                return TF_ERROR;
+            }
+        }
+        p += match.rm_eo;
+        if (match_len == 0) {
+            if (*p) {
+                if (replace_append_char(&buf, &buf_cap, &buf_len, *p++) != TF_OK) {
+                    free(buf);
+                    return TF_ERROR;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    if (*out_replaced) {
+        if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, strlen(p)) != TF_OK) {
+            free(buf);
+            return TF_ERROR;
+        }
+        *out_buf = buf;
+    }
+    return TF_OK;
+}
+
+static int replace_build_literal(replace_state *st, const char *val,
+                                 char **out_buf, int *out_replaced) {
+    *out_buf = NULL;
+    *out_replaced = 0;
+    size_t pat_len = strlen(st->pattern);
+    if (pat_len == 0 || !strstr(val, st->pattern)) return TF_OK;
+
+    size_t rep_len = strlen(st->replacement);
+    size_t buf_cap = 0;
+    size_t buf_len = 0;
+    char *buf = NULL;
+    const char *p = val;
+    const char *found;
+    while ((found = strstr(p, st->pattern)) != NULL) {
+        size_t prefix = (size_t)(found - p);
+        if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, prefix) != TF_OK ||
+            replace_append_bytes(&buf, &buf_cap, &buf_len, st->replacement, rep_len) != TF_OK) {
+            free(buf);
+            return TF_ERROR;
+        }
+        p = found + pat_len;
+    }
+    if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, strlen(p)) != TF_OK) {
+        free(buf);
+        return TF_ERROR;
+    }
+    *out_replaced = 1;
+    *out_buf = buf;
+    return TF_OK;
+}
+
 static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
                            tf_side_channels *side) {
     replace_state *st = self->state;
@@ -126,162 +208,78 @@ static int replace_process(tf_step *self, tf_batch *in, tf_batch **out,
         tf_batch_free(ob);
         return TF_ERROR;
     }
+
+    int ci = tf_batch_col_index(in, st->column);
+    int can_replace = ci >= 0 && in->col_types[ci] == TF_TYPE_STRING;
     for (size_t r = 0; r < in->n_rows; r++) {
+        char *buf = NULL;
+        char *before_copy = NULL;
+        int replaced = 0;
+        const char *val = NULL;
         if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
             tf_batch_free(ob);
             return TF_ERROR;
         }
+        if (can_replace && !tf_batch_is_null(in, r, (size_t)ci)) {
+            val = tf_batch_get_string(in, r, (size_t)ci);
+            if (val) {
+                int build_rc = st->use_regex
+                    ? replace_build_regex(st, val, &buf, &replaced)
+                    : replace_build_literal(st, val, &buf, &replaced);
+                if (build_rc != TF_OK) {
+                    tf_batch_free(ob);
+                    return TF_ERROR;
+                }
+                if (replaced) {
+                    if (st->audit && st->audit_emitted < st->audit_limit) {
+                        before_copy = strdup(val);
+                        if (!before_copy) {
+                            free(buf);
+                            tf_batch_free(ob);
+                            return TF_ERROR;
+                        }
+                    }
+                    if (tf_batch_set_string(ob, r, (size_t)ci, buf) != TF_OK) {
+                        free(before_copy);
+                        free(buf);
+                        tf_batch_free(ob);
+                        return TF_ERROR;
+                    }
+                }
+            }
+        }
         if (tf_batch_expose_row(ob, r) != TF_OK) {
+            free(before_copy);
+            free(buf);
             tf_batch_free(ob);
             return TF_ERROR;
         }
-    }
-
-    int ci = tf_batch_col_index(ob, st->column);
-    if (ci >= 0 && ob->col_types[ci] == TF_TYPE_STRING) {
-        if (st->use_regex) {
-            /* Regex mode: use regexec to find matches */
-            for (size_t r = 0; r < ob->n_rows; r++) {
-                if (tf_batch_is_null(ob, r, (size_t)ci)) continue;
-                const char *val = tf_batch_get_string(ob, r, (size_t)ci);
-                size_t buf_cap = 0;
-                char *buf = NULL;
-                size_t buf_len = 0;
-                const char *p = val;
-                regmatch_t match;
-                int replaced = 0;
-                while (regexec(&st->compiled, p, 1, &match, 0) == 0 && match.rm_so >= 0) {
-                    replaced = 1;
-                    size_t prefix = (size_t)match.rm_so;
-                    size_t match_len = (size_t)(match.rm_eo - match.rm_so);
-                    if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, prefix) != TF_OK) {
-                        free(buf);
-                        tf_batch_free(ob);
-                        return TF_ERROR;
-                    }
-                    /* Expand replacement: & refers to whole match */
-                    for (const char *rp = st->replacement; *rp; rp++) {
-                        if (*rp == '&') {
-                            if (replace_append_bytes(&buf, &buf_cap, &buf_len,
-                                                     p + match.rm_so, match_len) != TF_OK) {
-                                free(buf);
-                                tf_batch_free(ob);
-                                return TF_ERROR;
-                            }
-                        } else {
-                            if (replace_append_char(&buf, &buf_cap, &buf_len, *rp) != TF_OK) {
-                                free(buf);
-                                tf_batch_free(ob);
-                                return TF_ERROR;
-                            }
-                        }
-                    }
-                    p += match.rm_eo;
-                    if (match_len == 0) {
-                        /* Zero-length match: copy one char to avoid infinite loop */
-                        if (*p) {
-                            if (replace_append_char(&buf, &buf_cap, &buf_len, *p++) != TF_OK) {
-                                free(buf);
-                                tf_batch_free(ob);
-                                return TF_ERROR;
-                            }
-                        } else break;
-                    }
-                }
-                if (replaced) {
-                    /* Copy remaining */
-                    size_t rest = strlen(p);
-                    if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, rest) != TF_OK) {
-                        free(buf);
-                        tf_batch_free(ob);
-                        return TF_ERROR;
-                    }
-                    char *before_copy = NULL;
-                    if (st->audit && st->audit_emitted < st->audit_limit) {
-                        before_copy = strdup(val);
-                        if (!before_copy) {
-                            free(buf);
-                            tf_batch_free(ob);
-                            return TF_ERROR;
-                        }
-                    }
-                    if (tf_batch_set_string(ob, r, (size_t)ci, buf) != TF_OK) {
-                        free(before_copy);
-                        free(buf);
-                        tf_batch_free(ob);
-                        return TF_ERROR;
-                    }
-                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
-                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before_copy ? before_copy : val, after, side) != TF_OK) {
-                        free(before_copy);
-                        free(buf);
-                        tf_batch_free(ob);
-                        return TF_ERROR;
-                    }
-                    free(before_copy);
-                }
+        if (replaced) {
+            size_t row_no = 0;
+            if (tf_size_add(row_base, r, &row_no) != TF_OK ||
+                tf_size_add(row_no, 1, &row_no) != TF_OK) {
+                free(before_copy);
                 free(buf);
+                tf_batch_free(ob);
+                return TF_ERROR;
             }
-        } else {
-            /* Substring mode */
-            size_t pat_len = strlen(st->pattern);
-            size_t rep_len = strlen(st->replacement);
-            if (pat_len > 0) {
-                for (size_t r = 0; r < ob->n_rows; r++) {
-                    if (tf_batch_is_null(ob, r, (size_t)ci)) continue;
-                    const char *val = tf_batch_get_string(ob, r, (size_t)ci);
-                    const char *p = val;
-                    if (!strstr(p, st->pattern)) continue;
-
-                    size_t buf_cap = 0;
-                    size_t buf_len = 0;
-                    char *buf = NULL;
-                    const char *found;
-                    while ((found = strstr(p, st->pattern)) != NULL) {
-                        size_t prefix = (size_t)(found - p);
-                        if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, prefix) != TF_OK ||
-                            replace_append_bytes(&buf, &buf_cap, &buf_len, st->replacement, rep_len) != TF_OK) {
-                            free(buf);
-                            tf_batch_free(ob);
-                            return TF_ERROR;
-                        }
-                        p = found + pat_len;
-                    }
-                    if (replace_append_bytes(&buf, &buf_cap, &buf_len, p, strlen(p)) != TF_OK) {
-                        free(buf);
-                        tf_batch_free(ob);
-                        return TF_ERROR;
-                    }
-                    char *before_copy = NULL;
-                    if (st->audit && st->audit_emitted < st->audit_limit) {
-                        before_copy = strdup(val);
-                        if (!before_copy) {
-                            free(buf);
-                            tf_batch_free(ob);
-                            return TF_ERROR;
-                        }
-                    }
-                    if (tf_batch_set_string(ob, r, (size_t)ci, buf) != TF_OK) {
-                        free(before_copy);
-                        free(buf);
-                        tf_batch_free(ob);
-                        return TF_ERROR;
-                    }
-                    const char *after = tf_batch_get_string(ob, r, (size_t)ci);
-                    if (emit_replace_audit(st, ob, r, (size_t)ci, row_base + r + 1, before_copy ? before_copy : val, after, side) != TF_OK) {
-                        free(before_copy);
-                        free(buf);
-                        tf_batch_free(ob);
-                        return TF_ERROR;
-                    }
-                    free(before_copy);
-                    free(buf);
-                }
+            const char *after = tf_batch_get_string(ob, r, (size_t)ci);
+            if (emit_replace_audit(st, ob, r, (size_t)ci, row_no,
+                                   before_copy ? before_copy : val, after, side) != TF_OK) {
+                free(before_copy);
+                free(buf);
+                tf_batch_free(ob);
+                return TF_ERROR;
             }
         }
+        free(before_copy);
+        free(buf);
     }
 
-    st->row_index += in->n_rows;
+    if (tf_size_add(st->row_index, in->n_rows, &st->row_index) != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
     *out = ob;
     return TF_OK;
 }
