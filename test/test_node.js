@@ -224,7 +224,41 @@ await test('cast audit side channel', async () => {
   assert(result.statsText.includes('"reason":"invalid_integer"'), 'cast audit should record invalid integer')
   assert(result.statsText.includes('"reason":"trailing_characters"'), 'cast audit should record trailing characters')
   assert(result.statsText.includes('"expected":"int"'), 'cast audit should include expected type')
+  assert(result.statsText.includes('"on_error":"coerce"'), 'cast audit should include default policy')
   assert(result.statsText.includes('"actual":"bad"'), 'cast audit should include actual value')
+  assert(result.statsText.includes('"coercion_failures":2'), 'cast stats should count coercion failures')
+  assert(result.statsText.includes('"coercion_nulled":0'), 'cast stats should count nulled coercions')
+  assert(result.statsText.includes('"audit_emitted":3'), 'cast stats should count emitted audit records')
+})
+
+
+await test('cast onError policies', async () => {
+  const nullStep = ops.cast({ age: 'int' }, { onError: 'null', audit: true, auditLimit: 3 })
+  assert(nullStep.args.on_error === 'null', 'cast helper should expose onError')
+  const result = await pipeline([
+    codec.csv({ batchSize: 2 }),
+    nullStep,
+    codec.csvEncode(),
+  ]).run({ input: 'age\n10\nbad\n12x\n' })
+  const lines = result.outputText.split(/\r?\n/)
+  assert(lines[0] === 'age', 'cast null policy should keep header')
+  assert(lines[1] === '10', 'cast null policy should keep valid value')
+  assert(lines[2] === '', 'cast null policy should null invalid integer')
+  assert(lines[3] === '', 'cast null policy should null partial integer')
+  assert(result.statsText.includes('"on_error":"null"'), 'cast audit should include nulling policy')
+  assert(result.statsText.includes('"event":"coercion_failed"'), 'cast audit should record failures')
+  assert(result.statsText.includes('"after":null'), 'cast audit should show null output')
+  assert(result.statsText.includes('"coercion_failures":2'), 'cast stats should count failures')
+  assert(result.statsText.includes('"coercion_nulled":2'), 'cast stats should count nulled values')
+
+  await assertRejects(
+    () => pipeline([
+      codec.csv({ batchSize: 1 }),
+      ops.cast({ age: 'int' }, { onError: 'fail' }),
+      codec.csvEncode(),
+    ]).run({ input: 'age\nbad\n' }),
+    /cast failed at row 1/
+  )
 })
 
 
@@ -2489,11 +2523,13 @@ await test('audit privacy migrated producers', async () => {
 
 
   const castStep = ops.cast({ secret: 'int' }, {
+    onError: 'null',
     audit: true,
     auditLimit: 1,
     auditColumns: ['secret'],
     auditRedact: ['secret'],
   })
+  assert(castStep.args.on_error === 'null', 'cast helper should pass onError')
   assert(castStep.args.audit_columns[0] === 'secret', 'cast helper should pass auditColumns')
   assert(castStep.args.audit_redact[0] === 'secret', 'cast helper should pass auditRedact')
   result = await pipeline([
@@ -5258,6 +5294,15 @@ if (createTranfi) {
     assert(castAudit.statsText.includes('"event":"coercion_failed"'), 'wasm cast audit should identify coercion failures')
     assert(castAudit.statsText.includes('"reason":"invalid_integer"'), 'wasm cast audit should include invalid reason')
     assert(castAudit.statsText.includes('"reason":"trailing_characters"'), 'wasm cast audit should include trailing reason')
+    assert(castAudit.statsText.includes('"on_error":"coerce"'), 'wasm cast audit should include default policy')
+
+    const castNull = tf.run('csv batch_size=2 | cast age=int on_error=null audit audit_limit=3 | csv', 'age\n10\nbad\n12x\n')
+    const castNullLines = castNull.outputText.split(/\r?\n/)
+    assert(castNullLines[1] === '10', 'wasm cast null policy should preserve valid output')
+    assert(castNullLines[2] === '', 'wasm cast null policy should null invalid integer')
+    assert(castNullLines[3] === '', 'wasm cast null policy should null partial integer')
+    assert(castNull.statsText.includes('"on_error":"null"'), 'wasm cast audit should include null policy')
+    assert(castNull.statsText.includes('"coercion_nulled":2'), 'wasm cast stats should count nulled values')
 
     const normalizeAudit = tf.run('csv batch_size=2 | normalize x minmax audit audit_limit=1 | csv', 'x\n10\n20\n30\n', { allowBlocking: true })
     assert(normalizeAudit.outputText.includes('0.5'), 'wasm normalize audit should preserve output')

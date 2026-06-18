@@ -361,8 +361,9 @@ const ops = {
     return { op: 'fill-null', args }
   },
 
-  cast(mapping, { audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
+  cast(mapping, { onError, audit = false, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes } = {}) {
     const args = { mapping }
+    if (onError !== undefined) args.on_error = onError
     if (audit) args.audit = true
     if (auditLimit !== undefined) args.audit_limit = auditLimit
     if (auditIncludeRow !== undefined) args.audit_include_row = !!auditIncludeRow

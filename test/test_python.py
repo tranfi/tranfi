@@ -1764,7 +1764,40 @@ def test_cast_audit_side_channel():
     assert '"reason":"invalid_integer"' in result.stats_text
     assert '"reason":"trailing_characters"' in result.stats_text
     assert '"expected":"int"' in result.stats_text
+    assert '"on_error":"coerce"' in result.stats_text
     assert '"actual":"bad"' in result.stats_text
+    assert '"coercion_failures":2' in result.stats_text
+    assert '"coercion_nulled":0' in result.stats_text
+    assert '"audit_emitted":3' in result.stats_text
+
+
+def test_cast_on_error_policies():
+    null_step = tf.ops.cast(age='int', on_error='null', audit=True, audit_limit=3)
+    assert null_step['args']['on_error'] == 'null'
+    p = tf.pipeline([
+        tf.codec.csv(batch_size=2),
+        null_step,
+        tf.codec.csv_encode(),
+    ])
+    result = p.run(input=b'age\n10\nbad\n12x\n')
+    lines = result.output_text.splitlines()
+    assert lines[0] == 'age'
+    assert lines[1] == '10'
+    assert lines[2] == ''
+    assert lines[3] == ''
+    assert '"on_error":"null"' in result.stats_text
+    assert '"event":"coercion_failed"' in result.stats_text
+    assert '"after":null' in result.stats_text
+    assert '"coercion_failures":2' in result.stats_text
+    assert '"coercion_nulled":2' in result.stats_text
+
+    fail_pipeline = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.cast(age='int', on_error='fail'),
+        tf.codec.csv_encode(),
+    ])
+    with pytest.raises(RuntimeError, match='cast failed at row 1'):
+        fail_pipeline.run(input=b'age\nbad\n')
 
 
 def test_normalize_audit_side_channel():
@@ -2572,11 +2605,13 @@ def test_ops_audit_privacy_migrated_producers():
 
     cast_step = tf.ops.cast(
         secret='int',
+        on_error='null',
         audit=True,
         audit_limit=1,
         audit_columns=['secret'],
         audit_redact=['secret'],
     )
+    assert cast_step['args']['on_error'] == 'null'
     assert cast_step['args']['audit_columns'] == ['secret']
     assert cast_step['args']['audit_redact'] == ['secret']
     cast_result = tf.pipeline([

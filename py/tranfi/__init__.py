@@ -607,9 +607,11 @@ class ops:
     @staticmethod
     def cast(audit=False, audit_limit=None, audit_include_row=None,
              audit_columns=None, audit_redact=None, audit_hash_columns=None,
-             audit_max_bytes=None, audit_max_cell_bytes=None, **mapping):
+             audit_max_bytes=None, audit_max_cell_bytes=None, on_error=None, **mapping):
         """Type conversion. Example: tf.ops.cast(age='int', score='float')"""
         args = {'mapping': mapping}
+        if on_error is not None:
+            args['on_error'] = on_error
         if audit:
             args['audit'] = True
         if audit_limit is not None:

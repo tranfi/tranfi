@@ -1529,6 +1529,26 @@ static cJSON *build_mapping_args_with_audit(const token_list *tokens, char **err
         if (audit_rc < 0) { cJSON_Delete(args); cJSON_Delete(mapping); return NULL; }
         if (audit_rc > 0) continue;
 
+        if (strcmp(op_name, "cast") == 0 &&
+            (strncmp(tokens->items[i], "on_error=", 9) == 0 ||
+             strncmp(tokens->items[i], "on-error=", 9) == 0 ||
+             strncmp(tokens->items[i], "on_coercion_error=", 18) == 0 ||
+             strncmp(tokens->items[i], "on-coercion-error=", 18) == 0)) {
+            const char *value = strchr(tokens->items[i], '=');
+            value = value ? value + 1 : "";
+            if (strcmp(value, "coerce") != 0 && strcmp(value, "legacy") != 0 &&
+                strcmp(value, "default") != 0 && strcmp(value, "fail") != 0 &&
+                strcmp(value, "error") != 0 && strcmp(value, "strict") != 0 &&
+                strcmp(value, "null") != 0 && strcmp(value, "nulling") != 0) {
+                cJSON_Delete(args);
+                cJSON_Delete(mapping);
+                set_error(error, "cast: on_error must be coerce, fail, or null");
+                return NULL;
+            }
+            cJSON_AddStringToObject(args, "on_error", value);
+            continue;
+        }
+
         char *saveptr = NULL;
         char *copy = strdup(tokens->items[i]);
         if (!copy) { cJSON_Delete(args); cJSON_Delete(mapping); return NULL; }

@@ -14,6 +14,12 @@
 
 /* Cast is row-local. Audit records are opt-in and capped so parse/coercion
  * diagnostics cannot become an unbounded second output stream. */
+typedef enum {
+    CAST_ON_ERROR_COERCE = 0,
+    CAST_ON_ERROR_FAIL,
+    CAST_ON_ERROR_NULL,
+} cast_error_policy;
+
 typedef struct {
     char    **col_names;
     tf_type  *target_types;
@@ -21,9 +27,38 @@ typedef struct {
     size_t    row_index;
     size_t    audit_limit;
     size_t    audit_emitted;
+    size_t    coercion_failures;
+    size_t    coercion_nulled;
     int       audit;
+    cast_error_policy on_error;
     tf_audit_options audit_opts;
 } cast_state;
+
+static const char *cast_error_policy_name(cast_error_policy p) {
+    switch (p) {
+        case CAST_ON_ERROR_COERCE: return "coerce";
+        case CAST_ON_ERROR_FAIL: return "fail";
+        case CAST_ON_ERROR_NULL: return "null";
+        default: return "coerce";
+    }
+}
+
+static int parse_cast_error_policy(const char *s, cast_error_policy *out) {
+    if (!s || !s[0] || strcmp(s, "coerce") == 0 || strcmp(s, "legacy") == 0 ||
+        strcmp(s, "default") == 0) {
+        *out = CAST_ON_ERROR_COERCE;
+        return 1;
+    }
+    if (strcmp(s, "fail") == 0 || strcmp(s, "error") == 0 || strcmp(s, "strict") == 0) {
+        *out = CAST_ON_ERROR_FAIL;
+        return 1;
+    }
+    if (strcmp(s, "null") == 0 || strcmp(s, "nulling") == 0) {
+        *out = CAST_ON_ERROR_NULL;
+        return 1;
+    }
+    return 0;
+}
 
 static const char *cast_type_name(tf_type t) {
     switch (t) {
@@ -127,6 +162,7 @@ static int emit_cast_audit(cast_state *st, const tf_batch *before_b, const tf_ba
     cJSON_AddStringToObject(obj, "from_type", cast_type_name(src_t));
     cJSON_AddStringToObject(obj, "to_type", cast_type_name(dst_t));
     cJSON_AddStringToObject(obj, "expected", cast_type_name(dst_t));
+    cJSON_AddStringToObject(obj, "on_error", cast_error_policy_name(st->on_error));
     if (src_t == TF_TYPE_STRING && !tf_batch_is_null(before_b, row, col)) {
         char actual_buf[256];
         const char *actual = tf_audit_format_string_for_column(&st->audit_opts, column_name,
@@ -278,10 +314,28 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
             }
             if (write_rc != TF_OK) goto fail;
 
+            if (failure_reason) {
+                st->coercion_failures++;
+                if (st->on_error == CAST_ON_ERROR_NULL || st->on_error == CAST_ON_ERROR_FAIL) {
+                    if (tf_batch_set_null(ob, r, c) != TF_OK) goto fail;
+                    if (st->on_error == CAST_ON_ERROR_NULL) st->coercion_nulled++;
+                }
+            }
+
             if (st->audit) {
                 const char *event = failure_reason ? "coercion_failed" : "value_changed";
                 const char *reason = failure_reason ? failure_reason : "type_cast";
                 if (emit_cast_audit(st, in, ob, r, c, row_base + r + 1, src_t, dst_t, event, reason, side) != TF_OK) goto fail;
+            }
+
+            if (failure_reason && st->on_error == CAST_ON_ERROR_FAIL) {
+                char msg[512];
+                snprintf(msg, sizeof(msg), "cast failed at row %zu column '%s': %s",
+                         row_base + r + 1,
+                         in->col_names[c] ? in->col_names[c] : "",
+                         failure_reason);
+                tf_set_last_error(msg);
+                goto fail;
             }
         }
     }
@@ -299,6 +353,18 @@ fail:
 
 static int cast_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
     (void)self; (void)side; *out = NULL; return TF_OK;
+}
+
+static int cast_append_stats(tf_step *self, tf_buffer *out) {
+    if (!self || !self->state || !out) return TF_ERROR;
+    cast_state *st = (cast_state *)self->state;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             ",\"on_error\":\"%s\",\"coercion_failures\":%zu,"
+             "\"coercion_nulled\":%zu,\"audit_emitted\":%zu",
+             cast_error_policy_name(st->on_error), st->coercion_failures,
+             st->coercion_nulled, st->audit_emitted);
+    return tf_buffer_write_str(out, buf);
 }
 
 static void cast_state_free(cast_state *st) {
@@ -330,6 +396,7 @@ tf_step *tf_cast_create(const cJSON *args) {
     st->target_types = tf_callocarray_checked(n > 0 ? (size_t)n : 1, sizeof(tf_type));
     st->n = (size_t)n;
     st->audit_limit = 1000;
+    st->on_error = CAST_ON_ERROR_COERCE;
     if (!st->col_names || !st->target_types) { cast_state_free(st); return NULL; }
 
     int i = 0;
@@ -340,6 +407,19 @@ tf_step *tf_cast_create(const cJSON *args) {
         st->target_types[i] = cJSON_IsString(entry) ? parse_type(entry->valuestring) : TF_TYPE_NULL;
         if (!st->col_names[i]) { cast_state_free(st); return NULL; }
         i++;
+    }
+
+    cJSON *on_error_j = cJSON_GetObjectItemCaseSensitive(args, "on_error");
+    if (!on_error_j) on_error_j = cJSON_GetObjectItemCaseSensitive(args, "onError");
+    if (!on_error_j) on_error_j = cJSON_GetObjectItemCaseSensitive(args, "on_coercion_error");
+    if (!on_error_j) on_error_j = cJSON_GetObjectItemCaseSensitive(args, "onCoercionError");
+    if (on_error_j) {
+        if (!cJSON_IsString(on_error_j) ||
+            !parse_cast_error_policy(on_error_j->valuestring, &st->on_error)) {
+            tf_set_last_error("cast: on_error must be coerce, fail, or null");
+            cast_state_free(st);
+            return NULL;
+        }
     }
 
     cJSON *audit_j = cJSON_GetObjectItemCaseSensitive(args, "audit");
@@ -367,6 +447,7 @@ tf_step *tf_cast_create(const cJSON *args) {
     step->process = cast_process;
     step->flush = cast_flush;
     step->destroy = cast_destroy;
+    step->append_stats = cast_append_stats;
     step->state = st;
     return step;
 }

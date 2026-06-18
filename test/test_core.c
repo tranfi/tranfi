@@ -5023,10 +5023,11 @@ static void test_dsl_codec_options(void) {
     assert(strcmp(cJSON_GetObjectItemCaseSensitive(quarantine_args, "message")->valuestring, "too_young") == 0);
     tf_ir_plan_free(plan);
 
-    dsl = "csv | cast age=int audit audit_limit=4 audit_redact=age | csv";
+    dsl = "csv | cast age=int on_error=null audit audit_limit=4 audit_redact=age | csv";
     plan = tf_dsl_parse(dsl, strlen(dsl), &error);
     assert(plan != NULL);
     cJSON *cast_args = plan->nodes[1].args;
+    assert(strcmp(cJSON_GetObjectItemCaseSensitive(cast_args, "on_error")->valuestring, "null") == 0);
     assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cast_args, "audit")));
     assert(cJSON_GetObjectItemCaseSensitive(cast_args, "audit_limit")->valueint == 4);
     cJSON *cast_redact = cJSON_GetObjectItemCaseSensitive(cast_args, "audit_redact");
@@ -6454,9 +6455,60 @@ static void test_pipeline_cast_audit_side_channel(void) {
     assert(strstr((char *)stats, "\"from_type\":\"string\"") != NULL);
     assert(strstr((char *)stats, "\"to_type\":\"int\"") != NULL);
     assert(strstr((char *)stats, "\"expected\":\"int\"") != NULL);
+    assert(strstr((char *)stats, "\"on_error\":\"coerce\"") != NULL);
     assert(strstr((char *)stats, "\"actual\":\"bad\"") != NULL);
     assert(strstr((char *)stats, "\"before\":\"bad\"") != NULL);
     assert(strstr((char *)stats, "\"after\":0") != NULL);
+    assert(strstr((char *)stats, "\"coercion_failures\":2") != NULL);
+    assert(strstr((char *)stats, "\"coercion_nulled\":0") != NULL);
+    assert(strstr((char *)stats, "\"audit_emitted\":3") != NULL);
+    tf_pipeline_free(p);
+}
+
+static void test_pipeline_cast_on_error_policies(void) {
+    const char *null_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"cast\",\"args\":{\"mapping\":{\"age\":\"int\"},\"on_error\":\"null\",\"audit\":true,\"audit_limit\":3}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    tf_pipeline *p = tf_pipeline_create(null_plan, strlen(null_plan));
+    assert(p != NULL);
+    const char *csv = "age\n10\nbad\n12x\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+
+    uint8_t out[1024];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strstr((char *)out, "\n10\n") != NULL);
+    assert(strstr((char *)out, "\n0\n") == NULL);
+    assert(strstr((char *)out, "\n12\n") == NULL);
+
+    uint8_t stats[8192];
+    size_t stats_n = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(stats_n > 0);
+    stats[stats_n] = '\0';
+    assert(strstr((char *)stats, "\"on_error\":\"null\"") != NULL);
+    assert(strstr((char *)stats, "\"event\":\"coercion_failed\"") != NULL);
+    assert(strstr((char *)stats, "\"after\":null") != NULL);
+    assert(strstr((char *)stats, "\"coercion_failures\":2") != NULL);
+    assert(strstr((char *)stats, "\"coercion_nulled\":2") != NULL);
+    tf_pipeline_free(p);
+
+    const char *fail_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"cast\",\"args\":{\"mapping\":{\"age\":\"int\"},\"on_error\":\"fail\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create(fail_plan, strlen(fail_plan));
+    assert(p != NULL);
+    const char *bad = "age\nbad\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)bad, strlen(bad)) == TF_ERROR);
+    assert(tf_pipeline_error(p) != NULL);
+    assert(strstr(tf_pipeline_error(p), "cast failed at row 1 column 'age': invalid_integer") != NULL);
     tf_pipeline_free(p);
 }
 
@@ -12685,6 +12737,7 @@ int main(int argc, char **argv) {
     printf("\nNew Operators:\n");
     TEST(test_pipeline_tail);
     TEST(test_pipeline_cast_audit_side_channel);
+    TEST(test_pipeline_cast_on_error_policies);
     TEST(test_pipeline_clip);
     TEST(test_pipeline_replace);
     TEST(test_pipeline_replace_audit_side_channel);
