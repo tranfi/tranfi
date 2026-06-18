@@ -283,23 +283,33 @@ static int emit_json_schema_audit(json_schema_state *st, const tf_batch *b, size
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "json-schema");
-    cJSON_AddStringToObject(obj, "event", "row_dropped");
-    cJSON_AddStringToObject(obj, "reason", "json_schema_failed");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "mode", json_schema_mode_name(st->mode));
-    cJSON_AddStringToObject(obj, "rule", "json-schema");
-    cJSON_AddStringToObject(obj, "column", st->column ? st->column : "_line");
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "json-schema") != TF_OK ||
+        tf_json_add_string(obj, "event", "row_dropped") != TF_OK ||
+        tf_json_add_string(obj, "reason", "json_schema_failed") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "mode", json_schema_mode_name(st->mode)) != TF_OK ||
+        tf_json_add_string(obj, "rule", "json-schema") != TF_OK ||
+        tf_json_add_string(obj, "column", st->column ? st->column : "_line") != TF_OK) {
+        goto done;
+    }
     char actual_buf[256];
-    cJSON_AddStringToObject(obj, "actual",
-                            tf_audit_format_string_for_column(&st->audit_opts, st->column,
-                                                              actual ? actual : "schema_mismatch",
-                                                              actual_buf, sizeof(actual_buf)));
-    cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
+    if (tf_json_add_string(obj, "actual",
+                           tf_audit_format_string_for_column(&st->audit_opts, st->column,
+                                                             actual ? actual : "schema_mismatch",
+                                                             actual_buf, sizeof(actual_buf))) != TF_OK ||
+        tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) {
+        goto done;
+    }
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;

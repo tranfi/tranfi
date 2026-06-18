@@ -71,13 +71,16 @@ static int emit_replace_audit(replace_state *st, const tf_batch *b, size_t row, 
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "replace");
-    cJSON_AddStringToObject(obj, "event", "value_changed");
-    cJSON_AddStringToObject(obj, "reason", "replace_match");
-    cJSON_AddStringToObject(obj, "channel", "audit");
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "replace") != TF_OK ||
+        tf_json_add_string(obj, "event", "value_changed") != TF_OK ||
+        tf_json_add_string(obj, "reason", "replace_match") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK) {
+        goto done;
+    }
     const char *column_name = b->col_names[col] ? b->col_names[col] : "";
-    cJSON_AddStringToObject(obj, "column", column_name);
+    if (tf_json_add_string(obj, "column", column_name) != TF_OK) goto done;
     char pattern_buf[256];
     char replacement_buf[256];
     char before_buf[256];
@@ -86,17 +89,26 @@ static int emit_replace_audit(replace_state *st, const tf_batch *b, size_t row, 
                                                                  st->pattern, pattern_buf, sizeof(pattern_buf));
     const char *safe_replacement = tf_audit_format_string_for_column(&st->audit_opts, column_name,
                                                                      st->replacement, replacement_buf, sizeof(replacement_buf));
-    cJSON_AddStringToObject(obj, "pattern", safe_pattern ? safe_pattern : "");
-    cJSON_AddStringToObject(obj, "replacement", safe_replacement ? safe_replacement : "");
-    cJSON_AddBoolToObject(obj, "regex", st->use_regex ? 1 : 0);
-    cJSON_AddNumberToObject(obj, "row", (double)row_no);
+    if (tf_json_add_string(obj, "pattern", safe_pattern ? safe_pattern : "") != TF_OK ||
+        tf_json_add_string(obj, "replacement", safe_replacement ? safe_replacement : "") != TF_OK ||
+        tf_json_add_bool(obj, "regex", st->use_regex ? 1 : 0) != TF_OK ||
+        tf_json_add_number(obj, "row", (double)row_no) != TF_OK) {
+        goto done;
+    }
     const char *safe_before = tf_audit_format_string_for_column(&st->audit_opts, column_name, before, before_buf, sizeof(before_buf));
     const char *safe_after = tf_audit_format_string_for_column(&st->audit_opts, column_name, after, after_buf, sizeof(after_buf));
-    cJSON_AddStringToObject(obj, "before", safe_before ? safe_before : "");
-    cJSON_AddStringToObject(obj, "after", safe_after ? safe_after : "");
+    if (tf_json_add_string(obj, "before", safe_before ? safe_before : "") != TF_OK ||
+        tf_json_add_string(obj, "after", safe_after ? safe_after : "") != TF_OK) {
+        goto done;
+    }
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;

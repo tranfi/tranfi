@@ -151,11 +151,9 @@ static int normalize_add_audit_number(cJSON *obj, const char *key,
         char safe_buf[256];
         if (tf_format_float64(raw, sizeof(raw), value) != TF_OK) return TF_ERROR;
         const char *safe = tf_audit_format_string_for_column(opts, column, raw, safe_buf, sizeof(safe_buf));
-        cJSON_AddStringToObject(obj, key, safe ? safe : "");
-    } else {
-        cJSON_AddNumberToObject(obj, key, value);
+        return tf_json_add_string(obj, key, safe ? safe : "");
     }
-    return TF_OK;
+    return tf_json_add_number(obj, key, value);
 }
 
 static double get_numeric(const tf_batch *b, size_t r, int ci) {
@@ -171,30 +169,40 @@ static int emit_normalize_audit(normalize_state *st, const tf_batch *before_b,
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "normalize");
-    cJSON_AddStringToObject(obj, "event", "value_changed");
-    cJSON_AddStringToObject(obj, "reason", st->method == NORM_ZSCORE ? "normalize_zscore" : "normalize_minmax");
-    cJSON_AddStringToObject(obj, "channel", "audit");
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "normalize") != TF_OK ||
+        tf_json_add_string(obj, "event", "value_changed") != TF_OK ||
+        tf_json_add_string(obj, "reason",
+                           st->method == NORM_ZSCORE ? "normalize_zscore" : "normalize_minmax") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK) {
+        goto done;
+    }
     const char *column_name = after_b->col_names[col] ? after_b->col_names[col] : "";
-    cJSON_AddStringToObject(obj, "column", column_name);
-    cJSON_AddStringToObject(obj, "method", method_name(st->method));
-    cJSON_AddNumberToObject(obj, "row", (double)row_no);
+    if (tf_json_add_string(obj, "column", column_name) != TF_OK ||
+        tf_json_add_string(obj, "method", method_name(st->method)) != TF_OK ||
+        tf_json_add_number(obj, "row", (double)row_no) != TF_OK) {
+        goto done;
+    }
     cJSON *before = tf_audit_cell_to_json(before_b, before_row, col, &st->audit_opts);
-    if (before) cJSON_AddItemToObject(obj, "before", before);
+    if (!before || tf_json_add_item(obj, "before", before) != TF_OK) goto done;
     cJSON *after = tf_audit_cell_to_json(after_b, after_row, col, &st->audit_opts);
-    if (after) cJSON_AddItemToObject(obj, "after", after);
-    cJSON_AddNumberToObject(obj, "count", (double)cs->count);
+    if (!after || tf_json_add_item(obj, "after", after) != TF_OK) goto done;
+    if (tf_json_add_number(obj, "count", (double)cs->count) != TF_OK) goto done;
     if (normalize_add_audit_number(obj, "min", &st->audit_opts, column_name, cs->min_val) != TF_OK ||
         normalize_add_audit_number(obj, "max", &st->audit_opts, column_name, cs->max_val) != TF_OK ||
         normalize_add_audit_number(obj, "mean", &st->audit_opts, column_name, cs->mean) != TF_OK ||
         normalize_add_audit_number(obj, "stddev", &st->audit_opts, column_name, normalize_stddev(cs)) != TF_OK) {
-        cJSON_Delete(obj);
-        return TF_ERROR;
+        goto done;
     }
     cJSON *row_obj = tf_audit_row_to_json(after_b, after_row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;

@@ -28,19 +28,27 @@ static int emit_fill_null_audit(fill_null_state *st, const tf_batch *b, size_t r
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "fill-null");
-    cJSON_AddStringToObject(obj, "event", "null_filled");
-    cJSON_AddStringToObject(obj, "reason", "null_filled");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "column", b->col_names[col] ? b->col_names[col] : "");
-    cJSON_AddNumberToObject(obj, "row", (double)row_no);
-    cJSON_AddItemToObject(obj, "before", cJSON_CreateNull());
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "fill-null") != TF_OK ||
+        tf_json_add_string(obj, "event", "null_filled") != TF_OK ||
+        tf_json_add_string(obj, "reason", "null_filled") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "column", b->col_names[col] ? b->col_names[col] : "") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)row_no) != TF_OK ||
+        tf_json_add_null(obj, "before") != TF_OK) {
+        goto done;
+    }
     cJSON *after = tf_audit_cell_to_json(b, row, col, &st->audit_opts);
-    if (after) cJSON_AddItemToObject(obj, "after", after);
+    if (!after || tf_json_add_item(obj, "after", after) != TF_OK) goto done;
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;

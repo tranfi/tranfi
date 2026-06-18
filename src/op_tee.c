@@ -86,7 +86,10 @@ static cJSON *tee_selected_row_to_json(const tee_state *st, const tf_batch *in, 
         if (!tee_audit_column_allowed(st, name)) continue;
         cJSON *value = tf_audit_cell_to_json(in, row, (size_t)ci, &st->audit_opts);
         if (!value) { cJSON_Delete(data); return NULL; }
-        cJSON_AddItemToObject(data, name, value);
+        if (tf_json_add_item(data, name, value) != TF_OK) {
+            cJSON_Delete(data);
+            return NULL;
+        }
     }
     if (st->audit_opts.max_bytes > 0) {
         char *printed = cJSON_PrintUnformatted(data);
@@ -97,8 +100,11 @@ static cJSON *tee_selected_row_to_json(const tee_state *st, const tf_batch *in, 
             cJSON_Delete(data);
             data = cJSON_CreateObject();
             if (!data) return NULL;
-            cJSON_AddBoolToObject(data, "_audit_truncated", 1);
-            cJSON_AddNumberToObject(data, "max_bytes", (double)st->audit_opts.max_bytes);
+            if (tf_json_add_bool(data, "_audit_truncated", 1) != TF_OK ||
+                tf_json_add_number(data, "max_bytes", (double)st->audit_opts.max_bytes) != TF_OK) {
+                cJSON_Delete(data);
+                return NULL;
+            }
         }
     }
     return data;
@@ -141,20 +147,26 @@ static int tee_emit_row(tee_state *st, const tf_batch *in, size_t row,
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "tee");
-    cJSON_AddStringToObject(obj, "op", "tee");
-    cJSON_AddStringToObject(obj, "name", st->name ? st->name : "tee");
-    cJSON_AddStringToObject(obj, "channel", st->channel_name ? st->channel_name : "samples");
-    if (st->expr_text && st->expr_text[0]) cJSON_AddStringToObject(obj, "expr", st->expr_text);
-    if (st->include_row) cJSON_AddNumberToObject(obj, "row", (double)st->row_index);
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "tee") != TF_OK ||
+        tf_json_add_string(obj, "op", "tee") != TF_OK ||
+        tf_json_add_string(obj, "name", st->name ? st->name : "tee") != TF_OK ||
+        tf_json_add_string(obj, "channel", st->channel_name ? st->channel_name : "samples") != TF_OK) {
+        goto done;
+    }
+    if (st->expr_text && st->expr_text[0] &&
+        tf_json_add_string(obj, "expr", st->expr_text) != TF_OK) {
+        goto done;
+    }
+    if (st->include_row && tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) goto done;
 
     if (st->audit_opts.include_row) {
         cJSON *data = tee_selected_row_to_json(st, in, row);
-        if (!data) { cJSON_Delete(obj); return TF_ERROR; }
-        cJSON_AddItemToObject(obj, "data", data);
+        if (!data || tf_json_add_item(obj, "data", data) != TF_OK) goto done;
     }
 
-    int rc = tf_buffer_write_json_line(buf, obj);
+    rc = tf_buffer_write_json_line(buf, obj);
+done:
     cJSON_Delete(obj);
     return rc;
 }

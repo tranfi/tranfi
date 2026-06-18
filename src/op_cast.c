@@ -152,33 +152,45 @@ static int emit_cast_audit(cast_state *st, const tf_batch *before_b, const tf_ba
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "cast");
-    cJSON_AddStringToObject(obj, "event", event ? event : "value_changed");
-    cJSON_AddStringToObject(obj, "reason", reason ? reason : "type_cast");
-    cJSON_AddStringToObject(obj, "channel", "audit");
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "cast") != TF_OK ||
+        tf_json_add_string(obj, "event", event ? event : "value_changed") != TF_OK ||
+        tf_json_add_string(obj, "reason", reason ? reason : "type_cast") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK) {
+        goto done;
+    }
     const char *column_name = before_b->col_names[col] ? before_b->col_names[col] : "";
-    cJSON_AddStringToObject(obj, "column", column_name);
-    cJSON_AddStringToObject(obj, "from_type", cast_type_name(src_t));
-    cJSON_AddStringToObject(obj, "to_type", cast_type_name(dst_t));
-    cJSON_AddStringToObject(obj, "expected", cast_type_name(dst_t));
-    cJSON_AddStringToObject(obj, "on_error", cast_error_policy_name(st->on_error));
+    if (tf_json_add_string(obj, "column", column_name) != TF_OK ||
+        tf_json_add_string(obj, "from_type", cast_type_name(src_t)) != TF_OK ||
+        tf_json_add_string(obj, "to_type", cast_type_name(dst_t)) != TF_OK ||
+        tf_json_add_string(obj, "expected", cast_type_name(dst_t)) != TF_OK ||
+        tf_json_add_string(obj, "on_error", cast_error_policy_name(st->on_error)) != TF_OK) {
+        goto done;
+    }
     if (src_t == TF_TYPE_STRING && !tf_batch_is_null(before_b, row, col)) {
         char actual_buf[256];
         const char *actual = tf_audit_format_string_for_column(&st->audit_opts, column_name,
                                                                tf_batch_get_string(before_b, row, col),
                                                                actual_buf, sizeof(actual_buf));
-        cJSON_AddStringToObject(obj, "actual", actual ? actual : "");
+        if (tf_json_add_string(obj, "actual", actual ? actual : "") != TF_OK) goto done;
     }
-    cJSON_AddStringToObject(obj, "action", "cast");
-    cJSON_AddNumberToObject(obj, "row", (double)row_no);
+    if (tf_json_add_string(obj, "action", "cast") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)row_no) != TF_OK) {
+        goto done;
+    }
     cJSON *before = tf_audit_cell_to_json(before_b, row, col, &st->audit_opts);
-    if (before) cJSON_AddItemToObject(obj, "before", before);
+    if (!before || tf_json_add_item(obj, "before", before) != TF_OK) goto done;
     cJSON *after = tf_audit_cell_to_json(after_b, row, col, &st->audit_opts);
-    if (after) cJSON_AddItemToObject(obj, "after", after);
+    if (!after || tf_json_add_item(obj, "after", after) != TF_OK) goto done;
     cJSON *row_obj = tf_audit_row_to_json(after_b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;

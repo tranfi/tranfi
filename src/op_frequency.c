@@ -185,22 +185,32 @@ static int emit_frequency_overflow_audit(frequency_state *st, const char *key,
     if (!st->audit || st->audit_emitted >= st->audit_limit || !side || !side->stats) return TF_OK;
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return TF_ERROR;
-    cJSON_AddStringToObject(obj, "type", "audit");
-    cJSON_AddStringToObject(obj, "op", "frequency");
-    cJSON_AddStringToObject(obj, "event", "category_overflow");
-    cJSON_AddStringToObject(obj, "reason", "max_values_overflow");
-    cJSON_AddStringToObject(obj, "channel", "audit");
-    cJSON_AddStringToObject(obj, "action", "other");
+    int rc = TF_ERROR;
+    if (tf_json_add_string(obj, "type", "audit") != TF_OK ||
+        tf_json_add_string(obj, "op", "frequency") != TF_OK ||
+        tf_json_add_string(obj, "event", "category_overflow") != TF_OK ||
+        tf_json_add_string(obj, "reason", "max_values_overflow") != TF_OK ||
+        tf_json_add_string(obj, "channel", "audit") != TF_OK ||
+        tf_json_add_string(obj, "action", "other") != TF_OK) {
+        goto done;
+    }
     char key_buf[256];
     const char *safe_key = frequency_format_key_for_audit(st, key, b, row, key_buf, sizeof(key_buf));
-    cJSON_AddStringToObject(obj, "value", safe_key ? safe_key : "");
-    cJSON_AddStringToObject(obj, "bucket", st->other_label ? st->other_label : "__other__");
-    cJSON_AddNumberToObject(obj, "row", (double)row_no);
-    cJSON_AddNumberToObject(obj, "max_values", (double)st->max_values);
-    cJSON_AddNumberToObject(obj, "tracked_values", (double)st->map.count);
+    if (tf_json_add_string(obj, "value", safe_key ? safe_key : "") != TF_OK ||
+        tf_json_add_string(obj, "bucket", st->other_label ? st->other_label : "__other__") != TF_OK ||
+        tf_json_add_number(obj, "row", (double)row_no) != TF_OK ||
+        tf_json_add_number(obj, "max_values", (double)st->max_values) != TF_OK ||
+        tf_json_add_number(obj, "tracked_values", (double)st->map.count) != TF_OK) {
+        goto done;
+    }
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);
-    if (row_obj) cJSON_AddItemToObject(obj, "data", row_obj);
-    int rc = tf_buffer_write_json_line(side->stats, obj);
+    if (row_obj) {
+        if (tf_json_add_item(obj, "data", row_obj) != TF_OK) goto done;
+    } else if (st->audit_opts.include_row) {
+        goto done;
+    }
+    rc = tf_buffer_write_json_line(side->stats, obj);
+done:
     cJSON_Delete(obj);
     if (rc == TF_OK) st->audit_emitted++;
     return rc;
