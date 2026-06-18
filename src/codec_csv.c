@@ -8,9 +8,9 @@
  *      fields with escaped quotes ("") need copying (rare in practice).
  *
  *   2. Type detection window: the first batch (batch_size rows) detects
- *      column types via progressive widening (NULL → INT64 → FLOAT64 →
- *      STRING). Types freeze after the first batch. This matches the
- *      behavior of Arrow CSV, DuckDB, and other production parsers.
+ *      column types via progressive widening (NULL → BOOL / INT64 →
+ *      FLOAT64 / DATE / TIMESTAMP → STRING). Types freeze after the
+ *      first batch. This matches Arrow CSV, DuckDB, and other production parsers.
  *
  *   3. Direct-to-typed parsing: after types freeze, field slices are parsed
  *      directly into typed column arrays (int64, double, string) without
@@ -283,12 +283,36 @@ static int fast_timestamp(const char *s, size_t len, int64_t *out) {
     return 1;
 }
 
+static int ascii_lower_char(int ch) {
+    return (ch >= 'A' && ch <= 'Z') ? ch + ('a' - 'A') : ch;
+}
+
+static int slice_ieq(const char *s, const char *lit, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (ascii_lower_char((unsigned char)s[i]) != (unsigned char)lit[i]) return 0;
+    }
+    return 1;
+}
+
+static int fast_bool(const char *s, size_t len, int *out) {
+    if (len == 4 && slice_ieq(s, "true", 4)) {
+        if (out) *out = 1;
+        return 1;
+    }
+    if (len == 5 && slice_ieq(s, "false", 5)) {
+        if (out) *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
 /* Detect the type of a field slice without copying it. */
 static tf_type detect_type_slice(const char *s, size_t len) {
     if (len == 0) return TF_TYPE_NULL;
     int64_t iv;
     double fv;
     int32_t dv;
+    if (fast_bool(s, len, NULL)) return TF_TYPE_BOOL;
     if (fast_int64(s, len, &iv)) return TF_TYPE_INT64;
     if (fast_double(s, len, &fv)) return TF_TYPE_FLOAT64;
     if (fast_date(s, len, &dv)) return TF_TYPE_DATE;
@@ -296,7 +320,7 @@ static tf_type detect_type_slice(const char *s, size_t len) {
     return TF_TYPE_STRING;
 }
 
-/* Widen a column type if needed (NULL < INT64 < FLOAT64 < STRING). */
+/* Widen a column type if needed. */
 static tf_type widen_type(tf_type current, tf_type incoming) {
     if (current == incoming) return current;
     if (current == TF_TYPE_NULL) return incoming;
@@ -988,6 +1012,15 @@ static int add_row_typed(tf_batch *b, const csv_decoder_state *st,
             continue;
         }
         switch (types[i]) {
+            case TF_TYPE_BOOL: {
+                int v;
+                if (fast_bool(fields[i].ptr, fields[i].len, &v)) {
+                    if (tf_batch_set_bool(b, row, i, v != 0) != TF_OK) return TF_ERROR;
+                } else {
+                    if (tf_batch_set_null(b, row, i) != TF_OK) return TF_ERROR;
+                }
+                break;
+            }
             case TF_TYPE_INT64: {
                 int64_t v;
                 if (fast_int64(fields[i].ptr, fields[i].len, &v)) {
@@ -1085,6 +1118,21 @@ static tf_batch *convert_batch_types(csv_decoder_state *st) {
             }
             size_t vlen = strlen(val);
             switch (st->col_types[c]) {
+                case TF_TYPE_BOOL: {
+                    int v;
+                    if (fast_bool(val, vlen, &v)) {
+                        if (tf_batch_set_bool(dst, r, c, v != 0) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
+                    } else {
+                        if (tf_batch_set_null(dst, r, c) != TF_OK) {
+                            tf_batch_free(dst);
+                            return NULL;
+                        }
+                    }
+                    break;
+                }
                 case TF_TYPE_INT64: {
                     int64_t v;
                     if (fast_int64(val, vlen, &v)) {

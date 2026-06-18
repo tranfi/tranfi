@@ -11,7 +11,7 @@
  *   add_expr = mul_expr (('+' | '-') mul_expr)*
  *   mul_expr = unary (('*' | '/') unary)*
  *   unary    = '-' unary | atom
- *   atom     = NUMBER | STRING | col_ref | '(' expr ')'
+ *   atom     = NUMBER | STRING | BOOL | col_ref | '(' expr ')'
  *   col_ref  = 'col(' STRING ')'
  *   NUMBER   = [0-9]+('.'[0-9]+)?
  *   STRING   = '\'' [^']* '\'' | '"' [^"]* '"'
@@ -324,6 +324,14 @@ static tf_expr *parse_atom(parser_state *p, unsigned depth) {
             e->func.name = name;
             e->func.args = args;
             e->func.n_args = n_args;
+            return e;
+        }
+
+        if (strcmp(name, "true") == 0 || strcmp(name, "false") == 0) {
+            tf_expr *e = make_expr(EXPR_LIT_BOOL);
+            if (!e) { free(name); return NULL; }
+            e->lit_bool = (strcmp(name, "true") == 0);
+            free(name);
             return e;
         }
 
@@ -755,6 +763,20 @@ static eval_val eval_cmp(eval_val lv, eval_val rv, cmp_op op) {
             case CMP_LE: return val_bool(cmp <= 0);
             case CMP_EQ: return val_bool(cmp == 0);
             case CMP_NE: return val_bool(cmp != 0);
+        }
+    }
+
+    /* Boolean comparison */
+    if (lv.tag == VAL_BOOL && rv.tag == VAL_BOOL) {
+        int l = lv.b ? 1 : 0;
+        int r = rv.b ? 1 : 0;
+        switch (op) {
+            case CMP_GT: return val_bool(l > r);
+            case CMP_GE: return val_bool(l >= r);
+            case CMP_LT: return val_bool(l < r);
+            case CMP_LE: return val_bool(l <= r);
+            case CMP_EQ: return val_bool(l == r);
+            case CMP_NE: return val_bool(l != r);
         }
     }
 
@@ -1421,6 +1443,8 @@ static eval_val eval_node(const tf_expr *e, const tf_batch *batch, size_t row) {
             return val_float(e->lit_float);
         case EXPR_LIT_STR:
             return val_str(e->lit_str);
+        case EXPR_LIT_BOOL:
+            return val_bool(e->lit_bool);
         case EXPR_COL_REF: {
             int ci = tf_batch_col_index(batch, e->col_name);
             if (ci < 0) return val_null();

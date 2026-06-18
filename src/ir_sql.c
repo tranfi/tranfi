@@ -221,6 +221,10 @@ static int expr_to_sql(const tf_expr *e, strbuf *sb) {
       sql_quote_str(sb, e->lit_str);
       return 0;
 
+    case EXPR_LIT_BOOL:
+      sb_append(sb, e->lit_bool ? "TRUE" : "FALSE");
+      return 0;
+
     case EXPR_COL_REF:
       sql_quote_ident(sb, e->col_name);
       return 0;
@@ -1326,16 +1330,16 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
                  cte_name, prev, qn.data, cats.data, sql_agg, qv.data);
       sb_free(&cats);
     } else {
-      if (strcmp(prev, "input_data") == 0) {
-        sb_appendf(sb,
-                   "%s AS (PIVOT %s ON %s IN (SELECT %s FROM "
-                   "(SELECT %s, row_number() OVER () AS \"__tf_pivot_category_ordinal\" FROM %s) __tf_pivot_cats "
-                   "GROUP BY %s ORDER BY min(\"__tf_pivot_category_ordinal\")) USING %s(%s))",
-                   cte_name, prev, qn.data, qn.data, qn.data, prev, qn.data, sql_agg, qv.data);
-      } else {
-        sb_appendf(sb, "%s AS (PIVOT %s ON %s USING %s(%s))",
-                   cte_name, prev, qn.data, sql_agg, qv.data);
+      if (strcmp(prev, "input_data") != 0) {
+        sb_free(&qn); sb_free(&qv);
+        *error = strdup("pivot: dynamic SQL pivot after upstream transforms requires categories=...");
+        return -1;
       }
+      sb_appendf(sb,
+                 "%s AS (PIVOT %s ON %s IN (SELECT %s FROM "
+                 "(SELECT %s, row_number() OVER () AS \"__tf_pivot_category_ordinal\" FROM %s) __tf_pivot_cats "
+                 "GROUP BY %s ORDER BY min(\"__tf_pivot_category_ordinal\")) USING %s(%s))",
+                 cte_name, prev, qn.data, qn.data, qn.data, prev, qn.data, sql_agg, qv.data);
     }
     if (qn.failed || qv.failed || sb->failed) {
       sb_free(&qn); sb_free(&qv);

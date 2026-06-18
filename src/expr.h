@@ -11,6 +11,7 @@ typedef enum {
   EXPR_LIT_INT,
   EXPR_LIT_FLOAT,
   EXPR_LIT_STR,
+  EXPR_LIT_BOOL,
   EXPR_COL_REF,
   EXPR_CMP,
   EXPR_AND,
@@ -34,6 +35,7 @@ struct tf_expr {
     int64_t lit_int;
     double  lit_float;
     char   *lit_str;
+    int     lit_bool;
     char   *col_name;    /* for EXPR_COL_REF */
     struct {              /* for EXPR_CMP */
       struct tf_expr *left;

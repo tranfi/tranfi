@@ -42,6 +42,15 @@ class TestCompileToSql:
         assert 'WHERE' in sql
         assert '"age"' in sql
 
+    def test_bool_literals(self):
+        sql = tf.compile_to_sql('csv | filter "col(\'flag\') == true" | csv')
+        assert '"flag" = TRUE' in sql
+        assert '"true"' not in sql
+
+        sql = tf.compile_to_sql('csv | filter "col(\'flag\') != false" | csv')
+        assert '"flag" <> FALSE' in sql
+        assert '"false"' not in sql
+
     def test_select(self):
         sql = tf.compile_to_sql('csv | select name,age | csv')
         assert '"name"' in sql
@@ -299,6 +308,7 @@ CSV_PIVOT = b'id,metric,value\n1,revenue,100\n1,cost,40\n2,revenue,200\n2,cost,8
 CSV_DATES = b'id,date,value\n1,2024-03-15,100\n2,2023-12-01,200\n3,2024-07-22,150\n'
 CSV_FILLDOWN = b'group,value\nA,1\n,2\n,3\nB,4\n,5\n'
 CSV_NULLS = b'name,age,city,score\nAlice,30,NY,95.5\nBob,,LA,87.0\nCharlie,35,,92.3\nDiana,28,SF,\n'
+CSV_BOOLEANS = b'name,flag\nAlice,true\nBob,false\nCharlie,true\n'
 
 
 class TestParitySelection:
@@ -309,6 +319,12 @@ class TestParitySelection:
 
     def test_filter_equality(self):
         assert_parity('csv | filter "col(\'city\') == \'NY\'" | csv', data=CSV_CITIES)
+
+    def test_filter_bool_literals(self):
+        assert_parity('csv | filter "col(\'flag\') == true" | csv',
+                      data=CSV_BOOLEANS, ordered=True)
+        assert_parity('csv | filter "col(\'flag\') == false" | csv',
+                      data=CSV_BOOLEANS, ordered=True)
 
     def test_select(self):
         assert_parity('csv | select name,age | csv', data=CSV_CITIES)
@@ -579,6 +595,23 @@ class TestParityReshape:
     def test_pivot_missing_cells(self):
         data = b'id,metric,value\n1,revenue,100\n2,cost,80\n3,revenue,150\n3,cost,60\n'
         assert_parity('csv | pivot metric value sum | sort id | csv', data=data, ordered=True)
+
+    def test_pivot_after_filter_requires_categories(self):
+        data = (
+            b'id,metric,value,keep\n'
+            b'1,revenue,100,true\n'
+            b'1,cost,40,true\n'
+            b'1,margin,60,true\n'
+            b'2,cost,80,true\n'
+            b'2,revenue,200,true\n'
+            b'3,margin,90,false\n'
+            b'3,revenue,150,false\n'
+        )
+        with pytest.raises(RuntimeError, match='requires categories'):
+            tf.pipeline(
+                'csv | filter "col(\'keep\') == true" | pivot metric value sum | sort id | csv',
+                engine='duckdb'
+            ).run(input=data)
 
     def test_pivot_declared_category_order(self):
         dsl = 'csv | pivot metric value sum categories=revenue,cost | sort id | csv'

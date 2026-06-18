@@ -705,6 +705,66 @@ static void test_expr_eval_and_or(void) {
     tf_batch_free(b);
 }
 
+static void test_expr_bool_literals(void) {
+    tf_batch *b = tf_batch_create(2, 2);
+    ASSERT_OK(tf_batch_set_schema(b, 0, "flag", TF_TYPE_BOOL));
+    ASSERT_OK(tf_batch_set_schema(b, 1, "other", TF_TYPE_BOOL));
+    ASSERT_OK(tf_batch_set_bool(b, 0, 0, true));
+    ASSERT_OK(tf_batch_set_bool(b, 0, 1, false));
+    ASSERT_OK(tf_batch_set_bool(b, 1, 0, false));
+    ASSERT_OK(tf_batch_set_bool(b, 1, 1, true));
+    b->n_rows = 2;
+
+    tf_eval_result val;
+    bool result = false;
+
+    tf_expr *e = tf_expr_parse("true");
+    assert(e != NULL);
+    ASSERT_OK(tf_expr_eval_val(e, b, 0, &val));
+    assert(val.type == TF_TYPE_BOOL && val.b == true);
+    ASSERT_OK(tf_expr_eval(e, b, 0, &result));
+    assert(result == true);
+    tf_expr_free(e);
+
+    e = tf_expr_parse("false");
+    assert(e != NULL);
+    ASSERT_OK(tf_expr_eval_val(e, b, 0, &val));
+    assert(val.type == TF_TYPE_BOOL && val.b == false);
+    ASSERT_OK(tf_expr_eval(e, b, 0, &result));
+    assert(result == false);
+    tf_expr_free(e);
+
+    e = tf_expr_parse("col(flag) == true");
+    assert(e != NULL);
+    ASSERT_OK(tf_expr_eval(e, b, 0, &result));
+    assert(result == true);
+    ASSERT_OK(tf_expr_eval(e, b, 1, &result));
+    assert(result == false);
+    tf_expr_free(e);
+
+    e = tf_expr_parse("col(flag) == false");
+    assert(e != NULL);
+    ASSERT_OK(tf_expr_eval(e, b, 0, &result));
+    assert(result == false);
+    ASSERT_OK(tf_expr_eval(e, b, 1, &result));
+    assert(result == true);
+    tf_expr_free(e);
+
+    e = tf_expr_parse("true > false");
+    assert(e != NULL);
+    ASSERT_OK(tf_expr_eval(e, b, 0, &result));
+    assert(result == true);
+    tf_expr_free(e);
+
+    e = tf_expr_parse("coalesce(col(missing), false)");
+    assert(e != NULL);
+    ASSERT_OK(tf_expr_eval_val(e, b, 0, &val));
+    assert(val.type == TF_TYPE_BOOL && val.b == false);
+    tf_expr_free(e);
+
+    tf_batch_free(b);
+}
+
 /* ================================================================
  * Full pipeline tests
  * ================================================================ */
@@ -4934,6 +4994,25 @@ static void test_compile_to_sql_grep_literal_chars(void) {
     tf_string_free(sql);
 }
 
+static void test_compile_to_sql_bool_literals(void) {
+    const char *dsl = "csv | filter \"col('flag') == true\" | csv";
+    char *error = NULL;
+    char *sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert(strstr(sql, "\"flag\" = TRUE") != NULL);
+    assert(strstr(sql, "\"true\"") == NULL);
+    tf_string_free(sql);
+
+    dsl = "csv | filter \"col('flag') != false\" | csv";
+    sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert(strstr(sql, "\"flag\" <> FALSE") != NULL);
+    assert(strstr(sql, "\"false\"") == NULL);
+    tf_string_free(sql);
+}
+
 static void assert_sql_has_generated_alias(const char *sql, const char *column, const char *suffix) {
     char expected[384];
     int n = snprintf(expected, sizeof(expected), "\"%s%s\"", column, suffix);
@@ -5140,6 +5219,7 @@ static void test_compile_to_sql_rejected_matrix(void) {
         {"frequency-all", "csv | frequency | csv", "requires explicit columns"},
         {"frequency-overflow", "csv | frequency city max_values=2 overflow=other | csv", "overflow=other"},
         {"frequency-approx", "csv | frequency city mode=approx max_values=2 | csv", "mode=approx"},
+        {"dynamic-pivot-after-transform", "csv | filter \"col('keep') == true\" | pivot metric value sum | csv", "requires categories"},
         {"selected-key-set", "csv | intersect other.csv columns=id | csv", "all-column set operations"},
         {"stats", "csv | stats count | csv", "native report shape"},
         {"scan", "csv | scan count | csv", "unsupported op"},
@@ -9996,6 +10076,26 @@ static void test_registry_count_updated(void) {
  * Date/Timestamp tests
  * ================================================================ */
 
+static void test_csv_bool_autodetect_and_filter(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"filter\",\"args\":{\"expr\":\"col('active') == true\"}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+    const char *csv = "name,active\nAlice,true\nBob,false\nCara,TRUE\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)csv, strlen(csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    uint8_t out[1024];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strcmp((char *)out, "name,active\nAlice,true\nCara,true\n") == 0);
+    tf_pipeline_free(p);
+}
+
 static void test_csv_date_autodetect(void) {
     const char *plan =
         "{\"steps\":["
@@ -13570,6 +13670,7 @@ int main(int argc, char **argv) {
     TEST(test_expr_eval_numeric);
     TEST(test_expr_eval_string);
     TEST(test_expr_eval_and_or);
+    TEST(test_expr_bool_literals);
 
     printf("\nPipeline (CSV):\n");
     TEST(test_pipeline_csv_passthrough);
@@ -13695,6 +13796,7 @@ int main(int argc, char **argv) {
     printf("\nCompiler:\n");
     TEST(test_compile_native_valid);
     TEST(test_compile_to_sql_grep_literal_chars);
+    TEST(test_compile_to_sql_bool_literals);
     TEST(test_compile_to_sql_generated_default_aliases);
     TEST(test_compile_to_sql_rejects_sample);
     TEST(test_compile_to_sql_rejects_stats);
@@ -13820,6 +13922,7 @@ int main(int argc, char **argv) {
     TEST(test_spill_sort_uses_private_session_dir);
 
     printf("\nDate/Timestamp:\n");
+    TEST(test_csv_bool_autodetect_and_filter);
     TEST(test_csv_date_autodetect);
     TEST(test_csv_timestamp_autodetect);
     TEST(test_csv_date_timestamp_widening);
