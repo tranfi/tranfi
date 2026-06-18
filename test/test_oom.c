@@ -214,6 +214,11 @@ int main(void) {
         "name,d,ts,score\n"
         "Alice,2024-03-15,2024-03-15T12:34:56Z,10\n"
         "Bob,2023-12-25,2023-12-25T08:09:10Z,20\n";
+    const char *reshape_dates =
+        "name,full,d,score,tags,x,y,active\n"
+        "Alice,Alice Smith,2024-03-15,10,a|b,1,4,true\n"
+        "Bob,Bob Jones,2023-12-25,20,c,2,5,false\n"
+        "Cara,Cara Stone,2024-01-02,30,d|e,3,6,true\n";
     const char *selector_people =
         "id,score_math,score_read,name,active,code\n"
         "1,90.2,80.7,Alice,true,OK\n"
@@ -345,6 +350,12 @@ int main(void) {
             "csv batch_size=1 | sort -score | head 3 | bottom-k 2 age | slice-min score n=2 with_ties=false | slice-max age 2 with_ties=false | unique city,name sorted=false max_keys=8 max_state_bytes=32768 | group-agg city sum:score:total count:*:rows sorted=false max_groups=8 max_state_bytes=32768 | frequency city max_values=2 max_state_bytes=32768 overflow=other other=OTHER audit audit_limit=2 | csv",
             people,
             920
+        },
+        {
+            "dsl_reshape_window_builder_args",
+            "csv batch_size=1 | replace --regex name \"^A\" A audit audit_limit=2 | clip score min=0 max=100 | bin score 10 20 30 missing=null on_type_error=null | datetime d extract=year,month missing=null on_type_error=null | explode tags \"|\" max_tokens_per_row=4 max_token_bytes=16 max_output_rows_per_input_row=4 max_output_rows_per_batch=24 | split full \" \" first last | unpivot x y max_output_rows_per_input_row=2 max_output_rows_per_batch=64 | window score 2 sum score_win missing=null on_type_error=null | rolling-any active 2 active_any nulls=propagate | rolling-sum score 2 score_roll missing=null on_type_error=null | step score running-sum score_run | flatten | csv",
+            reshape_dates,
+            900
         },
         {
             "csv_strict_good_rows",
