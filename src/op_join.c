@@ -2825,7 +2825,10 @@ static tf_step *tf_join_create_with_how(const cJSON *args, const char *how) {
     cJSON *copy = cJSON_Duplicate(args, 1);
     if (!copy) return NULL;
     cJSON_DeleteItemFromObjectCaseSensitive(copy, "how");
-    cJSON_AddStringToObject(copy, "how", how);
+    if (tf_json_add_string(copy, "how", how) != TF_OK) {
+        cJSON_Delete(copy);
+        return NULL;
+    }
     tf_step *step = tf_join_create(copy);
     cJSON_Delete(copy);
     return step;

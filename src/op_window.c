@@ -247,8 +247,8 @@ static tf_step *tf_window_create_alias(const cJSON *args, const char *func, cons
     if (!copy) return NULL;
     cJSON_DeleteItemFromObjectCaseSensitive(copy, "func");
     cJSON_DeleteItemFromObjectCaseSensitive(copy, "__op_label");
-    if (!cJSON_AddStringToObject(copy, "__op_label", label) ||
-        !cJSON_AddStringToObject(copy, "func", func)) {
+    if (tf_json_add_string(copy, "__op_label", label) != TF_OK ||
+        tf_json_add_string(copy, "func", func) != TF_OK) {
         cJSON_Delete(copy);
         return NULL;
     }

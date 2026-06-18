@@ -84,33 +84,76 @@ tf_ir_plan *tf_ir_from_json(const char *json, size_t len, char **error) {
 
 char *tf_ir_to_json(const tf_ir_plan *plan) {
     cJSON *root = cJSON_CreateObject();
-    cJSON *steps = cJSON_AddArrayToObject(root, "steps");
+    if (!root) return NULL;
+    cJSON *steps = cJSON_CreateArray();
+    if (!steps || tf_json_add_item(root, "steps", steps) != TF_OK) {
+        cJSON_Delete(root);
+        return NULL;
+    }
 
     for (size_t i = 0; i < plan->n_nodes; i++) {
         const tf_ir_node *node = &plan->nodes[i];
         cJSON *step = cJSON_CreateObject();
-        cJSON_AddStringToObject(step, "op", node->op);
-        if (node->args) {
-            cJSON_AddItemToObject(step, "args", cJSON_Duplicate(node->args, 1));
-        } else {
-            cJSON_AddItemToObject(step, "args", cJSON_CreateObject());
+        if (!step) {
+            cJSON_Delete(root);
+            return NULL;
         }
-        cJSON_AddStringToObject(step, "memory_class", tf_memory_class_name(node->memory_class));
-        cJSON_AddStringToObject(step, "emit_class", tf_emit_class_name(node->emit_class));
-        cJSON_AddStringToObject(step, "schema_class", tf_schema_class_name(node->schema_class));
-        cJSON_AddStringToObject(step, "state_estimate", node->state_estimate ? node->state_estimate : "unknown");
+        if (tf_json_add_string(step, "op", node->op) != TF_OK) {
+            cJSON_Delete(step);
+            cJSON_Delete(root);
+            return NULL;
+        }
+        if (node->args) {
+            cJSON *args = cJSON_Duplicate(node->args, 1);
+            if (!args || tf_json_add_item(step, "args", args) != TF_OK) {
+                cJSON_Delete(step);
+                cJSON_Delete(root);
+                return NULL;
+            }
+        } else {
+            cJSON *args = cJSON_CreateObject();
+            if (!args || tf_json_add_item(step, "args", args) != TF_OK) {
+                cJSON_Delete(step);
+                cJSON_Delete(root);
+                return NULL;
+            }
+        }
+        if (tf_json_add_string(step, "memory_class", tf_memory_class_name(node->memory_class)) != TF_OK ||
+            tf_json_add_string(step, "emit_class", tf_emit_class_name(node->emit_class)) != TF_OK ||
+            tf_json_add_string(step, "schema_class", tf_schema_class_name(node->schema_class)) != TF_OK ||
+            tf_json_add_string(step, "state_estimate",
+                               node->state_estimate ? node->state_estimate : "unknown") != TF_OK) {
+            cJSON_Delete(step);
+            cJSON_Delete(root);
+            return NULL;
+        }
         size_t state_bytes = 0;
         char state_reason[192] = {0};
         if (tf_estimate_step_state_bytes(node, &state_bytes, state_reason, sizeof(state_reason))) {
-            cJSON_AddNumberToObject(step, "state_bytes_estimate", (double)state_bytes);
+            if (tf_json_add_number(step, "state_bytes_estimate", (double)state_bytes) != TF_OK) {
+                cJSON_Delete(step);
+                cJSON_Delete(root);
+                return NULL;
+            }
         } else {
-            cJSON_AddNullToObject(step, "state_bytes_estimate");
+            if (tf_json_add_null(step, "state_bytes_estimate") != TF_OK) {
+                cJSON_Delete(step);
+                cJSON_Delete(root);
+                return NULL;
+            }
             if (node->memory_class == TF_MEM_KEY_STATE || node->memory_class == TF_MEM_BLOCKING) {
-                cJSON_AddStringToObject(step, "state_bytes_reason",
-                                        state_reason[0] ? state_reason : "no native byte estimator");
+                if (tf_json_add_string(step, "state_bytes_reason",
+                                       state_reason[0] ? state_reason : "no native byte estimator") != TF_OK) {
+                    cJSON_Delete(step);
+                    cJSON_Delete(root);
+                    return NULL;
+                }
             }
         }
-        cJSON_AddItemToArray(steps, step);
+        if (tf_json_add_array_item(steps, step) != TF_OK) {
+            cJSON_Delete(root);
+            return NULL;
+        }
     }
 
     char *out = cJSON_PrintUnformatted(root);

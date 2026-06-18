@@ -330,7 +330,10 @@ static tf_step *top_create_with_default_desc(const cJSON *args, int default_desc
     cJSON *copy = cJSON_Duplicate(args, 1);
     if (!copy) return NULL;
     if (!cJSON_GetObjectItemCaseSensitive(copy, "desc")) {
-        cJSON_AddBoolToObject(copy, "desc", default_desc);
+        if (tf_json_add_bool(copy, "desc", default_desc) != TF_OK) {
+            cJSON_Delete(copy);
+            return NULL;
+        }
     }
     tf_step *step = tf_top_create(copy);
     cJSON_Delete(copy);
