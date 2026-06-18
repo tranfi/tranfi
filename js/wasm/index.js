@@ -2,7 +2,6 @@
 var BLOCKING_OPS = {
   'sort': true,
   'pivot': true,
-  'stack': true,
   'interpolate': true,
   'normalize': true,
   'acf': true,

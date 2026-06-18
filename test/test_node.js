@@ -837,6 +837,29 @@ await test('multi-file source column', async () => {
   }
 })
 
+await test('stack file append runs without blocking opt-in', async () => {
+  const dir = await mkdtemp(join(tmpdir(), `tranfi-stack-${process.pid}-`))
+  const append = join(dir, 'append.csv')
+  try {
+    await writeFile(append, 'name,age\nCara,35\nDan,41\n')
+    const result = await pipeline([
+      codec.csv(),
+      ops.stack(append),
+      codec.csvEncode(),
+    ]).run({
+      input: 'name,age\nAlice,30\nBob,25\n',
+      allowFs: true,
+      chunkSize: 5,
+    })
+    assert(result.outputText.includes('Alice,30'), 'stack should keep source row')
+    assert(result.outputText.includes('Bob,25'), 'stack should keep second source row')
+    assert(result.outputText.includes('Cara,35'), 'stack should append file row')
+    assert(result.outputText.includes('Dan,41'), 'stack should append second file row')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 
 await test('multi-file skip repeated CSV header', async () => {
   const dir = await mkdtemp(join(tmpdir(), `tranfi-header-${process.pid}-`))

@@ -3,7 +3,6 @@
 const BLOCKING_OPS = new Set([
   'sort',
   'pivot',
-  'stack',
   'interpolate',
   'normalize',
   'acf',

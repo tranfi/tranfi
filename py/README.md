@@ -352,7 +352,7 @@ for r in tf.recipes():
 
 ## Memory policy
 
-Native execution rejects full-input blocking steps such as `sort`, `pivot`, `stack`, `normalize`, `acf`, and table encoding unless you opt in for known-small data:
+Native execution rejects full-input blocking steps such as `sort`, `pivot`, `normalize`, `acf`, and table encoding unless you opt in for known-small data:
 
 ```python
 tf.pipeline('csv | sort age | csv').run(input_file='small.csv', allow_blocking=True)

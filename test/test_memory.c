@@ -1173,6 +1173,55 @@ static void test_union_all_streams_appended_file(void) {
     remove(file_path);
 }
 
+static void test_stack_streams_appended_file(void) {
+    assert_contract_for_op("csv | stack /tmp/tranfi_memory_stack.csv | csv", "stack",
+                           TF_MEM_BOUNDED_STATE, TF_EMIT_MIXED);
+
+    const char *file_path = "/tmp/tranfi_memory_stack.csv";
+    FILE *f = fopen(file_path, "w");
+    assert(f != NULL);
+    fprintf(f, "id,score,group\n");
+
+    char chunk[8192];
+    for (size_t row = 0; row < JOIN_ROWS; row += CHUNK_ROWS) {
+        size_t n_rows = CHUNK_ROWS;
+        if (row + n_rows > JOIN_ROWS) n_rows = JOIN_ROWS - row;
+        size_t len = write_rows(chunk, sizeof(chunk), row, n_rows);
+        assert(fwrite(chunk, 1, len, f) == len);
+    }
+    fclose(f);
+
+    char dsl[512];
+    snprintf(dsl, sizeof(dsl), "csv | stack %s | csv", file_path);
+    tf_pipeline *p = create_pipeline_from_dsl(dsl);
+
+    memory_sink_capture cap = {0};
+    assert(tf_pipeline_set_sink(p, TF_CHAN_MAIN, memory_counting_sink, &cap) == TF_OK);
+
+    const char *header = "id,score,group\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)header, strlen(header)) == TF_OK);
+    size_t len = write_rows(chunk, sizeof(chunk), JOIN_ROWS, CHUNK_ROWS);
+    assert(tf_pipeline_push(p, (const uint8_t *)chunk, len) == TF_OK);
+    assert(tf_buffer_readable(&p->output[TF_CHAN_MAIN]) == 0);
+
+    long start_kb = current_rss_kb();
+    long peak_kb = start_kb;
+    assert(tf_pipeline_finish(p) == TF_OK);
+    update_peak(&peak_kb);
+    drain_channel(p, TF_CHAN_STATS);
+
+    assert(p->rows_in == CHUNK_ROWS);
+    assert(p->rows_out == JOIN_ROWS + CHUNK_ROWS);
+    assert(cap.calls > 1);
+    assert(cap.bytes > JOIN_ROWS);
+    assert(tf_buffer_readable(&p->output[TF_CHAN_MAIN]) == 0);
+    assert(p->output[TF_CHAN_MAIN].cap <= STREAM_CAP_LIMIT);
+    assert_rss_delta_bounded(start_kb, peak_kb);
+
+    tf_pipeline_free(p);
+    remove(file_path);
+}
+
 static void test_blocking_sort_contract_and_flush_latency(void) {
     assert_contract_for_op("csv | sort score | csv", "sort",
                            TF_MEM_BLOCKING, TF_EMIT_ON_FLUSH);
@@ -2025,6 +2074,9 @@ int main(void) {
     test_union_all_streams_appended_file();
     printf("  union-all appended file streams             PASS\n");
 
+    test_stack_streams_appended_file();
+    printf("  stack appended file streams                 PASS\n");
+
     test_blocking_sort_contract_and_flush_latency();
     printf("  blocking sort contract and flush latency     PASS\n");
 
@@ -2064,6 +2116,6 @@ int main(void) {
     test_sorted_pivot_declared_categories_streams_current_group();
     printf("  sorted pivot declared categories stream      PASS\n");
 
-    printf("\n34/34 memory regression tests passed\n");
+    printf("\n35/35 memory regression tests passed\n");
     return 0;
 }

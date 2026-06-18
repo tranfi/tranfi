@@ -1015,7 +1015,7 @@ class TestStack:
             tf.codec.csv(),
             tf.ops.stack(self.file_b),
             tf.codec.csv_encode(),
-        ], data=CSV_STACK_A, allow_blocking=True)
+        ], data=CSV_STACK_A)
         df_a = pd.read_csv(io.BytesIO(CSV_STACK_A))
         df_b = pd.read_csv(io.BytesIO(CSV_STACK_B))
         assert len(result) == len(df_a) + len(df_b)
@@ -1026,7 +1026,7 @@ class TestStack:
             tf.codec.csv(),
             tf.ops.stack(self.file_b),
             tf.codec.csv_encode(),
-        ], data=CSV_STACK_A, allow_blocking=True)
+        ], data=CSV_STACK_A)
         names = set(result['name'])
         assert names == {'Alice', 'Bob', 'Charlie', 'Diana'}
 
@@ -1036,7 +1036,7 @@ class TestStack:
             tf.codec.csv(),
             tf.ops.stack(self.file_b),
             tf.codec.csv_encode(),
-        ], data=CSV_STACK_A, allow_blocking=True)
+        ], data=CSV_STACK_A)
         df_a = pd.read_csv(io.BytesIO(CSV_STACK_A))
         df_b = pd.read_csv(io.BytesIO(CSV_STACK_B))
         expected = pd.concat([df_a, df_b], ignore_index=True)

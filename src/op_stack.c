@@ -22,35 +22,46 @@ typedef struct {
     char *tag_col;       /* NULL if no tag */
     char *tag_value;     /* value for appended rows */
     char *tag_value_in;  /* value for passthrough rows (filename or "input") */
-
-    /* Schema from first input batch */
-    char **col_names;
-    tf_type *col_types;
-    size_t n_cols;
-    int schema_captured;
-    int has_tag;         /* whether tag column was added */
+    FILE *file;
+    tf_decoder *decoder;
+    tf_batch **pending_batches;
+    size_t n_pending_batches;
+    size_t pending_batch_index;
+    int file_started;
+    int file_done;
 } stack_state;
 
-static void stack_clear_schema(stack_state *st) {
-    if (!st) return;
-    if (st->col_names) {
-        for (size_t i = 0; i < st->n_cols; i++) free(st->col_names[i]);
-        free(st->col_names);
+static void stack_clear_pending(stack_state *st) {
+    if (!st || !st->pending_batches) return;
+    for (size_t i = st->pending_batch_index; i < st->n_pending_batches; i++) {
+        if (st->pending_batches[i]) tf_batch_free(st->pending_batches[i]);
     }
-    free(st->col_types);
-    st->col_names = NULL;
-    st->col_types = NULL;
-    st->n_cols = 0;
-    st->schema_captured = 0;
+    free(st->pending_batches);
+    st->pending_batches = NULL;
+    st->n_pending_batches = 0;
+    st->pending_batch_index = 0;
+}
+
+static void stack_close_file_reader(stack_state *st) {
+    if (!st) return;
+    stack_clear_pending(st);
+    if (st->decoder) {
+        st->decoder->destroy(st->decoder);
+        st->decoder = NULL;
+    }
+    if (st->file) {
+        fclose(st->file);
+        st->file = NULL;
+    }
 }
 
 static void stack_state_free(stack_state *st) {
     if (!st) return;
+    stack_close_file_reader(st);
     free(st->file_path);
     free(st->tag_col);
     free(st->tag_value);
     free(st->tag_value_in);
-    stack_clear_schema(st);
     free(st);
 }
 
@@ -59,37 +70,80 @@ static void stack_destroy(tf_step *self) {
     free(self);
 }
 
-static int stack_capture_schema(stack_state *st, const tf_batch *in) {
-    if (!st || !in) return TF_ERROR;
-    if (st->schema_captured || in->n_cols == 0) return TF_OK;
+static int stack_write_error(tf_side_channels *side, const char *msg) {
+    return tf_side_write_error(side, msg);
+}
 
-    st->n_cols = in->n_cols;
-    st->col_names = calloc(in->n_cols, sizeof(char *));
-    st->col_types = calloc(in->n_cols, sizeof(tf_type));
-    if (!st->col_names || !st->col_types) {
-        stack_clear_schema(st);
+static int stack_open_file_reader(stack_state *st, tf_side_channels *side) {
+    if (st->file_started) return TF_OK;
+    st->file_started = 1;
+    st->file = fopen(st->file_path, "rb");
+    if (!st->file) {
+        stack_write_error(side, "stack: cannot open file");
         return TF_ERROR;
     }
-    for (size_t i = 0; i < in->n_cols; i++) {
-        st->col_names[i] = strdup(in->col_names[i] ? in->col_names[i] : "");
-        if (!st->col_names[i]) {
-            stack_clear_schema(st);
-            return TF_ERROR;
-        }
-        st->col_types[i] = in->col_types[i];
+    st->decoder = tf_csv_decoder_create(NULL);
+    if (!st->decoder) {
+        stack_close_file_reader(st);
+        return TF_ERROR;
     }
-    st->schema_captured = 1;
     return TF_OK;
 }
 
-static void stack_free_file_col_names(char **names, size_t n) {
-    if (!names) return;
-    for (size_t i = 0; i < n; i++) free(names[i]);
-    free(names);
+static int stack_take_pending_batch(stack_state *st, tf_batch **out) {
+    if (!st->pending_batches || st->pending_batch_index >= st->n_pending_batches) {
+        stack_clear_pending(st);
+        return 0;
+    }
+    *out = st->pending_batches[st->pending_batch_index];
+    st->pending_batches[st->pending_batch_index] = NULL;
+    st->pending_batch_index++;
+    if (st->pending_batch_index >= st->n_pending_batches) stack_clear_pending(st);
+    return 1;
 }
 
-static int stack_write_error(tf_side_channels *side, const char *msg) {
-    return tf_side_write_error(side, msg);
+static int stack_next_decoded_file_batch(stack_state *st, tf_batch **out,
+                                         tf_side_channels *side) {
+    *out = NULL;
+    if (stack_take_pending_batch(st, out)) return TF_OK;
+    if (st->file_done) return TF_OK;
+    if (stack_open_file_reader(st, side) != TF_OK) return TF_ERROR;
+
+    for (;;) {
+        uint8_t buf[64 * 1024];
+        size_t n = fread(buf, 1, sizeof(buf), st->file);
+        tf_batch **batches = NULL;
+        size_t n_batches = 0;
+        int rc = TF_OK;
+
+        if (n > 0) {
+            rc = st->decoder->decode(st->decoder, buf, n, &batches, &n_batches, side);
+        } else {
+            if (ferror(st->file)) {
+                stack_write_error(side, "stack: failed reading file");
+                stack_close_file_reader(st);
+                st->file_done = 1;
+                return TF_ERROR;
+            }
+            rc = st->decoder->flush(st->decoder, &batches, &n_batches, side);
+            st->file_done = 1;
+            stack_close_file_reader(st);
+        }
+        if (rc != TF_OK) {
+            if (batches) {
+                for (size_t i = 0; i < n_batches; i++) tf_batch_free(batches[i]);
+                free(batches);
+            }
+            stack_close_file_reader(st);
+            st->file_done = 1;
+            return TF_ERROR;
+        }
+        st->pending_batches = batches;
+        st->n_pending_batches = n_batches;
+        st->pending_batch_index = 0;
+        if (stack_take_pending_batch(st, out)) return TF_OK;
+        if (st->file_done) return TF_OK;
+    }
 }
 
 /*
@@ -127,8 +181,6 @@ static int stack_process(tf_step *self, tf_batch *in, tf_batch **out,
     (void)side;
     *out = NULL;
 
-    if (stack_capture_schema(st, in) != TF_OK) return TF_ERROR;
-
     if (st->tag_col) {
         *out = add_tag_column(in, st->tag_col, st->tag_value_in);
         return *out ? TF_OK : TF_ERROR;
@@ -154,149 +206,30 @@ static int stack_process(tf_step *self, tf_batch *in, tf_batch **out,
     return TF_OK;
 }
 
-static int stack_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
+static int stack_flush_next(tf_step *self, tf_batch **out, tf_side_channels *side) {
     stack_state *st = self->state;
-    (void)side;
     *out = NULL;
 
-    FILE *f = fopen(st->file_path, "rb");
-    if (!f) {
-        stack_write_error(side, "stack: cannot open file");
-        return TF_ERROR;
-    }
-
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return TF_ERROR; }
-    long fsize = ftell(f);
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return TF_ERROR; }
-    if (fsize <= 0) { fclose(f); return TF_OK; }
-
-    char *data = malloc((size_t)fsize + 1);
-    if (!data) { fclose(f); return TF_ERROR; }
-    size_t nread = fread(data, 1, (size_t)fsize, f);
-    int read_error = ferror(f);
-    fclose(f);
-    if (read_error) { free(data); return TF_ERROR; }
-    data[nread] = '\0';
-
-    char **file_col_names = NULL;
-    size_t file_n_cols = 0;
-    tf_batch *ob = NULL;
-    int rc = TF_ERROR;
-
-    size_t n_rows = 0;
-    char *end = data + nread;
-
-    char *p = data;
-    while (p < end) {
-        char *nl = memchr(p, '\n', (size_t)(end - p));
-        if (!nl) nl = end;
-        if (nl > p || p < end) n_rows++;
-        p = (nl < end) ? nl + 1 : end;
-    }
-    if (n_rows == 0) { rc = TF_OK; goto done; }
-    n_rows--; /* subtract header */
-
-    char *line = data;
-    char *nl = memchr(line, '\n', (size_t)(end - line));
-    if (!nl) nl = end;
-    size_t hdr_len = (size_t)(nl - line);
-    if (hdr_len > 0 && line[hdr_len - 1] == '\r') hdr_len--;
-
-    file_n_cols = 1;
-    for (size_t i = 0; i < hdr_len; i++) {
-        if (line[i] == ',') file_n_cols++;
-    }
-
-    file_col_names = calloc(file_n_cols, sizeof(char *));
-    if (!file_col_names) goto done;
-    size_t ci = 0;
-    size_t field_start = 0;
-    for (size_t i = 0; i <= hdr_len; i++) {
-        if (i == hdr_len || line[i] == ',') {
-            if (ci >= file_n_cols) goto done;
-            size_t flen = i - field_start;
-            while (flen > 0 && (line[field_start] == ' ' || line[field_start] == '\t'))
-                { field_start++; flen--; }
-            while (flen > 0 && (line[field_start + flen - 1] == ' ' || line[field_start + flen - 1] == '\t'))
-                flen--;
-            file_col_names[ci] = malloc(flen + 1);
-            if (!file_col_names[ci]) goto done;
-            memcpy(file_col_names[ci], line + field_start, flen);
-            file_col_names[ci][flen] = '\0';
-            ci++;
-            field_start = i + 1;
+    for (;;) {
+        tf_batch *batch = NULL;
+        if (stack_next_decoded_file_batch(st, &batch, side) != TF_OK) return TF_ERROR;
+        if (!batch) return TF_OK;
+        if (batch->n_rows == 0) {
+            tf_batch_free(batch);
+            continue;
         }
-    }
-    if (ci != file_n_cols) goto done;
-
-    size_t out_cols = file_n_cols;
-    size_t col_offset = 0;
-    if (st->tag_col) {
-        if (tf_size_add(file_n_cols, 1, &out_cols) != TF_OK) goto done;
-        col_offset = 1;
-    }
-    ob = tf_batch_create(out_cols, n_rows > 0 ? n_rows : 1);
-    if (!ob) goto done;
-
-    if (st->tag_col) {
-        if (tf_batch_set_schema(ob, 0, st->tag_col, TF_TYPE_STRING) != TF_OK) goto done;
-    }
-    for (size_t i = 0; i < file_n_cols; i++) {
-        if (tf_batch_set_schema(ob, i + col_offset, file_col_names[i], TF_TYPE_STRING) != TF_OK) goto done;
-    }
-
-    p = (nl < end) ? nl + 1 : end;
-    size_t row = 0;
-    while (p < end && row < n_rows) {
-        nl = memchr(p, '\n', (size_t)(end - p));
-        if (!nl) nl = end;
-        size_t line_len = (size_t)(nl - p);
-        if (line_len > 0 && p[line_len - 1] == '\r') line_len--;
-        if (line_len == 0) { p = (nl < end) ? nl + 1 : end; continue; }
-
-        if (tf_batch_ensure_capacity(ob, row + 1) != TF_OK) goto done;
-
-        if (st->tag_col) {
-            if (tf_batch_set_string(ob, row, 0, st->tag_value ? st->tag_value : "") != TF_OK) goto done;
+        if (!st->tag_col) {
+            *out = batch;
+            return TF_OK;
         }
-
-        size_t fc = 0;
-        size_t fs = 0;
-        for (size_t i = 0; i <= line_len; i++) {
-            if (i == line_len || p[i] == ',') {
-                if (fc < file_n_cols) {
-                    size_t flen = i - fs;
-                    const char *fp = p + fs;
-                    while (flen > 0 && (*fp == ' ' || *fp == '\t')) { fp++; flen--; }
-                    while (flen > 0 && (fp[flen - 1] == ' ' || fp[flen - 1] == '\t')) flen--;
-                    if (flen == 0) {
-                        if (tf_batch_set_null(ob, row, fc + col_offset) != TF_OK) goto done;
-                    } else {
-                        if (tf_batch_set_string_len(ob, row, fc + col_offset, fp, flen) != TF_OK) goto done;
-                    }
-                    fc++;
-                }
-                fs = i + 1;
-            }
-        }
-        for (size_t c = fc; c < file_n_cols; c++) {
-            if (tf_batch_set_null(ob, row, c + col_offset) != TF_OK) goto done;
-        }
-
-        if (tf_batch_expose_row(ob, row) != TF_OK) goto done;
-        row++;
-        p = (nl < end) ? nl + 1 : end;
+        *out = add_tag_column(batch, st->tag_col, st->tag_value);
+        tf_batch_free(batch);
+        return *out ? TF_OK : TF_ERROR;
     }
+}
 
-    *out = ob;
-    ob = NULL;
-    rc = TF_OK;
-
-done:
-    if (ob) tf_batch_free(ob);
-    stack_free_file_col_names(file_col_names, file_n_cols);
-    free(data);
-    return rc;
+static int stack_flush(tf_step *self, tf_batch **out, tf_side_channels *side) {
+    return stack_flush_next(self, out, side);
 }
 
 tf_step *tf_stack_create(const cJSON *args) {
@@ -327,6 +260,7 @@ tf_step *tf_stack_create(const cJSON *args) {
     if (!step) { stack_state_free(st); return NULL; }
     step->process = stack_process;
     step->flush = stack_flush;
+    step->flush_next = stack_flush_next;
     step->destroy = stack_destroy;
     step->state = st;
     return step;

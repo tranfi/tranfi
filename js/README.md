@@ -384,7 +384,7 @@ for (const r of await recipes()) {
 
 ## Memory policy
 
-Native Node/WASM execution rejects full-input blocking steps such as `sort`, `pivot`, `stack`, `normalize`, `acf`, and table encoding unless you opt in for known-small data:
+Native Node/WASM execution rejects full-input blocking steps such as `sort`, `pivot`, `normalize`, `acf`, and table encoding unless you opt in for known-small data:
 
 ```js
 await pipeline('csv | sort age | csv').run({ inputFile: 'small.csv', allowBlocking: true })

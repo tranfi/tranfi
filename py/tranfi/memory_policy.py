@@ -9,7 +9,6 @@ from typing import Any, Dict, Iterable, Tuple
 BLOCKING_OPS = {
     'sort',
     'pivot',
-    'stack',
     'interpolate',
     'normalize',
     'acf',
