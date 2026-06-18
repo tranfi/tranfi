@@ -532,6 +532,17 @@ int main(void) {
         "csv batch_size=1 | unique city max_keys=8 max_state_bytes=1048576 | csv",
         key_state_silent_rows,
         520);
+    run_case_no_silent_output_oom(
+        "group_agg_hash_key_materialization",
+        "csv batch_size=1 | group-agg city sum:score:total count:*:rows "
+        "max_groups=8 max_state_bytes=1048576 | csv",
+        key_state_silent_rows,
+        620);
+    run_case_no_silent_output_oom(
+        "group_agg_sorted_key_materialization",
+        "csv batch_size=1 | group-agg city sum:score:total count:*:rows sorted=true | csv",
+        sorted_people,
+        620);
     const char *sorted_union_lookup_path = "/tmp/tranfi_oom_sorted_union_lookup.csv";
     FILE *sorted_union_lookup = fopen(sorted_union_lookup_path, "wb");
     assert(sorted_union_lookup);
@@ -573,6 +584,20 @@ int main(void) {
     if (mkdir(spill_root, 0700) != 0 && errno != EEXIST) {
         assert(!"failed to create OOM spill root");
     }
+    char spill_group_agg_dsl[512];
+    int spill_group_agg_n = snprintf(
+        spill_group_agg_dsl,
+        sizeof(spill_group_agg_dsl),
+        "csv batch_size=1 | group-agg city sum:score:total count:*:rows "
+        "spill_dir=%s spill_run_rows=2 spill_output_rows=2 | csv",
+        spill_root);
+    assert(spill_group_agg_n > 0 &&
+           (size_t)spill_group_agg_n < sizeof(spill_group_agg_dsl));
+    run_case_no_silent_output_oom(
+        "group_agg_spill_key_materialization",
+        spill_group_agg_dsl,
+        key_state_silent_rows,
+        620);
     char spill_sort_plan[1024];
     int spill_sort_n = snprintf(
         spill_sort_plan,
