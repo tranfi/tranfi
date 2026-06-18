@@ -397,7 +397,18 @@ typedef struct {
     int want_sample;
 } stats_state;
 
-static void accum_init(col_accum *a, const stats_state *st) {
+static char *stats_strdup(const char *s) {
+    const char *src = s ? s : "";
+    size_t len = strlen(src);
+    size_t n;
+    if (tf_size_add(len, 1, &n) != TF_OK) return NULL;
+    char *out = tf_mallocarray_checked(n, sizeof(char));
+    if (!out) return NULL;
+    memcpy(out, src, len + 1);
+    return out;
+}
+
+static int accum_init(col_accum *a, const stats_state *st) {
     a->min = DBL_MAX;
     a->max = -DBL_MAX;
     p2_init(&a->p2_median, 0.5);
@@ -405,17 +416,21 @@ static void accum_init(col_accum *a, const stats_state *st) {
     p2_init(&a->p2_p75, 0.75);
 
     if (st->want_distinct) {
-        a->hll = calloc(1, sizeof(hll_state));
-        if (a->hll) hll_init(a->hll);
+        a->hll = tf_callocarray_checked(1, sizeof(hll_state));
+        if (!a->hll) return TF_ERROR;
+        hll_init(a->hll);
     }
     if (st->want_hist) {
-        a->hist = calloc(1, sizeof(hist_state));
-        if (a->hist) hist_init(a->hist);
+        a->hist = tf_callocarray_checked(1, sizeof(hist_state));
+        if (!a->hist) return TF_ERROR;
+        hist_init(a->hist);
     }
     if (st->want_sample) {
-        a->reservoir = calloc(1, sizeof(reservoir_state));
-        if (a->reservoir) reservoir_init(a->reservoir);
+        a->reservoir = tf_callocarray_checked(1, sizeof(reservoir_state));
+        if (!a->reservoir) return TF_ERROR;
+        reservoir_init(a->reservoir);
     }
+    return TF_OK;
 }
 
 static void accum_update(col_accum *a, double val, const char *str_val,
@@ -462,6 +477,23 @@ static void accum_free(col_accum *a) {
     free(a->reservoir);
 }
 
+static void stats_clear_accumulation(stats_state *st) {
+    if (!st) return;
+    if (st->accums) {
+        for (size_t i = 0; i < st->n_cols; i++)
+            accum_free(&st->accums[i]);
+        free(st->accums);
+    }
+    if (st->col_names) {
+        for (size_t i = 0; i < st->n_cols; i++) free(st->col_names[i]);
+        free(st->col_names);
+    }
+    st->accums = NULL;
+    st->col_names = NULL;
+    st->n_cols = 0;
+    st->initialized = 0;
+}
+
 /* ---- Process / Flush / Destroy ---- */
 
 static int stats_process(tf_step *self, tf_batch *in, tf_batch **out,
@@ -472,12 +504,18 @@ static int stats_process(tf_step *self, tf_batch *in, tf_batch **out,
 
     if (!st->initialized) {
         st->n_cols = in->n_cols;
-        st->accums = calloc(in->n_cols, sizeof(col_accum));
-        st->col_names = calloc(in->n_cols, sizeof(char *));
-        if (!st->accums || !st->col_names) return TF_ERROR;
+        st->accums = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(col_accum));
+        st->col_names = tf_callocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(char *));
+        if (!st->accums || !st->col_names) {
+            stats_clear_accumulation(st);
+            return TF_ERROR;
+        }
         for (size_t c = 0; c < in->n_cols; c++) {
-            st->col_names[c] = strdup(in->col_names[c]);
-            accum_init(&st->accums[c], st);
+            st->col_names[c] = stats_strdup(in->col_names[c]);
+            if (!st->col_names[c] || accum_init(&st->accums[c], st) != TF_OK) {
+                stats_clear_accumulation(st);
+                return TF_ERROR;
+            }
         }
         st->initialized = 1;
     }
@@ -749,15 +787,7 @@ done:
 static void stats_destroy(tf_step *self) {
     stats_state *st = self->state;
     if (st) {
-        if (st->accums) {
-            for (size_t i = 0; i < st->n_cols; i++)
-                accum_free(&st->accums[i]);
-            free(st->accums);
-        }
-        if (st->col_names) {
-            for (size_t i = 0; i < st->n_cols; i++) free(st->col_names[i]);
-            free(st->col_names);
-        }
+        stats_clear_accumulation(st);
         free(st);
     }
     free(self);
@@ -811,7 +841,7 @@ static void scan_enable_default(stats_state *st) {
 }
 
 static tf_step *stats_create_common(const cJSON *args, int scan_defaults) {
-    stats_state *st = calloc(1, sizeof(stats_state));
+    stats_state *st = tf_callocarray_checked(1, sizeof(stats_state));
     if (!st) return NULL;
 
     cJSON *stats_arr = args ? cJSON_GetObjectItemCaseSensitive(args, "stats") : NULL;
@@ -827,7 +857,7 @@ static tf_step *stats_create_common(const cJSON *args, int scan_defaults) {
         stats_enable_default(st);
     }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st); return NULL; }
     step->process = stats_process;
     step->flush = stats_flush;

@@ -5974,7 +5974,7 @@ static void test_pipeline_csv_stats_hist_sample(void) {
     const char *plan =
         "{\"steps\":["
         "{\"op\":\"codec.csv.decode\",\"args\":{}},"
-        "{\"op\":\"stats\",\"args\":{\"stats\":[\"hist\",\"sample\"]}},"
+        "{\"op\":\"stats\",\"args\":{\"stats\":[\"distinct\",\"hist\",\"sample\"]}},"
         "{\"op\":\"codec.csv.encode\",\"args\":{}}"
         "]}";
 
@@ -5990,11 +5990,12 @@ static void test_pipeline_csv_stats_hist_sample(void) {
     assert(n > 0);
     out[n] = '\0';
 
-    /* hist should have colon-separated format, sample should have comma-separated values */
-    assert(strstr((char *)out, "hist,sample") != NULL);
+    /* distinct, hist, and sample each allocate bounded online state. */
+    assert(strstr((char *)out, "column,distinct,hist,sample") != NULL);
     /* hist output contains colons for "lo:hi:counts" */
     char *data_line = strstr((char *)out, "\nval,");
     assert(data_line != NULL);
+    assert(strstr(data_line, "10,") != NULL);
     assert(strstr(data_line, ":") != NULL); /* hist has colons */
 
     tf_pipeline_free(p);

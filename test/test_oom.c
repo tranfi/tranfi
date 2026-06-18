@@ -598,10 +598,10 @@ int main(void) {
             360
         },
         {
-            "stats_hist_sample",
-            "csv batch_size=1 | stats hist,sample | csv",
+            "stats_distinct_hist_sample",
+            "csv batch_size=1 | stats distinct,hist,sample | csv",
             people,
-            360
+            420
         },
         {
             "flush_report_schema_infer",
