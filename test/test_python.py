@@ -6,6 +6,7 @@ Run: cd tranfi-core && python -m pytest test/test_python.py -v
 """
 
 import gzip
+import json
 import os
 import sys
 import tempfile
@@ -2308,6 +2309,52 @@ def test_ops_schema_actions():
             tf.ops.schema(columns={'name': 'string', 'age': 'int'}, max={'age': 120}, mode='fail', message='schema rule'),
             tf.codec.csv_encode(),
         ]).run(input=b'name,age\nAlice,30\nBob,200\n')
+
+
+def test_recurring_delivery_gate_from_fixture():
+    baseline_fixture = {
+        'columns': {'name': 'string', 'city': 'string', 'score': 'int'},
+        'values': {'city': ['NY', 'LA']},
+    }
+    fixture_path = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.json', delete=False) as f:
+            json.dump(baseline_fixture, f)
+            fixture_path = f.name
+        with open(fixture_path, 'r', encoding='utf-8') as f:
+            baseline = json.load(f)
+    finally:
+        if fixture_path:
+            os.unlink(fixture_path)
+
+    result = tf.pipeline([
+        tf.codec.csv(batch_size=1),
+        tf.ops.schema(baseline=baseline, mode='warn', name='delivery_schema'),
+        tf.ops.assert_(aggregate='count', op='>=', value=3, action='warn',
+                       name='delivery_row_count'),
+        tf.ops.assert_(aggregate='missing_rate:score', op='<=', value=0.25,
+                       action='warn', name='score_missing_rate'),
+        tf.codec.csv_encode(),
+    ]).run(input=b'name,city,score\nAlice,NY,\nBob,SF,\n', chunk_size=5)
+
+    assert 'Alice,NY,' in result.output_text
+    errors = result.errors.decode('utf-8')
+    assert '"name":"delivery_schema"' in errors
+    assert '"rule":"values"' in errors
+    assert '"actual":"SF"' in errors
+    assert '"rule":"missing_category"' in errors
+    assert '"expected":"LA"' in errors
+    assert '"name":"delivery_row_count"' in errors
+    assert '"aggregate":"count"' in errors
+    assert '"actual":2' in errors
+    assert '"name":"score_missing_rate"' in errors
+    assert '"aggregate":"missing_rate"' in errors
+    assert '"actual":1' in errors
+    assert '"baseline_mode":true' in result.stats_text
+    assert '"extra_column_failures":0' in result.stats_text
+    assert '"missing_category_failures":1' in result.stats_text
+    assert '"aggregate_rows":2' in result.stats_text
+    assert '"aggregate_missing":2' in result.stats_text
 
 
 def test_ops_schema_selectors():

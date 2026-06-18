@@ -367,6 +367,24 @@ Aliases: `reorder` (select), `dedup` (unique).
 
 Host APIs and JSON plans can pass a saved recurring-delivery baseline object to `schema`. The baseline uses the same keys as inline schema contracts, for example `{"columns":{"name":"string","city":"string"},"values":{"city":["NY","LA"]}}`; Python/Node callers can load that JSON from a project-owned fixture file and pass it as `tf.ops.schema(baseline=baseline, mode="warn")` or `ops.schema({ baseline, mode: "warn" })`. Baseline mode is strict by default: listed columns are required, unexpected input columns produce `extra_column` drift records, and declared `values` are both allowlists for new categories and finish-time expected-category coverage checks. Set `allow_extra_columns=true` or `require_values_seen=false` to relax those defaults. Category coverage retains only one byte per declared category and emits `missing_category` at `finish()`; warning mode records drift while preserving output, and fail mode aborts at finish. The core deliberately does not read a `baseline_file` path: host code owns file access, workspace policy, and browser portability.
 
+```python
+import json
+import tranfi as tf
+
+with open('delivery_baseline.json', encoding='utf-8') as f:
+    baseline = json.load(f)
+
+result = tf.pipeline([
+    tf.codec.csv(batch_size=1),
+    tf.ops.schema(baseline=baseline, mode='warn', name='delivery_schema'),
+    tf.ops.assert_(aggregate='count', op='>=', value=1000, action='warn',
+                   name='delivery_row_count'),
+    tf.ops.assert_(aggregate='missing_rate:score', op='<=', value=0.01,
+                   action='warn', name='score_missing_rate'),
+    tf.codec.csv_encode(),
+]).run(input_file='delivery.csv')
+```
+
 `schema infer [rows=N]` emits one schema-report row per input column at `finish()` without retaining input rows. It samples at most `rows` decoded rows, defaults to `10000`, and reports `column`, inferred decoded `type`, `nullable`, `non_null`, `rows_seen`, `rows_sampled`, `missing`, `non_missing`, `observed_types`, and `warning`. `warning` includes `sample_limited` when more rows were seen than sampled and `no_non_null_sample` when a column had no non-null sampled values. The alias `schema-infer guess_max=N` is accepted for readr-style vocabulary. This is `memory_class=bounded_state`, `emit_class=on_flush`, `schema_class=parametric`, native/WASM only, and intentionally a report generator rather than automatic type mutation.
 
 `sample N [seed=N|seed=random]` keeps a bounded reservoir and emits only at `finish()`. Omitting `seed` is deterministic and equivalent to `seed=0`, so the same pipeline produces identical sampled rows across runs and byte chunk cuts. Use `seed=random` only when nondeterministic sampling is explicitly desired. This is `memory_class=bounded_state`, `emit_class=on_flush`, and native/WASM only.
