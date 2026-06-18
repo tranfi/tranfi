@@ -9,6 +9,7 @@
  */
 
 #include "tranfi.h"
+#include "report.h"
 #include <assert.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -442,6 +443,51 @@ static void run_sql_case_with_oom(const oom_sql_case *tc) {
         oom_enabled = 0;
         assert(oom_failed);
     }
+}
+
+static char *run_report_format_once(void) {
+    static const char stats_csv[] =
+        "column,count,avg,min,max,stddev,median,p25,p75,distinct,hist,sample\n"
+        "age,3,25,20,30,4.08,25,20,30,3,"
+        "\"20:30:1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1\","
+        "\"20,25,30\"\n"
+        "city,3,,,,,,,,2,,\n";
+    return tf_report_format(stats_csv, sizeof(stats_csv) - 1, 1);
+}
+
+static size_t count_successful_report_allocs(void) {
+    oom_enabled = 1;
+    oom_fail_at = (size_t)-1;
+    oom_alloc_count = 0;
+    oom_failed = 0;
+    char *baseline = run_report_format_once();
+    oom_enabled = 0;
+    assert(baseline != NULL);
+    free(baseline);
+    assert(!oom_failed);
+    return oom_alloc_count;
+}
+
+static void run_report_format_with_oom(void) {
+    char *baseline = run_report_format_once();
+    assert(baseline != NULL);
+    size_t allocs = count_successful_report_allocs();
+    assert(allocs > 0);
+
+    for (size_t fail_at = 1; fail_at <= allocs; fail_at++) {
+        oom_enabled = 1;
+        oom_fail_at = fail_at;
+        oom_alloc_count = 0;
+        oom_failed = 0;
+        char *out = run_report_format_once();
+        oom_enabled = 0;
+        assert(oom_failed);
+        if (out) {
+            assert(strcmp(out, baseline) == 0);
+            free(out);
+        }
+    }
+    free(baseline);
 }
 
 int main(void) {
@@ -1986,6 +2032,10 @@ int main(void) {
         run_sql_case_with_oom(&sql_cases[i]);
         printf("PASS\n");
     }
+    printf("  %-32s", "report_format");
+    fflush(stdout);
+    run_report_format_with_oom();
+    printf("PASS\n");
     remove(union_lookup_path);
     remove(sorted_lookup_path);
     remove(join_lookup_path);

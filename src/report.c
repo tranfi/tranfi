@@ -215,7 +215,7 @@ static csv_table *csv_parse(const char *csv, size_t len) {
 static void csv_free(csv_table *t) {
   if (!t) return;
   for (size_t i = 0; i < t->n_cols; i++) free(t->headers[i]);
-  for (size_t r = 0; r < t->n_rows; r++)
+  for (size_t r = 0; r < MAX_ROWS; r++)
     for (size_t c = 0; c < t->n_cols; c++)
       free(t->cells[r][c]);
   free(t);
