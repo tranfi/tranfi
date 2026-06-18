@@ -7034,6 +7034,26 @@ static void test_pipeline_cast_audit_side_channel(void) {
     assert(strstr((char *)stats, "\"coercion_nulled\":0") != NULL);
     assert(strstr((char *)stats, "\"audit_emitted\":3") != NULL);
     tf_pipeline_free(p);
+
+    const char *finalized_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"cast\",\"args\":{\"mapping\":{\"age\":\"int\"},\"audit\":true,\"audit_limit\":1}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create(finalized_plan, strlen(finalized_plan));
+    assert(p != NULL);
+    const char *single = "name,age,city\nAlice,42x,Paris\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)single, strlen(single)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    stats_n = tf_pipeline_pull(p, TF_CHAN_STATS, stats, sizeof(stats) - 1);
+    assert(stats_n > 0);
+    stats[stats_n] = '\0';
+    assert(strstr((char *)stats,
+                  "\"data\":{\"name\":\"Alice\",\"age\":42,\"city\":\"Paris\"}") != NULL);
+    assert(strstr((char *)stats,
+                  "\"data\":{\"name\":\"Alice\",\"age\":42,\"city\":null}") == NULL);
+    tf_pipeline_free(p);
 }
 
 static void test_pipeline_cast_on_error_policies(void) {

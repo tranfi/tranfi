@@ -34,6 +34,14 @@ typedef struct {
     tf_audit_options audit_opts;
 } cast_state;
 
+typedef struct {
+    size_t col;
+    tf_type src_t;
+    tf_type dst_t;
+    const char *event;
+    const char *reason;
+} cast_audit_event;
+
 static const char *cast_error_policy_name(cast_error_policy p) {
     switch (p) {
         case CAST_ON_ERROR_COERCE: return "coerce";
@@ -202,7 +210,8 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
     *out = NULL;
     size_t row_base = st->row_index;
 
-    tf_type *out_types = malloc(in->n_cols * sizeof(tf_type));
+    tf_type *out_types = tf_mallocarray_checked(in->n_cols > 0 ? in->n_cols : 1,
+                                                sizeof(tf_type));
     if (!out_types) return TF_ERROR;
     for (size_t c = 0; c < in->n_cols; c++) out_types[c] = in->col_types[c];
     for (size_t k = 0; k < st->n; k++) {
@@ -210,17 +219,39 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
         if (ci >= 0) out_types[ci] = st->target_types[k];
     }
 
+    cast_audit_event *audit_events = NULL;
     tf_batch *ob = tf_batch_create(in->n_cols, in->n_rows);
     if (!ob) { free(out_types); return TF_ERROR; }
     for (size_t c = 0; c < in->n_cols; c++) {
         if (tf_batch_set_schema(ob, c, in->col_names[c], out_types[c]) != TF_OK) goto fail;
     }
+    if (st->audit) {
+        audit_events = tf_callocarray_checked(in->n_cols > 0 ? in->n_cols : 1,
+                                              sizeof(cast_audit_event));
+        if (!audit_events) goto fail;
+    }
 
     for (size_t r = 0; r < in->n_rows; r++) {
-        if (tf_batch_ensure_capacity(ob, r + 1) != TF_OK) goto fail;
-        /* Audit serialization reads the in-progress row after its changed cell is written. */
-        if (tf_batch_expose_row(ob, r) != TF_OK) goto fail;
+        size_t needed_rows = 0;
+        if (tf_size_add(r, 1, &needed_rows) != TF_OK ||
+            tf_batch_ensure_capacity(ob, needed_rows) != TF_OK) {
+            goto fail;
+        }
+        size_t audit_count = 0;
+        int row_failed = 0;
+        size_t row_failed_col = 0;
+        const char *row_failed_reason = NULL;
         for (size_t c = 0; c < in->n_cols; c++) {
+            if (row_failed) {
+                if (tf_batch_is_null(in, r, c)) {
+                    if (tf_batch_set_null(ob, r, c) != TF_OK) goto fail;
+                } else if (in->col_types[c] == out_types[c]) {
+                    if (tf_batch_copy_cell(ob, r, c, in, r, c) != TF_OK) goto fail;
+                } else if (tf_batch_set_null(ob, r, c) != TF_OK) {
+                    goto fail;
+                }
+                continue;
+            }
             if (tf_batch_is_null(in, r, c)) {
                 if (tf_batch_set_null(ob, r, c) != TF_OK) goto fail;
                 continue;
@@ -335,27 +366,58 @@ static int cast_process(tf_step *self, tf_batch *in, tf_batch **out,
             if (st->audit) {
                 const char *event = failure_reason ? "coercion_failed" : "value_changed";
                 const char *reason = failure_reason ? failure_reason : "type_cast";
-                if (emit_cast_audit(st, in, ob, r, c, row_base + r + 1, src_t, dst_t, event, reason, side) != TF_OK) goto fail;
+                if (st->audit_emitted < st->audit_limit &&
+                    audit_count < st->audit_limit - st->audit_emitted) {
+                    audit_events[audit_count++] = (cast_audit_event){
+                        .col = c,
+                        .src_t = src_t,
+                        .dst_t = dst_t,
+                        .event = event,
+                        .reason = reason,
+                    };
+                }
             }
 
             if (failure_reason && st->on_error == CAST_ON_ERROR_FAIL) {
+                row_failed = 1;
+                row_failed_col = c;
+                row_failed_reason = failure_reason;
+            }
+        }
+        if (tf_batch_expose_row(ob, r) != TF_OK) goto fail;
+        if (audit_count > 0 || row_failed) {
+            size_t row_no = 0;
+            if (tf_size_add(row_base, r, &row_no) != TF_OK ||
+                tf_size_add(row_no, 1, &row_no) != TF_OK) {
+                goto fail;
+            }
+            for (size_t i = 0; i < audit_count; i++) {
+                cast_audit_event *ev = &audit_events[i];
+                if (emit_cast_audit(st, in, ob, r, ev->col, row_no, ev->src_t,
+                                    ev->dst_t, ev->event, ev->reason, side) != TF_OK) {
+                    goto fail;
+                }
+            }
+            if (row_failed) {
                 char msg[512];
                 snprintf(msg, sizeof(msg), "cast failed at row %zu column '%s': %s",
-                         row_base + r + 1,
-                         in->col_names[c] ? in->col_names[c] : "",
-                         failure_reason);
+                         row_no,
+                         in->col_names[row_failed_col] ? in->col_names[row_failed_col] : "",
+                         row_failed_reason ? row_failed_reason : "type_cast");
                 tf_set_last_error(msg);
                 goto fail;
             }
         }
     }
 
-    st->row_index += in->n_rows;
+    if (tf_size_add(st->row_index, in->n_rows, &st->row_index) != TF_OK) goto fail;
+    free(audit_events);
     free(out_types);
     *out = ob;
     return TF_OK;
 
 fail:
+    free(audit_events);
     tf_batch_free(ob);
     free(out_types);
     return TF_ERROR;
@@ -413,7 +475,7 @@ tf_step *tf_cast_create(const cJSON *args) {
     cJSON *entry = NULL;
     cJSON_ArrayForEach(entry, mapping) {
         if (!entry->string || !entry->string[0]) { cast_state_free(st); return NULL; }
-        st->col_names[i] = strdup(entry->string);
+        st->col_names[i] = tf_strdup_checked(entry->string);
         st->target_types[i] = cJSON_IsString(entry) ? parse_type(entry->valuestring) : TF_TYPE_NULL;
         if (!st->col_names[i]) { cast_state_free(st); return NULL; }
         i++;
