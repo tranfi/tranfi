@@ -151,10 +151,27 @@ static void sql_quote_ident_part(strbuf *sb, const char *name) {
   }
 }
 
+static void sql_quote_ident_part_range(strbuf *sb, const char *name, size_t len) {
+  if (!name && len > 0) {
+    if (sb) sb->failed = 1;
+    return;
+  }
+  for (size_t i = 0; i < len; i++) {
+    if (name[i] == '"') sb_append(sb, "\"\"");
+    else sb_appendn(sb, name + i, 1);
+  }
+}
+
 /* Append a SQL-quoted identifier: "name" */
 static void sql_quote_ident(strbuf *sb, const char *name) {
   sb_append(sb, "\"");
   sql_quote_ident_part(sb, name);
+  sb_append(sb, "\"");
+}
+
+static void sql_quote_ident_range(strbuf *sb, const char *name, size_t len) {
+  sb_append(sb, "\"");
+  sql_quote_ident_part_range(sb, name, len);
   sb_append(sb, "\"");
 }
 
@@ -1059,21 +1076,19 @@ static int emit_cte(strbuf *sb, const char *cte_name, const char *prev,
     strbuf cond;
     sb_init(&cond);
     if (eq) {
-      char left_col[128], right_col[128];
+      const char *left = on;
       size_t llen = (size_t)(eq - on);
-      if (llen >= sizeof(left_col)) llen = sizeof(left_col) - 1;
-      memcpy(left_col, on, llen);
-      left_col[llen] = '\0';
-      strncpy(right_col, eq + 1, sizeof(right_col) - 1);
-      right_col[sizeof(right_col) - 1] = '\0';
-      /* Trim whitespace */
-      while (llen > 0 && left_col[llen - 1] == ' ') left_col[--llen] = '\0';
-      char *rp = right_col;
-      while (*rp == ' ') rp++;
+      while (llen > 0 && *left == ' ') { left++; llen--; }
+      while (llen > 0 && left[llen - 1] == ' ') llen--;
+
+      const char *right = eq + 1;
+      while (*right == ' ') right++;
+      size_t rlen = strlen(right);
+      while (rlen > 0 && right[rlen - 1] == ' ') rlen--;
       sb_append(&cond, "a.");
-      sql_quote_ident(&cond, left_col);
+      sql_quote_ident_range(&cond, left, llen);
       sb_append(&cond, " = b.");
-      sql_quote_ident(&cond, rp);
+      sql_quote_ident_range(&cond, right, rlen);
     } else {
       sb_append(&cond, "a.");
       sql_quote_ident(&cond, on);

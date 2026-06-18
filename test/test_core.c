@@ -4663,12 +4663,19 @@ static void assert_sql_has_generated_alias(const char *sql, const char *column, 
     assert(strstr(sql, expected) != NULL);
 }
 
+static void assert_sql_has_qualified_column(const char *sql, const char *qualifier, const char *column) {
+    char expected[384];
+    int n = snprintf(expected, sizeof(expected), "%s.\"%s\"", qualifier, column);
+    assert(n > 0 && (size_t)n < sizeof(expected));
+    assert(strstr(sql, expected) != NULL);
+}
+
 static void test_compile_to_sql_generated_default_aliases(void) {
     char col[301];
     memset(col, 'v', sizeof(col) - 1);
     col[sizeof(col) - 1] = '\0';
 
-    char dsl[512];
+    char dsl[1024];
     int n = snprintf(dsl, sizeof(dsl), "csv | group-agg city sum:%s | csv", col);
     assert(n > 0 && (size_t)n < sizeof(dsl));
 
@@ -4698,6 +4705,21 @@ static void test_compile_to_sql_generated_default_aliases(void) {
     assert(strstr(sql, "SELECT * REPLACE") != NULL);
     assert(strstr(sql, " AS \"date\"") != NULL);
     assert(strstr(sql, "date_month") == NULL);
+    tf_string_free(sql);
+
+    char right[301];
+    memset(col, 'l', sizeof(col) - 1);
+    memset(right, 'r', sizeof(right) - 1);
+    col[sizeof(col) - 1] = '\0';
+    right[sizeof(right) - 1] = '\0';
+    n = snprintf(dsl, sizeof(dsl), "csv | join lookup.csv on=%s=%s | csv", col, right);
+    assert(n > 0 && (size_t)n < sizeof(dsl));
+
+    sql = tf_compile_to_sql(dsl, strlen(dsl), &error);
+    assert(sql != NULL);
+    assert(error == NULL);
+    assert_sql_has_qualified_column(sql, "a", col);
+    assert_sql_has_qualified_column(sql, "b", right);
     tf_string_free(sql);
 }
 
