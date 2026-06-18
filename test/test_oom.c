@@ -335,6 +335,12 @@ int main(void) {
             760
         },
         {
+            "dsl_rowlocal_builder_args",
+            "csv batch_size=1 | source-name source default=unknown | rename name=full_name,city=town | derive score2=col(score)*2 | across columns=full_name fn=upper replace=false names={col}_{fn} | relocate full_name_upper after=full_name | select source,full_name,full_name_upper,town,score2 | stats count,missing | csv",
+            people,
+            640
+        },
+        {
             "csv_strict_good_rows",
             "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
             people,

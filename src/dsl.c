@@ -61,6 +61,8 @@ static int dsl_set_object_item(cJSON *obj, const char *key, cJSON *item);
 static int dsl_set_string_arg(cJSON *obj, const char *key, const char *value);
 static int dsl_set_number_arg(cJSON *obj, const char *key, double value);
 static int dsl_set_bool_arg(cJSON *obj, const char *key, int value);
+static int dsl_add_string_array_item(cJSON *arr, const char *value);
+static int dsl_add_array_duplicate(cJSON *arr, cJSON *src);
 static int add_audit_csv_arg(cJSON *args, const char *key, const char *spec);
 static char *trimmed_token_copy(const char *start, size_t len);
 static int add_comma_columns(cJSON *cols, const char *spec, char **error, const char *op_label);
@@ -997,6 +999,18 @@ static int dsl_set_bool_arg(cJSON *obj, const char *key, int value) {
     return dsl_set_object_item(obj, key, item);
 }
 
+static int dsl_add_string_array_item(cJSON *arr, const char *value) {
+    cJSON *item = cJSON_CreateString(value ? value : "");
+    if (!item) return TF_ERROR;
+    return tf_json_add_array_item(arr, item);
+}
+
+static int dsl_add_array_duplicate(cJSON *arr, cJSON *src) {
+    cJSON *item = cJSON_Duplicate(src, 1);
+    if (!item) return TF_ERROR;
+    return tf_json_add_array_item(arr, item);
+}
+
 static int dsl_add_csv_list(cJSON *arr, const char *text) {
     char *copy = strdup(text ? text : "");
     if (!copy) return TF_ERROR;
@@ -1006,8 +1020,7 @@ static int dsl_add_csv_list(cJSON *arr, const char *text) {
         size_t len = strlen(tok);
         while (len > 0 && (tok[len - 1] == ' ' || tok[len - 1] == '	')) tok[--len] = '\0';
         if (len > 0) {
-            cJSON *item = cJSON_CreateString(tok);
-            if (!item || tf_json_add_array_item(arr, item) != TF_OK) {
+            if (dsl_add_string_array_item(arr, tok) != TF_OK) {
                 free(copy);
                 return TF_ERROR;
             }
@@ -1129,8 +1142,7 @@ static int add_csv_strings(cJSON *arr, const char *text) {
     char *tok = strtok(copy, ",");
     while (tok) {
         if (*tok) {
-            cJSON *item = cJSON_CreateString(tok);
-            if (!item || tf_json_add_array_item(arr, item) != TF_OK) {
+            if (dsl_add_string_array_item(arr, tok) != TF_OK) {
                 free(copy);
                 return TF_ERROR;
             }
@@ -1402,11 +1414,17 @@ static cJSON *build_select_args(const token_list *tokens, char **error) {
     }
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
+    if (!args || !cols) goto oom;
     for (size_t i = 1; i < tokens->count; i++) {
-        cJSON_AddItemToArray(cols, cJSON_CreateString(tokens->items[i]));
+        if (dsl_add_string_array_item(cols, tokens->items[i]) != TF_OK) goto oom;
     }
-    cJSON_AddItemToObject(args, "columns", cols);
+    if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
     return args;
+oom:
+    cJSON_Delete(args);
+    cJSON_Delete(cols);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_relocate_args(const token_list *tokens, char **error) {
@@ -1418,6 +1436,7 @@ static cJSON *build_relocate_args(const token_list *tokens, char **error) {
 
     cJSON *args = cJSON_CreateObject();
     cJSON *cols = cJSON_CreateArray();
+    if (!args || !cols) goto oom;
     bool has_before = false;
     bool has_after = false;
 
@@ -1427,15 +1446,17 @@ static cJSON *build_relocate_args(const token_list *tokens, char **error) {
             const char *value = strchr(tok, '=') + 1;
             if (*value == '\0') {
                 cJSON_Delete(args);
+                cJSON_Delete(cols);
                 set_error(error, "relocate: before requires a column name");
                 return NULL;
             }
             if (has_after) {
                 cJSON_Delete(args);
+                cJSON_Delete(cols);
                 set_error(error, "relocate: before and after are mutually exclusive");
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "before", value);
+            if (tf_json_add_string(args, "before", value) != TF_OK) goto oom;
             has_before = true;
             continue;
         }
@@ -1443,21 +1464,24 @@ static cJSON *build_relocate_args(const token_list *tokens, char **error) {
             const char *value = strchr(tok, '=') + 1;
             if (*value == '\0') {
                 cJSON_Delete(args);
+                cJSON_Delete(cols);
                 set_error(error, "relocate: after requires a column name");
                 return NULL;
             }
             if (has_before) {
                 cJSON_Delete(args);
+                cJSON_Delete(cols);
                 set_error(error, "relocate: before and after are mutually exclusive");
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "after", value);
+            if (tf_json_add_string(args, "after", value) != TF_OK) goto oom;
             has_after = true;
             continue;
         }
 
         if (add_comma_columns(cols, tok, error, "relocate") != 0) {
             cJSON_Delete(args);
+            cJSON_Delete(cols);
             return NULL;
         }
 
@@ -1465,12 +1489,18 @@ static cJSON *build_relocate_args(const token_list *tokens, char **error) {
 
     if (cJSON_GetArraySize(cols) <= 0) {
         cJSON_Delete(args);
+        cJSON_Delete(cols);
         set_error(error, "relocate requires at least one column name");
         return NULL;
     }
 
-    cJSON_AddItemToObject(args, "columns", cols);
+    if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
     return args;
+oom:
+    cJSON_Delete(args);
+    cJSON_Delete(cols);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_rename_args(const token_list *tokens, char **error) {
@@ -1511,7 +1541,7 @@ static cJSON *build_rename_args(const token_list *tokens, char **error) {
                 return NULL;
             }
             *eq = '\0';
-            if (!cJSON_AddStringToObject(mapping, part, eq + 1)) {
+            if (tf_json_add_string(mapping, part, eq + 1) != TF_OK) {
                 free(copy);
                 cJSON_Delete(mapping);
                 cJSON_Delete(args);
@@ -1523,8 +1553,8 @@ static cJSON *build_rename_args(const token_list *tokens, char **error) {
         free(copy);
     }
 
-    if (!cJSON_AddItemToObject(args, "mapping", mapping)) {
-        cJSON_Delete(mapping);
+    if (tf_json_add_item(args, "mapping", mapping) != TF_OK) {
+        mapping = NULL;
         cJSON_Delete(args);
         set_error(error, "out of memory building rename args");
         return NULL;
@@ -1657,6 +1687,7 @@ static cJSON *build_mapping_args_with_audit(const token_list *tokens, char **err
     if (!args || !mapping) {
         cJSON_Delete(args);
         cJSON_Delete(mapping);
+        set_oom_error_if_unset(error);
         return NULL;
     }
 
@@ -1681,13 +1712,23 @@ static cJSON *build_mapping_args_with_audit(const token_list *tokens, char **err
                 set_error(error, "cast: on_error must be coerce, fail, or null");
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "on_error", value);
+            if (tf_json_add_string(args, "on_error", value) != TF_OK) {
+                cJSON_Delete(args);
+                cJSON_Delete(mapping);
+                set_oom_error_if_unset(error);
+                return NULL;
+            }
             continue;
         }
 
         char *saveptr = NULL;
         char *copy = strdup(tokens->items[i]);
-        if (!copy) { cJSON_Delete(args); cJSON_Delete(mapping); return NULL; }
+        if (!copy) {
+            cJSON_Delete(args);
+            cJSON_Delete(mapping);
+            set_oom_error_if_unset(error);
+            return NULL;
+        }
         char *part = strtok_r(copy, ",", &saveptr);
         while (part) {
             char *eq = strchr(part, '=');
@@ -1699,13 +1740,24 @@ static cJSON *build_mapping_args_with_audit(const token_list *tokens, char **err
                 return NULL;
             }
             *eq = '\0';
-            cJSON_AddStringToObject(mapping, part, eq + 1);
+            if (tf_json_add_string(mapping, part, eq + 1) != TF_OK) {
+                free(copy);
+                cJSON_Delete(args);
+                cJSON_Delete(mapping);
+                set_oom_error_if_unset(error);
+                return NULL;
+            }
             part = strtok_r(NULL, ",", &saveptr);
         }
         free(copy);
     }
 
-    cJSON_AddItemToObject(args, "mapping", mapping);
+    if (tf_json_add_item(args, "mapping", mapping) != TF_OK) {
+        mapping = NULL;
+        cJSON_Delete(args);
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     return args;
 }
 
@@ -1725,7 +1777,7 @@ static cJSON *build_head_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    if (!args || !cJSON_AddNumberToObject(args, "n", n)) {
+    if (!args || tf_json_add_number(args, "n", n) != TF_OK) {
         cJSON_Delete(args);
         set_error(error, "out of memory building head args");
         return NULL;
@@ -1747,7 +1799,7 @@ static cJSON *build_skip_args(const token_list *tokens, char **error) {
         return NULL;
     }
     cJSON *args = cJSON_CreateObject();
-    if (!args || !cJSON_AddNumberToObject(args, "n", n)) {
+    if (!args || tf_json_add_number(args, "n", n) != TF_OK) {
         cJSON_Delete(args);
         set_error(error, "out of memory building skip args");
         return NULL;
@@ -1763,24 +1815,40 @@ static cJSON *build_derive_args(const token_list *tokens, char **error) {
     }
     cJSON *args = cJSON_CreateObject();
     cJSON *columns = cJSON_CreateArray();
+    if (!args || !columns) goto oom;
 
     for (size_t i = 1; i < tokens->count; i++) {
         char *eq = strchr(tokens->items[i], '=');
         if (!eq) {
             cJSON_Delete(args);
+            cJSON_Delete(columns);
             set_errorf(error, "derive: invalid mapping '%s' (expected name=expr)", tokens->items[i]);
             return NULL;
         }
         *eq = '\0';
         cJSON *col = cJSON_CreateObject();
-        cJSON_AddStringToObject(col, "name", tokens->items[i]);
-        cJSON_AddStringToObject(col, "expr", eq + 1);
-        cJSON_AddItemToArray(columns, col);
+        if (!col ||
+            tf_json_add_string(col, "name", tokens->items[i]) != TF_OK ||
+            tf_json_add_string(col, "expr", eq + 1) != TF_OK) {
+            *eq = '=';
+            cJSON_Delete(col);
+            goto oom;
+        }
+        if (tf_json_add_array_item(columns, col) != TF_OK) {
+            *eq = '=';
+            col = NULL;
+            goto oom;
+        }
         *eq = '='; /* restore */
     }
 
-    cJSON_AddItemToObject(args, "columns", columns);
+    if (tf_json_add_item(args, "columns", columns) != TF_OK) { columns = NULL; goto oom; }
     return args;
+oom:
+    cJSON_Delete(args);
+    cJSON_Delete(columns);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 
@@ -1799,10 +1867,17 @@ static int add_comma_values_to_array(cJSON *arr, const char *value, char **error
             return -1;
         }
         char *item = malloc(len + 1);
-        if (!item) return -1;
+        if (!item) {
+            set_oom_error_if_unset(error);
+            return -1;
+        }
         memcpy(item, p, len);
         item[len] = '\0';
-        cJSON_AddItemToArray(arr, cJSON_CreateString(item));
+        if (dsl_add_string_array_item(arr, item) != TF_OK) {
+            free(item);
+            set_oom_error_if_unset(error);
+            return -1;
+        }
         free(item);
         if (!comma) break;
         p = comma + 1;
@@ -1812,7 +1887,10 @@ static int add_comma_values_to_array(cJSON *arr, const char *value, char **error
 
 static cJSON *build_source_name_args(const token_list *tokens, char **error) {
     cJSON *args = cJSON_CreateObject();
-    if (!args) return NULL;
+    if (!args) {
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     int have_result = 0;
     int have_default = 0;
     for (size_t i = 1; i < tokens->count; i++) {
@@ -1827,7 +1905,7 @@ static cJSON *build_source_name_args(const token_list *tokens, char **error) {
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "result", result);
+            if (tf_json_add_string(args, "result", result) != TF_OK) goto oom;
             have_result = 1;
             continue;
         }
@@ -1837,7 +1915,7 @@ static cJSON *build_source_name_args(const token_list *tokens, char **error) {
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "default", tok + 8);
+            if (tf_json_add_string(args, "default", tok + 8) != TF_OK) goto oom;
             have_default = 1;
             continue;
         }
@@ -1847,7 +1925,7 @@ static cJSON *build_source_name_args(const token_list *tokens, char **error) {
                 cJSON_Delete(args);
                 return NULL;
             }
-            cJSON_AddStringToObject(args, "result", tok);
+            if (tf_json_add_string(args, "result", tok) != TF_OK) goto oom;
             have_result = 1;
             continue;
         }
@@ -1856,6 +1934,10 @@ static cJSON *build_source_name_args(const token_list *tokens, char **error) {
         return NULL;
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static cJSON *build_across_args(const token_list *tokens, char **error) {
@@ -1871,6 +1953,7 @@ static cJSON *build_across_args(const token_list *tokens, char **error) {
     cJSON *bare = cJSON_CreateArray();
     if (!args || !cols || !functions || !bare) {
         cJSON_Delete(args); cJSON_Delete(cols); cJSON_Delete(functions); cJSON_Delete(bare);
+        set_oom_error_if_unset(error);
         return NULL;
     }
 
@@ -1892,7 +1975,7 @@ static cJSON *build_across_args(const token_list *tokens, char **error) {
         if (strncmp(tok, "names=", 6) == 0 || strncmp(tok, ".names=", 7) == 0) {
             const char *value = strchr(tok, '=') + 1;
             if (!value[0]) { set_error(error, "across names cannot be empty"); goto fail; }
-            cJSON_AddStringToObject(args, "names", value);
+            if (tf_json_add_string(args, "names", value) != TF_OK) goto oom;
             continue;
         }
         if (strncmp(tok, "replace=", 8) == 0) {
@@ -1901,33 +1984,41 @@ static cJSON *build_across_args(const token_list *tokens, char **error) {
                 set_error(error, "across replace must be true or false");
                 goto fail;
             }
-            cJSON_AddBoolToObject(args, "replace", value);
+            if (tf_json_add_bool(args, "replace", value) != TF_OK) goto oom;
             continue;
         }
-        cJSON_AddItemToArray(bare, cJSON_CreateString(tok));
+        if (dsl_add_string_array_item(bare, tok) != TF_OK) goto oom;
     }
 
     int n_bare = cJSON_GetArraySize(bare);
     if (have_explicit_fn) {
-        for (int i = 0; i < n_bare; i++) cJSON_AddItemToArray(cols, cJSON_Duplicate(cJSON_GetArrayItem(bare, i), 1));
+        for (int i = 0; i < n_bare; i++) {
+            if (dsl_add_array_duplicate(cols, cJSON_GetArrayItem(bare, i)) != TF_OK) goto oom;
+        }
     } else {
         if (n_bare < 2 && cJSON_GetArraySize(cols) == 0) {
             set_error(error, "across compact form requires selector and function");
             goto fail;
         }
         if (n_bare > 0) {
-            for (int i = 0; i < n_bare - 1; i++) cJSON_AddItemToArray(cols, cJSON_Duplicate(cJSON_GetArrayItem(bare, i), 1));
-            cJSON_AddItemToArray(functions, cJSON_Duplicate(cJSON_GetArrayItem(bare, n_bare - 1), 1));
+            for (int i = 0; i < n_bare - 1; i++) {
+                if (dsl_add_array_duplicate(cols, cJSON_GetArrayItem(bare, i)) != TF_OK) goto oom;
+            }
+            if (dsl_add_array_duplicate(functions, cJSON_GetArrayItem(bare, n_bare - 1)) != TF_OK) goto oom;
         }
     }
 
     if (cJSON_GetArraySize(cols) <= 0) { set_error(error, "across requires at least one column selector"); goto fail; }
     if (cJSON_GetArraySize(functions) <= 0) { set_error(error, "across requires at least one function"); goto fail; }
-    cJSON_AddItemToObject(args, "columns", cols);
-    cJSON_AddItemToObject(args, "functions", functions);
+    if (tf_json_add_item(args, "columns", cols) != TF_OK) { cols = NULL; goto oom; }
+    cols = NULL;
+    if (tf_json_add_item(args, "functions", functions) != TF_OK) { functions = NULL; goto oom; }
+    functions = NULL;
     cJSON_Delete(bare);
     return args;
 
+oom:
+    set_oom_error_if_unset(error);
 fail:
     cJSON_Delete(args);
     cJSON_Delete(cols);
@@ -1937,18 +2028,29 @@ fail:
 }
 
 static cJSON *build_stats_args(const token_list *tokens, char **error) {
-    (void)error;
     /* stats [count,sum,avg,min,max] */
     cJSON *args = cJSON_CreateObject();
+    if (!args) {
+        set_oom_error_if_unset(error);
+        return NULL;
+    }
     if (tokens->count >= 2) {
         /* Parse comma-separated stat names */
         cJSON *stats = cJSON_CreateArray();
+        if (!stats) goto oom;
         for (size_t i = 1; i < tokens->count; i++) {
-            cJSON_AddItemToArray(stats, cJSON_CreateString(tokens->items[i]));
+            if (dsl_add_string_array_item(stats, tokens->items[i]) != TF_OK) {
+                cJSON_Delete(stats);
+                goto oom;
+            }
         }
-        cJSON_AddItemToObject(args, "stats", stats);
+        if (tf_json_add_item(args, "stats", stats) != TF_OK) goto oom;
     }
     return args;
+oom:
+    cJSON_Delete(args);
+    set_oom_error_if_unset(error);
+    return NULL;
 }
 
 static int parse_positive_option(const char *tok, const char *name,
@@ -1981,7 +2083,10 @@ static char *trimmed_token_copy(const char *start, size_t len) {
 static int append_category_value(cJSON **cats, const char *start, size_t len,
                                  char **error, const char *op_label) {
     char *value = trimmed_token_copy(start, len);
-    if (!value) return -1;
+    if (!value) {
+        set_oom_error_if_unset(error);
+        return -1;
+    }
     if (value[0] == '\0') {
         free(value);
         set_errorf(error, "%s: empty category", op_label);
@@ -1989,15 +2094,18 @@ static int append_category_value(cJSON **cats, const char *start, size_t len,
     }
     if (!*cats) {
         *cats = cJSON_CreateArray();
-        if (!*cats) { free(value); return -1; }
+        if (!*cats) {
+            free(value);
+            set_oom_error_if_unset(error);
+            return -1;
+        }
     }
-    cJSON *item = cJSON_CreateString(value);
-    free(value);
-    if (!item) return -1;
-    if (!cJSON_AddItemToArray(*cats, item)) {
-        cJSON_Delete(item);
+    if (dsl_add_string_array_item(*cats, value) != TF_OK) {
+        free(value);
+        set_oom_error_if_unset(error);
         return -1;
     }
+    free(value);
     return 0;
 }
 
@@ -3665,13 +3773,20 @@ static int add_comma_columns(cJSON *cols, const char *spec, char **error, const 
         const char *comma = dsl_find_top_level_comma(p, end);
         size_t len = comma ? (size_t)(comma - p) : (size_t)(end - p);
         char *value = trimmed_token_copy(p, len);
-        if (!value) return -1;
+        if (!value) {
+            set_oom_error_if_unset(error);
+            return -1;
+        }
         if (value[0] == '\0') {
             free(value);
             set_errorf(error, "%s: empty column name", op_label);
             return -1;
         }
-        cJSON_AddItemToArray(cols, cJSON_CreateString(value));
+        if (dsl_add_string_array_item(cols, value) != TF_OK) {
+            free(value);
+            set_oom_error_if_unset(error);
+            return -1;
+        }
         free(value);
         if (!comma) break;
         p = comma + 1;

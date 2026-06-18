@@ -253,8 +253,8 @@ publish-python:
 		$(PYTHON) ../scripts/check-csrc-sync.py --mirror py && \
 		rm -rf tranfi/app && cp -r ../app/dist tranfi/app && rm -rf tranfi/app/wasm tranfi/app/lib && \
 		$(PY_BUILD_ENV) $(PYTHON) -m build --sdist && \
-		$(PYTHON) ../scripts/audit-package-artifacts.py --python-sdist "dist/tranfi-*.tar.gz" && \
-		$(PYTHON) ../scripts/smoke-install-packages.py --python-sdist "dist/tranfi-*.tar.gz" --python "$(PYTHON)" && \
+		$(PACKAGE_ENV) $(PYTHON) ../scripts/audit-package-artifacts.py --python-sdist "dist/tranfi-*.tar.gz" && \
+		$(PACKAGE_ENV) $(PYTHON) ../scripts/smoke-install-packages.py --python-sdist "dist/tranfi-*.tar.gz" --python "$(PYTHON)" && \
 		$(TWINE) upload dist/*.tar.gz
 
 publish-node: build-js test-packaging-node-install
