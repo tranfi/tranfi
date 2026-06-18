@@ -81,24 +81,14 @@ static int emit_replace_audit(replace_state *st, const tf_batch *b, size_t row, 
     }
     const char *column_name = b->col_names[col] ? b->col_names[col] : "";
     if (tf_json_add_string(obj, "column", column_name) != TF_OK) goto done;
-    char pattern_buf[256];
-    char replacement_buf[256];
-    char before_buf[256];
-    char after_buf[256];
-    const char *safe_pattern = tf_audit_format_string_for_column(&st->audit_opts, column_name,
-                                                                 st->pattern, pattern_buf, sizeof(pattern_buf));
-    const char *safe_replacement = tf_audit_format_string_for_column(&st->audit_opts, column_name,
-                                                                     st->replacement, replacement_buf, sizeof(replacement_buf));
-    if (tf_json_add_string(obj, "pattern", safe_pattern ? safe_pattern : "") != TF_OK ||
-        tf_json_add_string(obj, "replacement", safe_replacement ? safe_replacement : "") != TF_OK ||
+    if (tf_json_add_audit_string(obj, "pattern", &st->audit_opts, column_name, st->pattern) != TF_OK ||
+        tf_json_add_audit_string(obj, "replacement", &st->audit_opts, column_name, st->replacement) != TF_OK ||
         tf_json_add_bool(obj, "regex", st->use_regex ? 1 : 0) != TF_OK ||
         tf_json_add_number(obj, "row", (double)row_no) != TF_OK) {
         goto done;
     }
-    const char *safe_before = tf_audit_format_string_for_column(&st->audit_opts, column_name, before, before_buf, sizeof(before_buf));
-    const char *safe_after = tf_audit_format_string_for_column(&st->audit_opts, column_name, after, after_buf, sizeof(after_buf));
-    if (tf_json_add_string(obj, "before", safe_before ? safe_before : "") != TF_OK ||
-        tf_json_add_string(obj, "after", safe_after ? safe_after : "") != TF_OK) {
+    if (tf_json_add_audit_string(obj, "before", &st->audit_opts, column_name, before) != TF_OK ||
+        tf_json_add_audit_string(obj, "after", &st->audit_opts, column_name, after) != TF_OK) {
         goto done;
     }
     cJSON *row_obj = tf_audit_row_to_json(b, row, &st->audit_opts);

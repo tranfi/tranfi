@@ -177,11 +177,9 @@ static int emit_cast_audit(cast_state *st, const tf_batch *before_b, const tf_ba
         goto done;
     }
     if (src_t == TF_TYPE_STRING && !tf_batch_is_null(before_b, row, col)) {
-        char actual_buf[256];
-        const char *actual = tf_audit_format_string_for_column(&st->audit_opts, column_name,
-                                                               tf_batch_get_string(before_b, row, col),
-                                                               actual_buf, sizeof(actual_buf));
-        if (tf_json_add_string(obj, "actual", actual ? actual : "") != TF_OK) goto done;
+        if (tf_json_add_audit_string(obj, "actual", &st->audit_opts, column_name,
+                                     tf_batch_get_string(before_b, row, col)) != TF_OK)
+            goto done;
     }
     if (tf_json_add_string(obj, "action", "cast") != TF_OK ||
         tf_json_add_number(obj, "row", (double)row_no) != TF_OK) {

@@ -148,10 +148,8 @@ static int normalize_add_audit_number(cJSON *obj, const char *key,
                                       const char *column, double value) {
     if (opts && (tf_audit_column_is_redacted(opts, column) || tf_audit_column_is_hashed(opts, column))) {
         char raw[128];
-        char safe_buf[256];
         if (tf_format_float64(raw, sizeof(raw), value) != TF_OK) return TF_ERROR;
-        const char *safe = tf_audit_format_string_for_column(opts, column, raw, safe_buf, sizeof(safe_buf));
-        return tf_json_add_string(obj, key, safe ? safe : "");
+        return tf_json_add_audit_string(obj, key, opts, column, raw);
     }
     return tf_json_add_number(obj, key, value);
 }

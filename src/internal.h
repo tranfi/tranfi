@@ -260,6 +260,14 @@ int  tf_audit_column_is_hashed(const tf_audit_options *opts, const char *column)
 int  tf_audit_hash_string(const char *value, char *out, size_t out_size);
 const char *tf_audit_format_string_for_column(const tf_audit_options *opts, const char *column,
                                               const char *value, char *buf, size_t buf_size);
+TF_WARN_UNUSED char *tf_audit_format_string_dup_for_column(const tf_audit_options *opts,
+                                                           const char *column,
+                                                           const char *value);
+cJSON *tf_audit_string_to_json_for_column(const tf_audit_options *opts, const char *column,
+                                          const char *value);
+TF_WARN_UNUSED int tf_json_add_audit_string(cJSON *obj, const char *name,
+                                            const tf_audit_options *opts,
+                                            const char *column, const char *value);
 cJSON *tf_audit_cell_to_json(const tf_batch *b, size_t row, size_t col, const tf_audit_options *opts);
 cJSON *tf_audit_row_to_json(const tf_batch *b, size_t row, const tf_audit_options *opts);
 

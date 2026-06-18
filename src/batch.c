@@ -781,10 +781,54 @@ const char *tf_audit_format_string_for_column(const tf_audit_options *opts, cons
     return src;
 }
 
+cJSON *tf_audit_string_to_json_for_column(const tf_audit_options *opts, const char *column,
+                                          const char *value) {
+    char *safe = tf_audit_format_string_dup_for_column(opts, column, value);
+    if (!safe) return NULL;
+    cJSON *item = cJSON_CreateString(safe);
+    free(safe);
+    return item;
+}
+
+char *tf_audit_format_string_dup_for_column(const tf_audit_options *opts,
+                                            const char *column,
+                                            const char *value) {
+    const char *src = value ? value : "";
+    if (!opts) return tf_strdup_checked(src);
+    if (tf_audit_column_is_redacted(opts, column)) return tf_strdup_checked("[REDACTED]");
+    if (tf_audit_column_is_hashed(opts, column)) {
+        char hash[32];
+        if (tf_audit_hash_string(src, hash, sizeof(hash)) != TF_OK) return tf_strdup_checked("[HASHED]");
+        return tf_strdup_checked(hash);
+    }
+    if (opts->max_cell_bytes > 0 && strlen(src) > opts->max_cell_bytes) {
+        size_t payload_len = opts->max_cell_bytes;
+        size_t with_ellipsis = 0;
+        size_t alloc_len = 0;
+        if (tf_size_add(payload_len, 3, &with_ellipsis) != TF_OK ||
+            tf_size_add(with_ellipsis, 1, &alloc_len) != TF_OK) {
+            return NULL;
+        }
+        char *out = tf_mallocarray_checked(alloc_len, sizeof(char));
+        if (!out) return NULL;
+        if (payload_len > 0) memcpy(out, src, payload_len);
+        memcpy(out + payload_len, "...", 3);
+        out[with_ellipsis] = '\0';
+        return out;
+    }
+    return tf_strdup_checked(src);
+}
+
+int tf_json_add_audit_string(cJSON *obj, const char *name,
+                             const tf_audit_options *opts,
+                             const char *column, const char *value) {
+    cJSON *item = tf_audit_string_to_json_for_column(opts, column, value);
+    if (!item) return TF_ERROR;
+    return tf_json_add_item(obj, name, item);
+}
+
 static cJSON *audit_string_json(const tf_audit_options *opts, const char *column, const char *value) {
-    char buf[256];
-    const char *safe = tf_audit_format_string_for_column(opts, column, value, buf, sizeof(buf));
-    return cJSON_CreateString(safe ? safe : "");
+    return tf_audit_string_to_json_for_column(opts, column, value);
 }
 
 cJSON *tf_audit_cell_to_json(const tf_batch *b, size_t row, size_t col, const tf_audit_options *opts) {

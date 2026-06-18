@@ -922,11 +922,24 @@ int main(void) {
         "csv batch_size=1 | stats distinct,hist,sample | csv",
         people,
         520);
+    char large_audit_cell[401];
+    memset(large_audit_cell, 'x', 400);
+    large_audit_cell[400] = '\0';
+    char large_audit_rows[512];
+    int large_audit_n = snprintf(large_audit_rows, sizeof(large_audit_rows),
+                                 "note\n%s\n", large_audit_cell);
+    assert(large_audit_n > 0 && (size_t)large_audit_n < sizeof(large_audit_rows));
     run_case_no_silent_channel_oom(
         "filter_audit_side_channel_materialization",
         "csv batch_size=1 | filter \"col(age) >= 30\" audit audit_limit=2 | csv",
         people,
         360);
+    run_case_no_silent_channel_oom(
+        "audit_large_cell_cap_side_channel_materialization",
+        "csv batch_size=1 | filter \"false\" audit audit_limit=1 "
+        "audit_max_cell_bytes=300 | csv",
+        large_audit_rows,
+        420);
     run_case_no_silent_channel_oom(
         "quality_side_channel_materialization",
         "csv batch_size=1 | validate \"col(age) > 25\" audit audit_limit=2 | "

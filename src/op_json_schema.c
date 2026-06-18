@@ -294,11 +294,8 @@ static int emit_json_schema_audit(json_schema_state *st, const tf_batch *b, size
         tf_json_add_string(obj, "column", st->column ? st->column : "_line") != TF_OK) {
         goto done;
     }
-    char actual_buf[256];
-    if (tf_json_add_string(obj, "actual",
-                           tf_audit_format_string_for_column(&st->audit_opts, st->column,
-                                                             actual ? actual : "schema_mismatch",
-                                                             actual_buf, sizeof(actual_buf))) != TF_OK ||
+    if (tf_json_add_audit_string(obj, "actual", &st->audit_opts, st->column,
+                                 actual ? actual : "schema_mismatch") != TF_OK ||
         tf_json_add_number(obj, "row", (double)st->row_index) != TF_OK) {
         goto done;
     }

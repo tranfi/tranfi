@@ -580,17 +580,21 @@ static char *csv_raw_preview(const csv_decoder_state *st, const char *line, size
 
 static int csv_add_raw_payload(csv_decoder_state *st, cJSON *obj, const char *raw, int truncated) {
     if (st && st->audit_opts.include_row) {
-        char raw_buf[256];
-        const char *safe_raw = tf_audit_format_string_for_column(&st->audit_opts, "raw", raw, raw_buf, sizeof(raw_buf));
-        if (st->audit_opts.max_bytes > 0 && safe_raw && strlen(safe_raw) > st->audit_opts.max_bytes) {
+        char *safe_raw = tf_audit_format_string_dup_for_column(&st->audit_opts, "raw", raw);
+        if (!safe_raw) return TF_ERROR;
+        if (st->audit_opts.max_bytes > 0 && strlen(safe_raw) > st->audit_opts.max_bytes) {
             if (tf_json_add_bool(obj, "_audit_truncated", 1) != TF_OK ||
                 tf_json_add_number(obj, "max_bytes", (double)st->audit_opts.max_bytes) != TF_OK) {
+                free(safe_raw);
                 return TF_ERROR;
             }
         } else {
-            if (tf_json_add_string(obj, "raw", safe_raw ? safe_raw : "") != TF_OK)
+            if (tf_json_add_string(obj, "raw", safe_raw) != TF_OK) {
+                free(safe_raw);
                 return TF_ERROR;
+            }
         }
+        free(safe_raw);
     }
     if (truncated && tf_json_add_bool(obj, "truncated", 1) != TF_OK) return TF_ERROR;
     return TF_OK;

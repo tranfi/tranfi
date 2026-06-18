@@ -686,10 +686,7 @@ static int emit_failure(schema_state *st, const char *rule, const char *column,
     if (column && tf_json_add_string(obj, "column", column) != TF_OK) goto done;
     if (expected && tf_json_add_string(obj, "expected", expected) != TF_OK) goto done;
     if (actual) {
-        char actual_buf[256];
-        if (tf_json_add_string(obj, "actual",
-                               tf_audit_format_string_for_column(&st->audit_opts, column, actual,
-                                                                 actual_buf, sizeof(actual_buf))) != TF_OK) {
+        if (tf_json_add_audit_string(obj, "actual", &st->audit_opts, column, actual) != TF_OK) {
             goto done;
         }
     }
@@ -732,10 +729,7 @@ static int emit_schema_audit(schema_state *st, const char *rule, const char *col
     if (column && tf_json_add_string(obj, "column", column) != TF_OK) goto done;
     if (expected && tf_json_add_string(obj, "expected", expected) != TF_OK) goto done;
     if (actual) {
-        char actual_buf[256];
-        if (tf_json_add_string(obj, "actual",
-                               tf_audit_format_string_for_column(&st->audit_opts, column, actual,
-                                                                 actual_buf, sizeof(actual_buf))) != TF_OK) {
+        if (tf_json_add_audit_string(obj, "actual", &st->audit_opts, column, actual) != TF_OK) {
             goto done;
         }
     }

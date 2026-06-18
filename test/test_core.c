@@ -8527,6 +8527,64 @@ static void test_pipeline_schema_audit_privacy_controls(void) {
     tf_ir_plan_free(parsed);
 }
 
+static void test_pipeline_audit_max_cell_bytes_large_cap(void) {
+    char long_x[401];
+    char long_y[401];
+    memset(long_x, 'x', 400);
+    long_x[400] = '\0';
+    memset(long_y, 'y', 400);
+    long_y[400] = '\0';
+
+    char expected_x[304];
+    char expected_y[304];
+    memset(expected_x, 'x', 300);
+    memcpy(expected_x + 300, "...", 4);
+    memset(expected_y, 'y', 300);
+    memcpy(expected_y + 300, "...", 4);
+
+    char input[512];
+    int n_input = snprintf(input, sizeof(input), "note\n%s\n", long_x);
+    assert(n_input > 0 && (size_t)n_input < sizeof(input));
+
+    const char *filter_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"filter\",\"args\":{\"expr\":\"false\",\"audit\":true,\"audit_limit\":1,\"audit_max_cell_bytes\":300}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    tf_pipeline *p = tf_pipeline_create(filter_plan, strlen(filter_plan));
+    assert(p != NULL);
+    assert(tf_pipeline_push(p, (const uint8_t *)input, strlen(input)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    uint8_t buf[8192];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_STATS, buf, sizeof(buf) - 1);
+    assert(n > 0);
+    buf[n] = '\0';
+    assert(strstr((char *)buf, "\"event\":\"row_dropped\"") != NULL);
+    assert(strstr((char *)buf, expected_x) != NULL);
+    tf_pipeline_free(p);
+
+    const char *replace_plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+        "{\"op\":\"replace\",\"args\":{\"column\":\"note\",\"pattern\":\"x\",\"replacement\":\"y\",\"audit\":true,\"audit_limit\":1,\"audit_max_cell_bytes\":300}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+        "]}";
+    p = tf_pipeline_create(replace_plan, strlen(replace_plan));
+    assert(p != NULL);
+    assert(tf_pipeline_push(p, (const uint8_t *)input, strlen(input)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    n = tf_pipeline_pull(p, TF_CHAN_STATS, buf, sizeof(buf) - 1);
+    assert(n > 0);
+    buf[n] = '\0';
+    assert(strstr((char *)buf, "\"op\":\"replace\"") != NULL);
+    assert(strstr((char *)buf, "\"before\"") != NULL);
+    assert(strstr((char *)buf, expected_x) != NULL);
+    assert(strstr((char *)buf, "\"after\"") != NULL);
+    assert(strstr((char *)buf, expected_y) != NULL);
+    tf_pipeline_free(p);
+}
+
 static void test_pipeline_audit_privacy_migrated_producers(void) {
     const char *csv = "name,ssn,age\nAlice,111-22-3333,20\nBob,222-33-4444,40\n";
     uint8_t buf[8192];
@@ -13736,6 +13794,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_schema_selectors);
     TEST(test_pipeline_schema_regex_budgets);
     TEST(test_pipeline_schema_audit_privacy_controls);
+    TEST(test_pipeline_audit_max_cell_bytes_large_cap);
     TEST(test_pipeline_audit_privacy_migrated_producers);
     TEST(test_selector_depth_limit);
     TEST(test_json_path_depth_limit);
