@@ -181,28 +181,35 @@ static void step_destroy(tf_step *self) {
     free(self);
 }
 
+static char *step_default_result_name(const char *column, const char *func) {
+    char *suffix = tf_string_append_suffix_checked("_", func);
+    if (!suffix) return NULL;
+    char *result = tf_string_append_suffix_checked(column, suffix);
+    free(suffix);
+    return result;
+}
+
 tf_step *tf_step_create(const cJSON *args) {
     if (!args) return NULL;
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     cJSON *func_j = cJSON_GetObjectItemCaseSensitive(args, "func");
     if (!cJSON_IsString(col_j) || !cJSON_IsString(func_j)) return NULL;
 
-    step_state *st = calloc(1, sizeof(step_state));
+    step_state *st = tf_callocarray_checked(1, sizeof(step_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
+    if (!st->column) { free(st); return NULL; }
     st->func = parse_func(func_j->valuestring);
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {
-        st->result = strdup(res_j->valuestring);
+        st->result = tf_strdup_checked(res_j->valuestring);
     } else {
-        /* Default result name */
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_%s", st->column, func_j->valuestring);
-        st->result = strdup(buf);
+        st->result = step_default_result_name(st->column, func_j->valuestring);
     }
+    if (!st->result) { free(st->column); free(st); return NULL; }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st); return NULL; }
     step->process = step_process;
     step->flush = step_flush;

@@ -364,6 +364,12 @@ int main(void) {
             520
         },
         {
+            "generated_suffix_constructor_args",
+            "csv batch_size=1 | ewma score 0.5 | anomaly score 2 | diff score | step score running-sum | rolling-sum score 2 | rolling-mean score 2 | rolling-min score 2 | rolling-max score 2 | rolling-any active 2 | label-encode city max_categories=8 | csv",
+            people,
+            760
+        },
+        {
             "csv_strict_good_rows",
             "csv batch_size=1 mode=strict max_record_bytes=96 max_columns=16 | csv",
             people,

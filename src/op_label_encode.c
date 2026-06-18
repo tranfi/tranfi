@@ -115,7 +115,7 @@ static int assign_entry(label_encode_state *st, const char *val) {
         st->entries = tmp;
         st->cap = newcap;
     }
-    char *value = strdup(val);
+    char *value = tf_strdup_checked(val);
     if (!value) return -1;
     st->entries[st->n_entries].value = value;
     st->entries[st->n_entries].label = st->next_label++;
@@ -323,19 +323,17 @@ tf_step *tf_label_encode_create(const cJSON *args) {
     cJSON *col_j = cJSON_GetObjectItemCaseSensitive(args, "column");
     if (!cJSON_IsString(col_j)) return NULL;
 
-    label_encode_state *st = calloc(1, sizeof(label_encode_state));
+    label_encode_state *st = tf_callocarray_checked(1, sizeof(label_encode_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { label_encode_state_free(st); return NULL; }
     st->unknown = TF_CAT_UNKNOWN_ADD;
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {
-        st->result = strdup(res_j->valuestring);
+        st->result = tf_strdup_checked(res_j->valuestring);
     } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_encoded", st->column);
-        st->result = strdup(buf);
+        st->result = tf_string_append_suffix_checked(st->column, "_encoded");
     }
     if (!st->result) { label_encode_state_free(st); return NULL; }
 
@@ -410,7 +408,7 @@ tf_step *tf_label_encode_create(const cJSON *args) {
         }
     }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { label_encode_state_free(st); return NULL; }
     step->process = label_encode_process;
     step->flush = label_encode_flush;

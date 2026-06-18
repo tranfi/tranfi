@@ -12041,6 +12041,12 @@ static int csv_header_has_exact(const char *output, const char *name) {
     return 0;
 }
 
+static void assert_csv_header_has_suffix(const char *output, const char *column, const char *suffix) {
+    char expected[384];
+    int n = snprintf(expected, sizeof(expected), "%s%s", column, suffix);
+    assert(n > 0 && (size_t)n < sizeof(expected));
+    assert(csv_header_has_exact(output, expected));
+}
 
 static void test_pipeline_unique_sorted(void) {
     char out[2048];
@@ -12262,16 +12268,54 @@ static void test_pipeline_suffix_ops_preserve_long_default_names(void) {
     char out[4096];
     run_plan_chunked(plan, input, 11, out, sizeof(out));
 
-    char expected[320];
-    n = snprintf(expected, sizeof(expected), "%s_bin", col);
-    assert(n > 0 && (size_t)n < sizeof(expected));
-    assert(csv_header_has_exact(out, expected));
-    n = snprintf(expected, sizeof(expected), "%s_lag", col);
-    assert(n > 0 && (size_t)n < sizeof(expected));
-    assert(csv_header_has_exact(out, expected));
-    n = snprintf(expected, sizeof(expected), "%s_lead", col);
-    assert(n > 0 && (size_t)n < sizeof(expected));
-    assert(csv_header_has_exact(out, expected));
+    assert_csv_header_has_suffix(out, col, "_bin");
+    assert_csv_header_has_suffix(out, col, "_lag");
+    assert_csv_header_has_suffix(out, col, "_lead");
+}
+
+static void test_pipeline_generated_suffix_ops_preserve_long_default_names(void) {
+    char num_col[301];
+    char str_col[301];
+    memset(num_col, 'n', sizeof(num_col) - 1);
+    memset(str_col, 's', sizeof(str_col) - 1);
+    num_col[sizeof(num_col) - 1] = '\0';
+    str_col[sizeof(str_col) - 1] = '\0';
+
+    char input[1024];
+    int n = snprintf(input, sizeof(input),
+                     "%s,%s,flag\n"
+                     "10,A,true\n"
+                     "20,B,false\n"
+                     "30,A,true\n",
+                     num_col, str_col);
+    assert(n > 0 && (size_t)n < sizeof(input));
+
+    char plan[8192];
+    n = snprintf(plan, sizeof(plan),
+                 "{\"steps\":["
+                 "{\"op\":\"codec.csv.decode\",\"args\":{\"batch_size\":1}},"
+                 "{\"op\":\"ewma\",\"args\":{\"column\":\"%s\",\"alpha\":0.5}},"
+                 "{\"op\":\"anomaly\",\"args\":{\"column\":\"%s\",\"threshold\":2}},"
+                 "{\"op\":\"diff\",\"args\":{\"column\":\"%s\",\"order\":1}},"
+                 "{\"op\":\"step\",\"args\":{\"column\":\"%s\",\"func\":\"running-sum\"}},"
+                 "{\"op\":\"rolling-sum\",\"args\":{\"column\":\"%s\",\"size\":2}},"
+                 "{\"op\":\"rolling-any\",\"args\":{\"column\":\"flag\",\"size\":2}},"
+                 "{\"op\":\"label-encode\",\"args\":{\"column\":\"%s\",\"max_categories\":8}},"
+                 "{\"op\":\"codec.csv.encode\",\"args\":{}}"
+                 "]}",
+                 num_col, num_col, num_col, num_col, num_col, str_col);
+    assert(n > 0 && (size_t)n < sizeof(plan));
+
+    char out[8192];
+    run_plan_chunked(plan, input, 13, out, sizeof(out));
+
+    assert_csv_header_has_suffix(out, num_col, "_ewma");
+    assert_csv_header_has_suffix(out, num_col, "_anomaly");
+    assert_csv_header_has_suffix(out, num_col, "_diff");
+    assert_csv_header_has_suffix(out, num_col, "_running-sum");
+    assert_csv_header_has_suffix(out, num_col, "_sum2");
+    assert(csv_header_has_exact(out, "flag_any2"));
+    assert_csv_header_has_suffix(out, str_col, "_encoded");
 }
 
 static void test_pipeline_rleid(void) {
@@ -13071,6 +13115,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_lag_preserves_string_type);
     TEST(test_pipeline_shift_lead_large_offset_chunks);
     TEST(test_pipeline_suffix_ops_preserve_long_default_names);
+    TEST(test_pipeline_generated_suffix_ops_preserve_long_default_names);
     TEST(test_pipeline_rleid);
     TEST(test_pipeline_ewma);
     TEST(test_pipeline_h14_numeric_missing_type_policies);

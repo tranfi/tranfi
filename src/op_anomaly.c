@@ -217,9 +217,9 @@ tf_step *tf_anomaly_create(const cJSON *args) {
         return NULL;
     }
 
-    anomaly_state *st = calloc(1, sizeof(anomaly_state));
+    anomaly_state *st = tf_callocarray_checked(1, sizeof(anomaly_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     if (!st->column) { free(st); return NULL; }
 
     cJSON *thresh_j = cJSON_GetObjectItemCaseSensitive(args, "threshold");
@@ -239,15 +239,13 @@ tf_step *tf_anomaly_create(const cJSON *args) {
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {
-        st->result = strdup(res_j->valuestring);
+        st->result = tf_strdup_checked(res_j->valuestring);
     } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_anomaly", st->column);
-        st->result = strdup(buf);
+        st->result = tf_string_append_suffix_checked(st->column, "_anomaly");
     }
     if (!st->result) { free(st->column); free(st); return NULL; }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st); return NULL; }
     step->process = anomaly_process;
     step->flush = anomaly_flush;

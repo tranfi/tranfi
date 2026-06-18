@@ -63,6 +63,22 @@ static const char *window_label(const window_state *st) {
     return (st && st->op_label) ? st->op_label : "window";
 }
 
+static char *window_default_result_name(const char *column, const char *func, size_t size) {
+    char size_buf[32];
+    int n = snprintf(size_buf, sizeof(size_buf), "%zu", size);
+    if (n < 0 || (size_t)n >= sizeof(size_buf)) return NULL;
+
+    char *func_suffix = tf_string_append_suffix_checked("_", func);
+    if (!func_suffix) return NULL;
+    char *full_suffix = tf_string_append_suffix_checked(func_suffix, size_buf);
+    free(func_suffix);
+    if (!full_suffix) return NULL;
+
+    char *result = tf_string_append_suffix_checked(column, full_suffix);
+    free(full_suffix);
+    return result;
+}
+
 static void window_set_col_error(const window_state *st, const char *suffix) {
     char msg[512];
     snprintf(msg, sizeof(msg), "%s: column '%s' %s", window_label(st), st && st->column ? st->column : "", suffix);
@@ -476,23 +492,22 @@ static tf_step *tf_rolling_bool_create(const cJSON *args, bool_roll_func func) {
     bool_null_policy nulls;
     if (parse_bool_null_policy(args, &nulls) != TF_OK) return NULL;
 
-    bool_window_state *st = calloc(1, sizeof(bool_window_state));
+    bool_window_state *st = tf_callocarray_checked(1, sizeof(bool_window_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
+    st->column = tf_strdup_checked(col_j->valuestring);
     st->func = func;
     st->nulls = nulls;
     st->size = win_size;
-    st->values = calloc(win_size, sizeof(uint8_t));
-    st->is_null = calloc(win_size, sizeof(uint8_t));
+    st->values = tf_callocarray_checked(win_size, sizeof(uint8_t));
+    st->is_null = tf_callocarray_checked(win_size, sizeof(uint8_t));
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {
-        st->result = strdup(res_j->valuestring);
+        st->result = tf_strdup_checked(res_j->valuestring);
     } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_%s%zu", st->column,
-                 func == BOOL_ROLL_ANY ? "any" : "all", win_size);
-        st->result = strdup(buf);
+        st->result = window_default_result_name(st->column,
+                                                func == BOOL_ROLL_ANY ? "any" : "all",
+                                                win_size);
     }
 
     if (!st->column || !st->result || !st->values || !st->is_null) {
@@ -500,7 +515,7 @@ static tf_step *tf_rolling_bool_create(const cJSON *args, bool_roll_func func) {
         return NULL;
     }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st->values); free(st->is_null); free(st); return NULL; }
     step->process = bool_window_process;
     step->flush = bool_window_flush;
@@ -543,13 +558,13 @@ tf_step *tf_window_create(const cJSON *args) {
         return NULL;
     }
 
-    window_state *st = calloc(1, sizeof(window_state));
+    window_state *st = tf_callocarray_checked(1, sizeof(window_state));
     if (!st) return NULL;
-    st->column = strdup(col_j->valuestring);
-    st->op_label = strdup(label);
+    st->column = tf_strdup_checked(col_j->valuestring);
+    st->op_label = tf_strdup_checked(label);
     st->func = func;
     st->size = win_size;
-    st->ring = calloc(win_size, sizeof(double));
+    st->ring = tf_callocarray_checked(win_size, sizeof(double));
     if (!st->column || !st->op_label || !st->ring) {
         free(st->column); free(st->op_label); free(st->ring); free(st); return NULL;
     }
@@ -560,16 +575,13 @@ tf_step *tf_window_create(const cJSON *args) {
 
     cJSON *res_j = cJSON_GetObjectItemCaseSensitive(args, "result");
     if (cJSON_IsString(res_j)) {
-        st->result = strdup(res_j->valuestring);
+        st->result = tf_strdup_checked(res_j->valuestring);
     } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s_%s%zu", st->column,
-                 func_j->valuestring, win_size);
-        st->result = strdup(buf);
+        st->result = window_default_result_name(st->column, func_j->valuestring, win_size);
     }
     if (!st->result) { free(st->column); free(st->op_label); free(st->ring); free(st); return NULL; }
 
-    tf_step *step = calloc(1, sizeof(tf_step));
+    tf_step *step = tf_callocarray_checked(1, sizeof(tf_step));
     if (!step) { free(st->column); free(st->result); free(st->op_label); free(st->ring); free(st); return NULL; }
     step->process = window_process;
     step->flush = window_flush;
