@@ -404,6 +404,271 @@ static tf_transform_code session_check_totals(
     return tf_transform_poll_cancel(runtime, error);
 }
 
+static int recipe_uses_median(const tf_transform_recipe *recipe) {
+    if (!recipe) return 0;
+    for (size_t i = 0; i < recipe->column_count; ++i)
+        if (recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN) return 1;
+    return 0;
+}
+
+static void median_store_clear(tf_transform_median_store *store) {
+    if (!store) return;
+    for (size_t i = 0; i < store->block_count; ++i) free(store->blocks[i]);
+    free(store->blocks);
+    memset(store, 0, sizeof(*store));
+}
+
+static void analyzer_median_stores_clear(tf_transform_analyzer *analyzer) {
+    if (!analyzer || !analyzer->median_stores) return;
+    for (size_t i = 0; i < analyzer->input_schema.field_count; ++i)
+        median_store_clear(&analyzer->median_stores[i]);
+    free(analyzer->median_stores);
+    analyzer->median_stores = NULL;
+}
+
+static tf_transform_code analyzer_allocate_retained(
+    tf_transform_analyzer *analyzer, size_t bytes, void **out,
+    tf_transform_error **error) {
+    void *allocated;
+    tf_transform_code code;
+    if (out) *out = NULL;
+    if (!analyzer || !out || bytes == 0)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "invalid median retained-state allocation");
+    if ((uint64_t)bytes > analyzer->runtime.limits.max_allocation_bytes
+        || analyzer->allocation_count == UINT64_MAX
+        || analyzer->allocation_count + 1
+            > analyzer->runtime.limits.max_allocations_per_session
+        || analyzer->resident_state_bytes > UINT64_MAX - (uint64_t)bytes
+        || analyzer->resident_state_bytes + (uint64_t)bytes
+            > analyzer->runtime.limits.max_resident_state_bytes)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "median retained state exceeds analyzer limits");
+    code = poll_and_recheck(&analyzer->runtime, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    allocated = malloc(bytes);
+    if (!allocated)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_ALLOCATION,
+            "median retained-state allocation failed");
+    ++analyzer->allocation_count;
+    analyzer->resident_state_bytes += (uint64_t)bytes;
+    *out = allocated;
+    return TF_TRANSFORM_OK;
+}
+
+static tf_transform_code median_store_grow_index(
+    tf_transform_analyzer *analyzer, tf_transform_median_store *store,
+    size_t required, tf_transform_error **error) {
+    size_t maximum;
+    size_t capacity;
+    size_t bytes;
+    size_t old_bytes;
+    uint64_t maximum_u64;
+    double **blocks = NULL;
+    tf_transform_code code;
+    if (required <= store->block_capacity) return TF_TRANSFORM_OK;
+    maximum_u64 = analyzer->runtime.limits.max_allocation_bytes
+        / sizeof(*blocks);
+    maximum = maximum_u64 > (uint64_t)SIZE_MAX
+        ? SIZE_MAX : (size_t)maximum_u64;
+    if (required > maximum)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "median block index exceeds allocation limit");
+    capacity = store->block_capacity == 0 ? 4 : store->block_capacity;
+    if (capacity > maximum) capacity = maximum;
+    while (capacity < required) {
+        if (capacity > maximum / 2) {
+            capacity = maximum;
+            break;
+        }
+        capacity *= 2;
+    }
+    if (capacity < required || capacity > SIZE_MAX / sizeof(*blocks))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "median block index size overflows");
+    bytes = capacity * sizeof(*blocks);
+    code = analyzer_allocate_retained(
+        analyzer, bytes, (void **)&blocks, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    old_bytes = store->block_capacity * sizeof(*blocks);
+    if (store->block_count != 0) {
+        code = tf_transform_copy_bytes_runtime(
+            blocks, store->blocks,
+            store->block_count * sizeof(*blocks),
+            &analyzer->runtime, error);
+        if (code != TF_TRANSFORM_OK) {
+            free(blocks);
+            analyzer->resident_state_bytes -= (uint64_t)bytes;
+            return code;
+        }
+    }
+    free(store->blocks);
+    analyzer->resident_state_bytes -= (uint64_t)old_bytes;
+    store->blocks = blocks;
+    store->block_capacity = capacity;
+    return TF_TRANSFORM_OK;
+}
+
+static tf_transform_code median_store_append(
+    tf_transform_analyzer *analyzer, tf_transform_median_store *store,
+    double value, tf_transform_error **error) {
+    uint64_t block_index_u64;
+    size_t block_index;
+    size_t offset;
+    size_t block_bytes;
+    double *block = NULL;
+    tf_transform_code code;
+    if (!store || store->values_per_block == 0 || store->count == UINT64_MAX)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "median retained-value count exceeds limits");
+    block_index_u64 = store->count / (uint64_t)store->values_per_block;
+    if (block_index_u64 > SIZE_MAX)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "median block index overflows");
+    block_index = (size_t)block_index_u64;
+    offset = (size_t)(store->count % (uint64_t)store->values_per_block);
+    if (block_index == store->block_count) {
+        if (store->block_count == SIZE_MAX)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "median block count overflows");
+        code = median_store_grow_index(
+            analyzer, store, store->block_count + 1, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        block_bytes = store->values_per_block * sizeof(*block);
+        code = analyzer_allocate_retained(
+            analyzer, block_bytes, (void **)&block, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        store->blocks[store->block_count++] = block;
+    } else if (block_index > store->block_count) {
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "median retained-value block sequence is invalid");
+    }
+    store->blocks[block_index][offset] = value;
+    ++store->count;
+    return TF_TRANSFORM_OK;
+}
+
+static double median_store_get(
+    const tf_transform_median_store *store, uint64_t index) {
+    size_t block_index = (size_t)(index / (uint64_t)store->values_per_block);
+    size_t offset = (size_t)(index % (uint64_t)store->values_per_block);
+    return store->blocks[block_index][offset];
+}
+
+static void median_store_set(
+    tf_transform_median_store *store, uint64_t index, double value) {
+    size_t block_index = (size_t)(index / (uint64_t)store->values_per_block);
+    size_t offset = (size_t)(index % (uint64_t)store->values_per_block);
+    store->blocks[block_index][offset] = value;
+}
+
+static int median_value_compare(double left, double right) {
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+}
+
+static tf_transform_code median_sort_tick(
+    const tf_transform_runtime_copy *runtime, size_t *ticks,
+    tf_transform_error **error) {
+    ++*ticks;
+    if (*ticks < TF_TRANSFORM_CANCEL_ITERS_V1) return TF_TRANSFORM_OK;
+    *ticks = 0;
+    return poll_and_recheck(runtime, error);
+}
+
+static tf_transform_code median_store_sift_down(
+    tf_transform_median_store *store, uint64_t root, uint64_t end,
+    const tf_transform_runtime_copy *runtime, size_t *ticks,
+    tf_transform_error **error) {
+    if (end == 0) return TF_TRANSFORM_OK;
+    while (root <= (end - 1) / 2) {
+        uint64_t child = root * 2 + 1;
+        uint64_t candidate = root;
+        tf_transform_code code = median_sort_tick(runtime, ticks, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        if (median_value_compare(
+                median_store_get(store, candidate),
+                median_store_get(store, child)) < 0)
+            candidate = child;
+        if (child < end) {
+            code = median_sort_tick(runtime, ticks, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            if (median_value_compare(
+                    median_store_get(store, candidate),
+                    median_store_get(store, child + 1)) < 0)
+                candidate = child + 1;
+        }
+        if (candidate == root) return TF_TRANSFORM_OK;
+        {
+            double root_value = median_store_get(store, root);
+            double candidate_value = median_store_get(store, candidate);
+            median_store_set(store, root, candidate_value);
+            median_store_set(store, candidate, root_value);
+        }
+        root = candidate;
+    }
+    return TF_TRANSFORM_OK;
+}
+
+static tf_transform_code median_store_resolve(
+    tf_transform_median_store *store,
+    const tf_transform_runtime_copy *runtime,
+    double *out, tf_transform_error **error) {
+    size_t ticks = 0;
+    tf_transform_code code;
+    if (!store || !runtime || !out || store->count == 0)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "median retained state is unavailable");
+    if (store->count > 1) {
+        uint64_t start = store->count / 2;
+        uint64_t end = store->count - 1;
+        while (start != 0) {
+            --start;
+            code = median_store_sift_down(
+                store, start, end, runtime, &ticks, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        while (end != 0) {
+            double first = median_store_get(store, 0);
+            double last = median_store_get(store, end);
+            median_store_set(store, 0, last);
+            median_store_set(store, end, first);
+            --end;
+            code = median_store_sift_down(
+                store, 0, end, runtime, &ticks, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+    }
+    code = poll_and_recheck(runtime, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    if ((store->count & UINT64_C(1)) != 0) {
+        *out = median_store_get(store, store->count / 2);
+    } else {
+        double lower = median_store_get(store, store->count / 2 - 1);
+        double upper = median_store_get(store, store->count / 2);
+        double lower_half = lower / 2.0;
+        double upper_half = upper / 2.0;
+        *out = lower_half + upper_half;
+        if (!tf_transform_double_is_finite(*out))
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_NUMERIC_DOMAIN,
+                "median imputation value became nonfinite");
+    }
+    if (*out == 0.0) *out = 0.0;
+    return TF_TRANSFORM_OK;
+}
+
 tf_transform_code tf_transform_analyzer_create(
     const tf_transform_recipe *recipe, const tf_schema_view_v1 *input_schema,
     const tf_transform_runtime_v1 *runtime,
@@ -413,10 +678,14 @@ tf_transform_code tf_transform_analyzer_create(
     tf_transform_schema schema = {0};
     tf_transform_code code;
     size_t state_bytes = 0;
+    size_t median_store_bytes = 0;
+    size_t median_values_per_block = 0;
     uint64_t schema_resident = 0;
     uint64_t schema_allocations = 0;
     uint64_t session_resident;
     uint64_t session_allocations;
+    uint64_t analyzer_allocations;
+    int uses_median;
 
     if (out) *out = NULL;
     tf_transform_clear_error(error);
@@ -457,6 +726,31 @@ tf_transform_code tf_transform_analyzer_create(
         schema.field_count, sizeof(tf_transform_running_stats), &state_bytes,
         error, "analyzer state byte count overflows");
     if (code != TF_TRANSFORM_OK) goto fail;
+    uses_median = recipe_uses_median(recipe);
+    if (uses_median) {
+        uint64_t target_block_bytes = runtime_copy.limits.max_allocation_bytes;
+        if (target_block_bytes > TF_TRANSFORM_CANCEL_BYTES_V1)
+            target_block_bytes = TF_TRANSFORM_CANCEL_BYTES_V1;
+        median_values_per_block = (size_t)(target_block_bytes / sizeof(double));
+        if (median_values_per_block == 0) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "median value blocks exceed the allocation limit");
+            goto fail;
+        }
+        code = checked_mul_size(
+            schema.field_count, sizeof(tf_transform_median_store),
+            &median_store_bytes, error,
+            "median store byte count overflows");
+        if (code != TF_TRANSFORM_OK) goto fail;
+        if ((uint64_t)median_store_bytes
+                > runtime_copy.limits.max_allocation_bytes) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "median stores exceed the allocation limit");
+            goto fail;
+        }
+    }
     if ((uint64_t)state_bytes > runtime_copy.limits.max_resident_state_bytes
         || (uint64_t)state_bytes > runtime_copy.limits.max_allocation_bytes) {
         code = tf_transform_set_error(
@@ -469,13 +763,17 @@ tf_transform_code tf_transform_analyzer_create(
     if ((uint64_t)state_bytes > (UINT64_MAX - sizeof(*created)) / 2)
         goto resource_overflow;
     session_resident = sizeof(*created) + (uint64_t)state_bytes * 2;
+    if ((uint64_t)median_store_bytes > UINT64_MAX - session_resident)
+        goto resource_overflow;
+    session_resident += (uint64_t)median_store_bytes;
     if (schema_resident > UINT64_MAX - session_resident)
         goto resource_overflow;
     session_resident += schema_resident;
-    if (schema_allocations > UINT64_MAX - 4)
+    analyzer_allocations = 4 + (uses_median ? 1u : 0u);
+    if (schema_allocations > UINT64_MAX - analyzer_allocations)
         goto resource_overflow;
     /* Schema copy also allocates and frees one uniqueness index. */
-    session_allocations = schema_allocations + 4;
+    session_allocations = schema_allocations + analyzer_allocations;
     code = session_check_totals(
         &runtime_copy, 0, session_resident, 0, session_allocations, error);
     if (code != TF_TRANSFORM_OK) goto fail;
@@ -509,6 +807,22 @@ tf_transform_code tf_transform_analyzer_create(
             "analyzer scratch allocation failed");
         goto fail;
     }
+    if (uses_median) {
+        code = tf_transform_poll_cancel(&runtime_copy, error);
+        if (code != TF_TRANSFORM_OK) goto fail;
+        created->median_stores = (tf_transform_median_store *)calloc(
+            schema.field_count, sizeof(*created->median_stores));
+        if (!created->median_stores) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_ALLOCATION,
+                "median store allocation failed");
+            goto fail;
+        }
+        for (size_t i = 0; i < schema.field_count; ++i)
+            if (recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN)
+                created->median_stores[i].values_per_block
+                    = median_values_per_block;
+    }
     created->recipe = (tf_transform_recipe *)recipe;
     tf_transform_recipe_retain(created->recipe);
     created->input_schema = schema;
@@ -527,6 +841,7 @@ fail:
     tf_transform_schema_clear(&schema);
     if (created) {
         tf_transform_recipe_release(created->recipe);
+        analyzer_median_stores_clear(created);
         tf_transform_schema_clear(&created->input_schema);
         free(created->stats);
         free(created->scratch);
@@ -538,6 +853,7 @@ fail:
 void tf_transform_analyzer_destroy(tf_transform_analyzer **analyzer) {
     if (!analyzer || !*analyzer) return;
     tf_transform_recipe_release((*analyzer)->recipe);
+    analyzer_median_stores_clear(*analyzer);
     tf_transform_schema_clear(&(*analyzer)->input_schema);
     free((*analyzer)->stats);
     free((*analyzer)->scratch);
@@ -611,6 +927,19 @@ tf_transform_code tf_transform_analyzer_push(
     if (code != TF_TRANSFORM_OK) goto failed;
     code = poll_and_recheck(&analyzer->runtime, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
+    if (analyzer->median_stores) {
+        for (size_t i = 0; i < analyzer->input_schema.field_count; ++i) {
+            if (analyzer->recipe->columns[i].impute
+                    == TF_TRANSFORM_IMPUTE_MEDIAN
+                && analyzer->median_stores[i].count
+                    != analyzer->stats[i].observed) {
+                code = tf_transform_set_error(
+                    error, TF_TRANSFORM_INTERNAL,
+                    "median retained state does not match analyzer statistics");
+                goto guarded_failed;
+            }
+        }
+    }
     for (size_t row = 0; row < table->row_count; ++row) {
         if (row != 0 && row % TF_TRANSFORM_CANCEL_ROWS_V1 == 0) {
             code = poll_and_recheck(&analyzer->runtime, error);
@@ -678,6 +1007,13 @@ tf_transform_code tf_transform_analyzer_push(
                     "numeric analyzer state became nonfinite");
                 goto guarded_failed;
             }
+            if (analyzer->recipe->columns[column_index].impute
+                    == TF_TRANSFORM_IMPUTE_MEDIAN) {
+                code = median_store_append(
+                    analyzer, &analyzer->median_stores[column_index],
+                    value, error);
+                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+            }
             stats->observed = observed;
             stats->mean = mean;
             stats->m2 = m2;
@@ -718,6 +1054,7 @@ static tf_transform_code finite_or_domain(
 static tf_transform_code finalize_numeric_column(
     const tf_transform_recipe_column *recipe,
     const tf_transform_running_stats *stats,
+    double median_value, int has_median_value,
     tf_transform_numeric_state *state, tf_transform_error **error) {
     uint64_t logical_count = stats->observed;
     double mean = stats->mean;
@@ -735,7 +1072,8 @@ static tf_transform_code finalize_numeric_column(
     state->normalize = recipe->normalize;
     state->ddof = recipe->ddof;
     if (stats->observed == 0 && stats->missing == 0
-        && recipe->impute == TF_TRANSFORM_IMPUTE_MEAN)
+        && (recipe->impute == TF_TRANSFORM_IMPUTE_MEAN
+            || recipe->impute == TF_TRANSFORM_IMPUTE_MEDIAN))
         return tf_transform_set_error(
             error, TF_TRANSFORM_INSUFFICIENT_DATA,
             "learned imputation requires at least one analyzed row");
@@ -750,6 +1088,20 @@ static tf_transform_code finalize_numeric_column(
         else return tf_transform_set_error(
             error, TF_TRANSFORM_INSUFFICIENT_DATA,
             "mean imputation has no observed values");
+    } else if (recipe->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
+        if (stats->observed != 0) {
+            if (!has_median_value)
+                return tf_transform_set_error(
+                    error, TF_TRANSFORM_INTERNAL,
+                    "median imputation value is unavailable");
+            impute_value = median_value;
+        } else if (recipe->all_missing == TF_TRANSFORM_ALL_MISSING_ZERO) {
+            impute_value = 0.0;
+        } else {
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INSUFFICIENT_DATA,
+                "median imputation has no observed values");
+        }
     }
     if (has_impute) {
         state->impute_value = impute_value;
@@ -934,12 +1286,30 @@ tf_transform_code tf_transform_analyzer_finalize(
         goto guarded_failed;
     }
     for (size_t i = 0; i < plan->input_schema.field_count; ++i) {
+        double median_value = 0.0;
+        int has_median_value = 0;
         if (i != 0 && i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
             code = poll_and_recheck(&analyzer->runtime, error);
             if (code != TF_TRANSFORM_OK) goto guarded_failed;
         }
+        if (plan->recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN
+            && analyzer->stats[i].observed != 0) {
+            tf_transform_median_store *store = analyzer->median_stores
+                ? &analyzer->median_stores[i] : NULL;
+            if (!store || store->count != analyzer->stats[i].observed) {
+                code = tf_transform_set_error(
+                    error, TF_TRANSFORM_INTERNAL,
+                    "median retained state does not match finalized statistics");
+                goto guarded_failed;
+            }
+            code = median_store_resolve(
+                store, &analyzer->runtime, &median_value, error);
+            if (code != TF_TRANSFORM_OK) goto guarded_failed;
+            has_median_value = 1;
+        }
         code = finalize_numeric_column(
             &plan->recipe->columns[i], &analyzer->stats[i],
+            median_value, has_median_value,
             &plan->states[i], error);
         if (code != TF_TRANSFORM_OK) goto guarded_failed;
     }

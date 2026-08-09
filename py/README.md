@@ -134,7 +134,7 @@ for chunk in p.iter_chunks(input_files=parts, source_column='src'):
 
 Prepared transforms are separate from byte-stream pipelines. They are for typed operations whose parameters must be learned from reference data: an analyzer consumes one or more bounded-memory batches, `finalize()` freezes an immutable plan and output schema, and an apply session runs that plan over either a second pass of the original data (`fit_transform`-style) or later compatible batches.
 
-The current slice accepts declared `float32`/`float64` columns and implements numeric none/zero/constant/mean imputation plus none/standard/min-max normalization. Categorical encoding, median, and kind inference are not implemented yet.
+The current slice accepts declared `float32`/`float64` columns and implements numeric none/zero/constant/mean/exact-median imputation plus none/standard/min-max normalization. Exact median is retained under the configured session limits and fails with resource code `104` rather than spilling without host authority. Categorical encoding and kind inference are not implemented yet.
 
 ```python
 from array import array

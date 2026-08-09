@@ -10,7 +10,8 @@ typedef enum tf_transform_impute_op {
     TF_TRANSFORM_IMPUTE_NONE = 0,
     TF_TRANSFORM_IMPUTE_ZERO,
     TF_TRANSFORM_IMPUTE_CONSTANT,
-    TF_TRANSFORM_IMPUTE_MEAN
+    TF_TRANSFORM_IMPUTE_MEAN,
+    TF_TRANSFORM_IMPUTE_MEDIAN
 } tf_transform_impute_op;
 
 typedef enum tf_transform_normalize_op {
@@ -89,6 +90,14 @@ typedef struct tf_transform_running_stats {
     int has_value;
 } tf_transform_running_stats;
 
+typedef struct tf_transform_median_store {
+    double **blocks;
+    size_t block_count;
+    size_t block_capacity;
+    size_t values_per_block;
+    uint64_t count;
+} tf_transform_median_store;
+
 typedef struct tf_transform_runtime_copy {
     tf_transform_limits_v1 limits;
     tf_transform_cancel_fn cancel;
@@ -115,6 +124,7 @@ struct tf_transform_analyzer {
     tf_transform_runtime_copy runtime;
     tf_transform_running_stats *stats;
     tf_transform_running_stats *scratch;
+    tf_transform_median_store *median_stores;
     uint64_t total_rows;
     uint64_t total_input_bytes;
     uint64_t allocation_count;

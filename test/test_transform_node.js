@@ -1,6 +1,7 @@
 'use strict'
 
 const assert = require('assert/strict')
+const { createHash } = require('crypto')
 const { once } = require('events')
 const path = require('path')
 const { Worker } = require('worker_threads')
@@ -11,6 +12,8 @@ const vectors = require('./vectors/prepared_transform_v1.json')
 const schema64 = [{ id: 'x0', dtype: 'float64' }]
 const supportedRecipes = new Set([
   'numeric_mean_standard',
+  'numeric_median_none',
+  'numeric_median_zero_none',
   'numeric_none_none',
   'numeric_zero_minmax'
 ])
@@ -23,6 +26,24 @@ function doubleBits(value) {
   const bytes = Buffer.alloc(8)
   bytes.writeDoubleBE(value, 0)
   return bytes.toString('hex')
+}
+
+function medianNegativeZeroPlan(planBytes) {
+  const original = Buffer.from(planBytes)
+  const decoded = JSON.parse(original.subarray(52).toString('utf8'))
+  assert.deepEqual(
+    Buffer.from(JSON.stringify(decoded)),
+    original.subarray(52),
+    'exported TFTR payload must already be canonical JSON'
+  )
+  decoded.steps[0].numeric.impute.value.v = '8000000000000000'
+  const payload = Buffer.from(JSON.stringify(decoded))
+  const mutated = Buffer.alloc(52 + payload.length)
+  original.copy(mutated, 0, 0, 20)
+  mutated.writeBigUInt64LE(BigInt(payload.length), 12)
+  createHash('sha256').update(payload).digest().copy(mutated, 20)
+  payload.copy(mutated, 52)
+  return mutated
 }
 
 function table(values, ArrayType = Float64Array, validity) {
@@ -213,13 +234,49 @@ function testSharedSemanticVectors() {
     const loaded = tf.TransformPlan.fromBytes(referenceBytes)
     assert.deepEqual(loaded.toBytes(), referenceBytes, `${item.id}: imported TFTR`)
     loaded.close()
+    if (item.id === 'numeric-signed-zero-median') {
+      assert.throws(
+        () => tf.TransformPlan.fromBytes(medianNegativeZeroPlan(referenceBytes)),
+        (error) => error instanceof tf.TranfiTransformError && error.code === 106
+      )
+    }
   }
+}
+
+function testMedianErrorsAndLimits() {
+  for (const item of vectors.semanticCases.filter((entry) =>
+    entry.recipe === 'numeric_median_none' && entry.expectedError
+  )) {
+    const recipe = tf.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    const values = item.analyze.rows.map((row) => doubleFromBits(row[0]))
+    analyzer.push(table(values))
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof tf.TranfiTransformError
+        && error.code === item.expectedError.code
+    )
+    closeAll(recipe, analyzer)
+  }
+
+  const recipe = tf.TransformRecipe.fromJSON(vectors.recipes.numeric_median_none)
+  const analyzer = recipe.analyzer(schema64, {
+    limits: { maxAllocationsPerSession: 9 }
+  })
+  assert.throws(
+    () => analyzer.push(table([1])),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 104
+  )
+  assert.throws(
+    () => analyzer.push(table([1])),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 112
+  )
+  closeAll(recipe, analyzer)
 }
 
 function testF32ValidityAndParentLifetime() {
   const schema = [{ id: 'x0', name: 'feature', dtype: 'float32' }]
-  const config = structuredClone(vectors.recipes.numeric_mean_standard)
-  config.columns[0].numeric.normalize = { ddof: null, op: 'none' }
+  const config = structuredClone(vectors.recipes.numeric_median_none)
   const recipe = tf.TransformRecipe.fromJSON(config)
   const analyzer = recipe.analyzer(schema)
   recipe.close()
@@ -650,6 +707,7 @@ async function testInCallCancellation() {
 async function main() {
   testSafeLimits()
   testSharedSemanticVectors()
+  testMedianErrorsAndLimits()
   testF32ValidityAndParentLifetime()
   testErrorsLimitsAndClosedState()
   await testInCallCancellation()

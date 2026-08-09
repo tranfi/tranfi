@@ -12,6 +12,8 @@ const vectors = require('./vectors/prepared_transform_v1.json')
 const schema64 = [{ id: 'x0', dtype: 'float64' }]
 const supportedRecipes = new Set([
   'numeric_mean_standard',
+  'numeric_median_none',
+  'numeric_median_zero_none',
   'numeric_none_none',
   'numeric_zero_minmax'
 ])
@@ -293,9 +295,41 @@ async function main() {
     loaded.close()
   }
 
+  for (const item of vectors.semanticCases.filter((entry) =>
+    entry.recipe === 'numeric_median_none' && entry.expectedError
+  )) {
+    const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table(item.analyze.rows.map((row) => doubleFromBits(row[0]))))
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof native.TranfiTransformError
+        && error.code === item.expectedError.code
+    )
+    closeAll(recipe, analyzer)
+  }
+
+  {
+    const recipe = wasm.TransformRecipe.fromJSON(
+      vectors.recipes.numeric_median_none
+    )
+    const analyzer = recipe.analyzer(schema64, {
+      limits: { maxAllocationsPerSession: 9 }
+    })
+    assert.throws(
+      () => analyzer.push(table([1])),
+      (error) => error instanceof native.TranfiTransformError && error.code === 104
+    )
+    assert.throws(
+      () => analyzer.push(table([1])),
+      (error) => error instanceof native.TranfiTransformError && error.code === 112
+    )
+    closeAll(recipe, analyzer)
+  }
+
   {
     const schema = [{ id: 'x0', name: 'feature', dtype: 'float32' }]
-    const config = structuredClone(vectors.recipes.numeric_none_none)
+    const config = structuredClone(vectors.recipes.numeric_median_none)
     const source = new Float32Array([1, 99, 2, 99, 3])
     const recipe = wasm.TransformRecipe.fromJSON(config)
     const analyzer = recipe.analyzer(schema)
@@ -313,7 +347,7 @@ async function main() {
       columns: [{ data: source, strideBytes: 8, validity: Uint8Array.of(0x05) }]
     })
     assert.deepEqual(Array.from(result.data, doubleBits), [
-      '3ff0000000000000', '7ff8000000000000', '4008000000000000'
+      '3ff0000000000000', '4000000000000000', '4008000000000000'
     ])
     assert.deepEqual(Array.from(source), [1, 99, 2, 99, 3])
     apply.close()

@@ -81,6 +81,39 @@ async function main() {
       '3ff6a09e667f3bcc'
     ])
 
+    const medianChunks = [
+      { rows: 2, columns: [new Float64Array([9, 1])] },
+      { rows: 2, columns: [new Float64Array([5, NaN])] }
+    ]
+    const medianPlanBytes = await client.analyzeTransform(
+      vectors.recipes.numeric_median_none,
+      schema,
+      medianChunks
+    )
+    const medianRecipe = native.TransformRecipe.fromJSON(
+      vectors.recipes.numeric_median_none
+    )
+    const medianAnalyzer = medianRecipe.analyzer(schema)
+    medianAnalyzer.push({ rows: 2, columns: [new Float64Array([9, 1])] })
+    medianAnalyzer.push({ rows: 2, columns: [new Float64Array([5, NaN])] })
+    const medianNativePlan = medianAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(medianPlanBytes),
+      medianNativePlan.toBytes(),
+      'worker and native exact-median TFTR bytes'
+    )
+    const medianResult = await client.applyTransform(
+      medianPlanBytes,
+      schema,
+      { rows: 1, columns: [new Float64Array([NaN])] }
+    )
+    assert.deepEqual(Array.from(medianResult.data, doubleBits), [
+      '4014000000000000'
+    ])
+    medianNativePlan.close()
+    medianAnalyzer.close()
+    medianRecipe.close()
+
     if (typeof SharedArrayBuffer !== 'undefined') {
       const controller = new AbortController()
       const rows = 8 * 1024 * 1024

@@ -196,6 +196,39 @@
       },
       "version": 1
     },
+    "numeric_median_zero_none": {
+      "columns": [
+        {
+          "categorical": null,
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "numeric"
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "median"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "none"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
     "numeric_none_none": {
       "columns": [
         {
@@ -399,6 +432,113 @@
         "scale": "3ff0000000000000"
       },
       "id": "numeric-even-median",
+      "recipe": "numeric_median_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["7fefffffffffffff"], ["7fefffffffffffff"]]
+      },
+      "apply": {
+        "expectedRows": [["7fefffffffffffff"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "7fefffffffffffff",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-even-overflow-safe-median",
+      "recipe": "numeric_median_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["0000000000000001"], ["0000000000000001"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "0000000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-even-subnormal-order-median",
+      "recipe": "numeric_median_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[4], [1, 2, 1]],
+        "rows": [["4022000000000000"], ["3ff0000000000000"], ["4014000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["4014000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "4014000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-odd-median",
+      "recipe": "numeric_median_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 1, 1]],
+        "rows": [["8000000000000000"], ["0000000000000000"], ["3ff0000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "0000000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-signed-zero-median",
+      "recipe": "numeric_median_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "0000000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-all-missing-zero-median",
+      "recipe": "numeric_median_zero_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedColumns": 1,
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 103,
+        "phase": "finalize"
+      },
+      "id": "numeric-all-missing-error-median",
       "recipe": "numeric_median_none"
     },
     {

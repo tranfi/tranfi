@@ -1146,14 +1146,16 @@ static tf_transform_code parse_numeric_column(
             || !parse_tagged_constant(constant, &out->constant, &out->constant_dtype))
             goto invalid;
         out->impute = TF_TRANSFORM_IMPUTE_CONSTANT;
-    } else if (json_string_equals(op, "mean")) {
+    } else if (json_string_equals(op, "mean")
+               || json_string_equals(op, "median")) {
         if (!cJSON_IsNull(constant)) goto invalid;
         if (json_string_equals(policy, "error"))
             out->all_missing = TF_TRANSFORM_ALL_MISSING_ERROR;
         else if (json_string_equals(policy, "zero"))
             out->all_missing = TF_TRANSFORM_ALL_MISSING_ZERO;
         else goto invalid;
-        out->impute = TF_TRANSFORM_IMPUTE_MEAN;
+        out->impute = json_string_equals(op, "mean")
+            ? TF_TRANSFORM_IMPUTE_MEAN : TF_TRANSFORM_IMPUTE_MEDIAN;
     } else goto invalid;
     normalize = required_item(numeric, "normalize");
     if (!exact_keys(normalize, normalize_keys, 2)) goto invalid;
@@ -1533,7 +1535,8 @@ static int build_budget_recipe(
             || !build_budget_object(budget, 2)
             || !build_budget_child(budget, "impute")
             || !build_budget_object(budget, 3)) return 0;
-        if (column->impute == TF_TRANSFORM_IMPUTE_MEAN) {
+        if (column->impute == TF_TRANSFORM_IMPUTE_MEAN
+            || column->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
             if (!build_budget_string_property(budget, "allMissing", 5)) return 0;
         } else if (!build_budget_primitive(budget, "allMissing")) return 0;
         if (column->impute == TF_TRANSFORM_IMPUTE_CONSTANT) {
@@ -1574,7 +1577,8 @@ static int build_budget_step(
         || !build_budget_object(budget, 2)
         || !build_budget_child(budget, "impute")
         || !build_budget_object(budget, 3)) return 0;
-    if (recipe->impute == TF_TRANSFORM_IMPUTE_MEAN) {
+    if (recipe->impute == TF_TRANSFORM_IMPUTE_MEAN
+        || recipe->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
         if (!build_budget_string_property(budget, "allMissing", 5)) return 0;
     } else if (!build_budget_primitive(budget, "allMissing")) return 0;
     if (!build_budget_string_property(budget, "op", 8)) return 0;
@@ -1750,7 +1754,8 @@ cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe) {
             || !add_item(kind, "rule", json_null())
             || !add_item(kind, "value", json_string("numeric"))
             || !transfer_item(entry, "kind", &kind)) goto entry_fail;
-        if (column->impute == TF_TRANSFORM_IMPUTE_MEAN) {
+        if (column->impute == TF_TRANSFORM_IMPUTE_MEAN
+            || column->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
             if (!add_item(impute, "allMissing", json_string(
                     column->all_missing == TF_TRANSFORM_ALL_MISSING_ZERO
                         ? "zero" : "error"))) goto entry_fail;
@@ -1761,7 +1766,8 @@ cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe) {
         } else if (!add_item(impute, "constant", json_null())) goto entry_fail;
         impute_name = column->impute == TF_TRANSFORM_IMPUTE_NONE ? "none"
             : column->impute == TF_TRANSFORM_IMPUTE_ZERO ? "zero"
-            : column->impute == TF_TRANSFORM_IMPUTE_CONSTANT ? "constant" : "mean";
+            : column->impute == TF_TRANSFORM_IMPUTE_CONSTANT ? "constant"
+            : column->impute == TF_TRANSFORM_IMPUTE_MEAN ? "mean" : "median";
         if (!add_item(impute, "op", json_string(impute_name))) goto entry_fail;
         if (!transfer_item(numeric, "impute", &impute)) goto entry_fail;
         if (column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD) {
@@ -1925,7 +1931,8 @@ static const char *impute_op_name(tf_transform_impute_op op) {
     if (op == TF_TRANSFORM_IMPUTE_NONE) return "none";
     if (op == TF_TRANSFORM_IMPUTE_ZERO) return "zero";
     if (op == TF_TRANSFORM_IMPUTE_CONSTANT) return "constant";
-    return "mean";
+    if (op == TF_TRANSFORM_IMPUTE_MEAN) return "mean";
+    return "median";
 }
 
 static const char *normalize_op_name(tf_transform_normalize_op op) {
@@ -1944,7 +1951,8 @@ static cJSON *numeric_step_to_json(
     if (!step || !numeric || !impute || !normalize) goto fail;
     if (!add_item(step, "categorical", json_null())
         || !add_item(step, "kind", json_string("numeric"))) goto fail;
-    if (recipe->impute == TF_TRANSFORM_IMPUTE_MEAN) {
+    if (recipe->impute == TF_TRANSFORM_IMPUTE_MEAN
+        || recipe->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
         if (!add_item(impute, "allMissing", json_string(
                 recipe->all_missing == TF_TRANSFORM_ALL_MISSING_ZERO
                     ? "zero" : "error"))) goto fail;
@@ -2213,7 +2221,8 @@ static int tagged_f64(const cJSON *value, double *out) {
 static int null_or_policy(
     const cJSON *value, tf_transform_all_missing policy,
     tf_transform_impute_op op) {
-    if (op != TF_TRANSFORM_IMPUTE_MEAN) return cJSON_IsNull(value);
+    if (op != TF_TRANSFORM_IMPUTE_MEAN
+        && op != TF_TRANSFORM_IMPUTE_MEDIAN) return cJSON_IsNull(value);
     return json_string_equals(value,
         policy == TF_TRANSFORM_ALL_MISSING_ZERO ? "zero" : "error");
 }
@@ -2283,6 +2292,9 @@ static tf_transform_code parse_numeric_step(
     } else {
         if (!tagged_f64(impute_value, &resolved)) goto corrupt;
         if (recipe->impute == TF_TRANSFORM_IMPUTE_ZERO
+            && tf_transform_double_bits(resolved) != 0) goto corrupt;
+        if (recipe->impute == TF_TRANSFORM_IMPUTE_MEDIAN
+            && resolved == 0.0
             && tf_transform_double_bits(resolved) != 0) goto corrupt;
         if (recipe->impute == TF_TRANSFORM_IMPUTE_CONSTANT
             && tf_transform_double_bits(resolved)

@@ -259,7 +259,9 @@ static void test_recipe_vectors_and_canonical_json(void) {
     cJSON *root = cJSON_Parse(text);
     cJSON *recipes;
     const char *numeric_names[] = {
-        "numeric_mean_standard", "numeric_none_none", "numeric_zero_minmax"
+        "numeric_mean_standard", "numeric_median_none",
+        "numeric_median_zero_none",
+        "numeric_none_none", "numeric_zero_minmax"
     };
     tf_transform_limits_v1 limits;
     assert(root != NULL);
@@ -475,6 +477,29 @@ static int cancel_on_call(void *user) {
     assert(counter != NULL);
     ++counter->calls;
     return counter->cancel_at != 0 && counter->calls >= counter->cancel_at;
+}
+
+typedef struct median_sort_cancel_probe {
+    tf_transform_analyzer *analyzer;
+    double original_first;
+    size_t calls;
+    int armed;
+    int observed_sort;
+} median_sort_cancel_probe;
+
+static int cancel_during_median_sort(void *user) {
+    median_sort_cancel_probe *probe = (median_sort_cancel_probe *)user;
+    assert(probe != NULL);
+    ++probe->calls;
+    if (probe->armed && probe->analyzer
+        && probe->analyzer->median_stores
+        && probe->analyzer->median_stores[0].count != 0
+        && probe->analyzer->median_stores[0].blocks[0][0]
+            != probe->original_first) {
+        probe->observed_sort = 1;
+        return 1;
+    }
+    return 0;
 }
 
 static void write_u16_le_test(uint8_t *out, uint16_t value) {
@@ -1156,6 +1181,108 @@ static void test_numeric_vector_semantics(void) {
     tf_transform_plan_destroy(&plan);
 }
 
+static void test_median_blocks_limits_and_cancellation(void) {
+    const size_t row_count = 20001;
+    double *values = (double *)malloc(row_count * sizeof(*values));
+    tf_transform_recipe *recipe = load_vector_recipe("numeric_median_none");
+    tf_transform_plan *one_chunk = NULL;
+    tf_transform_plan *split = NULL;
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_error *error = NULL;
+    tf_field_view_v1 field;
+    tf_schema_view_v1 schema;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    tf_transform_limits_v1 limits;
+    tf_transform_runtime_v1 runtime;
+    median_sort_cancel_probe probe = {0};
+    uint8_t *left = NULL;
+    size_t left_len = 0;
+    uint8_t *right = NULL;
+    size_t right_len = 0;
+    uint64_t base_resident;
+    uint64_t base_allocations;
+
+    assert(values != NULL);
+    for (size_t i = 0; i < row_count; ++i)
+        values[i] = (double)(row_count - i - 1);
+    one_chunk = fit_f64_plan(
+        "numeric_median_none", values, row_count, row_count);
+    split = fit_f64_plan(
+        "numeric_median_none", values, row_count, 8191);
+    assert(tf_transform_double_bits(one_chunk->states[0].impute_value)
+           == tf_transform_double_bits(10000.0));
+    assert(tf_transform_plan_export(
+        one_chunk, NULL, &left, &left_len, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_plan_export(
+        split, NULL, &right, &right_len, &error) == TF_TRANSFORM_OK);
+    assert(left_len == right_len && memcmp(left, right, left_len) == 0);
+    tf_transform_bytes_free(&left, &left_len);
+    tf_transform_bytes_free(&right, &right_len);
+    tf_transform_plan_destroy(&one_chunk);
+    tf_transform_plan_destroy(&split);
+
+    make_x0_schema(TF_VIEW_FLOAT64, &field, &schema);
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, NULL, &analyzer, &error) == TF_TRANSFORM_OK);
+    base_resident = analyzer->resident_state_bytes;
+    base_allocations = analyzer->allocation_count;
+    assert(analyzer->median_stores != NULL && base_allocations == 8);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.abi_version = 1;
+    runtime.struct_size = (uint32_t)sizeof(runtime);
+    runtime.limits = &limits;
+    limits.max_allocations_per_session = base_allocations + 1;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f64_table(values, 1, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    limits.max_allocations_per_session = UINT64_MAX;
+    limits.max_resident_state_bytes = base_resident
+        + 4 * sizeof(double *) + TF_TRANSFORM_CANCEL_BYTES_V1 - 1;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    probe.original_first = values[0];
+    runtime.limits = &limits;
+    runtime.cancel = cancel_during_median_sort;
+    runtime.cancel_user = &probe;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    probe.analyzer = analyzer;
+    make_f64_table(values, row_count, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    probe.armed = 1;
+    assert(tf_transform_analyzer_finalize(analyzer, &one_chunk, &error)
+           == TF_TRANSFORM_CANCELLED);
+    assert(one_chunk == NULL && probe.observed_sort && probe.calls > 1);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_finalize(analyzer, &one_chunk, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    assert(one_chunk == NULL);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+    tf_transform_recipe_destroy(&recipe);
+    free(values);
+}
+
 static tf_transform_code parse_recipe_entry(
     const cJSON *recipes, const char *name,
     tf_transform_recipe **out, tf_transform_error **error) {
@@ -1271,6 +1398,13 @@ static void execute_numeric_semantic_case(
         assert(tf_transform_double_bits(plan->states[0].scale)
                == parse_hex64(cJSON_GetObjectItemCaseSensitive(
                    expected_plan, "scale")->valuestring));
+        {
+            const cJSON *expected_impute = cJSON_GetObjectItemCaseSensitive(
+                expected_plan, "impute");
+            if (cJSON_IsString(expected_impute))
+                assert(tf_transform_double_bits(plan->states[0].impute_value)
+                       == parse_hex64(expected_impute->valuestring));
+        }
         assert(tf_transform_plan_export(
             plan, NULL, &plan_bytes, &plan_len, &error) == TF_TRANSFORM_OK);
         if (!reference_bytes) {
@@ -1342,7 +1476,7 @@ static void test_shared_semantic_case_table(void) {
         ++executed;
         tf_transform_recipe_destroy(&recipe);
     }
-    assert(executed == 5 && deferred == 4);
+    assert(executed == 12 && deferred == 3);
     cJSON_Delete(root);
     free(text);
 }
@@ -1813,6 +1947,63 @@ static uint8_t *wrap_tftr_test(
     return result;
 }
 
+static void test_median_negative_zero_import_rejected(void) {
+    const double values[] = {-0.0, 0.0, 1.0};
+    tf_transform_plan *plan = fit_f64_plan(
+        "numeric_median_none", values, 3, 1);
+    tf_transform_plan *imported = NULL;
+    tf_transform_error *error = NULL;
+    tf_transform_limits_v1 limits;
+    uint8_t *exported = NULL;
+    size_t exported_len = 0;
+    cJSON *root;
+    cJSON *step;
+    cJSON *numeric;
+    cJSON *impute;
+    cJSON *bits;
+    uint8_t *payload = NULL;
+    size_t payload_len = 0;
+    uint8_t *mutated;
+    size_t mutated_len = 0;
+
+    assert(tf_transform_double_bits(plan->states[0].impute_value) == 0);
+    assert(tf_transform_plan_export(
+        plan, NULL, &exported, &exported_len, &error) == TF_TRANSFORM_OK);
+    assert(error == NULL && exported_len > 52);
+    root = cJSON_ParseWithLength(
+        (const char *)exported + 52, exported_len - 52);
+    assert(root != NULL);
+    step = cJSON_GetArrayItem(
+        cJSON_GetObjectItemCaseSensitive(root, "steps"), 0);
+    numeric = cJSON_GetObjectItemCaseSensitive(step, "numeric");
+    impute = cJSON_GetObjectItemCaseSensitive(numeric, "impute");
+    bits = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(impute, "value"), "v");
+    assert(cJSON_IsString(bits)
+           && strcmp(bits->valuestring, "0000000000000000") == 0);
+    assert(cJSON_SetValuestring(bits, "8000000000000000") != NULL);
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    assert(tf_transform_json_print_canonical(
+        root, &limits, &payload, &payload_len, &error) == TF_TRANSFORM_OK);
+    assert(error == NULL && payload != NULL);
+    mutated = wrap_tftr_test(
+        payload, payload_len, 1, 0, 52, payload_len,
+        "TFTR", &mutated_len);
+    assert(tf_transform_plan_import(
+        mutated, mutated_len, NULL, &imported, &error)
+        == TF_TRANSFORM_CORRUPT_PLAN);
+    assert(imported == NULL && error != NULL
+           && tf_transform_error_get_code(error) == TF_TRANSFORM_CORRUPT_PLAN);
+
+    tf_transform_error_destroy(&error);
+    free(mutated);
+    tf_transform_bytes_free(&payload, &payload_len);
+    cJSON_Delete(root);
+    tf_transform_bytes_free(&exported, &exported_len);
+    tf_transform_plan_destroy(&plan);
+}
+
 static void test_oversized_tagged_state_is_bounded(void) {
     const size_t string_len = TF_TRANSFORM_CANCEL_BYTES_V1 * 3 + 17;
     char *text = read_file("test/vectors/tftr_malformed_v1.json");
@@ -2143,6 +2334,7 @@ int main(void) {
     test_numeric_lifecycle_and_schema();
     test_numeric_failure_is_terminal();
     test_numeric_vector_semantics();
+    test_median_blocks_limits_and_cancellation();
     test_shared_semantic_case_table();
     test_shared_validation_case_table();
     test_f32_stride_validity_and_apply_terminal();
@@ -2153,6 +2345,7 @@ int main(void) {
     test_long_schema_runtime_cancellation();
     test_valid_import_cancellation_sweep();
     test_tftr_baseline_and_malformed();
+    test_median_negative_zero_import_rejected();
     test_oversized_tagged_state_is_bounded();
     test_shared_tftr_case_table();
     puts("prepared transform primitive tests: OK");

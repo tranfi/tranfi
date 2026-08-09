@@ -163,7 +163,7 @@ The bundled Tranfi app runner is also preview-bounded by default: file chunks ar
 
 Prepared transforms are a separate typed-table API for operations whose parameters must be learned from reference data. `analyze` accumulates bounded statistics over one or more batches, `finalize` freezes an immutable plan and output schema, and `apply` runs that plan either over a second pass of the original data (`fit_transform`-style) or over later compatible batches. It does not replace the byte-stream pipeline API.
 
-The current slice accepts declared `float32`/`float64` columns. It supports numeric none/zero/constant/mean imputation and none/standard/min-max normalization; categorical encoding, median, and kind inference are not implemented yet.
+The current slice accepts declared `float32`/`float64` columns. It supports numeric none/zero/constant/mean/exact-median imputation and none/standard/min-max normalization. Exact median is retained under the configured session limits and fails with resource code `104` rather than spilling without host authority. Categorical encoding and kind inference are not implemented yet.
 
 ```js
 const tf = require('tranfi')

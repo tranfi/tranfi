@@ -112,7 +112,7 @@ recipe -> analyze reference batches -> finalize immutable plan -> apply
 
 `apply` can run over a second pass of the original reference data (the streaming equivalent of `fit_transform`) as well as over later compatible batches. The plan contains the learned state, resolved operations, and frozen input/output schemas; it can be exported as a canonical TFTR artifact and imported by another supported binding. This API does not replace the ordinary `create -> push -> finish -> pull` byte-stream pipeline.
 
-The current prepared-transform slice is deliberately narrow: declared `float32`/`float64` columns with numeric none/zero/constant/mean imputation and none/standard/min-max normalization. Native Node, standalone WASM/Worker, and Python bindings expose the same plan bytes, output/error semantics, resource limits, deterministic disposal, and stable numeric `TranfiTransformError.code`. Categorical encoding, median, and kind inference remain future phases. See the [Node/WASM](js/) and [Python](py/) package guides for examples.
+The current prepared-transform slice is deliberately narrow: declared `float32`/`float64` columns with numeric none/zero/constant/mean/exact-median imputation and none/standard/min-max normalization. Exact median retains finite observed values in resource-bounded blocks and never spills unless a future explicitly authorized host policy enables it. Native Node, standalone WASM/Worker, and Python bindings expose the same plan bytes, output/error semantics, resource limits, deterministic disposal, and stable numeric `TranfiTransformError.code`. Categorical encoding and kind inference remain future phases. See the [Node/WASM](js/) and [Python](py/) package guides for examples.
 
 ### DuckDB engine
 

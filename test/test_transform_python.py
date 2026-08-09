@@ -30,7 +30,9 @@ SCHEMA64 = [{'id': 'x0', 'name': 'x0', 'dtype': 'float64'}]
 SUPPORTED_CASES = [
     case for case in VECTORS['semanticCases']
     if case['recipe'] in {
-        'numeric_mean_standard', 'numeric_none_none', 'numeric_zero_minmax'
+        'numeric_mean_standard', 'numeric_median_none',
+        'numeric_median_zero_none',
+        'numeric_none_none', 'numeric_zero_minmax'
     } and 'expectedError' not in case
 ]
 
@@ -168,10 +170,32 @@ def test_empty_analysis_preserves_insufficient_data_code():
             assert caught.value.code == case['expectedError']['code']
 
 
+def test_median_errors_and_retained_state_limits():
+    case = next(
+        item for item in VECTORS['semanticCases']
+        if item['id'] == 'numeric-all-missing-error-median')
+    values = [double_from_bits(row[0]) for row in case['analyze']['rows']]
+    with tranfi.TransformRecipe.from_json(
+            recipe_text(case['recipe'])) as recipe:
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            analyzer.push(make_table(values))
+            with pytest.raises(tranfi.TranfiTransformError) as caught:
+                analyzer.finalize()
+            assert caught.value.code == case['expectedError']['code']
+
+        limits = tranfi.TransformLimits(max_allocations_per_session=9)
+        with recipe.analyzer(SCHEMA64, limits=limits) as analyzer:
+            with pytest.raises(tranfi.TranfiTransformError) as caught:
+                analyzer.push(make_table([1.0]))
+            assert caught.value.code == 104
+            with pytest.raises(tranfi.TranfiTransformError) as terminal:
+                analyzer.push(make_table([1.0]))
+            assert terminal.value.code == 112
+
+
 def test_f32_validity_readonly_and_parent_lifetimes():
     schema = [{'id': 'x0', 'name': 'feature', 'dtype': 'float32'}]
-    config = json.loads(recipe_text('numeric_mean_standard'))
-    config['columns'][0]['numeric']['normalize'] = {'ddof': None, 'op': 'none'}
+    config = json.loads(recipe_text('numeric_median_none'))
     recipe = tranfi.TransformRecipe.from_json(
         json.dumps(config, separators=(',', ':')))
     analyzer = recipe.analyzer(schema)
