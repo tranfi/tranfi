@@ -121,6 +121,146 @@
       },
       "version": 1
     },
+    "categorical_mode_label_error": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": null,
+              "unknown": "error"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_mode_label_other": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": null,
+              "unknown": "other"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_mode_zero_label_other": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": null,
+              "unknown": "other"
+            },
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_mode_label_collision": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": 1,
+              "unknown": "sentinel"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
     "categorical_none_onehot_all_zero": {
       "columns": [
         {
@@ -448,10 +588,93 @@
       "expectedPlan": {
         "categories": ["3ff0000000000000", "4000000000000000"],
         "impute": "3ff0000000000000",
-        "kind": "categorical"
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": -1,
+        "unknown": "sentinel"
       },
       "id": "categorical-mode-tie-smallest-label-sentinel",
       "recipe": "categorical_mode_label_sentinel"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 2], [1, 1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [],
+        "rows": [["4008000000000000"]]
+      },
+      "expectedError": {
+        "code": 108,
+        "phase": "apply"
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": "3ff0000000000000",
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "error"
+      },
+      "id": "categorical-mode-label-unknown-error",
+      "recipe": "categorical_mode_label_error"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[4], [1, 3], [2, 2]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"], ["4000000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["4000000000000000"], ["3ff0000000000000"], ["3ff0000000000000"]],
+        "rows": [["3ff0000000000000"], ["4008000000000000"], [null], ["4000000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": "4000000000000000",
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "other"
+      },
+      "id": "categorical-mode-label-unknown-other",
+      "recipe": "categorical_mode_label_other"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["3ff0000000000000"]],
+        "rows": [[null], ["3ff0000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["0000000000000000"],
+        "impute": "0000000000000000",
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "other"
+      },
+      "id": "categorical-mode-label-all-missing-zero-other",
+      "recipe": "categorical_mode_zero_label_other"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 101,
+        "phase": "finalize"
+      },
+      "id": "categorical-mode-label-sentinel-collision",
+      "recipe": "categorical_mode_label_collision"
     },
     {
       "analyze": {
@@ -796,6 +1019,26 @@
       "expectedCode": 0,
       "id": "max-categories-two-valid",
       "recipe": "infer_two_categories",
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "fractional-sentinel-label-invalid",
+      "mutation": {
+        "path": "/columns/0/categorical/encode/sentinelLabel",
+        "recipe": "categorical_mode_label_sentinel",
+        "value": 0.5
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "out-of-safe-range-sentinel-label-invalid",
+      "mutation": {
+        "path": "/columns/0/categorical/encode/sentinelLabel",
+        "recipe": "categorical_mode_label_sentinel",
+        "value": 10000000000000000
+      },
       "phase": "recipe"
     },
     {

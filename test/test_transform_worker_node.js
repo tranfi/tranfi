@@ -155,6 +155,45 @@ async function main() {
     categoricalAnalyzer.close()
     categoricalRecipe.close()
 
+    const labelChunks = [
+      { rows: 2, columns: [new Float64Array([1, 2])] },
+      { rows: 2, columns: [new Float64Array([2, NaN])] }
+    ]
+    const labelPlanBytes = await client.analyzeTransform(
+      vectors.recipes.categorical_mode_label_other,
+      schema,
+      labelChunks
+    )
+    const labelRecipe = native.TransformRecipe.fromJSON(
+      vectors.recipes.categorical_mode_label_other
+    )
+    const labelAnalyzer = labelRecipe.analyzer(schema)
+    for (const chunk of labelChunks) labelAnalyzer.push(chunk)
+    const labelNativePlan = labelAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(labelPlanBytes),
+      labelNativePlan.toBytes(),
+      'worker and native categorical-label TFTR bytes'
+    )
+    assert.equal(
+      labelNativePlan.schemaJSON('output').toString(),
+      '[{"category":null,"dtype":"float64","id":"x0%3Alabel",' +
+        '"name":"x0%3Alabel","role":"label","sourceId":"x0"}]'
+    )
+    const labelResult = await client.applyTransform(
+      labelPlanBytes,
+      schema,
+      { rows: 3, columns: [new Float64Array([1, 3, NaN])] }
+    )
+    assert.deepEqual(Array.from(labelResult.data, doubleBits), [
+      '0000000000000000',
+      '4000000000000000',
+      '3ff0000000000000'
+    ])
+    labelNativePlan.close()
+    labelAnalyzer.close()
+    labelRecipe.close()
+
     if (typeof SharedArrayBuffer !== 'undefined') {
       const controller = new AbortController()
       const rows = 8 * 1024 * 1024

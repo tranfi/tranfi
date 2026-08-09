@@ -6,6 +6,8 @@
 #include <fenv.h>
 #include <stdatomic.h>
 
+#define TF_TRANSFORM_MAX_SAFE_INTEGER_V1 INT64_C(9007199254740991)
+
 typedef enum tf_transform_impute_op {
     TF_TRANSFORM_IMPUTE_NONE = 0,
     TF_TRANSFORM_IMPUTE_ZERO,
@@ -30,6 +32,26 @@ typedef enum tf_transform_encode_op {
     TF_TRANSFORM_ENCODE_LABEL,
     TF_TRANSFORM_ENCODE_ONEHOT
 } tf_transform_encode_op;
+
+typedef enum tf_transform_unknown_policy {
+    TF_TRANSFORM_UNKNOWN_NONE = 0,
+    TF_TRANSFORM_UNKNOWN_ERROR,
+    TF_TRANSFORM_UNKNOWN_SENTINEL,
+    TF_TRANSFORM_UNKNOWN_OTHER,
+    TF_TRANSFORM_UNKNOWN_ALL_ZERO
+} tf_transform_unknown_policy;
+
+typedef enum tf_transform_output_role {
+    TF_TRANSFORM_ROLE_VALUE = 0,
+    TF_TRANSFORM_ROLE_LABEL,
+    TF_TRANSFORM_ROLE_ONEHOT
+} tf_transform_output_role;
+
+typedef enum tf_transform_schema_category_kind {
+    TF_TRANSFORM_SCHEMA_CATEGORY_NONE = 0,
+    TF_TRANSFORM_SCHEMA_CATEGORY_VALUE,
+    TF_TRANSFORM_SCHEMA_CATEGORY_OTHER
+} tf_transform_schema_category_kind;
 
 typedef enum tf_transform_normalize_op {
     TF_TRANSFORM_NORMALIZE_NONE = 0,
@@ -57,6 +79,9 @@ typedef struct tf_transform_recipe_column {
     tf_transform_all_missing categorical_all_missing;
     tf_transform_encode_op categorical_encode;
     int categorical_discover;
+    tf_transform_unknown_policy categorical_unknown;
+    int64_t categorical_sentinel_label;
+    int categorical_has_sentinel_label;
 } tf_transform_recipe_column;
 
 struct tf_transform_recipe {
@@ -73,6 +98,12 @@ typedef struct tf_transform_schema_field_owned {
     size_t id_len;
     char *name;
     size_t name_len;
+    char *source_id;
+    size_t source_id_len;
+    tf_transform_output_role role;
+    tf_transform_schema_category_kind category_kind;
+    uint32_t category_dtype;
+    uint64_t category_bits;
 } tf_transform_schema_field_owned;
 
 struct tf_transform_schema {
@@ -105,6 +136,11 @@ typedef struct tf_transform_categorical_state {
     size_t category_count;
     uint64_t impute_bits;
     int has_impute_value;
+    tf_transform_unknown_policy unknown;
+    int64_t sentinel_label;
+    int has_sentinel_label;
+    uint64_t other_ordinal;
+    int has_other_ordinal;
 } tf_transform_categorical_state;
 
 typedef struct tf_transform_column_state {
@@ -290,9 +326,9 @@ tf_transform_code tf_transform_category_key(
     double value, uint32_t dtype, uint64_t *out, tf_transform_error **error);
 double tf_transform_category_decode(uint64_t bits, uint32_t dtype);
 int tf_transform_category_compare(uint64_t left, uint64_t right, uint32_t dtype);
-tf_transform_code tf_transform_category_contains(
+tf_transform_code tf_transform_category_lookup(
     const tf_transform_categorical_state *state, uint64_t bits,
-    const tf_transform_runtime_copy *runtime, int *out,
+    const tf_transform_runtime_copy *runtime, size_t *ordinal, int *found,
     tf_transform_error **error);
 tf_transform_code tf_transform_fp_begin(
     tf_transform_fp_guard *guard, tf_transform_error **error);
@@ -323,6 +359,26 @@ tf_transform_code tf_transform_schema_clone_runtime(
     const tf_transform_runtime_copy *runtime,
     tf_transform_schema *out, tf_transform_error **error);
 void tf_transform_schema_clear(tf_transform_schema *schema);
+tf_transform_code tf_transform_output_schema_requirements(
+    const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_runtime_copy *runtime, uint64_t *resident_bytes,
+    uint64_t *allocation_count, uint64_t *collision_bytes,
+    tf_transform_error **error);
+tf_transform_code tf_transform_output_schema_build(
+    const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_runtime_copy *runtime, tf_transform_schema *out,
+    tf_transform_error **error);
+tf_transform_code tf_transform_output_schema_validate_collisions(
+    const tf_transform_schema *input, const tf_transform_schema *output,
+    const tf_transform_runtime_copy *runtime,
+    tf_transform_resource_ledger *ledger, tf_transform_code collision_code,
+    tf_transform_error **error);
+tf_transform_code tf_transform_output_schema_validate_contract(
+    const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_schema *output,
+    const tf_transform_runtime_copy *runtime,
+    tf_transform_resource_ledger *ledger, tf_transform_code mismatch_code,
+    tf_transform_error **error);
 int tf_transform_schema_equal_view(
     const tf_transform_schema *schema, const tf_schema_view_v1 *view);
 tf_transform_code tf_transform_schema_equal_view_runtime(

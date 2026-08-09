@@ -170,6 +170,49 @@ def validate_recipe(name: str, recipe: Any) -> int:
                     f"recipe {name}: infer maxCategories")
             require(column["numeric"] is not None and column["categorical"] is not None,
                     f"recipe {name}: inferred branches")
+        categorical = column["categorical"]
+        if categorical is not None:
+            require(isinstance(categorical, dict) and set(categorical) == {
+                "encode", "impute",
+            }, f"recipe {name}: categorical shape")
+            encode = categorical["encode"]
+            require(isinstance(encode, dict) and set(encode) == {
+                "categories", "op", "sentinelLabel", "unknown",
+            }, f"recipe {name}: categorical encode shape")
+            require(encode["categories"] == "discover",
+                    f"recipe {name}: only discovered categories are in V1 vectors")
+            if encode["op"] == "none":
+                require(encode["sentinelLabel"] is None
+                        and encode["unknown"] is None,
+                        f"recipe {name}: encode-none policy")
+            elif encode["op"] == "label":
+                require(encode["unknown"] in {"error", "sentinel", "other"},
+                        f"recipe {name}: label unknown policy")
+                sentinel = encode["sentinelLabel"]
+                if encode["unknown"] == "sentinel":
+                    require(isinstance(sentinel, int) and not isinstance(sentinel, bool)
+                            and abs(sentinel) <= 9007199254740991,
+                            f"recipe {name}: safe integer sentinel required")
+                else:
+                    require(sentinel is None,
+                            f"recipe {name}: sentinel is exclusive to sentinel policy")
+            else:
+                require(encode["op"] == "onehot"
+                        and encode["sentinelLabel"] is None
+                        and encode["unknown"] == "all_zero",
+                        f"recipe {name}: one-hot vector shape")
+            impute = categorical["impute"]
+            require(isinstance(impute, dict) and set(impute) == {
+                "allMissing", "constant", "op",
+            }, f"recipe {name}: categorical impute shape")
+            if impute["op"] == "mode":
+                require(impute["allMissing"] in {"error", "zero"}
+                        and impute["constant"] is None,
+                        f"recipe {name}: categorical mode policy")
+            else:
+                require(impute == {
+                    "allMissing": None, "constant": None, "op": "none",
+                }, f"recipe {name}: categorical impute-none policy")
     return len(columns)
 
 
@@ -236,6 +279,18 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
                         f"{case_id}: apply error requires plan expectation")
         else:
             require("expectedPlan" in case, f"{case_id}: plan expectation")
+        recipe_column = recipes[recipe_name]["columns"][0]
+        encode = (recipe_column["categorical"] or {}).get("encode")
+        expected_plan = case.get("expectedPlan")
+        if (encode is not None and encode["op"] == "label"
+                and expected_plan is not None
+                and expected_plan.get("kind") == "categorical"):
+            require(expected_plan.get("outputIds") == ["x0%3Alabel"],
+                    f"{case_id}: generated label output ID")
+            require(expected_plan.get("unknown") == encode["unknown"],
+                    f"{case_id}: label unknown policy")
+            require(expected_plan.get("sentinelLabel") == encode["sentinelLabel"],
+                    f"{case_id}: label sentinel")
 
     sqrt_cases = document.get("sqrtCases")
     require(isinstance(sqrt_cases, list) and sqrt_cases, "sqrt cases required")
@@ -276,12 +331,21 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
     require("max-categories-one-invalid" in validation_ids, "missing maxCategories=1 boundary")
     require("max-categories-two-valid" in validation_ids, "missing maxCategories=2 boundary")
     require({
+        "fractional-sentinel-label-invalid",
+        "out-of-safe-range-sentinel-label-invalid",
+    } <= validation_ids, "missing label sentinel validation boundaries")
+    require({
         "categorical-mode-tie-smallest-signed-zero",
         "categorical-mode-subnormal-order",
         "categorical-mode-all-missing-zero",
         "categorical-mode-all-missing-error",
         "categorical-mode-empty-analysis-zero-policy",
         "categorical-mode-unknown-apply",
+        "categorical-mode-tie-smallest-label-sentinel",
+        "categorical-mode-label-unknown-error",
+        "categorical-mode-label-unknown-other",
+        "categorical-mode-label-all-missing-zero-other",
+        "categorical-mode-label-sentinel-collision",
     } <= case_ids, "categorical mode edge corpus incomplete")
     return len(semantic_cases), len(validation_cases), len(sqrt_cases)
 

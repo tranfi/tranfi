@@ -11,6 +11,9 @@ const vectors = require('./vectors/prepared_transform_v1.json')
 
 const schema64 = [{ id: 'x0', dtype: 'float64' }]
 const supportedRecipes = new Set([
+  'categorical_mode_label_other',
+  'categorical_mode_label_sentinel',
+  'categorical_mode_zero_label_other',
   'categorical_mode_none',
   'categorical_mode_zero_none',
   'numeric_mean_standard',
@@ -292,6 +295,13 @@ async function main() {
         new TextDecoder().decode(plan.schemaJSON('input')),
         '[{"dtype":"float64","id":"x0","name":"x0"}]'
       )
+      if (item.expectedPlan.outputIds) {
+        assert.equal(
+          new TextDecoder().decode(plan.schemaJSON('output')),
+          '[{"category":null,"dtype":"float64","id":"x0%3Alabel",' +
+            '"name":"x0%3Alabel","role":"label","sourceId":"x0"}]'
+        )
+      }
       const apply = plan.apply(schema64)
       const result = apply.run(table(applyValues))
       assert.equal(result.rows, applyValues.length)
@@ -327,7 +337,73 @@ async function main() {
     analyzer.push(table(item.analyze.rows.map((row) => doubleFromBits(row[0]))))
     assert.throws(
       () => analyzer.finalize(),
-      (error) => error instanceof native.TranfiTransformError && error.code === 103
+      (error) => error instanceof native.TranfiTransformError &&
+        error.code === item.expectedError.code
+    )
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof native.TranfiTransformError && error.code === 112
+    )
+    closeAll(recipe, analyzer)
+  }
+
+  {
+    const item = vectors.semanticCases.find(
+      (entry) => entry.id === 'categorical-mode-label-unknown-error'
+    )
+    const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table(item.analyze.rows.map((row) => doubleFromBits(row[0]))))
+    const plan = analyzer.finalize()
+    const apply = plan.apply(schema64)
+    assert.throws(
+      () => apply.run(table(item.apply.rows.map((row) => doubleFromBits(row[0])))),
+      (error) => error instanceof native.TranfiTransformError && error.code === 108
+    )
+    assert.throws(
+      () => apply.run(table([1])),
+      (error) => error instanceof native.TranfiTransformError && error.code === 112
+    )
+    closeAll(recipe, analyzer, plan, apply)
+  }
+
+  for (const sentinel of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
+    const config = structuredClone(vectors.recipes.categorical_mode_label_sentinel)
+    config.columns[0].categorical.encode.sentinelLabel = sentinel
+    wasm.TransformRecipe.fromJSON(config).close()
+  }
+  for (const sentinel of [0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    const config = structuredClone(vectors.recipes.categorical_mode_label_sentinel)
+    config.columns[0].categorical.encode.sentinelLabel = sentinel
+    assert.throws(
+      () => wasm.TransformRecipe.fromJSON(config),
+      (error) => error instanceof native.TranfiTransformError && error.code === 101
+    )
+  }
+
+  {
+    const config = structuredClone(vectors.recipes.categorical_mode_label_error)
+    config.columns[0].sourceId = 'a'
+    const second = structuredClone(config.columns[0])
+    second.sourceId = 'a%3Alabel'
+    config.columns.push(second)
+    const collisionSchema = [
+      { id: 'a', name: 'first', dtype: 'float64' },
+      { id: 'a%3Alabel', name: 'second', dtype: 'float64' }
+    ]
+    const recipe = wasm.TransformRecipe.fromJSON(config)
+    const analyzer = recipe.analyzer(collisionSchema)
+    analyzer.push({
+      rows: 1,
+      columns: [new Float64Array([0]), new Float64Array([0])]
+    })
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof native.TranfiTransformError && error.code === 102
+    )
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof native.TranfiTransformError && error.code === 112
     )
     closeAll(recipe, analyzer)
   }
@@ -360,6 +436,36 @@ async function main() {
       (error) => error instanceof native.TranfiTransformError && error.code === 112
     )
     closeAll(recipe, analyzer, plan, apply, limited)
+  }
+
+  {
+    const schema32 = [{ id: 'x0', name: 'x0', dtype: 'float32' }]
+    const config = vectors.recipes.categorical_mode_label_other
+    const wasmRecipe = wasm.TransformRecipe.fromJSON(config)
+    const wasmAnalyzer = wasmRecipe.analyzer(schema32)
+    wasmAnalyzer.push(table([2, 1, 2], Float32Array))
+    const wasmPlan = wasmAnalyzer.finalize()
+    const nativeRecipe = native.TransformRecipe.fromJSON(config)
+    const nativeAnalyzer = nativeRecipe.analyzer(schema32)
+    nativeAnalyzer.push(table([2, 1, 2], Float32Array))
+    const nativePlan = nativeAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(wasmPlan.toBytes()),
+      nativePlan.toBytes(),
+      'native/WASM float32 categorical-label TFTR bytes'
+    )
+    const apply = wasmPlan.apply(schema32)
+    assert.deepEqual(
+      Array.from(
+        apply.run(table([1, 3, NaN], Float32Array)).data,
+        doubleBits
+      ),
+      ['0000000000000000', '4000000000000000', '3ff0000000000000']
+    )
+    closeAll(
+      wasmRecipe, wasmAnalyzer, wasmPlan, apply,
+      nativeRecipe, nativeAnalyzer, nativePlan
+    )
   }
 
   {

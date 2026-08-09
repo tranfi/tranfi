@@ -404,6 +404,18 @@ tf_transform_code tf_transform_category_plan_requirements(
                 "categorical mode has no observed values");
         count = 1;
     }
+    if (recipe->categorical_encode == TF_TRANSFORM_ENCODE_LABEL) {
+        if (count > (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "categorical label count exceeds the safe-integer domain");
+        if (recipe->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
+            && recipe->categorical_sentinel_label >= 0
+            && (uint64_t)recipe->categorical_sentinel_label < count)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INVALID_RECIPE,
+                "categorical sentinel collides with a learned label");
+    }
     if (count > analyzer->runtime.limits.max_categories_per_column
         || count > analyzer->runtime.limits.max_total_categories
         || count > SIZE_MAX / sizeof(tf_transform_category_value)
@@ -479,6 +491,39 @@ static tf_transform_code category_sort(
     return category_poll(runtime, error);
 }
 
+static tf_transform_code category_finalize_encoding(
+    const tf_transform_recipe_column *recipe,
+    tf_transform_categorical_state *out, tf_transform_error **error) {
+    if (!recipe || !out)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "categorical encoding state is invalid");
+    out->unknown = recipe->categorical_unknown;
+    out->sentinel_label = recipe->categorical_sentinel_label;
+    out->has_sentinel_label = recipe->categorical_has_sentinel_label;
+    if (out->encode != TF_TRANSFORM_ENCODE_LABEL) return TF_TRANSFORM_OK;
+    if ((uint64_t)out->category_count
+            > (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "categorical label count exceeds the safe-integer domain");
+    if (out->unknown == TF_TRANSFORM_UNKNOWN_SENTINEL) {
+        if (!out->has_sentinel_label)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INTERNAL,
+                "categorical sentinel state is missing");
+        if (out->sentinel_label >= 0
+            && (uint64_t)out->sentinel_label < (uint64_t)out->category_count)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INVALID_RECIPE,
+                "categorical sentinel collides with a learned label");
+    } else if (out->unknown == TF_TRANSFORM_UNKNOWN_OTHER) {
+        out->other_ordinal = (uint64_t)out->category_count;
+        out->has_other_ordinal = 1;
+    }
+    return TF_TRANSFORM_OK;
+}
+
 tf_transform_code tf_transform_category_finalize(
     const tf_transform_analyzer *analyzer, size_t column_index,
     tf_transform_categorical_state *out, tf_transform_error **error) {
@@ -523,6 +568,8 @@ tf_transform_code tf_transform_category_finalize(
         out->categories[0].bits = 0;
         out->impute_bits = 0;
         out->has_impute_value = 1;
+        code = category_finalize_encoding(recipe, out, error);
+        if (code != TF_TRANSFORM_OK) goto failed;
         return category_poll(&analyzer->runtime, error);
     }
     for (size_t i = 0; i < store->capacity; ++i) {
@@ -560,6 +607,8 @@ tf_transform_code tf_transform_category_finalize(
     if (code != TF_TRANSFORM_OK) goto failed;
     out->impute_bits = best_bits;
     out->has_impute_value = 1;
+    code = category_finalize_encoding(recipe, out, error);
+    if (code != TF_TRANSFORM_OK) goto failed;
     return TF_TRANSFORM_OK;
 failed:
     tf_transform_categorical_state_clear(out);
@@ -572,15 +621,15 @@ void tf_transform_categorical_state_clear(tf_transform_categorical_state *state)
     memset(state, 0, sizeof(*state));
 }
 
-tf_transform_code tf_transform_category_contains(
+tf_transform_code tf_transform_category_lookup(
     const tf_transform_categorical_state *state, uint64_t bits,
-    const tf_transform_runtime_copy *runtime, int *out,
+    const tf_transform_runtime_copy *runtime, size_t *ordinal, int *found,
     tf_transform_error **error) {
     size_t lower = 0;
     size_t upper;
     size_t ticks = 0;
     tf_transform_code code;
-    if (!state || !runtime || !out)
+    if (!state || !runtime || !ordinal || !found)
         return tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
             "categorical lookup arguments are invalid");
@@ -601,10 +650,12 @@ tf_transform_code tf_transform_category_contains(
         if (comparison < 0) lower = middle + 1;
         else if (comparison > 0) upper = middle;
         else {
-            *out = 1;
+            *ordinal = middle;
+            *found = 1;
             return TF_TRANSFORM_OK;
         }
     }
-    *out = 0;
+    *ordinal = 0;
+    *found = 0;
     return TF_TRANSFORM_OK;
 }

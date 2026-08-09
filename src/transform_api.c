@@ -456,6 +456,7 @@ void tf_transform_schema_clear(tf_transform_schema *schema) {
     for (size_t i = 0; i < schema->field_count; ++i) {
         free(schema->fields[i].id);
         free(schema->fields[i].name);
+        free(schema->fields[i].source_id);
     }
     free(schema->fields);
     memset(schema, 0, sizeof(*schema));
@@ -834,6 +835,11 @@ static tf_transform_code schema_clone_common(
         result.fields[i].dtype = source->fields[i].dtype;
         result.fields[i].id_len = source->fields[i].id_len;
         result.fields[i].name_len = source->fields[i].name_len;
+        result.fields[i].source_id_len = source->fields[i].source_id_len;
+        result.fields[i].role = source->fields[i].role;
+        result.fields[i].category_kind = source->fields[i].category_kind;
+        result.fields[i].category_dtype = source->fields[i].category_dtype;
+        result.fields[i].category_bits = source->fields[i].category_bits;
         if (runtime) {
             code = tf_transform_poll_cancel(runtime, error);
             if (code != TF_TRANSFORM_OK) {
@@ -843,7 +849,11 @@ static tf_transform_code schema_clone_common(
         }
         result.fields[i].id = (char *)malloc(source->fields[i].id_len + 1);
         result.fields[i].name = (char *)malloc(source->fields[i].name_len + 1);
-        if (!result.fields[i].id || !result.fields[i].name) {
+        if (source->fields[i].source_id)
+            result.fields[i].source_id = (char *)malloc(
+                source->fields[i].source_id_len + 1);
+        if (!result.fields[i].id || !result.fields[i].name
+            || (source->fields[i].source_id && !result.fields[i].source_id)) {
             tf_transform_schema_clear(&result);
             return tf_transform_set_error(
                 error, TF_TRANSFORM_ALLOCATION, "schema clone string failed");
@@ -864,6 +874,16 @@ static tf_transform_code schema_clone_common(
             return code;
         }
         result.fields[i].name[source->fields[i].name_len] = '\0';
+        if (source->fields[i].source_id) {
+            code = tf_transform_copy_bytes_runtime(
+                result.fields[i].source_id, source->fields[i].source_id,
+                source->fields[i].source_id_len, runtime, error);
+            if (code != TF_TRANSFORM_OK) {
+                tf_transform_schema_clear(&result);
+                return code;
+            }
+            result.fields[i].source_id[source->fields[i].source_id_len] = '\0';
+        }
     }
     tf_transform_schema_clear(out);
     *out = result;
@@ -883,6 +903,486 @@ tf_transform_code tf_transform_schema_clone_runtime(
     if (!runtime) return tf_transform_set_error(
         error, TF_TRANSFORM_INVALID_ARGUMENT, "schema runtime is null");
     return schema_clone_common(source, out, runtime, error);
+}
+
+static int generated_id_byte_is_plain(uint8_t byte) {
+    return (byte >= (uint8_t)'A' && byte <= (uint8_t)'Z')
+        || (byte >= (uint8_t)'a' && byte <= (uint8_t)'z')
+        || (byte >= (uint8_t)'0' && byte <= (uint8_t)'9');
+}
+
+static tf_transform_code generated_label_length(
+    const char *source, size_t source_len,
+    const tf_transform_runtime_copy *runtime, size_t *out,
+    tf_transform_error **error) {
+    static const size_t suffix_len = sizeof("%3Alabel") - 1;
+    size_t length = 0;
+    if (!source || !runtime || !out)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "generated label length arguments are invalid");
+    for (size_t i = 0; i < source_len; ++i) {
+        size_t added = generated_id_byte_is_plain((uint8_t)source[i]) ? 1u : 3u;
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            tf_transform_code code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (added > SIZE_MAX - length)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "generated label length overflows");
+        length += added;
+    }
+    if (suffix_len > SIZE_MAX - length)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "generated label length overflows");
+    length += suffix_len;
+    if ((uint64_t)length > runtime->limits.max_string_bytes
+        || (uint64_t)length + 1 > runtime->limits.max_allocation_bytes)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "generated label string exceeds limits");
+    *out = length;
+    return tf_transform_poll_cancel(runtime, error);
+}
+
+static tf_transform_code generated_label_write(
+    char *destination, size_t destination_len,
+    const char *source, size_t source_len,
+    const tf_transform_runtime_copy *runtime,
+    tf_transform_error **error) {
+    static const char digits[] = "0123456789ABCDEF";
+    static const char suffix[] = "%3Alabel";
+    size_t offset = 0;
+    if (!destination || !source || !runtime)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "generated label output arguments are invalid");
+    for (size_t i = 0; i < source_len; ++i) {
+        uint8_t byte = (uint8_t)source[i];
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            tf_transform_code code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (generated_id_byte_is_plain(byte)) destination[offset++] = (char)byte;
+        else {
+            destination[offset++] = '%';
+            destination[offset++] = digits[byte >> 4];
+            destination[offset++] = digits[byte & 15u];
+        }
+    }
+    if (sizeof(suffix) - 1 > destination_len - offset)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "generated label output length drifted");
+    memcpy(destination + offset, suffix, sizeof(suffix) - 1);
+    offset += sizeof(suffix) - 1;
+    if (offset != destination_len)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "generated label output length drifted");
+    destination[offset] = '\0';
+    return tf_transform_poll_cancel(runtime, error);
+}
+
+static tf_transform_code generated_label_matches(
+    const char *candidate, size_t candidate_len,
+    const char *source, size_t source_len,
+    const tf_transform_runtime_copy *runtime, int *matches,
+    tf_transform_error **error) {
+    static const char digits[] = "0123456789ABCDEF";
+    static const char suffix[] = "%3Alabel";
+    size_t expected_len = 0;
+    size_t offset = 0;
+    tf_transform_code code;
+    if (!candidate || !source || !runtime || !matches)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "generated label comparison arguments are invalid");
+    *matches = 0;
+    code = generated_label_length(
+        source, source_len, runtime, &expected_len, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    if (candidate_len != expected_len) return TF_TRANSFORM_OK;
+    for (size_t i = 0; i < source_len; ++i) {
+        uint8_t byte = (uint8_t)source[i];
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (generated_id_byte_is_plain(byte)) {
+            if ((uint8_t)candidate[offset++] != byte) return TF_TRANSFORM_OK;
+        } else {
+            if (candidate[offset++] != '%'
+                || candidate[offset++] != digits[byte >> 4]
+                || candidate[offset++] != digits[byte & 15u])
+                return TF_TRANSFORM_OK;
+        }
+    }
+    if (memcmp(candidate + offset, suffix, sizeof(suffix) - 1) != 0)
+        return TF_TRANSFORM_OK;
+    *matches = 1;
+    return tf_transform_poll_cancel(runtime, error);
+}
+
+tf_transform_code tf_transform_output_schema_requirements(
+    const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_runtime_copy *runtime, uint64_t *resident_bytes,
+    uint64_t *allocation_count, uint64_t *collision_bytes,
+    tf_transform_error **error) {
+    uint64_t resident;
+    uint64_t strings = 0;
+    uint64_t allocations = 1;
+    uint64_t generated = 0;
+    if (!input || !recipe || !runtime || !resident_bytes || !allocation_count
+        || !collision_bytes || input->field_count != recipe->column_count)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "output schema requirement arguments are invalid");
+    if ((uint64_t)input->field_count > recipe->max_output_columns
+        || (uint64_t)input->field_count > runtime->limits.max_output_columns
+        || input->field_count > SIZE_MAX / sizeof(*input->fields))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "output schema column count exceeds limits");
+    resident = (uint64_t)input->field_count * sizeof(*input->fields);
+    if (resident > runtime->limits.max_allocation_bytes)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "output schema fields exceed the allocation limit");
+    for (size_t i = 0; i < input->field_count; ++i) {
+        const tf_transform_schema_field_owned *field = &input->fields[i];
+        const tf_transform_recipe_column *column = &recipe->columns[i];
+        size_t id_len = field->id_len;
+        size_t name_len = field->name_len;
+        uint64_t field_strings;
+        tf_transform_code code;
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL) {
+            code = generated_label_length(
+                field->id, field->id_len, runtime, &id_len, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            name_len = id_len;
+            ++generated;
+        }
+        if ((uint64_t)id_len > runtime->limits.max_string_bytes
+            || (uint64_t)name_len > runtime->limits.max_string_bytes
+            || (uint64_t)field->id_len > runtime->limits.max_string_bytes
+            || (uint64_t)id_len + 1 > runtime->limits.max_allocation_bytes
+            || (uint64_t)name_len + 1 > runtime->limits.max_allocation_bytes
+            || (uint64_t)field->id_len + 1
+                > runtime->limits.max_allocation_bytes)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "output schema string exceeds limits");
+        field_strings = (uint64_t)id_len + 1;
+        if ((uint64_t)name_len + 1 > UINT64_MAX - field_strings
+            || (uint64_t)field->id_len + 1
+                > UINT64_MAX - field_strings - ((uint64_t)name_len + 1)
+            || strings > UINT64_MAX - field_strings
+                - ((uint64_t)name_len + 1) - ((uint64_t)field->id_len + 1))
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "output schema string bytes overflow");
+        strings += field_strings + (uint64_t)name_len + 1
+            + (uint64_t)field->id_len + 1;
+        if (allocations > UINT64_MAX - 3)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "output schema allocation count overflows");
+        allocations += 3;
+    }
+    if (strings > UINT64_MAX - resident
+        || resident + strings > runtime->limits.max_resident_state_bytes
+        || strings > runtime->limits.max_decoded_string_bytes)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "output schema resident strings exceed limits");
+    resident += strings;
+    if (generated == 0) {
+        *collision_bytes = 0;
+        *resident_bytes = resident;
+        *allocation_count = allocations;
+        return tf_transform_poll_cancel(runtime, error);
+    }
+    if (generated > UINT64_MAX - (uint64_t)input->field_count
+        || generated + (uint64_t)input->field_count
+            > SIZE_MAX / sizeof(tf_transform_schema_field_owned *))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "output schema collision index overflows");
+    *collision_bytes = (generated + (uint64_t)input->field_count)
+        * sizeof(tf_transform_schema_field_owned *);
+    if (*collision_bytes > runtime->limits.max_allocation_bytes
+        || allocations == UINT64_MAX)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "output schema collision index exceeds limits");
+    *resident_bytes = resident;
+    *allocation_count = allocations + 1;
+    return tf_transform_poll_cancel(runtime, error);
+}
+
+tf_transform_code tf_transform_output_schema_build(
+    const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_runtime_copy *runtime, tf_transform_schema *out,
+    tf_transform_error **error) {
+    tf_transform_schema result;
+    uint64_t resident = 0;
+    uint64_t allocations = 0;
+    uint64_t collision_bytes = 0;
+    tf_transform_code code;
+    if (!out) return tf_transform_set_error(
+        error, TF_TRANSFORM_INTERNAL, "output schema destination is null");
+    memset(&result, 0, sizeof(result));
+    code = tf_transform_output_schema_requirements(
+        input, recipe, runtime, &resident, &allocations,
+        &collision_bytes, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    (void)resident;
+    (void)allocations;
+    (void)collision_bytes;
+    result.fields = (tf_transform_schema_field_owned *)calloc(
+        input->field_count, sizeof(*result.fields));
+    if (!result.fields) return tf_transform_set_error(
+        error, TF_TRANSFORM_ALLOCATION, "output schema allocation failed");
+    result.field_count = input->field_count;
+    result.is_output = 1;
+    for (size_t i = 0; i < input->field_count; ++i) {
+        const tf_transform_schema_field_owned *source = &input->fields[i];
+        const tf_transform_recipe_column *column = &recipe->columns[i];
+        tf_transform_schema_field_owned *field = &result.fields[i];
+        size_t id_len = source->id_len;
+        int label = column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL;
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) goto failed;
+        }
+        if (label) {
+            code = generated_label_length(
+                source->id, source->id_len, runtime, &id_len, error);
+            if (code != TF_TRANSFORM_OK) goto failed;
+            field->id_len = id_len;
+            field->name_len = id_len;
+            field->role = TF_TRANSFORM_ROLE_LABEL;
+        } else {
+            field->id_len = source->id_len;
+            field->name_len = source->name_len;
+            field->role = TF_TRANSFORM_ROLE_VALUE;
+        }
+        field->dtype = TF_VIEW_FLOAT64;
+        field->source_id_len = source->id_len;
+        field->category_kind = TF_TRANSFORM_SCHEMA_CATEGORY_NONE;
+        field->id = (char *)malloc(field->id_len + 1);
+        field->name = (char *)malloc(field->name_len + 1);
+        field->source_id = (char *)malloc(field->source_id_len + 1);
+        if (!field->id || !field->name || !field->source_id) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_ALLOCATION,
+                "output schema string allocation failed");
+            goto failed;
+        }
+        if (label) {
+            code = generated_label_write(
+                field->id, field->id_len, source->id, source->id_len,
+                runtime, error);
+            if (code != TF_TRANSFORM_OK) goto failed;
+            code = tf_transform_copy_bytes_runtime(
+                field->name, field->id, field->id_len + 1, runtime, error);
+        } else {
+            code = tf_transform_copy_bytes_runtime(
+                field->id, source->id, source->id_len + 1, runtime, error);
+            if (code == TF_TRANSFORM_OK)
+                code = tf_transform_copy_bytes_runtime(
+                    field->name, source->name, source->name_len + 1,
+                    runtime, error);
+        }
+        if (code != TF_TRANSFORM_OK) goto failed;
+        code = tf_transform_copy_bytes_runtime(
+            field->source_id, source->id, source->id_len + 1,
+            runtime, error);
+        if (code != TF_TRANSFORM_OK) goto failed;
+    }
+    tf_transform_schema_clear(out);
+    *out = result;
+    return TF_TRANSFORM_OK;
+failed:
+    tf_transform_schema_clear(&result);
+    return code;
+}
+
+tf_transform_code tf_transform_output_schema_validate_collisions(
+    const tf_transform_schema *input, const tf_transform_schema *output,
+    const tf_transform_runtime_copy *runtime,
+    tf_transform_resource_ledger *ledger, tf_transform_code collision_code,
+    tf_transform_error **error) {
+    tf_transform_schema_field_owned **items = NULL;
+    size_t count;
+    size_t generated = 0;
+    size_t index = 0;
+    tf_transform_code code;
+    if (!input || !output || !runtime)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "output schema collision arguments are invalid");
+    for (size_t i = 0; i < output->field_count; ++i)
+        if (output->fields[i].role != TF_TRANSFORM_ROLE_VALUE) ++generated;
+    if (generated == 0) return tf_transform_poll_cancel(runtime, error);
+    if (generated > SIZE_MAX - input->field_count)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "output schema collision count overflows");
+    count = input->field_count + generated;
+    if (count > SIZE_MAX / sizeof(*items)
+        || (uint64_t)(count * sizeof(*items))
+            > runtime->limits.max_allocation_bytes)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "output schema collision index exceeds limits");
+    code = tf_transform_poll_cancel(runtime, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    items = ledger
+        ? (tf_transform_schema_field_owned **)tf_transform_resource_malloc(
+            ledger, count * sizeof(*items), error)
+        : (tf_transform_schema_field_owned **)malloc(count * sizeof(*items));
+    if (!items) return tf_transform_set_error(
+        error, ledger && ledger->last_code != TF_TRANSFORM_OK
+            ? ledger->last_code : TF_TRANSFORM_ALLOCATION,
+        "output schema collision index allocation failed");
+    for (size_t i = 0; i < input->field_count; ++i)
+        items[index++] = &input->fields[i];
+    for (size_t i = 0; i < output->field_count; ++i)
+        if (output->fields[i].role != TF_TRANSFORM_ROLE_VALUE)
+            items[index++] = &output->fields[i];
+    if (index != count) {
+        code = tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "output schema collision count drifted");
+        goto done;
+    }
+    code = sort_schema_fields(items, count, 0, runtime, error);
+    if (code == TF_TRANSFORM_OK) {
+        for (size_t i = 1; i < count; ++i) {
+            int comparison;
+            code = poll_runtime_iteration(runtime, i, error);
+            if (code != TF_TRANSFORM_OK) break;
+            code = schema_field_compare_runtime(
+                items[i - 1], items[i], 0, runtime, &comparison, error);
+            if (code != TF_TRANSFORM_OK) break;
+            if (comparison == 0) {
+                code = tf_transform_set_error(
+                    error, collision_code, "generated output ID collides");
+                break;
+            }
+        }
+    }
+    if (code == TF_TRANSFORM_OK)
+        code = sort_schema_fields(items, count, 1, runtime, error);
+    if (code == TF_TRANSFORM_OK) {
+        for (size_t i = 1; i < count; ++i) {
+            int comparison;
+            code = poll_runtime_iteration(runtime, i, error);
+            if (code != TF_TRANSFORM_OK) break;
+            code = schema_field_compare_runtime(
+                items[i - 1], items[i], 1, runtime, &comparison, error);
+            if (code != TF_TRANSFORM_OK) break;
+            if (comparison == 0) {
+                code = tf_transform_set_error(
+                    error, collision_code, "generated output name collides");
+                break;
+            }
+        }
+    }
+done:
+    free(items);
+    if (ledger)
+        tf_transform_resource_release(
+            ledger, (uint64_t)count * sizeof(*items));
+    return code;
+}
+
+tf_transform_code tf_transform_output_schema_validate_contract(
+    const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_schema *output,
+    const tf_transform_runtime_copy *runtime,
+    tf_transform_resource_ledger *ledger, tf_transform_code mismatch_code,
+    tf_transform_error **error) {
+    tf_transform_code code;
+    if (!input || !recipe || !output || !runtime
+        || input->field_count != recipe->column_count
+        || output->field_count != input->field_count)
+        return tf_transform_set_error(
+            error, mismatch_code, "output schema shape is inconsistent");
+    for (size_t i = 0; i < input->field_count; ++i) {
+        const tf_transform_schema_field_owned *source = &input->fields[i];
+        const tf_transform_schema_field_owned *field = &output->fields[i];
+        const tf_transform_recipe_column *column = &recipe->columns[i];
+        int equal = 0;
+        int label = column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL;
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (field->dtype != TF_VIEW_FLOAT64
+            || field->category_kind != TF_TRANSFORM_SCHEMA_CATEGORY_NONE
+            || !field->source_id)
+            return tf_transform_set_error(
+                error, mismatch_code, "output schema metadata is inconsistent");
+        code = tf_transform_compare_bytes_runtime(
+            source->id, source->id_len,
+            field->source_id, field->source_id_len,
+            runtime, &equal, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        if (equal != 0)
+            return tf_transform_set_error(
+                error, mismatch_code, "output schema source ID is inconsistent");
+        if (label) {
+            int id_matches = 0;
+            int name_matches = 0;
+            if (field->role != TF_TRANSFORM_ROLE_LABEL)
+                return tf_transform_set_error(
+                    error, mismatch_code, "label output role is inconsistent");
+            code = generated_label_matches(
+                field->id, field->id_len, source->id, source->id_len,
+                runtime, &id_matches, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            code = generated_label_matches(
+                field->name, field->name_len, source->id, source->id_len,
+                runtime, &name_matches, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            if (!id_matches || !name_matches)
+                return tf_transform_set_error(
+                    error, mismatch_code,
+                    "generated label output name is inconsistent");
+        } else {
+            int id_comparison = 0;
+            int name_comparison = 0;
+            if (field->role != TF_TRANSFORM_ROLE_VALUE)
+                return tf_transform_set_error(
+                    error, mismatch_code, "value output role is inconsistent");
+            code = tf_transform_compare_bytes_runtime(
+                source->id, source->id_len, field->id, field->id_len,
+                runtime, &id_comparison, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            code = tf_transform_compare_bytes_runtime(
+                source->name, source->name_len, field->name, field->name_len,
+                runtime, &name_comparison, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            if (id_comparison != 0 || name_comparison != 0)
+                return tf_transform_set_error(
+                    error, mismatch_code,
+                    "pass-through output schema is inconsistent");
+        }
+    }
+    return tf_transform_output_schema_validate_collisions(
+        input, output, runtime, ledger, mismatch_code, error);
 }
 
 int tf_transform_schema_equal_view(

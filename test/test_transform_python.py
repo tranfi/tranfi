@@ -31,6 +31,8 @@ SCHEMA32 = [{'id': 'x0', 'name': 'x0', 'dtype': 'float32'}]
 SUPPORTED_CASES = [
     case for case in VECTORS['semanticCases']
     if case['recipe'] in {
+        'categorical_mode_label_other', 'categorical_mode_label_sentinel',
+        'categorical_mode_zero_label_other',
         'categorical_mode_none', 'categorical_mode_zero_none',
         'numeric_mean_standard', 'numeric_median_none',
         'numeric_median_zero_none',
@@ -154,6 +156,11 @@ def test_semantic_vectors_chunk_plan_and_apply_parity(case):
                         assert blob == reference_blob
                     assert plan.schema_json('input') == (
                         b'[{"dtype":"float64","id":"x0","name":"x0"}]')
+                    if case['expectedPlan'].get('outputIds'):
+                        assert plan.schema_json('output') == (
+                            b'[{"category":null,"dtype":"float64",'
+                            b'"id":"x0%3Alabel","name":"x0%3Alabel",'
+                            b'"role":"label","sourceId":"x0"}]')
                     with plan.apply(SCHEMA64) as apply:
                         result = apply.run(make_table(apply_values))
                         assert result.rows == len(apply_values)
@@ -179,7 +186,8 @@ def test_empty_analysis_preserves_insufficient_data_code():
 def test_categorical_mode_errors_limits_and_float32():
     for case_id in (
             'categorical-mode-all-missing-error',
-            'categorical-mode-empty-analysis-zero-policy'):
+            'categorical-mode-empty-analysis-zero-policy',
+            'categorical-mode-label-sentinel-collision'):
         case = next(item for item in VECTORS['semanticCases']
                     if item['id'] == case_id)
         values = [double_from_bits(row[0]) for row in case['analyze']['rows']]
@@ -189,7 +197,65 @@ def test_categorical_mode_errors_limits_and_float32():
                 analyzer.push(make_table(values))
                 with pytest.raises(tranfi.TranfiTransformError) as caught:
                     analyzer.finalize()
-                assert caught.value.code == 103
+                assert caught.value.code == case['expectedError']['code']
+                with pytest.raises(tranfi.TranfiTransformError) as terminal:
+                    analyzer.finalize()
+                assert terminal.value.code == 112
+
+    case = next(
+        item for item in VECTORS['semanticCases']
+        if item['id'] == 'categorical-mode-label-unknown-error')
+    with tranfi.TransformRecipe.from_json(recipe_text(case['recipe'])) as recipe:
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            analyzer.push(make_table([
+                double_from_bits(row[0]) for row in case['analyze']['rows']]))
+            with analyzer.finalize() as plan:
+                with plan.apply(SCHEMA64) as apply:
+                    with pytest.raises(tranfi.TranfiTransformError) as caught:
+                        apply.run(make_table([
+                            double_from_bits(row[0])
+                            for row in case['apply']['rows']]))
+                    assert caught.value.code == 108
+                    with pytest.raises(tranfi.TranfiTransformError) as terminal:
+                        apply.run(make_table([1.0]))
+                    assert terminal.value.code == 112
+
+    for sentinel in (-9_007_199_254_740_991, 9_007_199_254_740_991):
+        config = json.loads(recipe_text('categorical_mode_label_sentinel'))
+        config['columns'][0]['categorical']['encode']['sentinelLabel'] = sentinel
+        with tranfi.TransformRecipe.from_json(
+                json.dumps(config, separators=(',', ':'))):
+            pass
+    for sentinel in (0.5, 9_007_199_254_740_992):
+        config = json.loads(recipe_text('categorical_mode_label_sentinel'))
+        config['columns'][0]['categorical']['encode']['sentinelLabel'] = sentinel
+        with pytest.raises(tranfi.TranfiTransformError) as caught:
+            tranfi.TransformRecipe.from_json(
+                json.dumps(config, separators=(',', ':')))
+        assert caught.value.code == 101
+
+    config = json.loads(recipe_text('categorical_mode_label_error'))
+    config['columns'][0]['sourceId'] = 'a'
+    second = json.loads(json.dumps(config['columns'][0]))
+    second['sourceId'] = 'a%3Alabel'
+    config['columns'].append(second)
+    collision_schema = [
+        {'id': 'a', 'name': 'first', 'dtype': 'float64'},
+        {'id': 'a%3Alabel', 'name': 'second', 'dtype': 'float64'},
+    ]
+    with tranfi.TransformRecipe.from_json(
+            json.dumps(config, separators=(',', ':'))) as recipe:
+        with recipe.analyzer(collision_schema) as analyzer:
+            analyzer.push({
+                'rows': 1,
+                'columns': [array('d', [0.0]), array('d', [0.0])],
+            })
+            with pytest.raises(tranfi.TranfiTransformError) as caught:
+                analyzer.finalize()
+            assert caught.value.code == 102
+            with pytest.raises(tranfi.TranfiTransformError) as terminal:
+                analyzer.finalize()
+            assert terminal.value.code == 112
 
     with tranfi.TransformRecipe.from_json(
             recipe_text('categorical_mode_none')) as recipe:
@@ -228,6 +294,19 @@ def test_categorical_mode_errors_limits_and_float32():
                     result = apply.run(make_table([-0.0, float('nan')], dtype='f'))
                     assert [double_bits(value) for value in result.data] == [
                         '8000000000000000', '0000000000000000']
+
+    with tranfi.TransformRecipe.from_json(
+            recipe_text('categorical_mode_label_other')) as recipe:
+        with recipe.analyzer(SCHEMA32) as analyzer:
+            analyzer.push(make_table([2.0, 1.0, 2.0], dtype='f'))
+            with analyzer.finalize() as plan:
+                with plan.apply(SCHEMA32) as apply:
+                    result = apply.run(make_table(
+                        [1.0, 3.0, float('nan')], dtype='f'))
+                    assert [double_bits(value) for value in result.data] == [
+                        '0000000000000000', '4000000000000000',
+                        '3ff0000000000000',
+                    ]
 
     analyze_values = [
         float32_from_bits(value)
