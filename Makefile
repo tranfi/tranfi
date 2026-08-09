@@ -30,7 +30,7 @@ BENCH_SMOKE_ROWS ?= 10000
 .PHONY: build-c build-debug build-tsan build-node build-wasm build-js build-py sync-js-csrc sync-py-csrc
 .PHONY: check-js-csrc-sync check-py-csrc-sync check-csrc-sync sbom test-packaging test-packaging-install
 .PHONY: test-packaging-node test-packaging-node-install test-packaging-python test-packaging-python-install test-properties
-.PHONY: test-c test-memory test-debug test-tsan test-oom test-python test-node test-parity test-duckdb
+.PHONY: test-c test-memory test-debug test-tsan test-oom test-python test-node test-parity test-duckdb test-vectors
 .PHONY: test-spill-sec test-depth-limits test-float-rt test-wide-csv
 .PHONY: publish-python publish-node publish-github
 
@@ -95,15 +95,19 @@ wasm: build-wasm
 
 # --- Test targets ---
 
-test: test-c test-python test-properties test-node test-packaging fuzz-smoke
+test: test-vectors test-c test-python test-properties test-node test-packaging fuzz-smoke
+
+test-vectors:
+	@$(PYTHON) test/validate_transform_vectors.py
 
 test-c: build-c
 	@bash scripts/check-local-diagnostics.sh
-	@cmake --build build --target test_memory test_core test_wasm_api > /dev/null
+	@cmake --build build --target test_memory test_core test_wasm_api test_transform > /dev/null
 	@mkdir -p "$(TEST_TMPDIR)/memory"
 	@env $(TEST_MEMORY_ENV) ./build/test_memory
 	@env $(BUILD_ENV) ./build/test_core
 	@env $(BUILD_ENV) ./build/test_wasm_api
+	@env $(BUILD_ENV) ./build/test_transform
 	@env $(BUILD_ENV) bash test/test_cli_memory_policy.sh ./build/tranfi
 
 test-memory: build-c
@@ -116,6 +120,7 @@ test-debug: build-debug
 	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_core
 	@$(ASAN_RUN) env $(TEST_MEMORY_ENV) ./build-debug/test_memory
 	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_wasm_api
+	@$(ASAN_RUN) env $(BUILD_ENV) ./build-debug/test_transform
 	@$(ASAN_RUN) env $(BUILD_ENV) bash test/test_cli_memory_policy.sh ./build-debug/tranfi
 
 test-tsan: build-tsan
@@ -258,7 +263,7 @@ build/fuzz_%: test/fuzz_%.c $(FUZZ_SRC) $(FUZZ_HEADERS)
 
 # --- Verify (full suite with sanitizers) ---
 
-verify: build-debug test-debug test-spill-sec test-depth-limits test-float-rt test-wide-csv test-oom test-tsan test-python test-properties test-node test-packaging fuzz-smoke
+verify: test-vectors build-debug test-debug test-spill-sec test-depth-limits test-float-rt test-wide-csv test-oom test-tsan test-python test-properties test-node test-packaging fuzz-smoke
 
 # --- App targets ---
 

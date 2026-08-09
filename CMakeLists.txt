@@ -48,6 +48,10 @@ endfunction()
 # Core sources
 set(CORE_SOURCES
     src/cJSON.c
+    src/transform_api.c
+    src/transform_json.c
+    src/transform_numeric.c
+    src/transform_sha256.c
     src/arena.c
     src/buffer.c
     src/size_utils.c
@@ -134,6 +138,16 @@ set(CORE_SOURCES
     src/report.c
 )
 
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    set_source_files_properties(
+        src/transform_api.c
+        src/transform_json.c
+        src/transform_numeric.c
+        src/transform_sha256.c
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off"
+    )
+endif()
+
 # Static library (used by all targets)
 add_library(tranfi_core STATIC ${CORE_SOURCES})
 target_include_directories(tranfi_core PUBLIC src)
@@ -216,6 +230,17 @@ if(BUILD_TESTING)
     tranfi_apply_executable_hardening(test_wasm_api)
     tranfi_apply_debug_sanitizer(test_wasm_api)
     add_test(NAME wasm_api_tests COMMAND test_wasm_api)
+
+    add_executable(test_transform test/test_transform.c)
+    target_link_libraries(test_transform tranfi_core)
+    target_include_directories(test_transform PRIVATE src)
+    tranfi_apply_c_common(test_transform)
+    target_compile_options(test_transform PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
+    tranfi_apply_executable_hardening(test_transform)
+    tranfi_apply_debug_sanitizer(test_transform)
+    add_test(NAME transform_tests COMMAND test_transform)
+    set_tests_properties(transform_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     add_test(NAME cli_memory_policy COMMAND bash ${CMAKE_SOURCE_DIR}/test/test_cli_memory_policy.sh $<TARGET_FILE:tranfi_cli>)
 

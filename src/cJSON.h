@@ -130,6 +130,7 @@ typedef struct cJSON_Hooks
 } cJSON_Hooks;
 
 typedef int cJSON_bool;
+typedef cJSON_bool (*cJSON_ParsePollFn)(void *user_data);
 
 /* Limits how deeply nested arrays/objects can be before cJSON rejects to parse them.
  * This is to prevent stack overflows. */
@@ -157,6 +158,13 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLength(const char *value, size_t buffer_len
 /* If you supply a ptr in return_parse_end and parsing fails, then return_parse_end will contain a pointer to the error so will match cJSON_GetErrorPtr(). */
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return_parse_end, cJSON_bool require_null_terminated);
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated);
+/* Tranfi local extension: bounded embedders may poll cooperatively while parsing.
+ * The callback runs before parsing and after at most byte_interval bytes of parser
+ * work or iteration_interval structural operations. Returning false aborts. */
+CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOptsAndPoll(
+    const char *value, size_t buffer_length, const char **return_parse_end,
+    cJSON_bool require_null_terminated, cJSON_ParsePollFn poll,
+    void *poll_user_data, size_t byte_interval, size_t iteration_interval);
 /* Tranfi local patch: after a failed parse, reports whether cJSON saw an allocation failure instead of a syntax/type parse error. */
 CJSON_PUBLIC(cJSON_bool) cJSON_ParseHadAllocationFailure(void);
 

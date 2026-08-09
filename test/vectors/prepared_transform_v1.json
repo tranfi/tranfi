@@ -1,0 +1,510 @@
+{
+  "encoding": {
+    "finiteFloat": "16 lowercase big-endian IEEE-754 binary64 hex digits",
+    "missing": null,
+    "matrixLayout": "rows of logical float64 cells"
+  },
+  "errorCodes": {
+    "corruptPlan": 106,
+    "insufficientData": 103,
+    "invalidRecipe": 101,
+    "numericDomain": 107,
+    "resourceLimit": 104,
+    "unsupportedRuntime": 113,
+    "unsupportedVersion": 105
+  },
+  "format": "tranfi.prepared-transform-vectors",
+  "recipes": {
+    "categorical_mode_label_sentinel": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": -1,
+              "unknown": "sentinel"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_none_onehot_all_zero": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "all_zero"
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "infer_two_categories": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": null,
+              "unknown": "error"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": 2,
+            "op": "infer",
+            "rule": "finite-integer-cardinality-v1",
+            "value": null
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "mean"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "none"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "numeric_mean_standard": {
+      "columns": [
+        {
+          "categorical": null,
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "numeric"
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "mean"
+            },
+            "normalize": {
+              "ddof": 0,
+              "op": "standard"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "numeric_median_none": {
+      "columns": [
+        {
+          "categorical": null,
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "numeric"
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "median"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "none"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "numeric_none_none": {
+      "columns": [
+        {
+          "categorical": null,
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "numeric"
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "none"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "numeric_zero_minmax": {
+      "columns": [
+        {
+          "categorical": null,
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "numeric"
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "zero"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "minmax"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    }
+  },
+  "semanticCases": [
+    {
+      "analyze": {
+        "chunkSplits": [[4], [1, 3], [2, 1, 1]],
+        "rows": [["3ff0000000000000"], [null], ["4008000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["bff6a09e667f3bcc"], ["0000000000000000"], ["3ff6a09e667f3bcc"]],
+        "rows": [["3ff0000000000000"], [null], ["4008000000000000"]]
+      },
+      "expectedPlan": {
+        "kind": "numeric",
+        "location": "4000000000000000",
+        "scale": "3fe6a09e667f3bcd"
+      },
+      "id": "numeric-mean-standard-missing-splits",
+      "recipe": "numeric_mean_standard"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 1, 1]],
+        "rows": [["c000000000000000"], [null], ["4018000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["3fd0000000000000"], ["3ff0000000000000"]],
+        "rows": [["c000000000000000"], [null], ["4018000000000000"]]
+      },
+      "expectedPlan": {
+        "kind": "numeric",
+        "location": "c000000000000000",
+        "scale": "4020000000000000"
+      },
+      "id": "numeric-zero-minmax",
+      "recipe": "numeric_zero_minmax"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["4000000000000000"]],
+        "rows": [[null], ["4000000000000000"]]
+      },
+      "expectedPlan": {
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-all-missing-zero-standard",
+      "recipe": "numeric_mean_standard"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2]],
+        "rows": [["3ff0000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["7ff8000000000000"], ["4000000000000000"]],
+        "rows": [[null], ["4000000000000000"]]
+      },
+      "expectedPlan": {
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-none-canonical-missing",
+      "recipe": "numeric_none_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[5], [2, 3], [1, 1, 1, 1, 1]],
+        "rows": [["4000000000000000"], ["3ff0000000000000"], ["4000000000000000"], ["3ff0000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["0000000000000000"], ["3ff0000000000000"], ["bff0000000000000"]],
+        "rows": [[null], ["3ff0000000000000"], ["4000000000000000"], ["4008000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": "3ff0000000000000",
+        "kind": "categorical"
+      },
+      "id": "categorical-mode-tie-smallest-label-sentinel",
+      "recipe": "categorical_mode_label_sentinel"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["4000000000000000"], ["3ff0000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["3ff0000000000000", "0000000000000000"], ["0000000000000000", "3ff0000000000000"], ["0000000000000000", "0000000000000000"], ["0000000000000000", "0000000000000000"]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"], ["4008000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "kind": "categorical",
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"]
+      },
+      "id": "categorical-onehot-unknown-and-missing-all-zero",
+      "recipe": "categorical_none_onehot_all_zero"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 2], [2, 1]],
+        "rows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]],
+        "rows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]]
+      },
+      "expectedPlan": {
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "infer-third-distinct-becomes-numeric",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[5], [2, 3]],
+        "rows": [["3ff0000000000000"], ["4010000000000000"], ["4000000000000000"], ["4008000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["4004000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "4004000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "numeric-even-median",
+      "recipe": "numeric_median_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[0]],
+        "rows": []
+      },
+      "apply": {
+        "expectedColumns": 1,
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 103,
+        "phase": "finalize"
+      },
+      "id": "empty-analysis-insufficient",
+      "recipe": "numeric_mean_standard"
+    }
+  ],
+  "sqrtCases": [
+    {
+      "expected": "4000000000000000",
+      "id": "exact-square",
+      "input": "4010000000000000",
+      "roundDirection": "exact"
+    },
+    {
+      "expected": "3ff6a09e667f3bcd",
+      "id": "normal-round-up",
+      "input": "4000000000000000",
+      "roundDirection": "up"
+    },
+    {
+      "expected": "3ffbb67ae8584caa",
+      "id": "normal-round-down",
+      "input": "4008000000000000",
+      "roundDirection": "down"
+    },
+    {
+      "expected": "2000000000000000",
+      "id": "minimum-normal-exact-root",
+      "input": "0010000000000000",
+      "roundDirection": "exact"
+    },
+    {
+      "expected": "1e60000000000000",
+      "id": "minimum-subnormal-exact-root",
+      "input": "0000000000000001",
+      "roundDirection": "exact"
+    },
+    {
+      "expected": "1e6bb67ae8584caa",
+      "id": "subnormal-variance-round-down",
+      "input": "0000000000000003",
+      "roundDirection": "down"
+    },
+    {
+      "expected": "5fefffffffffffff",
+      "id": "maximum-finite-round-down",
+      "input": "7fefffffffffffff",
+      "roundDirection": "down"
+    }
+  ],
+  "validationCases": [
+    {
+      "expectedCode": 101,
+      "id": "max-categories-one-invalid",
+      "mutation": {
+        "path": "/columns/0/kind/maxCategories",
+        "recipe": "infer_two_categories",
+        "value": 1
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 0,
+      "id": "max-categories-two-valid",
+      "recipe": "infer_two_categories",
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 107,
+      "id": "positive-infinity-rejected",
+      "phase": "analyze_push",
+      "recipe": "numeric_none_none",
+      "rows": [["7ff0000000000000"]]
+    },
+    {
+      "expectedCode": 107,
+      "id": "negative-infinity-rejected",
+      "phase": "analyze_push",
+      "recipe": "numeric_none_none",
+      "rows": [["fff0000000000000"]]
+    },
+    {
+      "expectedCode": 103,
+      "id": "sample-standard-single-value",
+      "mutation": {
+        "path": "/columns/0/numeric/normalize/ddof",
+        "recipe": "numeric_mean_standard",
+        "value": 1
+      },
+      "phase": "finalize",
+      "rows": [["3ff0000000000000"]]
+    }
+  ],
+  "version": 1
+}

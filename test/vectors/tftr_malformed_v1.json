@@ -1,0 +1,197 @@
+{
+  "base": {
+    "canonicalPayload": {
+      "format": "tranfi.transform-plan",
+      "inputSchema": [
+        {
+          "dtype": "float64",
+          "id": "x0",
+          "name": "x0"
+        }
+      ],
+      "outputSchema": [
+        {
+          "category": null,
+          "dtype": "float64",
+          "id": "x0",
+          "name": "x0",
+          "role": "value",
+          "sourceId": "x0"
+        }
+      ],
+      "recipe": {
+        "columns": [
+          {
+            "categorical": null,
+            "kind": {
+              "maxCategories": null,
+              "op": "declared",
+              "rule": null,
+              "value": "numeric"
+            },
+            "numeric": {
+              "impute": {
+                "allMissing": null,
+                "constant": null,
+                "op": "none"
+              },
+              "normalize": {
+                "ddof": null,
+                "op": "none"
+              }
+            },
+            "sourceId": "x0"
+          }
+        ],
+        "format": "tranfi.transform-recipe",
+        "outputDtype": "float64",
+        "policyVersion": 1,
+        "semanticLimits": {
+          "maxOutputColumns": 65536,
+          "maxOutputElementsPerApply": 134217728
+        },
+        "version": 1
+      },
+      "recipeSha256": "12d0bfe06b5ceb8cdd63e857eff568b2ed0fbde4f1153490656b21558c621fda",
+      "steps": [
+        {
+          "categorical": null,
+          "kind": "numeric",
+          "numeric": {
+            "impute": {
+              "allMissing": null,
+              "op": "none",
+              "value": null
+            },
+            "normalize": {
+              "ddof": null,
+              "location": {
+                "t": "f64",
+                "v": "0000000000000000"
+              },
+              "op": "none",
+              "scale": {
+                "t": "f64",
+                "v": "3ff0000000000000"
+              }
+            }
+          },
+          "sourceId": "x0",
+          "stateVersion": 1
+        }
+      ],
+      "version": 1
+    },
+    "payloadSha256": "b11e01f8a0152e7d64b623a728bb04e0d2edb22a1f98f3601b3bda44a70f9d1e",
+    "recipeSha256": "12d0bfe06b5ceb8cdd63e857eff568b2ed0fbde4f1153490656b21558c621fda",
+    "tftrHex": "544654520100000034000000d403000000000000b11e01f8a0152e7d64b623a728bb04e0d2edb22a1f98f3601b3bda44a70f9d1e7b22666f726d6174223a227472616e66692e7472616e73666f726d2d706c616e222c22696e707574536368656d61223a5b7b226474797065223a22666c6f61743634222c226964223a227830222c226e616d65223a227830227d5d2c226f7574707574536368656d61223a5b7b2263617465676f7279223a6e756c6c2c226474797065223a22666c6f61743634222c226964223a227830222c226e616d65223a227830222c22726f6c65223a2276616c7565222c22736f757263654964223a227830227d5d2c22726563697065223a7b22636f6c756d6e73223a5b7b2263617465676f726963616c223a6e756c6c2c226b696e64223a7b226d617843617465676f72696573223a6e756c6c2c226f70223a226465636c61726564222c2272756c65223a6e756c6c2c2276616c7565223a226e756d65726963227d2c226e756d65726963223a7b22696d70757465223a7b22616c6c4d697373696e67223a6e756c6c2c22636f6e7374616e74223a6e756c6c2c226f70223a226e6f6e65227d2c226e6f726d616c697a65223a7b2264646f66223a6e756c6c2c226f70223a226e6f6e65227d7d2c22736f757263654964223a227830227d5d2c22666f726d6174223a227472616e66692e7472616e73666f726d2d726563697065222c226f75747075744474797065223a22666c6f61743634222c22706f6c69637956657273696f6e223a312c2273656d616e7469634c696d697473223a7b226d61784f7574707574436f6c756d6e73223a36353533362c226d61784f7574707574456c656d656e74735065724170706c79223a3133343231373732387d2c2276657273696f6e223a317d2c22726563697065536861323536223a2231326430626665303662356365623863646436336538353765666635363862326564306662646534663131353334393036353662323135353863363231666461222c227374657073223a5b7b2263617465676f726963616c223a6e756c6c2c226b696e64223a226e756d65726963222c226e756d65726963223a7b22696d70757465223a7b22616c6c4d697373696e67223a6e756c6c2c226f70223a226e6f6e65222c2276616c7565223a6e756c6c7d2c226e6f726d616c697a65223a7b2264646f66223a6e756c6c2c226c6f636174696f6e223a7b2274223a22663634222c2276223a2230303030303030303030303030303030227d2c226f70223a226e6f6e65222c227363616c65223a7b2274223a22663634222c2276223a2233666630303030303030303030303030227d7d7d2c22736f757263654964223a227830222c22737461746556657273696f6e223a317d5d2c2276657273696f6e223a317d"
+  },
+  "cases": [
+    {
+      "expectedCode": 0,
+      "id": "canonical-baseline",
+      "mutation": "none"
+    },
+    {
+      "expectedCode": 106,
+      "id": "bad-magic",
+      "mutation": "bad_magic"
+    },
+    {
+      "expectedCode": 105,
+      "id": "unsupported-envelope-version",
+      "mutation": "envelope_version_2"
+    },
+    {
+      "expectedCode": 105,
+      "id": "unsupported-envelope-flags",
+      "mutation": "envelope_flags_1"
+    },
+    {
+      "expectedCode": 106,
+      "id": "bad-header-length",
+      "mutation": "header_length_51"
+    },
+    {
+      "expectedCode": 106,
+      "id": "payload-length-overflow",
+      "mutation": "payload_length_max"
+    },
+    {
+      "expectedCode": 106,
+      "id": "truncated",
+      "mutation": "truncate_one"
+    },
+    {
+      "expectedCode": 106,
+      "id": "trailing-byte",
+      "mutation": "append_zero"
+    },
+    {
+      "expectedCode": 106,
+      "id": "payload-hash-mismatch",
+      "mutation": "flip_payload_without_hash"
+    },
+    {
+      "expectedCode": 106,
+      "id": "reordered-keys-rehashed",
+      "mutation": "reordered_top_level_rehashed"
+    },
+    {
+      "expectedCode": 106,
+      "id": "whitespace-rehashed",
+      "mutation": "whitespace_rehashed"
+    },
+    {
+      "expectedCode": 106,
+      "id": "alternate-escape-rehashed",
+      "mutation": "alternate_escape_rehashed"
+    },
+    {
+      "expectedCode": 106,
+      "id": "duplicate-key-rehashed",
+      "mutation": "duplicate_top_key_rehashed"
+    },
+    {
+      "expectedCode": 106,
+      "id": "unknown-key-canonical-rehashed",
+      "mutation": "unknown_top_key_canonical_rehashed"
+    },
+    {
+      "expectedCode": 106,
+      "id": "nonfinite-state-canonical-rehashed",
+      "mutation": "nonfinite_scale_canonical_rehashed"
+    },
+    {
+      "expectedCode": 106,
+      "id": "recipe-fingerprint-mismatch-rehashed",
+      "mutation": "recipe_sha_mismatch_canonical_rehashed"
+    },
+    {
+      "expectedCode": 106,
+      "id": "compiled-step-source-mismatch-rehashed",
+      "mutation": "step_source_mismatch_canonical_rehashed"
+    },
+    {
+      "expectedCode": 105,
+      "id": "unsupported-plan-version-rehashed",
+      "mutation": "plan_version_2_canonical_rehashed"
+    },
+    {
+      "expectedCode": 104,
+      "hostLimits": {
+        "maxPlanBytes": 52
+      },
+      "id": "host-plan-byte-limit",
+      "mutation": "none"
+    },
+    {
+      "expectedCode": 113,
+      "id": "valid-plan-unsupported-runtime",
+      "mutation": "none",
+      "runtimeProbe": "gradual_underflow_unavailable"
+    }
+  ],
+  "format": "tranfi.tftr-malformed-vectors",
+  "version": 1
+}

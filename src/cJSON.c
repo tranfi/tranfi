@@ -42,6 +42,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <float.h>
 
@@ -325,7 +326,68 @@ typedef struct
     size_t offset;
     size_t depth; /* How deeply nested (in arrays/objects) is the input at the current offset. */
     internal_hooks hooks;
+    cJSON_ParsePollFn poll;
+    void *poll_user_data;
+    size_t poll_byte_interval;
+    size_t poll_iteration_interval;
+    size_t poll_bytes;
+    size_t poll_iterations;
+    cJSON_bool poll_failed;
 } parse_buffer;
+
+static cJSON_bool parse_poll_progress(
+    parse_buffer * const buffer, size_t bytes, size_t iterations)
+{
+    if ((buffer == NULL) || buffer->poll_failed)
+    {
+        return false;
+    }
+    if (bytes > (SIZE_MAX - buffer->poll_bytes)
+        || iterations > (SIZE_MAX - buffer->poll_iterations))
+    {
+        buffer->poll_failed = true;
+        return false;
+    }
+    buffer->poll_bytes += bytes;
+    buffer->poll_iterations += iterations;
+    if (buffer->poll != NULL
+        && ((buffer->poll_bytes >= buffer->poll_byte_interval)
+            || (buffer->poll_iterations >= buffer->poll_iteration_interval)))
+    {
+        if (!buffer->poll(buffer->poll_user_data))
+        {
+            buffer->poll_failed = true;
+            return false;
+        }
+        buffer->poll_bytes = 0;
+        buffer->poll_iterations = 0;
+    }
+    return true;
+}
+
+static void parse_delete(cJSON *item, parse_buffer *buffer)
+{
+    cJSON *next = NULL;
+    while (item != NULL)
+    {
+        next = item->next;
+        if (!(item->type & cJSON_IsReference) && (item->child != NULL))
+        {
+            parse_delete(item->child, buffer);
+        }
+        if (!(item->type & cJSON_IsReference) && (item->valuestring != NULL))
+        {
+            buffer->hooks.deallocate(item->valuestring);
+        }
+        if (!(item->type & cJSON_StringIsConst) && (item->string != NULL))
+        {
+            buffer->hooks.deallocate(item->string);
+        }
+        buffer->hooks.deallocate(item);
+        (void)parse_poll_progress(buffer, 0, 1);
+        item = next;
+    }
+}
 
 /* check if the given size is left to read in a given parse buffer (starting with 1) */
 #define can_read(buffer, size) ((buffer != NULL) && (((buffer)->offset + size) <= (buffer)->length))
@@ -356,6 +418,10 @@ static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_bu
      * This also takes care of '\0' not necessarily being available for marking the end of the input */
     for (i = 0; can_access_at_index(input_buffer, i); i++)
     {
+        if (!parse_poll_progress(input_buffer, 1, 0))
+        {
+            return false;
+        }
         switch (buffer_at_offset(input_buffer)[i])
         {
             case '0':
@@ -385,6 +451,10 @@ static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_bu
         }
     }
 loop_end:
+    if (!parse_poll_progress(input_buffer, 0, 1))
+    {
+        return false;
+    }
     /* malloc for temporary buffer, add 1 for '\0' */
     number_c_string = (unsigned char *) input_buffer->hooks.allocate(number_string_length + 1);
     if (number_c_string == NULL)
@@ -393,7 +463,19 @@ loop_end:
         return false; /* allocation failure */
     }
 
-    memcpy(number_c_string, buffer_at_offset(input_buffer), number_string_length);
+    for (i = 0; i < number_string_length;)
+    {
+        size_t remaining = number_string_length - i;
+        size_t chunk = remaining < input_buffer->poll_byte_interval
+            ? remaining : input_buffer->poll_byte_interval;
+        memcpy(number_c_string + i, buffer_at_offset(input_buffer) + i, chunk);
+        i += chunk;
+        if (!parse_poll_progress(input_buffer, chunk, 0))
+        {
+            input_buffer->hooks.deallocate(number_c_string);
+            return false;
+        }
+    }
     number_c_string[number_string_length] = '\0';
 
     if (has_decimal_point)
@@ -868,6 +950,10 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
         size_t skipped_bytes = 0;
         while (((size_t)(input_end - input_buffer->content) < input_buffer->length) && (*input_end != '\"'))
         {
+            if (!parse_poll_progress(input_buffer, 1, 0))
+            {
+                goto fail;
+            }
             /* is escape sequence */
             if (input_end[0] == '\\')
             {
@@ -877,6 +963,10 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
                     goto fail;
                 }
                 skipped_bytes++;
+                if (!parse_poll_progress(input_buffer, 1, 0))
+                {
+                    goto fail;
+                }
                 input_end++;
             }
             input_end++;
@@ -888,6 +978,10 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
 
         /* This is at most how much we need for the output */
         allocation_length = (size_t) (input_end - buffer_at_offset(input_buffer)) - skipped_bytes;
+        if (!parse_poll_progress(input_buffer, 0, 1))
+        {
+            goto fail;
+        }
         output = (unsigned char*)input_buffer->hooks.allocate(allocation_length + sizeof(""));
         if (output == NULL)
         {
@@ -900,6 +994,10 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
     /* loop through the string literal */
     while (input_pointer < input_end)
     {
+        if (!parse_poll_progress(input_buffer, 1, 0))
+        {
+            goto fail;
+        }
         if (*input_pointer != '\\')
         {
             *output_pointer++ = *input_pointer++;
@@ -948,6 +1046,11 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
 
                 default:
                     goto fail;
+            }
+            if ((sequence_length > 1)
+                && !parse_poll_progress(input_buffer, sequence_length - 1, 0))
+            {
+                goto fail;
             }
             input_pointer += sequence_length;
         }
@@ -1130,6 +1233,10 @@ static parse_buffer *buffer_skip_whitespace(parse_buffer * const buffer)
 
     while (can_access_at_index(buffer, 0) && (buffer_at_offset(buffer)[0] <= 32))
     {
+       if (!parse_poll_progress(buffer, 1, 0))
+       {
+           return buffer;
+       }
        buffer->offset++;
     }
 
@@ -1173,9 +1280,12 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return
 }
 
 /* Parse an object - create a new root, and populate. */
-CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated)
+static cJSON *cJSON_ParseWithLengthOptsInternal(
+    const char *value, size_t buffer_length, const char **return_parse_end,
+    cJSON_bool require_null_terminated, cJSON_ParsePollFn poll,
+    void *poll_user_data, size_t byte_interval, size_t iteration_interval)
 {
-    parse_buffer buffer = { 0, 0, 0, 0, { 0, 0, 0 } };
+    parse_buffer buffer = { 0 };
     cJSON *item = NULL;
 
     /* reset error position */
@@ -1193,6 +1303,17 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
     buffer.length = buffer_length;
     buffer.offset = 0;
     buffer.hooks = global_hooks;
+    buffer.poll = poll;
+    buffer.poll_user_data = poll_user_data;
+    buffer.poll_byte_interval = byte_interval == 0 ? SIZE_MAX : byte_interval;
+    buffer.poll_iteration_interval = iteration_interval == 0
+        ? SIZE_MAX : iteration_interval;
+
+    if (buffer.poll != NULL && !buffer.poll(buffer.poll_user_data))
+    {
+        buffer.poll_failed = true;
+        goto fail;
+    }
 
     item = cJSON_New_Item(&global_hooks);
     if (item == NULL) /* memory fail */
@@ -1215,6 +1336,12 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
             goto fail;
         }
     }
+    if (buffer.poll_failed
+        || (buffer.poll != NULL && !buffer.poll(buffer.poll_user_data)))
+    {
+        buffer.poll_failed = true;
+        goto fail;
+    }
     if (return_parse_end)
     {
         *return_parse_end = (const char*)buffer_at_offset(&buffer);
@@ -1227,7 +1354,7 @@ fail:
     global_parse_tracking = false;
     if (item != NULL)
     {
-        cJSON_Delete(item);
+        parse_delete(item, &buffer);
     }
 
     if (value != NULL)
@@ -1254,6 +1381,23 @@ fail:
     }
 
     return NULL;
+}
+
+CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated)
+{
+    return cJSON_ParseWithLengthOptsInternal(
+        value, buffer_length, return_parse_end, require_null_terminated,
+        NULL, NULL, 0, 0);
+}
+
+CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOptsAndPoll(
+    const char *value, size_t buffer_length, const char **return_parse_end,
+    cJSON_bool require_null_terminated, cJSON_ParsePollFn poll,
+    void *poll_user_data, size_t byte_interval, size_t iteration_interval)
+{
+    return cJSON_ParseWithLengthOptsInternal(
+        value, buffer_length, return_parse_end, require_null_terminated,
+        poll, poll_user_data, byte_interval, iteration_interval);
 }
 
 /* Default options for cJSON_Parse */
@@ -1403,6 +1547,11 @@ static cJSON_bool parse_value(cJSON * const item, parse_buffer * const input_buf
     if ((input_buffer == NULL) || (input_buffer->content == NULL))
     {
         return false; /* no input */
+    }
+
+    if (!parse_poll_progress(input_buffer, 0, 1))
+    {
+        return false;
     }
 
     /* parse the different types of values */
@@ -1564,6 +1713,10 @@ static cJSON_bool parse_array(cJSON * const item, parse_buffer * const input_buf
     /* loop through the comma separated array elements */
     do
     {
+        if (!parse_poll_progress(input_buffer, 0, 1))
+        {
+            goto fail;
+        }
         /* allocate next item */
         cJSON *new_item = cJSON_New_Item(&(input_buffer->hooks));
         if (new_item == NULL)
@@ -1618,7 +1771,7 @@ success:
 fail:
     if (head != NULL)
     {
-        cJSON_Delete(head);
+        parse_delete(head, input_buffer);
     }
 
     return false;
@@ -1722,6 +1875,10 @@ static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_bu
     /* loop through the comma separated array elements */
     do
     {
+        if (!parse_poll_progress(input_buffer, 0, 1))
+        {
+            goto fail;
+        }
         /* allocate next item */
         cJSON *new_item = cJSON_New_Item(&(input_buffer->hooks));
         if (new_item == NULL)
@@ -1798,7 +1955,7 @@ success:
 fail:
     if (head != NULL)
     {
-        cJSON_Delete(head);
+        parse_delete(head, input_buffer);
     }
 
     return false;
