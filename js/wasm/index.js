@@ -1,4 +1,6 @@
 
+var createTransformAPI = require('./transform.js')
+
 var BLOCKING_OPS = {
   'sort': true,
   'pivot': true,
@@ -328,6 +330,7 @@ async function createTranfi() {
   var mod = await import('./tranfi_core.js')
   var createModule = mod.default || mod
   var wasm = await createModule()
+  var transformAPI = createTransformAPI(wasm)
 
   function allocString(str) {
     var len = wasm.lengthBytesUTF8(str)
@@ -380,6 +383,15 @@ async function createTranfi() {
   return {
     /** Raw WASM module (for advanced use) */
     _wasm: wasm,
+
+    TranfiTransformError: transformAPI.TranfiTransformError,
+    TransformRecipe: transformAPI.TransformRecipe,
+    TransformAnalyzer: transformAPI.TransformAnalyzer,
+    TransformPlan: transformAPI.TransformPlan,
+    TransformApply: transformAPI.TransformApply,
+    TransformCancelToken: transformAPI.TransformCancelToken,
+    createTransformCancelToken: transformAPI.createTransformCancelToken,
+    safeTransformLimits: transformAPI.safeTransformLimits,
 
     /** Library version */
     version() {

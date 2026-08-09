@@ -870,6 +870,66 @@ static uint8_t *make_large_valid_tftr(size_t string_len, size_t *out_len) {
     return bytes;
 }
 
+static void test_json_construction_preflight_limits(void) {
+    const size_t string_len = TF_TRANSFORM_CANCEL_BYTES_V1 * 3 + 17;
+    large_transform_fixture fixture;
+    tf_transform_plan *plan;
+    tf_transform_limits_v1 limits;
+    tf_transform_error *error = NULL;
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+
+    large_transform_fixture_init(&fixture, string_len);
+    plan = fit_large_transform_fixture(&fixture);
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+
+    limits.max_string_bytes = string_len - 1;
+    assert(tf_transform_plan_schema_json(
+        plan, TF_TRANSFORM_SCHEMA_INPUT, &limits,
+        &bytes, &bytes_len, &error) == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(bytes == NULL && bytes_len == 0 && error != NULL);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_plan_export(
+        plan, &limits, &bytes, &bytes_len, &error)
+        == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(bytes == NULL && bytes_len == 0 && error != NULL);
+    tf_transform_error_destroy(&error);
+
+    limits.max_string_bytes = string_len;
+    assert(tf_transform_plan_schema_json(
+        plan, TF_TRANSFORM_SCHEMA_INPUT, &limits,
+        &bytes, &bytes_len, &error) == TF_TRANSFORM_OK);
+    assert(bytes != NULL && bytes_len > string_len && error == NULL);
+    tf_transform_bytes_free(&bytes, &bytes_len);
+    assert(tf_transform_plan_export(
+        plan, &limits, &bytes, &bytes_len, &error) == TF_TRANSFORM_OK);
+    assert(bytes != NULL && bytes_len > string_len * 8 && error == NULL);
+    tf_transform_bytes_free(&bytes, &bytes_len);
+
+    limits.max_input_columns = 2;
+    limits.max_output_columns = 1;
+    assert(tf_transform_plan_schema_json(
+        plan, TF_TRANSFORM_SCHEMA_INPUT, &limits,
+        &bytes, &bytes_len, &error) == TF_TRANSFORM_OK);
+    tf_transform_bytes_free(&bytes, &bytes_len);
+    assert(tf_transform_plan_schema_json(
+        plan, TF_TRANSFORM_SCHEMA_OUTPUT, &limits,
+        &bytes, &bytes_len, &error) == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(bytes == NULL && bytes_len == 0);
+    tf_transform_error_destroy(&error);
+
+    limits.max_input_columns = 1;
+    limits.max_output_columns = 2;
+    assert(tf_transform_plan_schema_json(
+        plan, TF_TRANSFORM_SCHEMA_OUTPUT, &limits,
+        &bytes, &bytes_len, &error) == TF_TRANSFORM_OK);
+    tf_transform_bytes_free(&bytes, &bytes_len);
+
+    tf_transform_plan_destroy(&plan);
+    large_transform_fixture_clear(&fixture);
+}
+
 static void test_long_schema_runtime_cancellation(void) {
     const size_t string_len = TF_TRANSFORM_CANCEL_BYTES_V1 * 3 + 17;
     large_transform_fixture fixture;
@@ -2089,6 +2149,7 @@ int main(void) {
     test_numeric_cancellation_is_terminal();
     test_runtime_safe_points_and_parser_limits();
     test_session_allocation_limits();
+    test_json_construction_preflight_limits();
     test_long_schema_runtime_cancellation();
     test_valid_import_cancellation_sweep();
     test_tftr_baseline_and_malformed();

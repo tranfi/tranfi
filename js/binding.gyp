@@ -4,7 +4,12 @@
       "target_name": "tranfi_napi",
       "sources": [
         "napi_api.c",
+        "napi_transform.c",
         "csrc/cJSON.c",
+        "csrc/transform_api.c",
+        "csrc/transform_json.c",
+        "csrc/transform_numeric.c",
+        "csrc/transform_sha256.c",
         "csrc/arena.c",
         "csrc/buffer.c",
         "csrc/size_utils.c",
@@ -96,6 +101,7 @@
       "cflags": [
         "-std=c11",
         "-Wall",
+        "-DNAPI_VERSION=8",
         "-D_POSIX_C_SOURCE=200809L",
         "-D_XOPEN_SOURCE=700",
         "-D_FORTIFY_SOURCE=3",
@@ -105,7 +111,9 @@
         "-Werror=format-security",
         "-Werror=unused-result",
         "-fno-common",
-        "-fstack-protector-strong"
+        "-fstack-protector-strong",
+        "-fno-fast-math",
+        "-ffp-contract=off"
       ]
     }
   ]

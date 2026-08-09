@@ -154,11 +154,14 @@ test-wide-csv: build-debug
 test-python: build-c
 	@mkdir -p "$(TEST_TMPDIR)/python"
 	@env $(TEST_PYTHON_ENV) PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 TRANFI_LIB_PATH=build/libtranfi.so \
-		$(PYTEST) test/test_python.py test/test_parity.py test/test_duckdb.py -v --tb=short
+		$(PYTEST) test/test_python.py test/test_transform_python.py test/test_parity.py test/test_duckdb.py -v --tb=short
 
 test-node: build-node build-wasm
 	@mkdir -p "$(TEST_TMPDIR)/node"
 	@env $(TEST_NODE_ENV) $(NODE) test/test_node.js
+	@env $(TEST_NODE_ENV) $(NODE) test/test_transform_node.js
+	@env $(TEST_NODE_ENV) $(NODE) test/test_transform_wasm_node.js
+	@env $(TEST_NODE_ENV) $(NODE) test/test_transform_worker_node.js
 
 test-parity: build-c
 	@mkdir -p "$(TEST_TMPDIR)/python"

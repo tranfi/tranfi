@@ -8,6 +8,7 @@
 #include "tranfi.h"
 #include "dsl.h"
 #include "recipes.h"
+#include "napi_transform.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -526,6 +527,7 @@ static napi_value init(napi_env env, napi_value exports) {
         {"recipeFindDsl",     NULL, napi_recipe_find_dsl,    NULL, NULL, NULL, napi_default, NULL},
     };
     NAPI_CALL(env, napi_define_properties(env, exports, 18, props));
+    NAPI_CALL(env, tranfi_napi_define_transform(env, exports));
     return exports;
 }
 

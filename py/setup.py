@@ -45,8 +45,9 @@ elif not os.path.isdir(csrc):
         'Run from the repo: python py/scripts/sync-csrc.py'
     )
 
-# All C sources except main.c (CLI) and wasm_api.c (Emscripten)
-exclude = {'main.c', 'wasm_api.c'}
+# Native extension excludes CLI and both raw Emscripten shims. Prepared-transform
+# Python calls the in-process transform API directly, never the wasm32 handle table.
+exclude = {'main.c', 'wasm_api.c', 'transform_wasm_api.c'}
 sources = [
     os.path.join('csrc', f)
     for f in sorted(os.listdir(csrc))
@@ -72,6 +73,8 @@ setup(
                 '-Werror=unused-result',
                 '-fno-common',
                 '-fstack-protector-strong',
+                '-fno-fast-math',
+                '-ffp-contract=off',
             ],
             libraries=['m'],
         )

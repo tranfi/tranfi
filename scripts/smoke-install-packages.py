@@ -58,7 +58,27 @@ def smoke_python(python: str, sdist: Path) -> None:
         }
         run([str(py), '-m', 'pip', 'install', '--no-deps', str(sdist)], env=env)
         code = r'''
+from array import array
+import ctypes
 import tranfi as tf
+import tranfi._native as native_extension
+native_symbols = ctypes.CDLL(native_extension.__file__)
+if hasattr(native_symbols, 'tf_wasm_transform_recipe_from_json'):
+    raise SystemExit('Python extension leaked the raw wasm32 transform shim')
+limits = tf.safe_transform_limits()
+if limits.max_recipe_bytes != 1048576:
+    raise SystemExit(f'unexpected transform limits: {limits.max_recipe_bytes!r}')
+recipe_json = '{"columns":[{"categorical":null,"kind":{"maxCategories":null,"op":"declared","rule":null,"value":"numeric"},"numeric":{"impute":{"allMissing":null,"constant":null,"op":"none"},"normalize":{"ddof":null,"op":"none"}},"sourceId":"x0"}],"format":"tranfi.transform-recipe","outputDtype":"float64","policyVersion":1,"semanticLimits":{"maxOutputColumns":65536,"maxOutputElementsPerApply":134217728},"version":1}'
+schema = [{'id': 'x0', 'dtype': 'float64'}]
+with tf.TransformRecipe.from_json(recipe_json) as recipe:
+    with recipe.analyzer(schema) as analyzer:
+        analyzer.push({'rows': 2, 'columns': [array('d', [1.0, 2.0])]})
+        with analyzer.finalize() as plan:
+            with tf.TransformPlan.from_bytes(plan.to_bytes()) as loaded:
+                with loaded.apply(schema) as apply:
+                    transformed = apply.run({'rows': 1, 'columns': [array('d', [3.0])]})
+                    if list(transformed.data) != [3.0]:
+                        raise SystemExit(f'unexpected prepared output: {transformed.data!r}')
 result = tf.pipeline('csv | filter "col(age) > 25" | csv').run(input=b'name,age\nA,20\nB,30\n')
 out = result.output_text
 if 'B,30' not in out or 'A,20' in out:
@@ -81,6 +101,23 @@ def smoke_npm(node: str, npm: str, tarball: Path) -> None:
         code = r'''
 const tf = require('tranfi')
 async function main () {
+  const recipeConfig = { columns: [{ categorical: null, kind: { maxCategories: null, op: 'declared', rule: null, value: 'numeric' }, numeric: { impute: { allMissing: null, constant: null, op: 'none' }, normalize: { ddof: null, op: 'none' } }, sourceId: 'x0' }], format: 'tranfi.transform-recipe', outputDtype: 'float64', policyVersion: 1, semanticLimits: { maxOutputColumns: 65536, maxOutputElementsPerApply: 134217728 }, version: 1 }
+  const schema = [{ id: 'x0', dtype: 'float64' }]
+  const recipe = tf.TransformRecipe.fromJSON(recipeConfig)
+  const analyzer = recipe.analyzer(schema)
+  analyzer.push({ rows: 2, columns: [new Float64Array([1, 2])] })
+  const plan = analyzer.finalize()
+  const loaded = tf.TransformPlan.fromBytes(plan.toBytes())
+  const apply = loaded.apply(schema)
+  const transformed = apply.run({ rows: 1, columns: [new Float64Array([3])] })
+  if (transformed.rows !== 1 || transformed.data[0] !== 3) {
+    throw new Error('unexpected prepared output')
+  }
+  apply.close()
+  loaded.close()
+  plan.close()
+  analyzer.close()
+  recipe.close()
   const result = await tf.pipeline('csv | filter "col(age) > 25" | csv').run({ input: 'name,age\nA,20\nB,30\n' })
   const out = result.outputText
   if (!out.includes('B,30') || out.includes('A,20')) {

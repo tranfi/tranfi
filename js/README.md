@@ -159,6 +159,67 @@ The Worker protocol streams chunks with transferable buffers and sends progress,
 
 The bundled Tranfi app runner is also preview-bounded by default: file chunks are streamed into WASM, main output is drained incrementally into a table preview capped by hidden `preview_rows` (default 200), and full output text is only materialized when `collect_output` is explicitly true in the schema.
 
+### Prepared reusable transforms
+
+Prepared transforms are a separate typed-table API for operations whose parameters must be learned from reference data. `analyze` accumulates bounded statistics over one or more batches, `finalize` freezes an immutable plan and output schema, and `apply` runs that plan either over a second pass of the original data (`fit_transform`-style) or over later compatible batches. It does not replace the byte-stream pipeline API.
+
+The current slice accepts declared `float32`/`float64` columns. It supports numeric none/zero/constant/mean imputation and none/standard/min-max normalization; categorical encoding, median, and kind inference are not implemented yet.
+
+```js
+const tf = require('tranfi')
+
+const recipeSpec = {
+  format: 'tranfi.transform-recipe',
+  version: 1,
+  policyVersion: 1,
+  outputDtype: 'float64',
+  semanticLimits: {
+    maxOutputColumns: 65536,
+    maxOutputElementsPerApply: 134217728
+  },
+  columns: [{
+    sourceId: 'x0',
+    kind: { op: 'declared', value: 'numeric', rule: null, maxCategories: null },
+    numeric: {
+      impute: { op: 'mean', constant: null, allMissing: 'zero' },
+      normalize: { op: 'standard', ddof: 0 }
+    },
+    categorical: null
+  }]
+}
+const schema = [{ id: 'x0', dtype: 'float64' }]
+
+const recipe = tf.TransformRecipe.fromJSON(recipeSpec)
+const analyzer = recipe.analyzer(schema)
+analyzer.push({ rows: 3, columns: [new Float64Array([1, NaN, 3])] })
+const plan = analyzer.finalize()
+
+const apply = plan.apply(schema)
+const fittedReference = apply.run({
+  rows: 3,
+  columns: [new Float64Array([1, NaN, 3])]
+})
+const planBytes = plan.toBytes() // canonical TFTR artifact
+
+apply.close()
+plan.close()
+analyzer.close()
+recipe.close()
+```
+
+`tranfi/wasm` exposes the same classes on the initialized module. The Worker adapter adds `analyzeTransform()` and `applyTransform()`. With `SharedArrayBuffer`, an `AbortSignal` interrupts a synchronous C call through an atomic poll cell. Without it, cancellation terminates the whole worker and reclaims its WASM heap. Pass a worker URL directly so the client can recreate it, or supply an owned worker plus `workerFactory`:
+
+```js
+const workerUrl = new URL('./tranfi-worker.js', import.meta.url)
+const makeWorker = () => new Worker(workerUrl, { type: 'module' })
+const client = createWorkerClient(makeWorker(), {
+  workerFactory: makeWorker,
+  terminateOnDispose: true
+})
+```
+
+All prepared-transform failures use `TranfiTransformError`; its numeric `code` is stable across native Node and WASM. Native Node accepts a SharedArrayBuffer-backed `Int32Array` as `cancelFlag`: cell 0 is the cancellation request, and an optional cell 1 is incremented modulo 2^32 at every native poll so another realm can observe operation progress without a timer.
+
 ## Codecs
 
 Codecs convert between raw bytes and columnar batches. Every pipeline starts with a decoder and ends with an encoder.

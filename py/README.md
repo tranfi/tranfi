@@ -130,6 +130,57 @@ for chunk in p.iter_chunks(input_files=parts, source_column='src'):
 
 `source_column` appends the path for each input row without preloading file contents. Tranfi flushes decoder input at each file boundary so an unterminated final record belongs to the correct source file. It does not remove repeated CSV headers from later files; use shards without repeated headers, `header=False`, or a pre-cleaning step when every file has its own header.
 
+### Prepared reusable transforms
+
+Prepared transforms are separate from byte-stream pipelines. They are for typed operations whose parameters must be learned from reference data: an analyzer consumes one or more bounded-memory batches, `finalize()` freezes an immutable plan and output schema, and an apply session runs that plan over either a second pass of the original data (`fit_transform`-style) or later compatible batches.
+
+The current slice accepts declared `float32`/`float64` columns and implements numeric none/zero/constant/mean imputation plus none/standard/min-max normalization. Categorical encoding, median, and kind inference are not implemented yet.
+
+```python
+from array import array
+import json
+import tranfi as tf
+
+recipe_spec = {
+    'format': 'tranfi.transform-recipe',
+    'version': 1,
+    'policyVersion': 1,
+    'outputDtype': 'float64',
+    'semanticLimits': {
+        'maxOutputColumns': 65536,
+        'maxOutputElementsPerApply': 134217728,
+    },
+    'columns': [{
+        'sourceId': 'x0',
+        'kind': {
+            'op': 'declared', 'value': 'numeric',
+            'rule': None, 'maxCategories': None,
+        },
+        'numeric': {
+            'impute': {'op': 'mean', 'constant': None, 'allMissing': 'zero'},
+            'normalize': {'op': 'standard', 'ddof': 0},
+        },
+        'categorical': None,
+    }],
+}
+schema = [{'id': 'x0', 'dtype': 'float64'}]
+reference = {
+    'rows': 3,
+    'columns': [array('d', [1.0, float('nan'), 3.0])],
+}
+
+with tf.TransformRecipe.from_json(json.dumps(recipe_spec)) as recipe:
+    with recipe.analyzer(schema) as analyzer:
+        analyzer.push(reference)
+        with analyzer.finalize() as plan:
+            with plan.apply(schema) as apply:
+                fitted_reference = apply.run(reference)
+            plan_bytes = plan.to_bytes()  # canonical TFTR artifact
+```
+
+Prepared-transform failures raise `TranfiTransformError`; its numeric `code` is stable across the C and Python APIs. `TransformLimits` starts from the C-owned safe profile and applies explicit overrides.
+For cooperative cancellation, create a `TransformCancelToken`, pass it to `recipe.analyzer(..., cancel_token=token)`, `plan.apply(..., cancel_token=token)`, or `TransformPlan.from_bytes(..., cancel_token=token)`, and call `token.request()` from another Python thread. Active analyzer/apply sessions retain the token for their lifetime.
+
 ## Codecs
 
 Codecs convert between raw bytes and columnar batches. Every pipeline starts with a decoder and ends with an encoder.

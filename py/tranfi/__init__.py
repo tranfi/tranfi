@@ -19,6 +19,9 @@ from .pipeline import (pipeline, param, expr, Pipeline, PipelineResult,
                        load_recipe, save_recipe, compile_dsl)
 from ._ffi import compile_to_sql
 from ._ffi import version
+from .transform import (DenseResult, TranfiTransformError, TransformAnalyzer,
+                        TransformApply, TransformCancelToken, TransformLimits,
+                        TransformPlan, TransformRecipe, safe_transform_limits)
 from . import _ffi
 
 __version__ = '0.1.2'

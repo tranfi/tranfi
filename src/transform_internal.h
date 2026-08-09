@@ -242,8 +242,15 @@ tf_transform_code tf_transform_recipe_parse_numeric(
     tf_transform_recipe **out, tf_transform_error **error);
 cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe);
 cJSON *tf_transform_schema_to_json(const tf_transform_schema *schema);
-cJSON *tf_transform_plan_to_json(const tf_transform_plan *plan,
-                                 tf_transform_error **error);
+tf_transform_code tf_transform_schema_json_preflight(
+    const tf_transform_schema *schema, const tf_transform_limits_v1 *limits,
+    tf_transform_error **error);
+tf_transform_code tf_transform_plan_json_preflight(
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    tf_transform_error **error);
+cJSON *tf_transform_plan_to_json(
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    tf_transform_error **error);
 tf_transform_code tf_transform_plan_from_json(
     const uint8_t *json, size_t json_len,
     const tf_transform_runtime_copy *runtime,

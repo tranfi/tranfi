@@ -14,6 +14,7 @@ _lib = None
 _SINK_CALLBACK = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p
 )
+_TRANSFORM_CANCEL_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
 
 
 class _TfHostPolicy(ctypes.Structure):
@@ -26,6 +27,111 @@ class _TfHostPolicy(ctypes.Structure):
         ('workspace_root', ctypes.c_char_p),
         ('resolve_path', ctypes.c_void_p),
         ('user', ctypes.c_void_p),
+    ]
+
+
+class _TfTransformLimitsV1(ctypes.Structure):
+    _fields_ = [
+        ('abi_version', ctypes.c_uint32),
+        ('struct_size', ctypes.c_uint32),
+        ('max_recipe_bytes', ctypes.c_uint64),
+        ('max_plan_bytes', ctypes.c_uint64),
+        ('max_json_depth', ctypes.c_uint64),
+        ('max_object_keys', ctypes.c_uint64),
+        ('max_steps', ctypes.c_uint64),
+        ('max_input_columns', ctypes.c_uint64),
+        ('max_output_columns', ctypes.c_uint64),
+        ('max_categories_per_column', ctypes.c_uint64),
+        ('max_total_categories', ctypes.c_uint64),
+        ('max_string_bytes', ctypes.c_uint64),
+        ('max_decoded_string_bytes', ctypes.c_uint64),
+        ('max_analyzer_rows', ctypes.c_uint64),
+        ('max_analyzer_input_bytes', ctypes.c_uint64),
+        ('max_resident_state_bytes', ctypes.c_uint64),
+        ('max_spill_bytes', ctypes.c_uint64),
+        ('max_apply_rows', ctypes.c_uint64),
+        ('max_apply_input_bytes', ctypes.c_uint64),
+        ('max_output_elements_per_call', ctypes.c_uint64),
+        ('max_allocation_bytes', ctypes.c_uint64),
+        ('max_allocations_per_session', ctypes.c_uint64),
+        ('max_live_handles', ctypes.c_uint64),
+        ('max_retired_handle_slots', ctypes.c_uint64),
+    ]
+
+
+class _TfTransformRuntimeV1(ctypes.Structure):
+    _fields_ = [
+        ('abi_version', ctypes.c_uint32),
+        ('struct_size', ctypes.c_uint32),
+        ('limits', ctypes.POINTER(_TfTransformLimitsV1)),
+        ('host_policy', ctypes.c_void_p),
+        ('spill_dir_utf8', ctypes.POINTER(ctypes.c_uint8)),
+        ('spill_dir_bytes', ctypes.c_size_t),
+        ('cancel', ctypes.c_void_p),
+        ('cancel_user', ctypes.c_void_p),
+        ('flags', ctypes.c_uint32),
+        ('reserved', ctypes.c_uint32),
+    ]
+
+
+class _TfFieldViewV1(ctypes.Structure):
+    _fields_ = [
+        ('abi_version', ctypes.c_uint32),
+        ('struct_size', ctypes.c_uint32),
+        ('dtype', ctypes.c_uint32),
+        ('flags', ctypes.c_uint32),
+        ('id_utf8', ctypes.POINTER(ctypes.c_uint8)),
+        ('id_bytes', ctypes.c_size_t),
+        ('name_utf8', ctypes.POINTER(ctypes.c_uint8)),
+        ('name_bytes', ctypes.c_size_t),
+    ]
+
+
+class _TfSchemaViewV1(ctypes.Structure):
+    _fields_ = [
+        ('abi_version', ctypes.c_uint32),
+        ('struct_size', ctypes.c_uint32),
+        ('column_count', ctypes.c_size_t),
+        ('fields', ctypes.POINTER(_TfFieldViewV1)),
+        ('fields_bytes', ctypes.c_size_t),
+    ]
+
+
+class _TfColumnViewV1(ctypes.Structure):
+    _fields_ = [
+        ('abi_version', ctypes.c_uint32),
+        ('struct_size', ctypes.c_uint32),
+        ('data', ctypes.c_void_p),
+        ('data_bytes', ctypes.c_size_t),
+        ('stride_bytes', ctypes.c_size_t),
+        ('validity', ctypes.POINTER(ctypes.c_uint8)),
+        ('validity_bytes', ctypes.c_size_t),
+        ('validity_bit_offset', ctypes.c_size_t),
+        ('validity_bit_stride', ctypes.c_size_t),
+    ]
+
+
+class _TfTableViewV1(ctypes.Structure):
+    _fields_ = [
+        ('abi_version', ctypes.c_uint32),
+        ('struct_size', ctypes.c_uint32),
+        ('row_count', ctypes.c_size_t),
+        ('column_count', ctypes.c_size_t),
+        ('columns', ctypes.POINTER(_TfColumnViewV1)),
+        ('columns_bytes', ctypes.c_size_t),
+    ]
+
+
+class _TfOwnedDenseV1(ctypes.Structure):
+    _fields_ = [
+        ('abi_version', ctypes.c_uint32),
+        ('struct_size', ctypes.c_uint32),
+        ('dtype', ctypes.c_uint32),
+        ('flags', ctypes.c_uint32),
+        ('rows', ctypes.c_size_t),
+        ('columns', ctypes.c_size_t),
+        ('data', ctypes.c_void_p),
+        ('data_bytes', ctypes.c_size_t),
     ]
 
 
@@ -198,6 +304,66 @@ def _load_lib():
     # tf_recipe_find_dsl
     _lib.tf_recipe_find_dsl.argtypes = [ctypes.c_char_p]
     _lib.tf_recipe_find_dsl.restype = ctypes.c_char_p
+
+    transform_code = ctypes.c_int
+    handle_out = ctypes.POINTER(ctypes.c_void_p)
+    error_out = ctypes.POINTER(ctypes.c_void_p)
+    _lib.tf_transform_limits_init_safe_v1.argtypes = [
+        ctypes.POINTER(_TfTransformLimitsV1), ctypes.c_size_t]
+    _lib.tf_transform_limits_init_safe_v1.restype = transform_code
+    _lib.tf_transform_recipe_from_json.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+        ctypes.POINTER(_TfTransformLimitsV1), handle_out, error_out]
+    _lib.tf_transform_recipe_from_json.restype = transform_code
+    _lib.tf_transform_analyzer_create.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_TfSchemaViewV1),
+        ctypes.POINTER(_TfTransformRuntimeV1), handle_out, error_out]
+    _lib.tf_transform_analyzer_create.restype = transform_code
+    _lib.tf_transform_analyzer_push.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_TfTableViewV1), error_out]
+    _lib.tf_transform_analyzer_push.restype = transform_code
+    _lib.tf_transform_analyzer_finalize.argtypes = [
+        ctypes.c_void_p, handle_out, error_out]
+    _lib.tf_transform_analyzer_finalize.restype = transform_code
+    _lib.tf_transform_plan_export.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_TfTransformLimitsV1),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), error_out]
+    _lib.tf_transform_plan_export.restype = transform_code
+    _lib.tf_transform_plan_import.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+        ctypes.POINTER(_TfTransformRuntimeV1), handle_out, error_out]
+    _lib.tf_transform_plan_import.restype = transform_code
+    _lib.tf_transform_apply_create.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_TfSchemaViewV1),
+        ctypes.POINTER(_TfTransformRuntimeV1), handle_out, error_out]
+    _lib.tf_transform_apply_create.restype = transform_code
+    _lib.tf_transform_apply_run.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_TfTableViewV1),
+        ctypes.POINTER(_TfOwnedDenseV1), error_out]
+    _lib.tf_transform_apply_run.restype = transform_code
+    for name in (
+        'tf_transform_recipe_destroy', 'tf_transform_analyzer_destroy',
+        'tf_transform_plan_destroy', 'tf_transform_apply_destroy',
+        'tf_transform_error_destroy',
+    ):
+        function = getattr(_lib, name)
+        function.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        function.restype = None
+    _lib.tf_transform_bytes_free.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
+    _lib.tf_transform_bytes_free.restype = None
+    _lib.tf_owned_dense_free.argtypes = [ctypes.POINTER(_TfOwnedDenseV1)]
+    _lib.tf_owned_dense_free.restype = None
+    _lib.tf_transform_error_get_code.argtypes = [ctypes.c_void_p]
+    _lib.tf_transform_error_get_code.restype = transform_code
+    _lib.tf_transform_error_message.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    _lib.tf_transform_error_message.restype = ctypes.c_void_p
+    _lib.tf_transform_plan_schema_json.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.POINTER(_TfTransformLimitsV1),
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), error_out]
+    _lib.tf_transform_plan_schema_json.restype = transform_code
 
     return _lib
 

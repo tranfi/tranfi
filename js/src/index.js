@@ -893,6 +893,15 @@ const io = {
   }
 }
 
+const {
+  TranfiTransformError,
+  TransformRecipe,
+  TransformAnalyzer,
+  TransformPlan,
+  TransformApply,
+  safeTransformLimits
+} = require('./transform.js')
+
 module.exports = {
   Pipeline,
   PipelineResult,
@@ -906,5 +915,11 @@ module.exports = {
   expr,
   codec,
   ops,
-  io
+  io,
+  TranfiTransformError,
+  TransformRecipe,
+  TransformAnalyzer,
+  TransformPlan,
+  TransformApply,
+  safeTransformLimits
 }

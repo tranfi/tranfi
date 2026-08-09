@@ -1,6 +1,7 @@
 "use strict"
 
 const createTranfi = require('./index.js')
+const { TranfiTransformError } = require('../src/transform_error.js')
 
 const CHAN_MAIN = 0
 const CHAN_ERRORS = 1
@@ -131,7 +132,94 @@ async function runWorkerServer(endpoint) {
   }
 
   function fail(id, err) {
-    send({ id: id, type: 'error', error: String(err && err.message ? err.message : err || 'unknown error') })
+    send({
+      id: id,
+      type: 'error',
+      error: String(err && err.message ? err.message : err || 'unknown error'),
+      errorName: err && err.name,
+      errorCode: err && Number.isInteger(err.code) ? err.code : undefined
+    })
+  }
+
+  function preparedCancelToken(msg) {
+    if (!msg.cancelBuffer) return null
+    var flag = new Int32Array(msg.cancelBuffer)
+    return tf.createTransformCancelToken({
+      sharedFlag: flag,
+      limits: msg.limits
+    })
+  }
+
+  function reportNativePoll(token, id, phase) {
+    if (token) {
+      token._observeNextPoll(function() {
+        send({ id: id, type: 'transform-ready', phase: phase })
+      })
+    } else {
+      send({ id: id, type: 'transform-ready', phase: phase })
+    }
+  }
+
+  function handleTransformAnalyze(msg) {
+    var token = null
+    var recipe = null
+    var analyzer = null
+    var plan = null
+    try {
+      token = preparedCancelToken(msg)
+      recipe = tf.TransformRecipe.fromJSON(msg.recipe, { limits: msg.limits })
+      analyzer = recipe.analyzer(msg.schema, {
+        limits: msg.limits,
+        cancelToken: token
+      })
+      var tables = Array.isArray(msg.tables) ? msg.tables : []
+      for (var i = 0; i < tables.length; i++) {
+        reportNativePoll(token, msg.id, 'analyze')
+        analyzer.push(tables[i])
+      }
+      reportNativePoll(token, msg.id, 'finalize')
+      plan = analyzer.finalize()
+      var planBytes = plan.toBytes({ limits: msg.limits })
+      send({ id: msg.id, type: 'transform-plan', planBytes: planBytes }, [planBytes.buffer])
+    } finally {
+      if (plan) plan.close()
+      if (analyzer) analyzer.close()
+      if (recipe) recipe.close()
+      if (token) token.close()
+    }
+  }
+
+  function handleTransformApply(msg) {
+    var token = null
+    var plan = null
+    var apply = null
+    try {
+      token = preparedCancelToken(msg)
+      reportNativePoll(token, msg.id, 'import')
+      plan = tf.TransformPlan.fromBytes(asBytes(msg.planBytes), {
+        limits: msg.limits,
+        cancelToken: token
+      })
+      apply = plan.apply(msg.schema, {
+        limits: msg.limits,
+        cancelToken: token
+      })
+      reportNativePoll(token, msg.id, 'apply')
+      var result = apply.run(msg.table)
+      send({
+        id: msg.id,
+        type: 'transform-result',
+        result: {
+          rows: result.rows,
+          columns: result.columns,
+          data: result.data
+        }
+      }, [result.data.buffer])
+    } finally {
+      if (apply) apply.close()
+      if (plan) plan.close()
+      if (token) token.close()
+    }
   }
 
   function requireJob(id) {
@@ -254,6 +342,14 @@ async function runWorkerServer(endpoint) {
       finishJob(runJob)
       return
     }
+    if (msg.type === 'transform-analyze') {
+      handleTransformAnalyze(msg)
+      return
+    }
+    if (msg.type === 'transform-apply') {
+      handleTransformApply(msg)
+      return
+    }
     if (msg.type === 'cancel') {
       var cancelJob = jobs[msg.id]
       if (cancelJob) {
@@ -281,8 +377,13 @@ function createWorkerClient(workerOrUrl, options) {
   options = options || {}
   var worker = workerOrUrl
   var ownsWorker = options.terminateOnDispose === true
+  var workerFactory = typeof options.workerFactory === 'function'
+    ? options.workerFactory
+    : null
+  if (workerFactory) ownsWorker = true
   if ((typeof workerOrUrl === 'string' || (typeof URL !== 'undefined' && workerOrUrl instanceof URL)) && typeof Worker !== 'undefined') {
-    worker = new Worker(workerOrUrl, options.workerOptions)
+    workerFactory = function() { return new Worker(workerOrUrl, options.workerOptions) }
+    worker = workerFactory()
     ownsWorker = true
   }
   if (!worker || typeof worker.postMessage !== 'function') throw new TypeError('worker must be a Worker instance or URL')
@@ -290,8 +391,13 @@ function createWorkerClient(workerOrUrl, options) {
   var nextId = 1
   var jobs = new Map()
   var transfer = options.transfer !== false
+  var disposed = false
+  var removeListener = null
+  var restartPromise = null
+  var restartError = null
 
   function send(msg, transfers) {
+    if (!worker) throw new Error('worker client has no live worker; recreate the client')
     worker.postMessage(msg, transfer && transfers && transfers.length ? transfers : undefined)
   }
 
@@ -339,8 +445,14 @@ function createWorkerClient(workerOrUrl, options) {
       if (state.onProgress) state.progressCallbacks.push(Promise.resolve().then(function() { return state.onProgress(msg.progress) }))
       return
     }
+    if (msg.type === 'transform-ready') {
+      if (state.onTransformReady) state.onTransformReady(msg.phase)
+      return
+    }
     if (msg.type === 'error') {
-      var err = new Error(msg.error || 'worker pipeline failed')
+      var err = msg.errorName === 'TranfiTransformError' && Number.isInteger(msg.errorCode)
+        ? new TranfiTransformError(msg.errorCode, msg.error || 'prepared transform failed')
+        : new Error(msg.error || 'worker pipeline failed')
       state.done = true
       rejectWaiters(state, err)
       return
@@ -353,9 +465,66 @@ function createWorkerClient(workerOrUrl, options) {
     resolveWaiter(state, msg)
   }
 
-  var removeListener = addWorkerMessageListener(worker, onMessage)
+  function attachWorker(nextWorker) {
+    if (!nextWorker || typeof nextWorker.postMessage !== 'function') {
+      throw new TypeError('workerFactory must return a Worker instance')
+    }
+    worker = nextWorker
+    restartError = null
+    removeListener = addWorkerMessageListener(worker, onMessage)
+  }
+
+  async function ensureWorker() {
+    var pending = restartPromise
+    if (pending) await pending
+    if (restartError) throw restartError
+    if (!worker) throw new Error('worker client has no live worker; recreate the client')
+  }
+
+  function terminateForCancellation(error) {
+    var oldWorker = worker
+    if (!oldWorker || typeof oldWorker.terminate !== 'function') {
+      throw new Error('whole-worker cancellation requires an owned terminable worker')
+    }
+    if (removeListener) {
+      removeListener()
+      removeListener = null
+    }
+    worker = null
+    for (var state of jobs.values()) {
+      if (!state.done) {
+        state.done = true
+        state.cancelled = true
+        rejectWaiters(state, error)
+      }
+    }
+    var terminated
+    try {
+      terminated = oldWorker.terminate()
+    } catch (_) {
+      terminated = undefined
+    }
+    if (!disposed && workerFactory) {
+      restartPromise = Promise.resolve(terminated).catch(function() {}).then(function() {
+        if (disposed) return
+        try {
+          attachWorker(workerFactory())
+        } catch (error) {
+          restartError = error
+          worker = null
+        }
+      }).finally(function() {
+        restartPromise = null
+      })
+      return restartPromise
+    }
+    return terminated
+  }
+
+  attachWorker(worker)
 
   async function runChunks(dsl, chunks, runOptions) {
+    await ensureWorker()
     runOptions = runOptions || {}
     var chunkSize = runOptions.chunkSize || DEFAULT_CHUNK_SIZE
     if (chunkSize <= 0) throw new Error('chunkSize must be positive')
@@ -470,6 +639,74 @@ function createWorkerClient(workerOrUrl, options) {
     throw new TypeError('file must be a Blob/File with stream() or slice()')
   }
 
+  async function runTransformRequest(type, payload, runOptions) {
+    runOptions = runOptions || {}
+    var signal = runOptions.signal
+    if (signal && signal.aborted) {
+      throw new TranfiTransformError(109, 'prepared transform worker request cancelled')
+    }
+    await ensureWorker()
+    if (signal && signal.aborted) {
+      throw new TranfiTransformError(109, 'prepared transform worker request cancelled')
+    }
+    var cancelFlag = null
+    var terminateOnAbort = false
+    if (signal) {
+      var sharedCancellation = options.sharedCancellation !== false
+        && typeof SharedArrayBuffer !== 'undefined'
+        && typeof Atomics !== 'undefined'
+      if (!sharedCancellation) {
+        if (!workerFactory || !worker || typeof worker.terminate !== 'function') {
+          throw new Error('prepared-transform cancellation without SharedArrayBuffer requires a worker URL or workerFactory for termination and recreation')
+        }
+        terminateOnAbort = true
+      } else {
+        cancelFlag = new Int32Array(new SharedArrayBuffer(4))
+      }
+    }
+    var id = nextId++
+    var state = {
+      id: id,
+      waiters: [],
+      done: false,
+      cancelled: false,
+      outputCallbacks: [],
+      progressCallbacks: [],
+      onTransformReady: typeof runOptions.onReady === 'function'
+        ? runOptions.onReady
+        : null
+    }
+    jobs.set(id, state)
+    var abortListener = null
+    if (signal && typeof signal.addEventListener === 'function') {
+      abortListener = terminateOnAbort
+        ? function() {
+            terminateForCancellation(new TranfiTransformError(
+              109, 'prepared transform worker request cancelled by worker termination'
+            ))
+          }
+        : function() { Atomics.store(cancelFlag, 0, 1) }
+      signal.addEventListener('abort', abortListener, { once: true })
+    }
+    try {
+      send(Object.assign({
+        id: id,
+        type: type,
+        cancelBuffer: cancelFlag ? cancelFlag.buffer : null
+      }, payload))
+      var responseType = type === 'transform-analyze'
+        ? 'transform-plan'
+        : 'transform-result'
+      return await waitFor(state, [responseType])
+    } finally {
+      state.done = true
+      if (signal && abortListener && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', abortListener)
+      }
+      jobs.delete(id)
+    }
+  }
+
   return {
     run: function(dsl, data, runOptions) {
       runOptions = runOptions || {}
@@ -482,14 +719,51 @@ function createWorkerClient(workerOrUrl, options) {
       var chunkSize = runOptions.chunkSize || DEFAULT_CHUNK_SIZE
       return runChunks(dsl, fileChunks(file, chunkSize), runOptions)
     },
+    analyzeTransform: async function(recipe, schema, tables, runOptions) {
+      runOptions = runOptions || {}
+      var response = await runTransformRequest('transform-analyze', {
+        recipe: recipe,
+        schema: schema,
+        tables: Array.isArray(tables) ? tables : [tables],
+        limits: runOptions.limits
+      }, runOptions)
+      return ownedBytes(response.planBytes)
+    },
+    applyTransform: async function(planBytes, schema, table, runOptions) {
+      runOptions = runOptions || {}
+      var response = await runTransformRequest('transform-apply', {
+        planBytes: ownedBytes(planBytes),
+        schema: schema,
+        table: table,
+        limits: runOptions.limits
+      }, runOptions)
+      return {
+        rows: response.result.rows,
+        columns: response.result.columns,
+        data: new Float64Array(
+          response.result.data.buffer,
+          response.result.data.byteOffset,
+          response.result.data.length
+        )
+      }
+    },
     cancelAll: function() {
       for (var state of jobs.values()) abortState(state)
     },
     dispose: function() {
+      var pendingRestart = restartPromise
+      disposed = true
       this.cancelAll()
-      removeListener()
-      if (ownsWorker && worker && typeof worker.terminate === 'function') return worker.terminate()
-      return undefined
+      if (removeListener) {
+        removeListener()
+        removeListener = null
+      }
+      if (ownsWorker && worker && typeof worker.terminate === 'function') {
+        var activeWorker = worker
+        worker = null
+        return activeWorker.terminate()
+      }
+      return pendingRestart || undefined
     }
   }
 }

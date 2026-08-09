@@ -167,7 +167,7 @@ tranfi_apply_debug_sanitizer(tranfi)
 
 # WASM (Emscripten)
 if(EMSCRIPTEN)
-    add_executable(tranfi_wasm src/wasm_api.c)
+    add_executable(tranfi_wasm src/wasm_api.c src/transform_wasm_api.c)
     target_link_libraries(tranfi_wasm tranfi_core)
     target_include_directories(tranfi_wasm PRIVATE src)
     tranfi_apply_c_common(tranfi_wasm)
@@ -222,7 +222,11 @@ if(BUILD_TESTING)
     tranfi_apply_debug_sanitizer(test_memory)
     add_test(NAME memory_tests COMMAND test_memory)
 
-    add_executable(test_wasm_api test/test_wasm_api.c src/wasm_api.c)
+    add_executable(test_wasm_api
+        test/test_wasm_api.c
+        src/wasm_api.c
+        src/transform_wasm_api.c
+    )
     target_link_libraries(test_wasm_api tranfi_core)
     target_include_directories(test_wasm_api PRIVATE src)
     tranfi_apply_c_common(test_wasm_api)

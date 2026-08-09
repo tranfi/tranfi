@@ -102,6 +102,18 @@ const result2 = await pipeline([
 ]).run({ inputFile: 'data.csv' })
 ```
 
+### Prepared reusable transforms
+
+Tranfi also has a separate typed-table lifecycle for data-dependent reusable transforms:
+
+```text
+recipe -> analyze reference batches -> finalize immutable plan -> apply
+```
+
+`apply` can run over a second pass of the original reference data (the streaming equivalent of `fit_transform`) as well as over later compatible batches. The plan contains the learned state, resolved operations, and frozen input/output schemas; it can be exported as a canonical TFTR artifact and imported by another supported binding. This API does not replace the ordinary `create -> push -> finish -> pull` byte-stream pipeline.
+
+The current prepared-transform slice is deliberately narrow: declared `float32`/`float64` columns with numeric none/zero/constant/mean imputation and none/standard/min-max normalization. Native Node, standalone WASM/Worker, and Python bindings expose the same plan bytes, output/error semantics, resource limits, deterministic disposal, and stable numeric `TranfiTransformError.code`. Categorical encoding, median, and kind inference remain future phases. See the [Node/WASM](js/) and [Python](py/) package guides for examples.
+
 ### DuckDB engine
 
 Tranfi pipelines can run on DuckDB instead of the native C core. The DSL is transpiled to SQL in C, so it works across all targets.
@@ -264,7 +276,7 @@ The low-level C constructors and raw WASM exports are policy-neutral compatibili
 
 Multi-file host input stays a source-adapter concern. Python `run(input_files=[...], source_column="src")` and Node `run({ inputFiles: [...], sourceColumn: "src" })` stream paths sequentially through one pipeline, set the current source name before each file, call an input-boundary flush between files, and append the path through the row-local `source-name` op. The boundary flush is decoder-only: it drains a final buffered CSV/JSONL/text record for that file without finishing transforms or encoders, so a row split at EOF is tagged with the file that produced it. CSV repeated header stripping is explicit codec policy: pass `csv skip_repeated_header=true`, `tf.codec.csv(skip_repeated_header=True)`, or `codec.csv({ skipRepeatedHeader: true })` to drop a later file's first parsed record only when it exactly matches the discovered header. Same-file repeated header-like rows are preserved as data.
 
-Browser Web Workers are a host placement detail, not an IR target. The core contract is `target=wasm`; `tranfi/wasm/worker` provides an optional client/server wrapper around the generic WASM `create/push/pull/finish/free` API. The wrapper supports `run()`, streamed `runChunks()`, browser `runFile()` over `File`/`Blob` chunks, transferable input/output buffers, progress snapshots (`bytesIn`, `bytesOut`, `chunksIn`, `chunksOut`, `phase`, `finished`), propagated stats/error side channels, and `AbortSignal` cancellation between chunk/flush boundaries.
+Browser Web Workers are a host placement detail, not an IR target. The core contract is `target=wasm`; `tranfi/wasm/worker` provides an optional client/server wrapper around the generic WASM `create/push/pull/finish/free` API. The wrapper supports `run()`, streamed `runChunks()`, browser `runFile()` over `File`/`Blob` chunks, transferable input/output buffers, progress snapshots (`bytesIn`, `bytesOut`, `chunksIn`, `chunksOut`, `phase`, `finished`), propagated stats/error side channels, and `AbortSignal` cancellation between chunk/flush boundaries. Prepared-transform worker calls additionally use a SharedArrayBuffer atomic cell for true in-call cancellation; without SharedArrayBuffer, an owned worker is terminated and recreated so its complete WASM heap is reclaimed rather than reused.
 
 The browser app uses the same streaming boundary for uploaded files: it drains WASM main output after each push/finish step into a bounded preview table (`preview_rows`, default 200) and does not retain the full output string unless the schema explicitly sets `collect_output=true` for a deliberate export/download path.
 

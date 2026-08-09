@@ -1420,6 +1420,311 @@ fail:
     return NULL;
 }
 
+typedef struct tf_json_build_budget {
+    uint64_t nodes;
+    uint64_t strings;
+    uint64_t string_bytes;
+    uint64_t object_keys;
+    uint64_t objects;
+    uint64_t max_string_bytes;
+    uint64_t max_object_width;
+    uint64_t depth;
+} tf_json_build_budget;
+
+static int build_budget_add(uint64_t *target, uint64_t value) {
+    if (*target > UINT64_MAX - value) return 0;
+    *target += value;
+    return 1;
+}
+
+static int build_budget_node(tf_json_build_budget *budget) {
+    return build_budget_add(&budget->nodes, 1);
+}
+
+static int build_budget_string(
+    tf_json_build_budget *budget, uint64_t bytes) {
+    if (!build_budget_add(&budget->strings, 1)
+        || !build_budget_add(&budget->string_bytes, bytes)) return 0;
+    if (bytes > budget->max_string_bytes) budget->max_string_bytes = bytes;
+    return 1;
+}
+
+static int build_budget_key(
+    tf_json_build_budget *budget, const char *key) {
+    size_t len = strlen(key);
+    return build_budget_add(&budget->object_keys, 1)
+        && build_budget_string(budget, (uint64_t)len);
+}
+
+static int build_budget_object(
+    tf_json_build_budget *budget, uint64_t width) {
+    if (!build_budget_node(budget)
+        || !build_budget_add(&budget->objects, 1)) return 0;
+    if (width > budget->max_object_width) budget->max_object_width = width;
+    return 1;
+}
+
+static int build_budget_array(tf_json_build_budget *budget) {
+    return build_budget_node(budget);
+}
+
+static int build_budget_primitive(
+    tf_json_build_budget *budget, const char *key) {
+    return build_budget_key(budget, key) && build_budget_node(budget);
+}
+
+static int build_budget_string_property(
+    tf_json_build_budget *budget, const char *key, uint64_t value_bytes) {
+    return build_budget_primitive(budget, key)
+        && build_budget_string(budget, value_bytes);
+}
+
+static int build_budget_child(
+    tf_json_build_budget *budget, const char *key) {
+    return build_budget_key(budget, key);
+}
+
+static int build_budget_tagged(
+    tf_json_build_budget *budget, const char *key, uint64_t value_bytes) {
+    return build_budget_child(budget, key)
+        && build_budget_object(budget, 2)
+        && build_budget_string_property(budget, "t", 3)
+        && build_budget_string_property(budget, "v", value_bytes);
+}
+
+static int build_budget_schema(
+    const tf_transform_schema *schema, tf_json_build_budget *budget) {
+    if (!schema || !build_budget_array(budget)) return 0;
+    for (size_t i = 0; i < schema->field_count; ++i) {
+        const tf_transform_schema_field_owned *field = &schema->fields[i];
+        if (!build_budget_object(budget, schema->is_output ? 6 : 3)) return 0;
+        if (schema->is_output
+            && !build_budget_primitive(budget, "category")) return 0;
+        if (!build_budget_string_property(budget, "dtype", 7)
+            || !build_budget_string_property(
+                budget, "id", (uint64_t)field->id_len)
+            || !build_budget_string_property(
+                budget, "name", (uint64_t)field->name_len)) return 0;
+        if (schema->is_output
+            && (!build_budget_string_property(budget, "role", 5)
+                || !build_budget_string_property(
+                    budget, "sourceId", (uint64_t)field->id_len))) return 0;
+    }
+    if (budget->depth < 3) budget->depth = 3;
+    return 1;
+}
+
+static int build_budget_recipe(
+    const tf_transform_recipe *recipe, tf_json_build_budget *budget) {
+    if (!recipe || !build_budget_object(budget, 6)
+        || !build_budget_child(budget, "columns")
+        || !build_budget_array(budget)) return 0;
+    for (size_t i = 0; i < recipe->column_count; ++i) {
+        const tf_transform_recipe_column *column = &recipe->columns[i];
+        if (!build_budget_object(budget, 4)
+            || !build_budget_primitive(budget, "categorical")
+            || !build_budget_child(budget, "kind")
+            || !build_budget_object(budget, 4)
+            || !build_budget_primitive(budget, "maxCategories")
+            || !build_budget_string_property(budget, "op", 8)
+            || !build_budget_primitive(budget, "rule")
+            || !build_budget_string_property(budget, "value", 7)
+            || !build_budget_child(budget, "numeric")
+            || !build_budget_object(budget, 2)
+            || !build_budget_child(budget, "impute")
+            || !build_budget_object(budget, 3)) return 0;
+        if (column->impute == TF_TRANSFORM_IMPUTE_MEAN) {
+            if (!build_budget_string_property(budget, "allMissing", 5)) return 0;
+        } else if (!build_budget_primitive(budget, "allMissing")) return 0;
+        if (column->impute == TF_TRANSFORM_IMPUTE_CONSTANT) {
+            if (!build_budget_tagged(
+                    budget, "constant",
+                    column->constant_dtype == TF_VIEW_FLOAT32 ? 8 : 16)) return 0;
+        } else if (!build_budget_primitive(budget, "constant")) return 0;
+        if (!build_budget_string_property(budget, "op", 8)
+            || !build_budget_child(budget, "normalize")
+            || !build_budget_object(budget, 2)) return 0;
+        if (column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD) {
+            if (!build_budget_primitive(budget, "ddof")) return 0;
+        } else if (!build_budget_primitive(budget, "ddof")) return 0;
+        if (!build_budget_string_property(budget, "op", 8)
+            || !build_budget_string_property(
+                budget, "sourceId", (uint64_t)column->source_id_len)) return 0;
+    }
+    if (!build_budget_string_property(budget, "format", 23)
+        || !build_budget_string_property(budget, "outputDtype", 7)
+        || !build_budget_primitive(budget, "policyVersion")
+        || !build_budget_child(budget, "semanticLimits")
+        || !build_budget_object(budget, 2)
+        || !build_budget_primitive(budget, "maxOutputColumns")
+        || !build_budget_primitive(budget, "maxOutputElementsPerApply")
+        || !build_budget_primitive(budget, "version")) return 0;
+    if (budget->depth < 8) budget->depth = 8;
+    return 1;
+}
+
+static int build_budget_step(
+    const tf_transform_recipe_column *recipe,
+    const tf_transform_numeric_state *state,
+    tf_json_build_budget *budget) {
+    if (!build_budget_object(budget, 6)
+        || !build_budget_primitive(budget, "categorical")
+        || !build_budget_string_property(budget, "kind", 7)
+        || !build_budget_child(budget, "numeric")
+        || !build_budget_object(budget, 2)
+        || !build_budget_child(budget, "impute")
+        || !build_budget_object(budget, 3)) return 0;
+    if (recipe->impute == TF_TRANSFORM_IMPUTE_MEAN) {
+        if (!build_budget_string_property(budget, "allMissing", 5)) return 0;
+    } else if (!build_budget_primitive(budget, "allMissing")) return 0;
+    if (!build_budget_string_property(budget, "op", 8)) return 0;
+    if (state->has_impute_value) {
+        if (!build_budget_tagged(budget, "value", 16)) return 0;
+    } else if (!build_budget_primitive(budget, "value")) return 0;
+    if (!build_budget_child(budget, "normalize")
+        || !build_budget_object(budget, 5)
+        || !build_budget_primitive(budget, "ddof")
+        || !build_budget_tagged(budget, "location", 16)
+        || !build_budget_string_property(budget, "op", 8)
+        || !build_budget_tagged(budget, "scale", 16)
+        || !build_budget_string_property(
+            budget, "sourceId", (uint64_t)recipe->source_id_len)
+        || !build_budget_primitive(budget, "stateVersion")) return 0;
+    return 1;
+}
+
+static tf_transform_code check_build_budget(
+    const tf_json_build_budget *budget,
+    const tf_transform_limits_v1 *limits,
+    uint64_t extra_allocations, uint64_t output_copies,
+    tf_transform_error **error) {
+    uint64_t allocations = budget->nodes;
+    uint64_t resident;
+    uint64_t output_upper;
+    uint64_t sort_bytes;
+    if (!build_budget_add(&allocations, budget->strings)
+        || !build_budget_add(&allocations, budget->objects)
+        || !build_budget_add(&allocations, extra_allocations)) goto overflow;
+    if (budget->nodes > UINT64_MAX / sizeof(cJSON)) goto overflow;
+    resident = budget->nodes * sizeof(cJSON);
+    if (!build_budget_add(&resident, budget->string_bytes)
+        || !build_budget_add(&resident, budget->strings)) goto overflow;
+    if (budget->max_object_width > UINT64_MAX / sizeof(cJSON *)) goto overflow;
+    sort_bytes = budget->max_object_width * sizeof(cJSON *);
+    if (!build_budget_add(&resident, sort_bytes)) goto overflow;
+    if (budget->nodes > UINT64_MAX / 32) goto overflow;
+    output_upper = budget->nodes * 32;
+    if (budget->string_bytes > (UINT64_MAX - output_upper) / 6)
+        goto overflow;
+    output_upper += budget->string_bytes * 6;
+    if (output_upper > limits->max_plan_bytes)
+        output_upper = limits->max_plan_bytes;
+    if (output_copies != 0 && output_upper > UINT64_MAX / output_copies)
+        goto overflow;
+    if (!build_budget_add(&resident, output_upper * output_copies)) goto overflow;
+    if (budget->depth > limits->max_json_depth
+        || budget->object_keys > limits->max_object_keys
+        || budget->string_bytes > limits->max_decoded_string_bytes
+        || budget->max_string_bytes > limits->max_string_bytes
+        || allocations > limits->max_allocations_per_session
+        || resident > limits->max_resident_state_bytes
+        || sizeof(cJSON) > limits->max_allocation_bytes
+        || sort_bytes > limits->max_allocation_bytes
+        || (budget->strings != 0
+            && (budget->max_string_bytes == UINT64_MAX
+                || budget->max_string_bytes + 1
+                    > limits->max_allocation_bytes)))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "JSON construction exceeds configured limits");
+    return TF_TRANSFORM_OK;
+overflow:
+    return tf_transform_set_error(
+        error, TF_TRANSFORM_RESOURCE_LIMIT,
+        "JSON construction resource estimate overflows");
+}
+
+tf_transform_code tf_transform_schema_json_preflight(
+    const tf_transform_schema *schema, const tf_transform_limits_v1 *limits,
+    tf_transform_error **error) {
+    tf_json_build_budget budget = {0};
+    if (!schema || !limits)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INVALID_ARGUMENT,
+            "schema JSON preflight argument is null");
+    if ((uint64_t)schema->field_count
+            > (schema->is_output ? limits->max_output_columns
+                                 : limits->max_input_columns)
+        || !build_budget_schema(schema, &budget))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "schema JSON construction estimate overflows");
+    return check_build_budget(&budget, limits, 1, 1, error);
+}
+
+tf_transform_code tf_transform_plan_json_preflight(
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    tf_transform_error **error) {
+    tf_json_build_budget fingerprint = {0};
+    tf_json_build_budget plan_json = {0};
+    tf_transform_code code;
+    uint64_t total_allocations;
+    if (!plan || !limits)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INVALID_ARGUMENT,
+            "plan JSON preflight argument is null");
+    if ((uint64_t)plan->input_schema.field_count > limits->max_input_columns
+        || (uint64_t)plan->output_schema.field_count > limits->max_output_columns
+        || (uint64_t)plan->input_schema.field_count > limits->max_steps)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "plan JSON structure exceeds configured limits");
+    if (!build_budget_object(&fingerprint, 3)
+        || !build_budget_child(&fingerprint, "inputSchema")
+        || !build_budget_schema(&plan->input_schema, &fingerprint)
+        || !build_budget_primitive(&fingerprint, "policyVersion")
+        || !build_budget_child(&fingerprint, "recipe")
+        || !build_budget_recipe(plan->recipe, &fingerprint)) goto overflow;
+    if (!build_budget_object(&plan_json, 7)
+        || !build_budget_string_property(&plan_json, "format", 21)
+        || !build_budget_child(&plan_json, "inputSchema")
+        || !build_budget_schema(&plan->input_schema, &plan_json)
+        || !build_budget_child(&plan_json, "outputSchema")
+        || !build_budget_schema(&plan->output_schema, &plan_json)
+        || !build_budget_child(&plan_json, "recipe")
+        || !build_budget_recipe(plan->recipe, &plan_json)
+        || !build_budget_string_property(&plan_json, "recipeSha256", 64)
+        || !build_budget_child(&plan_json, "steps")
+        || !build_budget_array(&plan_json)) goto overflow;
+    for (size_t i = 0; i < plan->input_schema.field_count; ++i) {
+        if (!build_budget_step(
+                &plan->recipe->columns[i], &plan->states[i], &plan_json))
+            goto overflow;
+    }
+    if (!build_budget_primitive(&plan_json, "version")) goto overflow;
+    if (plan_json.depth < 8) plan_json.depth = 8;
+    code = check_build_budget(&fingerprint, limits, 1, 1, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    code = check_build_budget(&plan_json, limits, 2, 2, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    total_allocations = fingerprint.nodes;
+    if (!build_budget_add(&total_allocations, fingerprint.strings)
+        || !build_budget_add(&total_allocations, fingerprint.objects)
+        || !build_budget_add(&total_allocations, plan_json.nodes)
+        || !build_budget_add(&total_allocations, plan_json.strings)
+        || !build_budget_add(&total_allocations, plan_json.objects)
+        || !build_budget_add(&total_allocations, 3)) goto overflow;
+    if (total_allocations > limits->max_allocations_per_session)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "plan JSON allocation count exceeds configured limit");
+    return TF_TRANSFORM_OK;
+overflow:
+    return tf_transform_set_error(
+        error, TF_TRANSFORM_RESOURCE_LIMIT,
+        "plan JSON construction estimate overflows");
+}
+
 cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe) {
     cJSON *root = cJSON_CreateObject();
     cJSON *columns = cJSON_CreateArray();
@@ -1674,20 +1979,28 @@ fail:
 }
 
 cJSON *tf_transform_plan_to_json(
-    const tf_transform_plan *plan, tf_transform_error **error) {
-    tf_transform_limits_v1 limits;
-    cJSON *root = cJSON_CreateObject();
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    tf_transform_error **error) {
+    cJSON *root = NULL;
     cJSON *input_schema = NULL;
     cJSON *output_schema = NULL;
     cJSON *recipe = NULL;
-    cJSON *steps = cJSON_CreateArray();
+    cJSON *steps = NULL;
     char fingerprint[65];
     tf_transform_code code;
-    if (!plan || !root || !steps) goto allocation_failed;
-    if (tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
-        != TF_TRANSFORM_OK) goto allocation_failed;
+    if (!plan || !limits) {
+        tf_transform_set_error(
+            error, TF_TRANSFORM_INVALID_ARGUMENT,
+            "plan JSON argument is null");
+        goto failed;
+    }
+    code = tf_transform_plan_json_preflight(plan, limits, error);
+    if (code != TF_TRANSFORM_OK) goto failed;
+    root = cJSON_CreateObject();
+    steps = cJSON_CreateArray();
+    if (!root || !steps) goto allocation_failed;
     code = plan_recipe_fingerprint(
-        plan->recipe, &plan->input_schema, &limits, fingerprint, error);
+        plan->recipe, &plan->input_schema, limits, fingerprint, error);
     if (code != TF_TRANSFORM_OK) goto failed;
     input_schema = tf_transform_schema_to_json(&plan->input_schema);
     output_schema = tf_transform_schema_to_json(&plan->output_schema);

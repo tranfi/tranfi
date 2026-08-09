@@ -1072,6 +1072,8 @@ tf_transform_code tf_transform_plan_schema_json(
     else if (which == TF_TRANSFORM_SCHEMA_OUTPUT) schema = &plan->output_schema;
     else return tf_transform_set_error(
         error, TF_TRANSFORM_INVALID_ARGUMENT, "unknown plan schema selector");
+    code = tf_transform_schema_json_preflight(schema, &copied, error);
+    if (code != TF_TRANSFORM_OK) return code;
     json = tf_transform_schema_to_json(schema);
     if (!json) return tf_transform_set_error(
         error, TF_TRANSFORM_ALLOCATION, "schema JSON allocation failed");
@@ -1155,7 +1157,7 @@ tf_transform_code tf_transform_plan_export(
             error, TF_TRANSFORM_INVALID_ARGUMENT, "plan export argument is null");
     code = tf_transform_copy_limits(limits, &copied, error);
     if (code != TF_TRANSFORM_OK) return code;
-    json = tf_transform_plan_to_json(plan, error);
+    json = tf_transform_plan_to_json(plan, &copied, error);
     if (!json) return error && *error
         ? (*error)->code : TF_TRANSFORM_ALLOCATION;
     code = tf_transform_json_print_canonical(
