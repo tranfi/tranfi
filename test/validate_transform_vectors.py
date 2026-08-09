@@ -28,6 +28,7 @@ RESOURCE_LIMIT = 104
 UNSUPPORTED_VERSION = 105
 CORRUPT_PLAN = 106
 NUMERIC_DOMAIN = 107
+UNKNOWN_CATEGORY = 108
 UNSUPPORTED_RUNTIME = 113
 
 
@@ -182,6 +183,7 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         "invalidRecipe": INVALID_RECIPE,
         "numericDomain": NUMERIC_DOMAIN,
         "resourceLimit": RESOURCE_LIMIT,
+        "unknownCategory": UNKNOWN_CATEGORY,
         "unsupportedRuntime": UNSUPPORTED_RUNTIME,
         "unsupportedVersion": UNSUPPORTED_VERSION,
     }, "error code table drift")
@@ -225,7 +227,13 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         validate_rows(expected_rows, expected_width, allow_nonfinite=True)
         if "expectedError" in case:
             error = case["expectedError"]
+            require(set(error) == {"code", "phase"}
+                    and error["phase"] in {"finalize", "apply"},
+                    f"{case_id}: expected error shape")
             require(error["code"] in codes.values(), f"{case_id}: expected error code")
+            if error["phase"] == "apply":
+                require("expectedPlan" in case,
+                        f"{case_id}: apply error requires plan expectation")
         else:
             require("expectedPlan" in case, f"{case_id}: plan expectation")
 
@@ -267,6 +275,14 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
 
     require("max-categories-one-invalid" in validation_ids, "missing maxCategories=1 boundary")
     require("max-categories-two-valid" in validation_ids, "missing maxCategories=2 boundary")
+    require({
+        "categorical-mode-tie-smallest-signed-zero",
+        "categorical-mode-subnormal-order",
+        "categorical-mode-all-missing-zero",
+        "categorical-mode-all-missing-error",
+        "categorical-mode-empty-analysis-zero-policy",
+        "categorical-mode-unknown-apply",
+    } <= case_ids, "categorical mode edge corpus incomplete")
     return len(semantic_cases), len(validation_cases), len(sqrt_cases)
 
 

@@ -49,6 +49,7 @@ endfunction()
 set(CORE_SOURCES
     src/cJSON.c
     src/transform_api.c
+    src/transform_categorical.c
     src/transform_json.c
     src/transform_numeric.c
     src/transform_sha256.c
@@ -141,6 +142,7 @@ set(CORE_SOURCES
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     set_source_files_properties(
         src/transform_api.c
+        src/transform_categorical.c
         src/transform_json.c
         src/transform_numeric.c
         src/transform_sha256.c

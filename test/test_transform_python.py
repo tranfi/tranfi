@@ -27,9 +27,11 @@ from tranfi import _ffi
 VECTORS = json.loads(
     (ROOT / 'test' / 'vectors' / 'prepared_transform_v1.json').read_text())
 SCHEMA64 = [{'id': 'x0', 'name': 'x0', 'dtype': 'float64'}]
+SCHEMA32 = [{'id': 'x0', 'name': 'x0', 'dtype': 'float32'}]
 SUPPORTED_CASES = [
     case for case in VECTORS['semanticCases']
     if case['recipe'] in {
+        'categorical_mode_none', 'categorical_mode_zero_none',
         'numeric_mean_standard', 'numeric_median_none',
         'numeric_median_zero_none',
         'numeric_none_none', 'numeric_zero_minmax'
@@ -49,6 +51,10 @@ def double_from_bits(value):
 
 def double_bits(value):
     return struct.pack('>d', value).hex()
+
+
+def float32_from_bits(value):
+    return struct.unpack('=f', struct.pack('=I', value))[0]
 
 
 def make_table(values, dtype='d', validity=None):
@@ -168,6 +174,86 @@ def test_empty_analysis_preserves_insufficient_data_code():
             with pytest.raises(tranfi.TranfiTransformError) as caught:
                 analyzer.finalize()
             assert caught.value.code == case['expectedError']['code']
+
+
+def test_categorical_mode_errors_limits_and_float32():
+    for case_id in (
+            'categorical-mode-all-missing-error',
+            'categorical-mode-empty-analysis-zero-policy'):
+        case = next(item for item in VECTORS['semanticCases']
+                    if item['id'] == case_id)
+        values = [double_from_bits(row[0]) for row in case['analyze']['rows']]
+        with tranfi.TransformRecipe.from_json(
+                recipe_text(case['recipe'])) as recipe:
+            with recipe.analyzer(SCHEMA64) as analyzer:
+                analyzer.push(make_table(values))
+                with pytest.raises(tranfi.TranfiTransformError) as caught:
+                    analyzer.finalize()
+                assert caught.value.code == 103
+
+    with tranfi.TransformRecipe.from_json(
+            recipe_text('categorical_mode_none')) as recipe:
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            analyzer.push(make_table([1.0, 2.0]))
+            with analyzer.finalize() as plan:
+                with plan.apply(SCHEMA64) as apply:
+                    with pytest.raises(tranfi.TranfiTransformError) as caught:
+                        apply.run(make_table([3.0]))
+                    assert caught.value.code == 108
+                    with pytest.raises(tranfi.TranfiTransformError) as terminal:
+                        apply.run(make_table([1.0]))
+                    assert terminal.value.code == 112
+
+        limits = tranfi.TransformLimits(max_categories_per_column=2)
+        with recipe.analyzer(SCHEMA64, limits=limits) as analyzer:
+            with pytest.raises(tranfi.TranfiTransformError) as caught:
+                analyzer.push(make_table([1.0, 2.0, 3.0]))
+            assert caught.value.code == 104
+            with pytest.raises(tranfi.TranfiTransformError) as terminal:
+                analyzer.push(make_table([1.0]))
+            assert terminal.value.code == 112
+
+    with tranfi.TransformRecipe.from_json(
+            recipe_text('categorical_mode_none')) as recipe:
+        with recipe.analyzer(SCHEMA32) as analyzer:
+            analyzer.push(make_table([-0.0, 0.0, 1.0, 1.0], dtype='f'))
+            with analyzer.finalize() as plan:
+                payload = json.loads(plan.to_bytes()[52:])
+                categories = payload['steps'][0]['categorical']['categories']
+                assert categories == [
+                    {'t': 'f32', 'v': '00000000'},
+                    {'t': 'f32', 'v': '3f800000'},
+                ]
+                with plan.apply(SCHEMA32) as apply:
+                    result = apply.run(make_table([-0.0, float('nan')], dtype='f'))
+                    assert [double_bits(value) for value in result.data] == [
+                        '8000000000000000', '0000000000000000']
+
+    analyze_values = [
+        float32_from_bits(value)
+        for value in (0x00000001, 0x80000001, 0x00000000)
+    ]
+    apply_values = [
+        float32_from_bits(value)
+        for value in (0x7FC00000, 0x80000001, 0x00000000, 0x00000001)
+    ]
+    with tranfi.TransformRecipe.from_json(
+            recipe_text('categorical_mode_none')) as recipe:
+        with recipe.analyzer(SCHEMA32) as analyzer:
+            analyzer.push(make_table(analyze_values, dtype='f'))
+            with analyzer.finalize() as plan:
+                payload = json.loads(plan.to_bytes()[52:])
+                assert payload['steps'][0]['categorical']['categories'] == [
+                    {'t': 'f32', 'v': '80000001'},
+                    {'t': 'f32', 'v': '00000000'},
+                    {'t': 'f32', 'v': '00000001'},
+                ]
+                with plan.apply(SCHEMA32) as apply:
+                    result = apply.run(make_table(apply_values, dtype='f'))
+                    assert [double_bits(value) for value in result.data] == [
+                        'b6a0000000000000', 'b6a0000000000000',
+                        '0000000000000000', '36a0000000000000',
+                    ]
 
 
 def test_median_errors_and_retained_state_limits():

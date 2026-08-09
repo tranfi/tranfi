@@ -14,6 +14,23 @@ typedef enum tf_transform_impute_op {
     TF_TRANSFORM_IMPUTE_MEDIAN
 } tf_transform_impute_op;
 
+typedef enum tf_transform_column_kind {
+    TF_TRANSFORM_KIND_NUMERIC = 0,
+    TF_TRANSFORM_KIND_CATEGORICAL
+} tf_transform_column_kind;
+
+typedef enum tf_transform_categorical_impute_op {
+    TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE = 0,
+    TF_TRANSFORM_CATEGORICAL_IMPUTE_CONSTANT,
+    TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE
+} tf_transform_categorical_impute_op;
+
+typedef enum tf_transform_encode_op {
+    TF_TRANSFORM_ENCODE_NONE = 0,
+    TF_TRANSFORM_ENCODE_LABEL,
+    TF_TRANSFORM_ENCODE_ONEHOT
+} tf_transform_encode_op;
+
 typedef enum tf_transform_normalize_op {
     TF_TRANSFORM_NORMALIZE_NONE = 0,
     TF_TRANSFORM_NORMALIZE_STANDARD,
@@ -29,12 +46,17 @@ typedef enum tf_transform_all_missing {
 typedef struct tf_transform_recipe_column {
     char *source_id;
     size_t source_id_len;
+    tf_transform_column_kind kind;
     tf_transform_impute_op impute;
     tf_transform_all_missing all_missing;
     double constant;
     uint32_t constant_dtype;
     tf_transform_normalize_op normalize;
     int ddof;
+    tf_transform_categorical_impute_op categorical_impute;
+    tf_transform_all_missing categorical_all_missing;
+    tf_transform_encode_op categorical_encode;
+    int categorical_discover;
 } tf_transform_recipe_column;
 
 struct tf_transform_recipe {
@@ -70,12 +92,35 @@ typedef struct tf_transform_numeric_state {
     double scale;
 } tf_transform_numeric_state;
 
+typedef struct tf_transform_category_value {
+    uint64_t bits;
+} tf_transform_category_value;
+
+typedef struct tf_transform_categorical_state {
+    tf_transform_categorical_impute_op impute;
+    tf_transform_all_missing all_missing;
+    tf_transform_encode_op encode;
+    uint32_t source_dtype;
+    tf_transform_category_value *categories;
+    size_t category_count;
+    uint64_t impute_bits;
+    int has_impute_value;
+} tf_transform_categorical_state;
+
+typedef struct tf_transform_column_state {
+    tf_transform_column_kind kind;
+    union {
+        tf_transform_numeric_state numeric;
+        tf_transform_categorical_state categorical;
+    } value;
+} tf_transform_column_state;
+
 struct tf_transform_plan {
     atomic_uint refcount;
     tf_transform_recipe *recipe;
     tf_transform_schema input_schema;
     tf_transform_schema output_schema;
-    tf_transform_numeric_state *states;
+    tf_transform_column_state *states;
     uint64_t import_allocation_count;
     uint64_t import_peak_resident_bytes;
 };
@@ -98,10 +143,13 @@ typedef struct tf_transform_median_store {
     uint64_t count;
 } tf_transform_median_store;
 
+typedef struct tf_transform_category_store tf_transform_category_store;
+
 typedef struct tf_transform_runtime_copy {
     tf_transform_limits_v1 limits;
     tf_transform_cancel_fn cancel;
     void *cancel_user;
+    int fp_guard_active;
 } tf_transform_runtime_copy;
 
 typedef struct tf_transform_resource_ledger {
@@ -125,6 +173,9 @@ struct tf_transform_analyzer {
     tf_transform_running_stats *stats;
     tf_transform_running_stats *scratch;
     tf_transform_median_store *median_stores;
+    tf_transform_category_store *category_stores;
+    size_t category_stores_initialized;
+    uint64_t total_categories;
     uint64_t total_rows;
     uint64_t total_input_bytes;
     uint64_t allocation_count;
@@ -210,6 +261,39 @@ void *tf_transform_resource_calloc(
     tf_transform_resource_ledger *ledger, size_t count, size_t size,
     tf_transform_error **error);
 tf_transform_code tf_transform_check_runtime_fp(tf_transform_error **error);
+
+tf_transform_code tf_transform_analyzer_allocate_retained(
+    tf_transform_analyzer *analyzer, size_t bytes, void **out,
+    tf_transform_error **error);
+
+tf_transform_code tf_transform_category_stores_requirements(
+    size_t column_count, uint64_t *resident_bytes,
+    uint64_t *allocation_count, tf_transform_error **error);
+tf_transform_code tf_transform_category_stores_init(
+    tf_transform_analyzer *analyzer, tf_transform_error **error);
+void tf_transform_category_stores_clear(tf_transform_analyzer *analyzer);
+tf_transform_code tf_transform_category_observe(
+    tf_transform_analyzer *analyzer, size_t column_index,
+    double value, uint32_t dtype, tf_transform_error **error);
+tf_transform_code tf_transform_category_check_observed(
+    const tf_transform_analyzer *analyzer, size_t column_index,
+    uint64_t observed, tf_transform_error **error);
+tf_transform_code tf_transform_category_plan_requirements(
+    const tf_transform_analyzer *analyzer, size_t column_index,
+    uint64_t *resident_bytes, uint64_t *allocation_count,
+    tf_transform_error **error);
+tf_transform_code tf_transform_category_finalize(
+    const tf_transform_analyzer *analyzer, size_t column_index,
+    tf_transform_categorical_state *out, tf_transform_error **error);
+void tf_transform_categorical_state_clear(tf_transform_categorical_state *state);
+tf_transform_code tf_transform_category_key(
+    double value, uint32_t dtype, uint64_t *out, tf_transform_error **error);
+double tf_transform_category_decode(uint64_t bits, uint32_t dtype);
+int tf_transform_category_compare(uint64_t left, uint64_t right, uint32_t dtype);
+tf_transform_code tf_transform_category_contains(
+    const tf_transform_categorical_state *state, uint64_t bits,
+    const tf_transform_runtime_copy *runtime, int *out,
+    tf_transform_error **error);
 tf_transform_code tf_transform_fp_begin(
     tf_transform_fp_guard *guard, tf_transform_error **error);
 void tf_transform_fp_end(tf_transform_fp_guard *guard);

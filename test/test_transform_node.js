@@ -11,6 +11,8 @@ const vectors = require('./vectors/prepared_transform_v1.json')
 
 const schema64 = [{ id: 'x0', dtype: 'float64' }]
 const supportedRecipes = new Set([
+  'categorical_mode_none',
+  'categorical_mode_zero_none',
   'numeric_mean_standard',
   'numeric_median_none',
   'numeric_median_zero_none',
@@ -28,6 +30,13 @@ function doubleBits(value) {
   return bytes.toString('hex')
 }
 
+function float32FromBits(bits) {
+  const buffer = new ArrayBuffer(bits.length * 4)
+  const view = new DataView(buffer)
+  for (let i = 0; i < bits.length; ++i) view.setUint32(i * 4, bits[i], true)
+  return new Float32Array(buffer)
+}
+
 function medianNegativeZeroPlan(planBytes) {
   const original = Buffer.from(planBytes)
   const decoded = JSON.parse(original.subarray(52).toString('utf8'))
@@ -37,6 +46,19 @@ function medianNegativeZeroPlan(planBytes) {
     'exported TFTR payload must already be canonical JSON'
   )
   decoded.steps[0].numeric.impute.value.v = '8000000000000000'
+  const payload = Buffer.from(JSON.stringify(decoded))
+  const mutated = Buffer.alloc(52 + payload.length)
+  original.copy(mutated, 0, 0, 20)
+  mutated.writeBigUInt64LE(BigInt(payload.length), 12)
+  createHash('sha256').update(payload).digest().copy(mutated, 20)
+  payload.copy(mutated, 52)
+  return mutated
+}
+
+function categoricalNegativeZeroPlan(planBytes) {
+  const original = Buffer.from(planBytes)
+  const decoded = JSON.parse(original.subarray(52).toString('utf8'))
+  decoded.steps[0].categorical.categories[0].v = '8000000000000000'
   const payload = Buffer.from(JSON.stringify(decoded))
   const mutated = Buffer.alloc(52 + payload.length)
   original.copy(mutated, 0, 0, 20)
@@ -240,7 +262,103 @@ function testSharedSemanticVectors() {
         (error) => error instanceof tf.TranfiTransformError && error.code === 106
       )
     }
+    if (item.id === 'categorical-mode-tie-smallest-signed-zero') {
+      assert.throws(
+        () => tf.TransformPlan.fromBytes(categoricalNegativeZeroPlan(referenceBytes)),
+        (error) => error instanceof tf.TranfiTransformError && error.code === 106
+      )
+    }
   }
+}
+
+function testCategoricalModeErrorsLimitsAndFloat32() {
+  for (const item of vectors.semanticCases.filter((entry) =>
+    entry.recipe.startsWith('categorical_mode_') && entry.expectedError &&
+      entry.expectedError.phase === 'finalize'
+  )) {
+    const recipe = tf.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table(item.analyze.rows.map((row) => doubleFromBits(row[0]))))
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof tf.TranfiTransformError && error.code === 103
+    )
+    closeAll(recipe, analyzer)
+  }
+
+  const recipe = tf.TransformRecipe.fromJSON(vectors.recipes.categorical_mode_none)
+  const analyzer = recipe.analyzer(schema64)
+  analyzer.push(table([1, 2]))
+  const plan = analyzer.finalize()
+  const apply = plan.apply(schema64)
+  assert.throws(
+    () => apply.run(table([3])),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 108
+  )
+  assert.throws(
+    () => apply.run(table([1])),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 112
+  )
+  const limited = recipe.analyzer(schema64, {
+    limits: { maxCategoriesPerColumn: 2 }
+  })
+  assert.throws(
+    () => limited.push(table([1, 2, 3])),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 104
+  )
+  assert.throws(
+    () => limited.push(table([1])),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 112
+  )
+  closeAll(recipe, analyzer, plan, apply, limited)
+
+  const schema32 = [{ id: 'x0', name: 'x0', dtype: 'float32' }]
+  const recipe32 = tf.TransformRecipe.fromJSON(vectors.recipes.categorical_mode_none)
+  const analyzer32 = recipe32.analyzer(schema32)
+  analyzer32.push(table([-0, 0, 1, 1], Float32Array))
+  const plan32 = analyzer32.finalize()
+  const payload = JSON.parse(Buffer.from(plan32.toBytes()).subarray(52))
+  assert.deepEqual(payload.steps[0].categorical.categories, [
+    { t: 'f32', v: '00000000' },
+    { t: 'f32', v: '3f800000' }
+  ])
+  const apply32 = plan32.apply(schema32)
+  assert.deepEqual(
+    Array.from(apply32.run(table([-0, NaN], Float32Array)).data, doubleBits),
+    ['8000000000000000', '0000000000000000']
+  )
+  closeAll(recipe32, analyzer32, plan32, apply32)
+
+  const subnormalAnalyze = float32FromBits([0x00000001, 0x80000001, 0x00000000])
+  const subnormalApply = float32FromBits([
+    0x7fc00000, 0x80000001, 0x00000000, 0x00000001
+  ])
+  const subnormalRecipe = tf.TransformRecipe.fromJSON(
+    vectors.recipes.categorical_mode_none
+  )
+  const subnormalAnalyzer = subnormalRecipe.analyzer(schema32)
+  subnormalAnalyzer.push({ rows: 3, columns: [subnormalAnalyze] })
+  const subnormalPlan = subnormalAnalyzer.finalize()
+  const subnormalPayload = JSON.parse(
+    Buffer.from(subnormalPlan.toBytes()).subarray(52)
+  )
+  assert.deepEqual(subnormalPayload.steps[0].categorical.categories, [
+    { t: 'f32', v: '80000001' },
+    { t: 'f32', v: '00000000' },
+    { t: 'f32', v: '00000001' }
+  ])
+  const subnormalSession = subnormalPlan.apply(schema32)
+  assert.deepEqual(
+    Array.from(subnormalSession.run({ rows: 4, columns: [subnormalApply] }).data,
+      doubleBits),
+    [
+      'b6a0000000000000', 'b6a0000000000000',
+      '0000000000000000', '36a0000000000000'
+    ]
+  )
+  closeAll(
+    subnormalRecipe, subnormalAnalyzer, subnormalPlan, subnormalSession
+  )
 }
 
 function testMedianErrorsAndLimits() {
@@ -708,6 +826,7 @@ async function main() {
   testSafeLimits()
   testSharedSemanticVectors()
   testMedianErrorsAndLimits()
+  testCategoricalModeErrorsLimitsAndFloat32()
   testF32ValidityAndParentLifetime()
   testErrorsLimitsAndClosedState()
   await testInCallCancellation()

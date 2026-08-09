@@ -10,11 +10,82 @@
     "invalidRecipe": 101,
     "numericDomain": 107,
     "resourceLimit": 104,
+    "unknownCategory": 108,
     "unsupportedRuntime": 113,
     "unsupportedVersion": 105
   },
   "format": "tranfi.prepared-transform-vectors",
   "recipes": {
+    "categorical_mode_none": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "none",
+              "sentinelLabel": null,
+              "unknown": null
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_mode_zero_none": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "none",
+              "sentinelLabel": null,
+              "unknown": null
+            },
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
     "categorical_mode_label_sentinel": {
       "columns": [
         {
@@ -557,6 +628,113 @@
       },
       "id": "empty-analysis-insufficient",
       "recipe": "numeric_mean_standard"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[7], [2, 3, 2], [1, 1, 1, 1, 1, 1, 1]],
+        "rows": [["8000000000000000"], ["0000000000000000"], ["3ff0000000000000"], ["4008000000000000"], ["3ff0000000000000"], ["4008000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["8000000000000000"], ["0000000000000000"], ["0000000000000000"], ["3ff0000000000000"], ["4008000000000000"]],
+        "rows": [["8000000000000000"], ["0000000000000000"], [null], ["3ff0000000000000"], ["4008000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["0000000000000000", "3ff0000000000000", "4008000000000000"],
+        "impute": "0000000000000000",
+        "kind": "categorical"
+      },
+      "id": "categorical-mode-tie-smallest-signed-zero",
+      "recipe": "categorical_mode_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 1, 1]],
+        "rows": [["0000000000000001"], ["8000000000000001"], ["0000000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["8000000000000001"], ["8000000000000001"], ["0000000000000000"], ["0000000000000001"]],
+        "rows": [[null], ["8000000000000001"], ["0000000000000000"], ["0000000000000001"]]
+      },
+      "expectedPlan": {
+        "categories": ["8000000000000001", "0000000000000000", "0000000000000001"],
+        "impute": "8000000000000001",
+        "kind": "categorical"
+      },
+      "id": "categorical-mode-subnormal-order",
+      "recipe": "categorical_mode_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["8000000000000000"]],
+        "rows": [[null], ["8000000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["0000000000000000"],
+        "impute": "0000000000000000",
+        "kind": "categorical"
+      },
+      "id": "categorical-mode-all-missing-zero",
+      "recipe": "categorical_mode_zero_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedColumns": 1,
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 103,
+        "phase": "finalize"
+      },
+      "id": "categorical-mode-all-missing-error",
+      "recipe": "categorical_mode_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[0]],
+        "rows": []
+      },
+      "apply": {
+        "expectedColumns": 1,
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 103,
+        "phase": "finalize"
+      },
+      "id": "categorical-mode-empty-analysis-zero-policy",
+      "recipe": "categorical_mode_zero_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"]]
+      },
+      "apply": {
+        "expectedColumns": 1,
+        "expectedRows": [],
+        "rows": [["4008000000000000"]]
+      },
+      "expectedError": {
+        "code": 108,
+        "phase": "apply"
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": "3ff0000000000000",
+        "kind": "categorical"
+      },
+      "id": "categorical-mode-unknown-apply",
+      "recipe": "categorical_mode_none"
     }
   ],
   "sqrtCases": [

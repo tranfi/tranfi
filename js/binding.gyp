@@ -7,6 +7,7 @@
         "napi_transform.c",
         "csrc/cJSON.c",
         "csrc/transform_api.c",
+        "csrc/transform_categorical.c",
         "csrc/transform_json.c",
         "csrc/transform_numeric.c",
         "csrc/transform_sha256.c",

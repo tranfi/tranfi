@@ -114,6 +114,47 @@ async function main() {
     medianAnalyzer.close()
     medianRecipe.close()
 
+    const categoricalChunks = [
+      { rows: 3, columns: [new Float64Array([-0, 0, 1])] },
+      { rows: 4, columns: [new Float64Array([3, 1, 3, NaN])] }
+    ]
+    const categoricalPlanBytes = await client.analyzeTransform(
+      vectors.recipes.categorical_mode_none,
+      schema,
+      categoricalChunks
+    )
+    const categoricalRecipe = native.TransformRecipe.fromJSON(
+      vectors.recipes.categorical_mode_none
+    )
+    const categoricalAnalyzer = categoricalRecipe.analyzer(schema)
+    for (const chunk of categoricalChunks) categoricalAnalyzer.push(chunk)
+    const categoricalNativePlan = categoricalAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(categoricalPlanBytes),
+      categoricalNativePlan.toBytes(),
+      'worker and native categorical-mode TFTR bytes'
+    )
+    const categoricalResult = await client.applyTransform(
+      categoricalPlanBytes,
+      schema,
+      { rows: 2, columns: [new Float64Array([-0, NaN])] }
+    )
+    assert.deepEqual(Array.from(categoricalResult.data, doubleBits), [
+      '8000000000000000',
+      '0000000000000000'
+    ])
+    await assert.rejects(
+      client.applyTransform(
+        categoricalPlanBytes,
+        schema,
+        { rows: 1, columns: [new Float64Array([2])] }
+      ),
+      (error) => error instanceof native.TranfiTransformError && error.code === 108
+    )
+    categoricalNativePlan.close()
+    categoricalAnalyzer.close()
+    categoricalRecipe.close()
+
     if (typeof SharedArrayBuffer !== 'undefined') {
       const controller = new AbortController()
       const rows = 8 * 1024 * 1024

@@ -236,6 +236,8 @@ tf_transform_code tf_transform_poll_cancel(
     if (runtime && runtime->cancel && runtime->cancel(runtime->cancel_user))
         return tf_transform_set_error(
             error, TF_TRANSFORM_CANCELLED, "prepared transform cancelled");
+    if (runtime && runtime->fp_guard_active)
+        return tf_transform_check_runtime_fp(error);
     return TF_TRANSFORM_OK;
 }
 
@@ -511,7 +513,7 @@ static tf_transform_code sort_schema_fields(
             items[end] = items[0];
             root = 0;
         }
-        while (root <= (end - 1) / 2 && end > 1) {
+        while (end > 1 && root <= (end - 2) / 2) {
             size_t child = root * 2 + 1;
             int comparison;
             if (child + 1 < end) {
@@ -959,6 +961,12 @@ void tf_transform_plan_release(tf_transform_plan *plan) {
     if (atomic_fetch_sub_explicit(&plan->refcount, 1u, memory_order_acq_rel) != 1u)
         return;
     tf_transform_recipe_release(plan->recipe);
+    if (plan->states) {
+        for (size_t i = 0; i < plan->input_schema.field_count; ++i)
+            if (plan->states[i].kind == TF_TRANSFORM_KIND_CATEGORICAL)
+                tf_transform_categorical_state_clear(
+                    &plan->states[i].value.categorical);
+    }
     tf_transform_schema_clear(&plan->input_schema);
     tf_transform_schema_clear(&plan->output_schema);
     free(plan->states);
@@ -1269,9 +1277,9 @@ tf_transform_code tf_transform_plan_import(
     }
     code = tf_transform_fp_begin(&guard, error);
     if (code != TF_TRANSFORM_OK) goto done;
+    copied.fp_guard_active = 1;
     code = tf_transform_poll_cancel(&copied, error);
-    if (code == TF_TRANSFORM_OK)
-        code = tf_transform_check_runtime_fp(error);
+    copied.fp_guard_active = 0;
     tf_transform_fp_end(&guard);
     if (code != TF_TRANSFORM_OK) goto done;
     *out = plan;

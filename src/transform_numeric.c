@@ -304,6 +304,8 @@ static tf_transform_code validate_table_view(
         if (runtime && i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
             code = tf_transform_poll_cancel(runtime, error);
             if (code != TF_TRANSFORM_OK) return code;
+            code = tf_transform_check_runtime_fp(error);
+            if (code != TF_TRANSFORM_OK) return code;
         }
         code = validate_column_view(
             &table->columns[i], table->row_count, schema->fields[i].dtype,
@@ -318,8 +320,10 @@ static tf_transform_code validate_table_view(
         return tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT, "table input bytes exceed limit");
     *input_bytes = total;
-    return runtime ? tf_transform_poll_cancel(runtime, error)
-                   : TF_TRANSFORM_OK;
+    if (!runtime) return TF_TRANSFORM_OK;
+    code = tf_transform_poll_cancel(runtime, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    return tf_transform_check_runtime_fp(error);
 }
 
 static int column_value_is_valid(const tf_column_view_v1 *column, size_t row) {
@@ -354,7 +358,8 @@ static tf_transform_code poll_and_recheck(
 
 static tf_transform_code schema_owned_metrics(
     const tf_transform_schema *schema, uint64_t *resident_bytes,
-    uint64_t *allocation_count, tf_transform_error **error) {
+    uint64_t *allocation_count, const tf_transform_runtime_copy *runtime,
+    int recheck_fp, tf_transform_error **error) {
     uint64_t resident;
     uint64_t allocations;
     if (!schema || !resident_bytes || !allocation_count)
@@ -368,6 +373,14 @@ static tf_transform_code schema_owned_metrics(
     resident = (uint64_t)schema->field_count * sizeof(*schema->fields);
     allocations = 1;
     for (size_t i = 0; i < schema->field_count; ++i) {
+        if (runtime && i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            tf_transform_code code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            if (recheck_fp) {
+                code = tf_transform_check_runtime_fp(error);
+                if (code != TF_TRANSFORM_OK) return code;
+            }
+        }
         uint64_t strings = (uint64_t)schema->fields[i].id_len + 1;
         if ((uint64_t)schema->fields[i].name_len + 1 > UINT64_MAX - strings
             || strings + (uint64_t)schema->fields[i].name_len + 1
@@ -404,13 +417,6 @@ static tf_transform_code session_check_totals(
     return tf_transform_poll_cancel(runtime, error);
 }
 
-static int recipe_uses_median(const tf_transform_recipe *recipe) {
-    if (!recipe) return 0;
-    for (size_t i = 0; i < recipe->column_count; ++i)
-        if (recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN) return 1;
-    return 0;
-}
-
 static void median_store_clear(tf_transform_median_store *store) {
     if (!store) return;
     for (size_t i = 0; i < store->block_count; ++i) free(store->blocks[i]);
@@ -426,7 +432,7 @@ static void analyzer_median_stores_clear(tf_transform_analyzer *analyzer) {
     analyzer->median_stores = NULL;
 }
 
-static tf_transform_code analyzer_allocate_retained(
+tf_transform_code tf_transform_analyzer_allocate_retained(
     tf_transform_analyzer *analyzer, size_t bytes, void **out,
     tf_transform_error **error) {
     void *allocated;
@@ -435,7 +441,7 @@ static tf_transform_code analyzer_allocate_retained(
     if (!analyzer || !out || bytes == 0)
         return tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
-            "invalid median retained-state allocation");
+            "invalid analyzer retained-state allocation");
     if ((uint64_t)bytes > analyzer->runtime.limits.max_allocation_bytes
         || analyzer->allocation_count == UINT64_MAX
         || analyzer->allocation_count + 1
@@ -445,14 +451,14 @@ static tf_transform_code analyzer_allocate_retained(
             > analyzer->runtime.limits.max_resident_state_bytes)
         return tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
-            "median retained state exceeds analyzer limits");
+            "retained state exceeds analyzer limits");
     code = poll_and_recheck(&analyzer->runtime, error);
     if (code != TF_TRANSFORM_OK) return code;
     allocated = malloc(bytes);
     if (!allocated)
         return tf_transform_set_error(
             error, TF_TRANSFORM_ALLOCATION,
-            "median retained-state allocation failed");
+            "retained-state allocation failed");
     ++analyzer->allocation_count;
     analyzer->resident_state_bytes += (uint64_t)bytes;
     *out = allocated;
@@ -492,7 +498,7 @@ static tf_transform_code median_store_grow_index(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
             "median block index size overflows");
     bytes = capacity * sizeof(*blocks);
-    code = analyzer_allocate_retained(
+    code = tf_transform_analyzer_allocate_retained(
         analyzer, bytes, (void **)&blocks, error);
     if (code != TF_TRANSFORM_OK) return code;
     old_bytes = store->block_capacity * sizeof(*blocks);
@@ -543,7 +549,7 @@ static tf_transform_code median_store_append(
             analyzer, store, store->block_count + 1, error);
         if (code != TF_TRANSFORM_OK) return code;
         block_bytes = store->values_per_block * sizeof(*block);
-        code = analyzer_allocate_retained(
+        code = tf_transform_analyzer_allocate_retained(
             analyzer, block_bytes, (void **)&block, error);
         if (code != TF_TRANSFORM_OK) return code;
         store->blocks[store->block_count++] = block;
@@ -680,12 +686,15 @@ tf_transform_code tf_transform_analyzer_create(
     size_t state_bytes = 0;
     size_t median_store_bytes = 0;
     size_t median_values_per_block = 0;
+    uint64_t category_store_resident = 0;
+    uint64_t category_store_allocations = 0;
     uint64_t schema_resident = 0;
     uint64_t schema_allocations = 0;
     uint64_t session_resident;
     uint64_t session_allocations;
     uint64_t analyzer_allocations;
-    int uses_median;
+    int uses_median = 0;
+    int uses_categorical = 0;
 
     if (out) *out = NULL;
     tf_transform_clear_error(error);
@@ -714,19 +723,23 @@ tf_transform_code tf_transform_analyzer_create(
             &runtime_copy, &comparison, error);
         if (code != TF_TRANSFORM_OK) goto fail;
         if (comparison != 0
-            || (column->impute == TF_TRANSFORM_IMPUTE_CONSTANT
+            || (column->kind == TF_TRANSFORM_KIND_NUMERIC
+                && column->impute == TF_TRANSFORM_IMPUTE_CONSTANT
                 && column->constant_dtype != schema.fields[i].dtype)) {
             code = tf_transform_set_error(
                 error, TF_TRANSFORM_SCHEMA_MISMATCH,
                 "recipe source or constant dtype does not match schema");
             goto fail;
         }
+        if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL)
+            uses_categorical = 1;
+        else if (column->impute == TF_TRANSFORM_IMPUTE_MEDIAN)
+            uses_median = 1;
     }
     code = checked_mul_size(
         schema.field_count, sizeof(tf_transform_running_stats), &state_bytes,
         error, "analyzer state byte count overflows");
     if (code != TF_TRANSFORM_OK) goto fail;
-    uses_median = recipe_uses_median(recipe);
     if (uses_median) {
         uint64_t target_block_bytes = runtime_copy.limits.max_allocation_bytes;
         if (target_block_bytes > TF_TRANSFORM_CANCEL_BYTES_V1)
@@ -751,6 +764,18 @@ tf_transform_code tf_transform_analyzer_create(
             goto fail;
         }
     }
+    if (uses_categorical) {
+        code = tf_transform_category_stores_requirements(
+            schema.field_count, &category_store_resident,
+            &category_store_allocations, error);
+        if (code != TF_TRANSFORM_OK) goto fail;
+        if (category_store_resident > runtime_copy.limits.max_allocation_bytes) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "categorical stores exceed the allocation limit");
+            goto fail;
+        }
+    }
     if ((uint64_t)state_bytes > runtime_copy.limits.max_resident_state_bytes
         || (uint64_t)state_bytes > runtime_copy.limits.max_allocation_bytes) {
         code = tf_transform_set_error(
@@ -758,7 +783,8 @@ tf_transform_code tf_transform_analyzer_create(
         goto fail;
     }
     code = schema_owned_metrics(
-        &schema, &schema_resident, &schema_allocations, error);
+        &schema, &schema_resident, &schema_allocations,
+        &runtime_copy, 0, error);
     if (code != TF_TRANSFORM_OK) goto fail;
     if ((uint64_t)state_bytes > (UINT64_MAX - sizeof(*created)) / 2)
         goto resource_overflow;
@@ -766,10 +792,16 @@ tf_transform_code tf_transform_analyzer_create(
     if ((uint64_t)median_store_bytes > UINT64_MAX - session_resident)
         goto resource_overflow;
     session_resident += (uint64_t)median_store_bytes;
+    if (category_store_resident > UINT64_MAX - session_resident)
+        goto resource_overflow;
+    session_resident += category_store_resident;
     if (schema_resident > UINT64_MAX - session_resident)
         goto resource_overflow;
     session_resident += schema_resident;
     analyzer_allocations = 4 + (uses_median ? 1u : 0u);
+    if (category_store_allocations > UINT64_MAX - analyzer_allocations)
+        goto resource_overflow;
+    analyzer_allocations += category_store_allocations;
     if (schema_allocations > UINT64_MAX - analyzer_allocations)
         goto resource_overflow;
     /* Schema copy also allocates and frees one uniqueness index. */
@@ -818,18 +850,27 @@ tf_transform_code tf_transform_analyzer_create(
                 "median store allocation failed");
             goto fail;
         }
-        for (size_t i = 0; i < schema.field_count; ++i)
+        for (size_t i = 0; i < schema.field_count; ++i) {
+            if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = tf_transform_poll_cancel(&runtime_copy, error);
+                if (code != TF_TRANSFORM_OK) goto fail;
+            }
             if (recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN)
                 created->median_stores[i].values_per_block
                     = median_values_per_block;
+        }
     }
     created->recipe = (tf_transform_recipe *)recipe;
     tf_transform_recipe_retain(created->recipe);
     created->input_schema = schema;
     memset(&schema, 0, sizeof(schema));
     created->runtime = runtime_copy;
-    created->allocation_count = session_allocations;
-    created->resident_state_bytes = session_resident;
+    created->allocation_count = session_allocations - category_store_allocations;
+    created->resident_state_bytes = session_resident - category_store_resident;
+    if (uses_categorical) {
+        code = tf_transform_category_stores_init(created, error);
+        if (code != TF_TRANSFORM_OK) goto fail;
+    }
     created->state = TF_ANALYZER_ACTIVE;
     *out = created;
     return TF_TRANSFORM_OK;
@@ -842,6 +883,7 @@ fail:
     if (created) {
         tf_transform_recipe_release(created->recipe);
         analyzer_median_stores_clear(created);
+        tf_transform_category_stores_clear(created);
         tf_transform_schema_clear(&created->input_schema);
         free(created->stats);
         free(created->scratch);
@@ -854,6 +896,7 @@ void tf_transform_analyzer_destroy(tf_transform_analyzer **analyzer) {
     if (!analyzer || !*analyzer) return;
     tf_transform_recipe_release((*analyzer)->recipe);
     analyzer_median_stores_clear(*analyzer);
+    tf_transform_category_stores_clear(*analyzer);
     tf_transform_schema_clear(&(*analyzer)->input_schema);
     free((*analyzer)->stats);
     free((*analyzer)->scratch);
@@ -884,51 +927,56 @@ tf_transform_code tf_transform_analyzer_push(
         return tf_transform_set_error(
             error, TF_TRANSFORM_INVALID_ARGUMENT, "analyzer table is null");
     }
-    code = poll_and_recheck(&analyzer->runtime, error);
+    code = tf_transform_fp_begin(&guard, error);
     if (code != TF_TRANSFORM_OK) goto failed;
+    analyzer->runtime.fp_guard_active = 1;
+    code = poll_and_recheck(&analyzer->runtime, error);
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = validate_table_view(
         &analyzer->input_schema, table, analyzer->runtime.limits.max_analyzer_rows,
         analyzer->runtime.limits.max_analyzer_input_bytes, &input_bytes,
         &analyzer->runtime, error);
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = checked_add_u64(
         analyzer->total_rows, (uint64_t)table->row_count, &new_rows,
         error, "analyzer row counter overflows");
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = checked_add_u64(
         analyzer->total_input_bytes, (uint64_t)input_bytes, &new_input_bytes,
         error, "analyzer input byte counter overflows");
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     if (new_rows > analyzer->runtime.limits.max_analyzer_rows
         || new_input_bytes > analyzer->runtime.limits.max_analyzer_input_bytes) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
             "cumulative analyzer input exceeds limits");
-        goto failed;
+        goto guarded_failed;
     }
     stats_bytes = analyzer->input_schema.field_count * sizeof(*pending);
     if (stats_bytes == 0) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL, "analyzer has no transactional state");
-        goto failed;
+        goto guarded_failed;
     }
     pending = analyzer->scratch;
     if (!pending) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
             "analyzer scratch state is unavailable");
-        goto failed;
+        goto guarded_failed;
     }
     code = tf_transform_copy_bytes_runtime(
         pending, analyzer->stats, stats_bytes,
         &analyzer->runtime, error);
-    if (code != TF_TRANSFORM_OK) goto failed;
-    code = tf_transform_fp_begin(&guard, error);
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = poll_and_recheck(&analyzer->runtime, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     if (analyzer->median_stores) {
         for (size_t i = 0; i < analyzer->input_schema.field_count; ++i) {
+            if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = poll_and_recheck(&analyzer->runtime, error);
+                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+            }
             if (analyzer->recipe->columns[i].impute
                     == TF_TRANSFORM_IMPUTE_MEDIAN
                 && analyzer->median_stores[i].count
@@ -938,6 +986,20 @@ tf_transform_code tf_transform_analyzer_push(
                     "median retained state does not match analyzer statistics");
                 goto guarded_failed;
             }
+        }
+    }
+    if (analyzer->category_stores) {
+        for (size_t i = 0; i < analyzer->input_schema.field_count; ++i) {
+            if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = poll_and_recheck(&analyzer->runtime, error);
+                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+            }
+            if (analyzer->recipe->columns[i].kind
+                    != TF_TRANSFORM_KIND_CATEGORICAL)
+                continue;
+            code = tf_transform_category_check_observed(
+                analyzer, i, analyzer->stats[i].observed, error);
+            if (code != TF_TRANSFORM_OK) goto guarded_failed;
         }
     }
     for (size_t row = 0; row < table->row_count; ++row) {
@@ -957,6 +1019,11 @@ tf_transform_code tf_transform_analyzer_push(
             double m2;
             uint64_t observed;
 
+            if (column_index != 0
+                && column_index % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = poll_and_recheck(&analyzer->runtime, error);
+                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+            }
             if (!column_value_is_valid(column, row)) {
                 if (stats->missing == UINT64_MAX) {
                     code = tf_transform_set_error(
@@ -984,6 +1051,21 @@ tf_transform_code tf_transform_analyzer_push(
                     error, TF_TRANSFORM_NUMERIC_DOMAIN,
                     "infinite analyzer input is not supported");
                 goto guarded_failed;
+            }
+            if (analyzer->recipe->columns[column_index].kind
+                    == TF_TRANSFORM_KIND_CATEGORICAL) {
+                if (stats->observed == UINT64_MAX) {
+                    code = tf_transform_set_error(
+                        error, TF_TRANSFORM_RESOURCE_LIMIT,
+                        "categorical observed-value counter overflows");
+                    goto guarded_failed;
+                }
+                code = tf_transform_category_observe(
+                    analyzer, column_index, value,
+                    analyzer->input_schema.fields[column_index].dtype, error);
+                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                ++stats->observed;
+                continue;
             }
             if (stats->observed == UINT64_MAX) {
                 code = tf_transform_set_error(
@@ -1027,6 +1109,7 @@ tf_transform_code tf_transform_analyzer_push(
             }
         }
     }
+    analyzer->runtime.fp_guard_active = 0;
     tf_transform_fp_end(&guard);
     {
         tf_transform_running_stats *committed = analyzer->stats;
@@ -1037,6 +1120,7 @@ tf_transform_code tf_transform_analyzer_push(
     analyzer->total_input_bytes = new_input_bytes;
     return TF_TRANSFORM_OK;
 guarded_failed:
+    analyzer->runtime.fp_guard_active = 0;
     tf_transform_fp_end(&guard);
 failed:
     analyzer->state = TF_ANALYZER_FAILED;
@@ -1208,6 +1292,9 @@ tf_transform_code tf_transform_analyzer_finalize(
     size_t state_bytes = 0;
     uint64_t schema_resident = 0;
     uint64_t schema_allocations = 0;
+    uint64_t category_plan_resident = 0;
+    uint64_t category_plan_allocations = 0;
+    uint64_t total_plan_categories = 0;
     uint64_t plan_resident;
     uint64_t plan_allocations;
 
@@ -1226,6 +1313,7 @@ tf_transform_code tf_transform_analyzer_finalize(
     }
     code = tf_transform_fp_begin(&guard, error);
     if (code != TF_TRANSFORM_OK) goto failed;
+    analyzer->runtime.fp_guard_active = 1;
     code = poll_and_recheck(&analyzer->runtime, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = checked_mul_size(
@@ -1233,8 +1321,46 @@ tf_transform_code tf_transform_analyzer_finalize(
         error, "plan state byte count overflows");
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = schema_owned_metrics(
-        &analyzer->input_schema, &schema_resident, &schema_allocations, error);
+        &analyzer->input_schema, &schema_resident, &schema_allocations,
+        &analyzer->runtime, 1, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
+    for (size_t i = 0; i < analyzer->input_schema.field_count; ++i) {
+        uint64_t resident = 0;
+        uint64_t allocations = 0;
+        uint64_t count;
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = poll_and_recheck(&analyzer->runtime, error);
+            if (code != TF_TRANSFORM_OK) goto guarded_failed;
+        }
+        if (analyzer->recipe->columns[i].kind
+                != TF_TRANSFORM_KIND_CATEGORICAL)
+            continue;
+        code = tf_transform_category_check_observed(
+            analyzer, i, analyzer->stats[i].observed, error);
+        if (code != TF_TRANSFORM_OK) goto guarded_failed;
+        code = tf_transform_category_plan_requirements(
+            analyzer, i, &resident, &allocations, error);
+        if (code != TF_TRANSFORM_OK) goto guarded_failed;
+        count = resident / sizeof(tf_transform_category_value);
+        if (category_plan_resident > UINT64_MAX - resident
+            || category_plan_allocations > UINT64_MAX - allocations
+            || total_plan_categories > UINT64_MAX - count) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "categorical plan resource count overflows");
+            goto guarded_failed;
+        }
+        category_plan_resident += resident;
+        category_plan_allocations += allocations;
+        total_plan_categories += count;
+    }
+    if (total_plan_categories
+            > analyzer->runtime.limits.max_total_categories) {
+        code = tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "categorical plan exceeds the total category limit");
+        goto guarded_failed;
+    }
     if (schema_resident > (UINT64_MAX - sizeof(*plan)
                            - (uint64_t)state_bytes) / 2
         || schema_allocations > (UINT64_MAX - 2) / 2) {
@@ -1245,7 +1371,18 @@ tf_transform_code tf_transform_analyzer_finalize(
     }
     plan_resident = sizeof(*plan) + (uint64_t)state_bytes
         + schema_resident * 2;
-    plan_allocations = 2 + schema_allocations * 2;
+    if (category_plan_resident > UINT64_MAX - plan_resident
+        || category_plan_allocations > UINT64_MAX - 2
+        || schema_allocations * 2
+            > UINT64_MAX - 2 - category_plan_allocations) {
+        code = tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "plan construction resource count overflows");
+        goto guarded_failed;
+    }
+    plan_resident += category_plan_resident;
+    plan_allocations = 2 + schema_allocations * 2
+        + category_plan_allocations;
     code = session_check_totals(
         &analyzer->runtime, analyzer->resident_state_bytes, plan_resident,
         analyzer->allocation_count, plan_allocations, error);
@@ -1268,8 +1405,13 @@ tf_transform_code tf_transform_analyzer_finalize(
         &plan->output_schema, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     plan->output_schema.is_output = 1;
-    for (size_t i = 0; i < plan->output_schema.field_count; ++i)
+    for (size_t i = 0; i < plan->output_schema.field_count; ++i) {
+        if (i != 0 && i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = poll_and_recheck(&analyzer->runtime, error);
+            if (code != TF_TRANSFORM_OK) goto guarded_failed;
+        }
         plan->output_schema.fields[i].dtype = TF_VIEW_FLOAT64;
+    }
     if ((uint64_t)state_bytes > analyzer->runtime.limits.max_resident_state_bytes
         || (uint64_t)state_bytes > analyzer->runtime.limits.max_allocation_bytes) {
         code = tf_transform_set_error(
@@ -1278,7 +1420,7 @@ tf_transform_code tf_transform_analyzer_finalize(
     }
     code = tf_transform_poll_cancel(&analyzer->runtime, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
-    plan->states = (tf_transform_numeric_state *)calloc(
+    plan->states = (tf_transform_column_state *)calloc(
         plan->input_schema.field_count, sizeof(*plan->states));
     if (!plan->states) {
         code = tf_transform_set_error(
@@ -1292,6 +1434,14 @@ tf_transform_code tf_transform_analyzer_finalize(
             code = poll_and_recheck(&analyzer->runtime, error);
             if (code != TF_TRANSFORM_OK) goto guarded_failed;
         }
+        if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+            plan->states[i].kind = TF_TRANSFORM_KIND_CATEGORICAL;
+            code = tf_transform_category_finalize(
+                analyzer, i, &plan->states[i].value.categorical, error);
+            if (code != TF_TRANSFORM_OK) goto guarded_failed;
+            continue;
+        }
+        plan->states[i].kind = TF_TRANSFORM_KIND_NUMERIC;
         if (plan->recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN
             && analyzer->stats[i].observed != 0) {
             tf_transform_median_store *store = analyzer->median_stores
@@ -1310,15 +1460,17 @@ tf_transform_code tf_transform_analyzer_finalize(
         code = finalize_numeric_column(
             &plan->recipe->columns[i], &analyzer->stats[i],
             median_value, has_median_value,
-            &plan->states[i], error);
+            &plan->states[i].value.numeric, error);
         if (code != TF_TRANSFORM_OK) goto guarded_failed;
     }
+    analyzer->runtime.fp_guard_active = 0;
     tf_transform_fp_end(&guard);
     analyzer->allocation_count += plan_allocations;
     analyzer->state = TF_ANALYZER_FINALIZED;
     *out = plan;
     return TF_TRANSFORM_OK;
 guarded_failed:
+    analyzer->runtime.fp_guard_active = 0;
     tf_transform_fp_end(&guard);
 failed:
     tf_transform_plan_release(plan);
@@ -1401,48 +1553,51 @@ tf_transform_code tf_transform_apply_run(
         return tf_transform_set_error(
             error, TF_TRANSFORM_INVALID_ARGUMENT, "apply table or output is null");
     }
-    code = poll_and_recheck(&apply->runtime, error);
+    code = tf_transform_fp_begin(&guard, error);
     if (code != TF_TRANSFORM_OK) goto failed;
+    apply->runtime.fp_guard_active = 1;
+    code = poll_and_recheck(&apply->runtime, error);
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = validate_table_view(
         &apply->plan->input_schema, table, apply->runtime.limits.max_apply_rows,
         apply->runtime.limits.max_apply_input_bytes, &input_bytes,
         &apply->runtime, error);
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = checked_add_u64(
         apply->total_rows, (uint64_t)table->row_count, &new_rows,
         error, "apply row counter overflows");
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = checked_add_u64(
         apply->total_input_bytes, (uint64_t)input_bytes, &new_input_bytes,
         error, "apply input byte counter overflows");
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     if (new_rows > apply->runtime.limits.max_apply_rows
         || new_input_bytes > apply->runtime.limits.max_apply_input_bytes) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
             "cumulative apply input exceeds limits");
-        goto failed;
+        goto guarded_failed;
     }
     code = checked_mul_size(
         table->row_count, apply->plan->output_schema.field_count, &elements,
         error, "output element count overflows");
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     if ((uint64_t)elements > apply->plan->recipe->max_output_elements_per_apply
         || (uint64_t)elements
             > apply->runtime.limits.max_output_elements_per_call)
     {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT, "output element count exceeds limits");
-        goto failed;
+        goto guarded_failed;
     }
     code = checked_mul_size(
         elements, sizeof(double), &data_bytes,
         error, "output byte count overflows");
-    if (code != TF_TRANSFORM_OK) goto failed;
+    if (code != TF_TRANSFORM_OK) goto guarded_failed;
     if ((uint64_t)data_bytes > apply->runtime.limits.max_allocation_bytes) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT, "output allocation exceeds limit");
-        goto failed;
+        goto guarded_failed;
     }
     pending.abi_version = 1;
     pending.struct_size = (uint32_t)sizeof(pending);
@@ -1456,25 +1611,23 @@ tf_transform_code tf_transform_apply_run(
             code = tf_transform_set_error(
                 error, TF_TRANSFORM_RESOURCE_LIMIT,
                 "apply session allocation count exceeds limit");
-            goto failed;
+            goto guarded_failed;
         }
         code = poll_and_recheck(&apply->runtime, error);
-        if (code != TF_TRANSFORM_OK) goto failed;
+        if (code != TF_TRANSFORM_OK) goto guarded_failed;
         pending.data = malloc(data_bytes);
         if (!pending.data) {
             code = tf_transform_set_error(
                 error, TF_TRANSFORM_ALLOCATION, "dense output allocation failed");
-            goto failed;
+            goto guarded_failed;
         }
         ++apply->allocation_count;
     }
     if (table->row_count != 0 && !pending.data) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL, "nonempty output has no allocation");
-        goto failed;
+        goto guarded_failed;
     }
-    code = tf_transform_fp_begin(&guard, error);
-    if (code != TF_TRANSFORM_OK) goto failed;
     code = poll_and_recheck(&apply->runtime, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     for (size_t row = 0; row < table->row_count; ++row) {
@@ -1489,12 +1642,19 @@ tf_transform_code tf_transform_apply_run(
         for (size_t column_index = 0;
              column_index < apply->plan->input_schema.field_count; ++column_index) {
             const tf_column_view_v1 *column = &table->columns[column_index];
-            const tf_transform_numeric_state *state = &apply->plan->states[column_index];
+            const tf_transform_column_state *column_state
+                = &apply->plan->states[column_index];
+            const tf_transform_numeric_state *state;
             double value;
             double centered;
             double transformed;
             size_t output_index = row * pending.columns + column_index;
             int missing = !column_value_is_valid(column, row);
+            if (column_index != 0
+                && column_index % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = poll_and_recheck(&apply->runtime, error);
+                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+            }
             if (!missing) {
                 value = read_numeric_value(
                     column, row, apply->plan->input_schema.fields[column_index].dtype);
@@ -1506,6 +1666,38 @@ tf_transform_code tf_transform_apply_run(
                     goto guarded_failed;
                 }
             }
+            if (column_state->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+                const tf_transform_categorical_state *categorical
+                    = &column_state->value.categorical;
+                if (missing) {
+                    if (!categorical->has_impute_value) {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_INTERNAL,
+                            "categorical plan has no mode value");
+                        goto guarded_failed;
+                    }
+                    value = tf_transform_category_decode(
+                        categorical->impute_bits, categorical->source_dtype);
+                } else {
+                    uint64_t bits;
+                    int known = 0;
+                    code = tf_transform_category_key(
+                        value, categorical->source_dtype, &bits, error);
+                    if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                    code = tf_transform_category_contains(
+                        categorical, bits, &apply->runtime, &known, error);
+                    if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                    if (!known) {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_UNKNOWN_CATEGORY,
+                            "apply input contains an unknown category");
+                        goto guarded_failed;
+                    }
+                }
+                ((double *)pending.data)[output_index] = value;
+                continue;
+            }
+            state = &column_state->value.numeric;
             if (missing && !state->has_impute_value) {
                 ((double *)pending.data)[output_index] =
                     tf_transform_double_from_bits(UINT64_C(0x7ff8000000000000));
@@ -1524,12 +1716,14 @@ tf_transform_code tf_transform_apply_run(
             ((double *)pending.data)[output_index] = transformed;
         }
     }
+    apply->runtime.fp_guard_active = 0;
     tf_transform_fp_end(&guard);
     apply->total_rows = new_rows;
     apply->total_input_bytes = new_input_bytes;
     *out = pending;
     return TF_TRANSFORM_OK;
 guarded_failed:
+    apply->runtime.fp_guard_active = 0;
     tf_transform_fp_end(&guard);
 failed:
     free(pending.data);

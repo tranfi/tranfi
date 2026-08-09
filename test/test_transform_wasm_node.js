@@ -11,6 +11,8 @@ const vectors = require('./vectors/prepared_transform_v1.json')
 
 const schema64 = [{ id: 'x0', dtype: 'float64' }]
 const supportedRecipes = new Set([
+  'categorical_mode_none',
+  'categorical_mode_zero_none',
   'numeric_mean_standard',
   'numeric_median_none',
   'numeric_median_zero_none',
@@ -26,6 +28,13 @@ function doubleBits(value) {
   const bytes = Buffer.alloc(8)
   bytes.writeDoubleBE(value, 0)
   return bytes.toString('hex')
+}
+
+function float32FromBits(bits) {
+  const buffer = new ArrayBuffer(bits.length * 4)
+  const view = new DataView(buffer)
+  for (let i = 0; i < bits.length; ++i) view.setUint32(i * 4, bits[i], true)
+  return new Float32Array(buffer)
 }
 
 function table(values, ArrayType = Float64Array, validity) {
@@ -307,6 +316,125 @@ async function main() {
         && error.code === item.expectedError.code
     )
     closeAll(recipe, analyzer)
+  }
+
+  for (const item of vectors.semanticCases.filter((entry) =>
+    entry.recipe.startsWith('categorical_mode_') && entry.expectedError &&
+      entry.expectedError.phase === 'finalize'
+  )) {
+    const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table(item.analyze.rows.map((row) => doubleFromBits(row[0]))))
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof native.TranfiTransformError && error.code === 103
+    )
+    closeAll(recipe, analyzer)
+  }
+
+  {
+    const recipe = wasm.TransformRecipe.fromJSON(
+      vectors.recipes.categorical_mode_none
+    )
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table([1, 2]))
+    const plan = analyzer.finalize()
+    const apply = plan.apply(schema64)
+    assert.throws(
+      () => apply.run(table([3])),
+      (error) => error instanceof native.TranfiTransformError && error.code === 108
+    )
+    assert.throws(
+      () => apply.run(table([1])),
+      (error) => error instanceof native.TranfiTransformError && error.code === 112
+    )
+    const limited = recipe.analyzer(schema64, {
+      limits: { maxCategoriesPerColumn: 2 }
+    })
+    assert.throws(
+      () => limited.push(table([1, 2, 3])),
+      (error) => error instanceof native.TranfiTransformError && error.code === 104
+    )
+    assert.throws(
+      () => limited.push(table([1])),
+      (error) => error instanceof native.TranfiTransformError && error.code === 112
+    )
+    closeAll(recipe, analyzer, plan, apply, limited)
+  }
+
+  {
+    const schema32 = [{ id: 'x0', name: 'x0', dtype: 'float32' }]
+    const config = vectors.recipes.categorical_mode_none
+    const wasmRecipe = wasm.TransformRecipe.fromJSON(config)
+    const wasmAnalyzer = wasmRecipe.analyzer(schema32)
+    wasmAnalyzer.push(table([-0, 0, 1, 1], Float32Array))
+    const wasmPlan = wasmAnalyzer.finalize()
+    const nativeRecipe = native.TransformRecipe.fromJSON(config)
+    const nativeAnalyzer = nativeRecipe.analyzer(schema32)
+    nativeAnalyzer.push(table([-0, 0, 1, 1], Float32Array))
+    const nativePlan = nativeAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(wasmPlan.toBytes()),
+      nativePlan.toBytes(),
+      'native/WASM float32 categorical-mode TFTR bytes'
+    )
+    const payload = JSON.parse(Buffer.from(wasmPlan.toBytes()).subarray(52))
+    assert.deepEqual(payload.steps[0].categorical.categories, [
+      { t: 'f32', v: '00000000' },
+      { t: 'f32', v: '3f800000' }
+    ])
+    const apply = wasmPlan.apply(schema32)
+    assert.deepEqual(
+      Array.from(apply.run(table([-0, NaN], Float32Array)).data, doubleBits),
+      ['8000000000000000', '0000000000000000']
+    )
+    closeAll(
+      wasmRecipe, wasmAnalyzer, wasmPlan, apply,
+      nativeRecipe, nativeAnalyzer, nativePlan
+    )
+  }
+
+  {
+    const schema32 = [{ id: 'x0', name: 'x0', dtype: 'float32' }]
+    const config = vectors.recipes.categorical_mode_none
+    const analyzeValues = float32FromBits([
+      0x00000001, 0x80000001, 0x00000000
+    ])
+    const applyValues = float32FromBits([
+      0x7fc00000, 0x80000001, 0x00000000, 0x00000001
+    ])
+    const wasmRecipe = wasm.TransformRecipe.fromJSON(config)
+    const wasmAnalyzer = wasmRecipe.analyzer(schema32)
+    wasmAnalyzer.push({ rows: 3, columns: [analyzeValues] })
+    const wasmPlan = wasmAnalyzer.finalize()
+    const nativeRecipe = native.TransformRecipe.fromJSON(config)
+    const nativeAnalyzer = nativeRecipe.analyzer(schema32)
+    nativeAnalyzer.push({ rows: 3, columns: [analyzeValues] })
+    const nativePlan = nativeAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(wasmPlan.toBytes()),
+      nativePlan.toBytes(),
+      'native/WASM float32 subnormal categorical-mode TFTR bytes'
+    )
+    const payload = JSON.parse(Buffer.from(wasmPlan.toBytes()).subarray(52))
+    assert.deepEqual(payload.steps[0].categorical.categories, [
+      { t: 'f32', v: '80000001' },
+      { t: 'f32', v: '00000000' },
+      { t: 'f32', v: '00000001' }
+    ])
+    const wasmApply = wasmPlan.apply(schema32)
+    assert.deepEqual(
+      Array.from(wasmApply.run({ rows: 4, columns: [applyValues] }).data,
+        doubleBits),
+      [
+        'b6a0000000000000', 'b6a0000000000000',
+        '0000000000000000', '36a0000000000000'
+      ]
+    )
+    closeAll(
+      wasmRecipe, wasmAnalyzer, wasmPlan, wasmApply,
+      nativeRecipe, nativeAnalyzer, nativePlan
+    )
   }
 
   {

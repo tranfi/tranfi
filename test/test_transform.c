@@ -8,6 +8,17 @@
 #include <xmmintrin.h>
 #endif
 
+static size_t cjson_test_allocations = 0;
+
+static void *counting_cjson_malloc(size_t bytes) {
+    ++cjson_test_allocations;
+    return malloc(bytes);
+}
+
+static void counting_cjson_free(void *memory) {
+    free(memory);
+}
+
 static char *read_file(const char *path) {
     FILE *stream = fopen(path, "rb");
     long size;
@@ -104,6 +115,24 @@ static void make_f64_table(
     table->columns_bytes = sizeof(*column);
 }
 
+static void make_f32_table(
+    const float *values, size_t rows,
+    tf_column_view_v1 *column, tf_table_view_v1 *table) {
+    memset(column, 0, sizeof(*column));
+    column->abi_version = 1;
+    column->struct_size = (uint32_t)sizeof(*column);
+    column->data = values;
+    column->data_bytes = rows * sizeof(*values);
+    column->stride_bytes = sizeof(*values);
+    memset(table, 0, sizeof(*table));
+    table->abi_version = 1;
+    table->struct_size = (uint32_t)sizeof(*table);
+    table->row_count = rows;
+    table->column_count = 1;
+    table->columns = column;
+    table->columns_bytes = sizeof(*column);
+}
+
 static tf_transform_plan *fit_f64_plan(
     const char *recipe_name, const double *values, size_t rows,
     size_t first_chunk) {
@@ -130,6 +159,30 @@ static tf_transform_plan *fit_f64_plan(
         assert(tf_transform_analyzer_push(analyzer, &table, &error)
                == TF_TRANSFORM_OK);
     }
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_OK);
+    assert(error == NULL && plan != NULL);
+    tf_transform_analyzer_destroy(&analyzer);
+    tf_transform_recipe_destroy(&recipe);
+    return plan;
+}
+
+static tf_transform_plan *fit_f32_plan(
+    const char *recipe_name, const float *values, size_t rows) {
+    tf_transform_recipe *recipe = load_vector_recipe(recipe_name);
+    tf_field_view_v1 field;
+    tf_schema_view_v1 schema;
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_plan *plan = NULL;
+    tf_transform_error *error = NULL;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    make_x0_schema(TF_VIEW_FLOAT32, &field, &schema);
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, NULL, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f32_table(values, rows, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
     assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
            == TF_TRANSFORM_OK);
     assert(error == NULL && plan != NULL);
@@ -477,6 +530,248 @@ static int cancel_on_call(void *user) {
     assert(counter != NULL);
     ++counter->calls;
     return counter->cancel_at != 0 && counter->calls >= counter->cancel_at;
+}
+
+typedef struct fp_mutation_probe {
+    size_t calls;
+    size_t mutate_at;
+    int mutated;
+} fp_mutation_probe;
+
+static int mutate_fp_on_call(void *user) {
+    fp_mutation_probe *probe = (fp_mutation_probe *)user;
+    assert(probe != NULL);
+    ++probe->calls;
+#if !defined(__wasm__)
+    if (!probe->mutated && probe->mutate_at != 0
+        && probe->calls == probe->mutate_at) {
+        assert(fesetround(FE_DOWNWARD) == 0);
+#if defined(__i386__) || defined(__x86_64__)
+        _mm_setcsr(_mm_getcsr() | (1u << 15) | (1u << 6));
+#endif
+        probe->mutated = 1;
+    }
+#endif
+    return 0;
+}
+
+typedef struct wide_categorical_fixture {
+    tf_transform_recipe *recipe;
+    tf_field_view_v1 *fields;
+    tf_column_view_v1 *columns;
+    tf_schema_view_v1 schema;
+    tf_table_view_v1 table;
+    double value;
+    size_t column_count;
+} wide_categorical_fixture;
+
+static void wide_categorical_fixture_clear(wide_categorical_fixture *fixture) {
+    if (!fixture) return;
+    free(fixture->fields);
+    free(fixture->columns);
+    tf_transform_recipe_destroy(&fixture->recipe);
+    memset(fixture, 0, sizeof(*fixture));
+}
+
+static void wide_categorical_fixture_init(
+    wide_categorical_fixture *fixture, size_t column_count) {
+    tf_transform_recipe *recipe;
+    assert(fixture != NULL && column_count != 0);
+    memset(fixture, 0, sizeof(*fixture));
+    recipe = (tf_transform_recipe *)calloc(1, sizeof(*recipe));
+    fixture->fields = (tf_field_view_v1 *)calloc(
+        column_count, sizeof(*fixture->fields));
+    fixture->columns = (tf_column_view_v1 *)calloc(
+        column_count, sizeof(*fixture->columns));
+    assert(recipe != NULL && fixture->fields != NULL
+           && fixture->columns != NULL);
+    recipe->columns = (tf_transform_recipe_column *)calloc(
+        column_count, sizeof(*recipe->columns));
+    assert(recipe->columns != NULL);
+    atomic_init(&recipe->refcount, 1u);
+    recipe->column_count = column_count;
+    recipe->max_output_columns = column_count;
+    recipe->max_output_elements_per_apply = column_count * 4;
+    fixture->recipe = recipe;
+    fixture->column_count = column_count;
+    fixture->value = 0.0;
+    for (size_t i = 0; i < column_count; ++i) {
+        char id[32];
+        int id_len = snprintf(id, sizeof(id), "c%05zu", i);
+        assert(id_len > 0 && (size_t)id_len < sizeof(id));
+        recipe->columns[i].source_id = (char *)malloc((size_t)id_len + 1);
+        assert(recipe->columns[i].source_id != NULL);
+        memcpy(recipe->columns[i].source_id, id, (size_t)id_len + 1);
+        recipe->columns[i].source_id_len = (size_t)id_len;
+        recipe->columns[i].kind = TF_TRANSFORM_KIND_NUMERIC;
+        recipe->columns[i].impute = TF_TRANSFORM_IMPUTE_NONE;
+        recipe->columns[i].all_missing = TF_TRANSFORM_ALL_MISSING_NONE;
+        recipe->columns[i].normalize = TF_TRANSFORM_NORMALIZE_NONE;
+        recipe->columns[i].ddof = 1;
+        fixture->fields[i].abi_version = 1;
+        fixture->fields[i].struct_size = (uint32_t)sizeof(fixture->fields[i]);
+        fixture->fields[i].dtype = TF_VIEW_FLOAT64;
+        fixture->fields[i].id_utf8
+            = (const uint8_t *)recipe->columns[i].source_id;
+        fixture->fields[i].id_bytes = (size_t)id_len;
+        fixture->fields[i].name_utf8
+            = (const uint8_t *)recipe->columns[i].source_id;
+        fixture->fields[i].name_bytes = (size_t)id_len;
+        fixture->columns[i].abi_version = 1;
+        fixture->columns[i].struct_size
+            = (uint32_t)sizeof(fixture->columns[i]);
+        fixture->columns[i].data = &fixture->value;
+        fixture->columns[i].data_bytes = sizeof(fixture->value);
+        fixture->columns[i].stride_bytes = sizeof(fixture->value);
+    }
+    recipe->columns[column_count - 1].kind = TF_TRANSFORM_KIND_CATEGORICAL;
+    recipe->columns[column_count - 1].categorical_impute
+        = TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE;
+    recipe->columns[column_count - 1].categorical_all_missing
+        = TF_TRANSFORM_ALL_MISSING_ZERO;
+    recipe->columns[column_count - 1].categorical_encode
+        = TF_TRANSFORM_ENCODE_NONE;
+    recipe->columns[column_count - 1].categorical_discover = 1;
+    fixture->schema.abi_version = 1;
+    fixture->schema.struct_size = (uint32_t)sizeof(fixture->schema);
+    fixture->schema.column_count = column_count;
+    fixture->schema.fields = fixture->fields;
+    fixture->schema.fields_bytes = column_count * sizeof(*fixture->fields);
+    fixture->table.abi_version = 1;
+    fixture->table.struct_size = (uint32_t)sizeof(fixture->table);
+    fixture->table.row_count = 1;
+    fixture->table.column_count = column_count;
+    fixture->table.columns = fixture->columns;
+    fixture->table.columns_bytes = column_count * sizeof(*fixture->columns);
+}
+
+static void test_guarded_callback_fp_mutation(void) {
+#if !defined(__wasm__)
+    const double numeric_values[] = {1.0, 2.0, 3.0};
+    tf_transform_recipe *recipe = load_vector_recipe("numeric_mean_standard");
+    tf_field_view_v1 field;
+    tf_schema_view_v1 schema;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_plan *plan = NULL;
+    tf_transform_apply *apply = NULL;
+    tf_transform_error *error = NULL;
+    tf_transform_runtime_v1 runtime;
+    tf_owned_dense_v1 dense;
+    fp_mutation_probe probe = {0, 0, 0};
+    size_t before;
+    size_t finalize_polls;
+    int original_rounding = fegetround();
+#if defined(__i386__) || defined(__x86_64__)
+    unsigned int original_mxcsr = _mm_getcsr();
+#endif
+
+    assert(original_rounding != -1);
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.abi_version = 1;
+    runtime.struct_size = (uint32_t)sizeof(runtime);
+    runtime.cancel = mutate_fp_on_call;
+    runtime.cancel_user = &probe;
+    make_x0_schema(TF_VIEW_FLOAT64, &field, &schema);
+    make_f64_table(numeric_values, 3, &column, &table);
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    before = probe.calls;
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_OK);
+    finalize_polls = probe.calls - before;
+    assert(finalize_polls > 1 && plan != NULL);
+    tf_transform_plan_destroy(&plan);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    probe.calls = 0;
+    probe.mutate_at = 0;
+    probe.mutated = 0;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    probe.mutate_at = probe.calls + finalize_polls;
+    original_rounding = fegetround();
+#if defined(__i386__) || defined(__x86_64__)
+    original_mxcsr = _mm_getcsr();
+#endif
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_UNSUPPORTED_RUNTIME);
+    assert(plan == NULL && probe.mutated
+           && tf_transform_error_get_code(error)
+                == TF_TRANSFORM_UNSUPPORTED_RUNTIME);
+    assert(fegetround() == original_rounding);
+#if defined(__i386__) || defined(__x86_64__)
+    assert(_mm_getcsr() == original_mxcsr);
+#endif
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+    tf_transform_recipe_destroy(&recipe);
+
+    {
+        wide_categorical_fixture fixture;
+        wide_categorical_fixture_init(&fixture, 2);
+        fixture.recipe->columns[0].kind = TF_TRANSFORM_KIND_CATEGORICAL;
+        fixture.recipe->columns[0].categorical_impute
+            = TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE;
+        fixture.recipe->columns[0].categorical_all_missing
+            = TF_TRANSFORM_ALL_MISSING_ZERO;
+        fixture.recipe->columns[0].categorical_encode
+            = TF_TRANSFORM_ENCODE_NONE;
+        fixture.recipe->columns[0].categorical_discover = 1;
+        fixture.recipe->columns[1].kind = TF_TRANSFORM_KIND_NUMERIC;
+        fixture.recipe->columns[1].categorical_impute
+            = TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE;
+        fixture.recipe->columns[1].categorical_all_missing
+            = TF_TRANSFORM_ALL_MISSING_NONE;
+        fixture.recipe->columns[1].categorical_encode
+            = TF_TRANSFORM_ENCODE_NONE;
+        fixture.recipe->columns[1].categorical_discover = 0;
+        assert(tf_transform_analyzer_create(
+            fixture.recipe, &fixture.schema, NULL, &analyzer, &error)
+            == TF_TRANSFORM_OK);
+        assert(tf_transform_analyzer_push(analyzer, &fixture.table, &error)
+               == TF_TRANSFORM_OK);
+        assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+               == TF_TRANSFORM_OK);
+        tf_transform_analyzer_destroy(&analyzer);
+
+        probe.calls = 0;
+        probe.mutate_at = 0;
+        probe.mutated = 0;
+        assert(tf_transform_apply_create(
+            plan, &fixture.schema, &runtime, &apply, &error) == TF_TRANSFORM_OK);
+        before = probe.calls;
+        probe.mutate_at = before + 6;
+        original_rounding = fegetround();
+#if defined(__i386__) || defined(__x86_64__)
+        original_mxcsr = _mm_getcsr();
+#endif
+        assert(tf_transform_apply_run(apply, &fixture.table, &dense, &error)
+               == TF_TRANSFORM_UNSUPPORTED_RUNTIME);
+        assert(dense.data == NULL && probe.mutated
+               && tf_transform_error_get_code(error)
+                    == TF_TRANSFORM_UNSUPPORTED_RUNTIME);
+        assert(fegetround() == original_rounding);
+#if defined(__i386__) || defined(__x86_64__)
+        assert(_mm_getcsr() == original_mxcsr);
+#endif
+        tf_transform_error_destroy(&error);
+        assert(tf_transform_apply_run(apply, &fixture.table, &dense, &error)
+               == TF_TRANSFORM_INVALID_STATE);
+        tf_transform_error_destroy(&error);
+        tf_transform_apply_destroy(&apply);
+        tf_transform_plan_destroy(&plan);
+        wide_categorical_fixture_clear(&fixture);
+    }
+#endif
 }
 
 typedef struct median_sort_cancel_probe {
@@ -1147,8 +1442,8 @@ static void test_numeric_vector_semantics(void) {
     uint8_t *right = NULL;
     size_t right_len = 0;
 
-    assert(one_chunk->states[0].location == 2.0);
-    assert(tf_transform_double_bits(one_chunk->states[0].scale)
+    assert(one_chunk->states[0].value.numeric.location == 2.0);
+    assert(tf_transform_double_bits(one_chunk->states[0].value.numeric.scale)
            == UINT64_C(0x3fe6a09e667f3bcd));
     assert(tf_transform_plan_export(
         one_chunk, NULL, &left, &left_len, &error) == TF_TRANSFORM_OK);
@@ -1162,16 +1457,16 @@ static void test_numeric_vector_semantics(void) {
     tf_transform_plan_destroy(&split);
 
     plan = fit_f64_plan("numeric_zero_minmax", minmax_rows, 3, 1);
-    assert(tf_transform_double_bits(plan->states[0].location)
+    assert(tf_transform_double_bits(plan->states[0].value.numeric.location)
            == UINT64_C(0xc000000000000000));
-    assert(tf_transform_double_bits(plan->states[0].scale)
+    assert(tf_transform_double_bits(plan->states[0].value.numeric.scale)
            == UINT64_C(0x4020000000000000));
     assert_apply_bits(plan, minmax_rows, 3, minmax_expected);
     tf_transform_plan_destroy(&plan);
 
     plan = fit_f64_plan("numeric_mean_standard", all_missing, 2, 1);
-    assert(tf_transform_double_bits(plan->states[0].location) == 0);
-    assert(tf_transform_double_bits(plan->states[0].scale)
+    assert(tf_transform_double_bits(plan->states[0].value.numeric.location) == 0);
+    assert(tf_transform_double_bits(plan->states[0].value.numeric.scale)
            == UINT64_C(0x3ff0000000000000));
     assert_apply_bits(plan, all_missing_apply, 2, all_missing_expected);
     tf_transform_plan_destroy(&plan);
@@ -1179,6 +1474,452 @@ static void test_numeric_vector_semantics(void) {
     plan = fit_f64_plan("numeric_none_none", none_rows, 2, 1);
     assert_apply_bits(plan, none_apply, 2, none_expected);
     tf_transform_plan_destroy(&plan);
+}
+
+static void test_categorical_mode_semantics(void) {
+    const double missing = tf_transform_double_from_bits(
+        UINT64_C(0x7ff8000000000042));
+    const double values[] = {-0.0, 0.0, 1.0, 3.0, 1.0, 3.0, missing};
+    const double permuted[] = {3.0, 1.0, missing, 0.0, 3.0, -0.0, 1.0};
+    const double apply_values[] = {-0.0, 0.0, missing, 1.0, 3.0};
+    const uint64_t expected[] = {
+        UINT64_C(0x8000000000000000), UINT64_C(0), UINT64_C(0),
+        UINT64_C(0x3ff0000000000000), UINT64_C(0x4008000000000000)
+    };
+    const double unknown[] = {2.0};
+    const double known[] = {1.0};
+    tf_transform_plan *one_chunk = fit_f64_plan(
+        "categorical_mode_none", values, 7, 7);
+    tf_transform_plan *split = fit_f64_plan(
+        "categorical_mode_none", values, 7, 2);
+    tf_transform_plan *reordered = fit_f64_plan(
+        "categorical_mode_none", permuted, 7, 3);
+    tf_transform_plan *imported = NULL;
+    tf_transform_error *error = NULL;
+    uint8_t *reference = NULL;
+    size_t reference_len = 0;
+    uint8_t *candidate = NULL;
+    size_t candidate_len = 0;
+    tf_field_view_v1 field;
+    tf_schema_view_v1 schema;
+    tf_transform_apply *apply = NULL;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    tf_owned_dense_v1 dense;
+
+    assert(one_chunk->states[0].kind == TF_TRANSFORM_KIND_CATEGORICAL);
+    assert(one_chunk->states[0].value.categorical.category_count == 3);
+    assert(one_chunk->states[0].value.categorical.categories[0].bits == 0);
+    assert(one_chunk->states[0].value.categorical.impute_bits == 0);
+    assert(tf_transform_plan_export(
+        one_chunk, NULL, &reference, &reference_len, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_plan_export(
+        split, NULL, &candidate, &candidate_len, &error) == TF_TRANSFORM_OK);
+    assert(candidate_len == reference_len
+           && memcmp(candidate, reference, reference_len) == 0);
+    tf_transform_bytes_free(&candidate, &candidate_len);
+    assert(tf_transform_plan_export(
+        reordered, NULL, &candidate, &candidate_len, &error) == TF_TRANSFORM_OK);
+    assert(candidate_len == reference_len
+           && memcmp(candidate, reference, reference_len) == 0);
+    tf_transform_bytes_free(&candidate, &candidate_len);
+    assert(tf_transform_plan_import(
+        reference, reference_len, NULL, &imported, &error) == TF_TRANSFORM_OK);
+    assert(imported != NULL
+           && imported->states[0].kind == TF_TRANSFORM_KIND_CATEGORICAL
+           && imported->states[0].value.categorical.category_count == 3);
+    assert_apply_bits(imported, apply_values, 5, expected);
+
+    make_x0_schema(TF_VIEW_FLOAT64, &field, &schema);
+    assert(tf_transform_apply_create(
+        imported, &schema, NULL, &apply, &error) == TF_TRANSFORM_OK);
+    make_f64_table(unknown, 1, &column, &table);
+    assert(tf_transform_apply_run(apply, &table, &dense, &error)
+           == TF_TRANSFORM_UNKNOWN_CATEGORY);
+    assert(error != NULL && tf_transform_error_get_code(error)
+           == TF_TRANSFORM_UNKNOWN_CATEGORY);
+    tf_transform_error_destroy(&error);
+    make_f64_table(known, 1, &column, &table);
+    assert(tf_transform_apply_run(apply, &table, &dense, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_apply_destroy(&apply);
+
+    tf_transform_bytes_free(&reference, &reference_len);
+    tf_transform_plan_destroy(&imported);
+    tf_transform_plan_destroy(&reordered);
+    tf_transform_plan_destroy(&split);
+    tf_transform_plan_destroy(&one_chunk);
+}
+
+static void test_categorical_subnormal_fp_environment(void) {
+    const uint32_t f32_bits[] = {
+        UINT32_C(0x00000001), UINT32_C(0x80000001), UINT32_C(0x00000000)
+    };
+    const uint32_t f32_apply_bits[] = {
+        UINT32_C(0x7fc00001), UINT32_C(0x80000001),
+        UINT32_C(0x00000000), UINT32_C(0x00000001)
+    };
+    const uint64_t f64_bits[] = {
+        UINT64_C(0x0000000000000001), UINT64_C(0x8000000000000001),
+        UINT64_C(0x0000000000000000)
+    };
+    const uint64_t f64_apply_bits[] = {
+        UINT64_C(0x7ff8000000000001), UINT64_C(0x8000000000000001),
+        UINT64_C(0x0000000000000000), UINT64_C(0x0000000000000001)
+    };
+    float f32_values[3];
+    float f32_apply_values[4];
+    double f64_values[3];
+    double f64_apply_values[4];
+    uint64_t f32_expected[4];
+    const uint64_t f64_expected[] = {
+        UINT64_C(0x8000000000000001), UINT64_C(0x8000000000000001),
+        UINT64_C(0x0000000000000000), UINT64_C(0x0000000000000001)
+    };
+    tf_transform_plan *plan32;
+    tf_transform_plan *plan64;
+    tf_transform_plan *imported32 = NULL;
+    tf_transform_plan *imported64 = NULL;
+    tf_transform_apply *apply32 = NULL;
+    tf_transform_error *error = NULL;
+    tf_field_view_v1 field32;
+    tf_schema_view_v1 schema32;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    tf_owned_dense_v1 dense;
+    uint8_t *baseline32 = NULL;
+    size_t baseline32_len = 0;
+    uint8_t *baseline64 = NULL;
+    size_t baseline64_len = 0;
+    uint8_t *candidate = NULL;
+    size_t candidate_len = 0;
+#if !defined(__wasm__)
+    int original_rounding = fegetround();
+#if defined(__i386__) || defined(__x86_64__)
+    unsigned int original_mxcsr = _mm_getcsr();
+    unsigned int caller_mxcsr;
+#endif
+#endif
+
+    memcpy(f32_values, f32_bits, sizeof(f32_values));
+    memcpy(f32_apply_values, f32_apply_bits, sizeof(f32_apply_values));
+    for (size_t i = 0; i < 3; ++i)
+        f64_values[i] = tf_transform_double_from_bits(f64_bits[i]);
+    for (size_t i = 0; i < 4; ++i) {
+        f64_apply_values[i] = tf_transform_double_from_bits(f64_apply_bits[i]);
+        f32_expected[i] = i == 0
+            ? tf_transform_double_bits((double)f32_apply_values[1])
+            : tf_transform_double_bits((double)f32_apply_values[i]);
+    }
+    plan32 = fit_f32_plan("categorical_mode_none", f32_values, 3);
+    plan64 = fit_f64_plan("categorical_mode_none", f64_values, 3, 3);
+    assert(plan32->states[0].value.categorical.categories[0].bits
+           == UINT32_C(0x80000001));
+    assert(plan32->states[0].value.categorical.categories[1].bits == 0);
+    assert(plan32->states[0].value.categorical.categories[2].bits == 1);
+    assert(plan64->states[0].value.categorical.categories[0].bits
+           == UINT64_C(0x8000000000000001));
+    assert(tf_transform_plan_export(
+        plan32, NULL, &baseline32, &baseline32_len, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_plan_export(
+        plan64, NULL, &baseline64, &baseline64_len, &error) == TF_TRANSFORM_OK);
+
+#if !defined(__wasm__)
+    assert(original_rounding != -1);
+    assert(fesetround(FE_DOWNWARD) == 0);
+#if defined(__i386__) || defined(__x86_64__)
+    caller_mxcsr = _mm_getcsr() | (1u << 15) | (1u << 6);
+    _mm_setcsr(caller_mxcsr);
+    assert(_mm_getcsr() == caller_mxcsr);
+#endif
+#endif
+    assert(tf_transform_plan_export(
+        plan32, NULL, &candidate, &candidate_len, &error) == TF_TRANSFORM_OK);
+    assert(candidate_len == baseline32_len
+           && memcmp(candidate, baseline32, candidate_len) == 0);
+    assert(tf_transform_plan_import(
+        candidate, candidate_len, NULL, &imported32, &error) == TF_TRANSFORM_OK);
+    tf_transform_bytes_free(&candidate, &candidate_len);
+    assert(tf_transform_plan_export(
+        plan64, NULL, &candidate, &candidate_len, &error) == TF_TRANSFORM_OK);
+    assert(candidate_len == baseline64_len
+           && memcmp(candidate, baseline64, candidate_len) == 0);
+    assert(tf_transform_plan_import(
+        candidate, candidate_len, NULL, &imported64, &error) == TF_TRANSFORM_OK);
+    tf_transform_bytes_free(&candidate, &candidate_len);
+
+    make_x0_schema(TF_VIEW_FLOAT32, &field32, &schema32);
+    assert(tf_transform_apply_create(
+        imported32, &schema32, NULL, &apply32, &error) == TF_TRANSFORM_OK);
+    make_f32_table(f32_apply_values, 4, &column, &table);
+    assert(tf_transform_apply_run(apply32, &table, &dense, &error)
+           == TF_TRANSFORM_OK);
+    for (size_t i = 0; i < 4; ++i)
+        assert(tf_transform_double_bits(((double *)dense.data)[i])
+               == f32_expected[i]);
+    tf_owned_dense_free(&dense);
+    assert_apply_bits(imported64, f64_apply_values, 4, f64_expected);
+#if !defined(__wasm__)
+    assert(fegetround() == FE_DOWNWARD);
+#if defined(__i386__) || defined(__x86_64__)
+    assert(_mm_getcsr() == caller_mxcsr);
+#endif
+    assert(fesetround(original_rounding) == 0);
+#if defined(__i386__) || defined(__x86_64__)
+    _mm_setcsr(original_mxcsr);
+    assert(_mm_getcsr() == original_mxcsr);
+#endif
+#endif
+
+    tf_transform_apply_destroy(&apply32);
+    tf_transform_bytes_free(&baseline32, &baseline32_len);
+    tf_transform_bytes_free(&baseline64, &baseline64_len);
+    tf_transform_plan_destroy(&imported32);
+    tf_transform_plan_destroy(&imported64);
+    tf_transform_plan_destroy(&plan32);
+    tf_transform_plan_destroy(&plan64);
+}
+
+static void test_categorical_mode_resources_and_cancellation(void) {
+    const size_t category_count = 8192;
+    double *values = (double *)malloc(category_count * sizeof(*values));
+    tf_transform_recipe *recipe = load_vector_recipe("categorical_mode_none");
+    tf_field_view_v1 field;
+    tf_schema_view_v1 schema;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_plan *plan = NULL;
+    tf_transform_error *error = NULL;
+    tf_transform_limits_v1 limits;
+    tf_transform_runtime_v1 runtime;
+    uint64_t base_resident;
+    uint64_t old_table_bytes;
+    uint64_t new_table_bytes;
+    cancel_counter counter = {0, 0};
+    size_t finalize_polls;
+
+    assert(values != NULL);
+    for (size_t i = 0; i < category_count; ++i) values[i] = (double)i;
+    make_x0_schema(TF_VIEW_FLOAT64, &field, &schema);
+
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, NULL, &analyzer, &error) == TF_TRANSFORM_OK);
+    base_resident = analyzer->resident_state_bytes;
+    make_f64_table(values, 8, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    old_table_bytes = analyzer->resident_state_bytes - base_resident;
+    make_f64_table(values + 8, 1, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    new_table_bytes = analyzer->resident_state_bytes - base_resident;
+    assert(old_table_bytes > 0 && new_table_bytes > old_table_bytes);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.abi_version = 1;
+    runtime.struct_size = (uint32_t)sizeof(runtime);
+    runtime.limits = &limits;
+    limits.max_resident_state_bytes = base_resident
+        + old_table_bytes + new_table_bytes - 1;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f64_table(values, 8, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    make_f64_table(values + 8, 1, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    limits.max_categories_per_column = 8;
+    runtime.limits = &limits;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f64_table(values, 9, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_RESOURCE_LIMIT);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    runtime.limits = &limits;
+    runtime.cancel = cancel_on_call;
+    runtime.cancel_user = &counter;
+    counter.calls = 0;
+    counter.cancel_at = 0;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    counter.cancel_at = counter.calls + 10;
+    make_f64_table(values, category_count, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_CANCELLED);
+    assert(analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    counter.calls = 0;
+    counter.cancel_at = 0;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f64_table(values, category_count, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    {
+        size_t before = counter.calls;
+        assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+               == TF_TRANSFORM_OK);
+        finalize_polls = counter.calls - before;
+        assert(finalize_polls > 10);
+    }
+    tf_transform_plan_destroy(&plan);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    counter.calls = 0;
+    counter.cancel_at = 0;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f64_table(values, category_count, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    counter.cancel_at = counter.calls + finalize_polls / 2;
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_CANCELLED);
+    assert(plan == NULL && analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    tf_transform_recipe_destroy(&recipe);
+    free(values);
+}
+
+static void test_wide_categorical_lifecycle_cancellation(void) {
+    const size_t column_count = TF_TRANSFORM_CANCEL_ITERS_V1 * 3 + 1;
+    wide_categorical_fixture fixture;
+    tf_transform_runtime_v1 runtime;
+    cancel_counter counter = {0, 0};
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_plan *plan = NULL;
+    tf_transform_plan *cancelled_plan = NULL;
+    tf_transform_apply *apply = NULL;
+    tf_transform_error *error = NULL;
+    tf_owned_dense_v1 dense;
+    size_t create_polls;
+    size_t push_polls;
+    size_t finalize_polls;
+    size_t apply_polls;
+    size_t before;
+
+    wide_categorical_fixture_init(&fixture, column_count);
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.abi_version = 1;
+    runtime.struct_size = (uint32_t)sizeof(runtime);
+    runtime.cancel = cancel_on_call;
+    runtime.cancel_user = &counter;
+
+    assert(tf_transform_analyzer_create(
+        fixture.recipe, &fixture.schema, &runtime, &analyzer, &error)
+        == TF_TRANSFORM_OK);
+    create_polls = counter.calls;
+    assert(create_polls > 3);
+    before = counter.calls;
+    assert(tf_transform_analyzer_push(analyzer, &fixture.table, &error)
+           == TF_TRANSFORM_OK);
+    push_polls = counter.calls - before;
+    assert(push_polls > 3);
+    before = counter.calls;
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_OK);
+    finalize_polls = counter.calls - before;
+    assert(finalize_polls > 3 && plan != NULL);
+    tf_transform_analyzer_destroy(&analyzer);
+    assert(tf_transform_apply_create(
+        plan, &fixture.schema, &runtime, &apply, &error) == TF_TRANSFORM_OK);
+    before = counter.calls;
+    assert(tf_transform_apply_run(apply, &fixture.table, &dense, &error)
+           == TF_TRANSFORM_OK);
+    apply_polls = counter.calls - before;
+    assert(apply_polls > 3);
+    tf_owned_dense_free(&dense);
+    tf_transform_apply_destroy(&apply);
+
+    counter.calls = 0;
+    counter.cancel_at = create_polls - 1;
+    assert(tf_transform_analyzer_create(
+        fixture.recipe, &fixture.schema, &runtime, &analyzer, &error)
+        == TF_TRANSFORM_CANCELLED);
+    assert(analyzer == NULL);
+    tf_transform_error_destroy(&error);
+
+    counter.calls = 0;
+    counter.cancel_at = 0;
+    assert(tf_transform_analyzer_create(
+        fixture.recipe, &fixture.schema, &runtime, &analyzer, &error)
+        == TF_TRANSFORM_OK);
+    before = counter.calls;
+    counter.cancel_at = before + push_polls - 1;
+    assert(tf_transform_analyzer_push(analyzer, &fixture.table, &error)
+           == TF_TRANSFORM_CANCELLED);
+    assert(analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_push(analyzer, &fixture.table, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    counter.calls = 0;
+    counter.cancel_at = 0;
+    assert(tf_transform_analyzer_create(
+        fixture.recipe, &fixture.schema, &runtime, &analyzer, &error)
+        == TF_TRANSFORM_OK);
+    assert(tf_transform_analyzer_push(analyzer, &fixture.table, &error)
+           == TF_TRANSFORM_OK);
+    before = counter.calls;
+    counter.cancel_at = before + finalize_polls - 1;
+    assert(tf_transform_analyzer_finalize(analyzer, &cancelled_plan, &error)
+           == TF_TRANSFORM_CANCELLED);
+    assert(cancelled_plan == NULL && analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_finalize(analyzer, &cancelled_plan, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    counter.calls = 0;
+    counter.cancel_at = 0;
+    assert(tf_transform_apply_create(
+        plan, &fixture.schema, &runtime, &apply, &error) == TF_TRANSFORM_OK);
+    before = counter.calls;
+    counter.cancel_at = before + apply_polls - 1;
+    assert(tf_transform_apply_run(apply, &fixture.table, &dense, &error)
+           == TF_TRANSFORM_CANCELLED);
+    assert(apply->state == TF_APPLY_FAILED && dense.data == NULL);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_apply_run(apply, &fixture.table, &dense, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_apply_destroy(&apply);
+
+    tf_transform_plan_destroy(&plan);
+    wide_categorical_fixture_clear(&fixture);
 }
 
 static void test_median_blocks_limits_and_cancellation(void) {
@@ -1210,7 +1951,7 @@ static void test_median_blocks_limits_and_cancellation(void) {
         "numeric_median_none", values, row_count, row_count);
     split = fit_f64_plan(
         "numeric_median_none", values, row_count, 8191);
-    assert(tf_transform_double_bits(one_chunk->states[0].impute_value)
+    assert(tf_transform_double_bits(one_chunk->states[0].value.numeric.impute_value)
            == tf_transform_double_bits(10000.0));
     assert(tf_transform_plan_export(
         one_chunk, NULL, &left, &left_len, &error) == TF_TRANSFORM_OK);
@@ -1327,7 +2068,7 @@ static double *decode_single_column_rows(
     return values;
 }
 
-static void execute_numeric_semantic_case(
+static void execute_semantic_case(
     const cJSON *entry, tf_transform_recipe *recipe) {
     const cJSON *analyze = cJSON_GetObjectItemCaseSensitive(entry, "analyze");
     const cJSON *apply = cJSON_GetObjectItemCaseSensitive(entry, "apply");
@@ -1378,7 +2119,9 @@ static void execute_numeric_semantic_case(
             offset += chunk_rows;
         }
         assert(offset == analyze_count);
-        if (expected_error) {
+        if (expected_error
+            && strcmp(cJSON_GetObjectItemCaseSensitive(
+                expected_error, "phase")->valuestring, "finalize") == 0) {
             tf_transform_code expected = (tf_transform_code)
                 cJSON_GetObjectItemCaseSensitive(
                     expected_error, "code")->valueint;
@@ -1392,17 +2135,33 @@ static void execute_numeric_semantic_case(
         assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
                == TF_TRANSFORM_OK);
         assert(plan != NULL && expected_plan != NULL);
-        assert(tf_transform_double_bits(plan->states[0].location)
-               == parse_hex64(cJSON_GetObjectItemCaseSensitive(
-                   expected_plan, "location")->valuestring));
-        assert(tf_transform_double_bits(plan->states[0].scale)
-               == parse_hex64(cJSON_GetObjectItemCaseSensitive(
-                   expected_plan, "scale")->valuestring));
-        {
+        if (strcmp(cJSON_GetObjectItemCaseSensitive(
+                expected_plan, "kind")->valuestring, "categorical") == 0) {
+            const cJSON *expected_categories = cJSON_GetObjectItemCaseSensitive(
+                expected_plan, "categories");
+            const tf_transform_categorical_state *state
+                = &plan->states[0].value.categorical;
+            assert(plan->states[0].kind == TF_TRANSFORM_KIND_CATEGORICAL);
+            assert(cJSON_GetArraySize(expected_categories)
+                   == (int)state->category_count);
+            for (size_t i = 0; i < state->category_count; ++i)
+                assert(state->categories[i].bits == parse_hex64(
+                    cJSON_GetArrayItem(expected_categories, (int)i)->valuestring));
+            assert(state->impute_bits == parse_hex64(
+                cJSON_GetObjectItemCaseSensitive(
+                    expected_plan, "impute")->valuestring));
+        } else {
             const cJSON *expected_impute = cJSON_GetObjectItemCaseSensitive(
                 expected_plan, "impute");
+            assert(plan->states[0].kind == TF_TRANSFORM_KIND_NUMERIC);
+            assert(tf_transform_double_bits(plan->states[0].value.numeric.location)
+                   == parse_hex64(cJSON_GetObjectItemCaseSensitive(
+                       expected_plan, "location")->valuestring));
+            assert(tf_transform_double_bits(plan->states[0].value.numeric.scale)
+                   == parse_hex64(cJSON_GetObjectItemCaseSensitive(
+                       expected_plan, "scale")->valuestring));
             if (cJSON_IsString(expected_impute))
-                assert(tf_transform_double_bits(plan->states[0].impute_value)
+                assert(tf_transform_double_bits(plan->states[0].value.numeric.impute_value)
                        == parse_hex64(expected_impute->valuestring));
         }
         assert(tf_transform_plan_export(
@@ -1420,6 +2179,21 @@ static void execute_numeric_semantic_case(
         assert(tf_transform_apply_create(
             plan, &schema, NULL, &apply_session, &error) == TF_TRANSFORM_OK);
         make_f64_table(apply_values, apply_count, &column, &table);
+        if (expected_error) {
+            tf_transform_code expected = (tf_transform_code)
+                cJSON_GetObjectItemCaseSensitive(
+                    expected_error, "code")->valueint;
+            assert(strcmp(cJSON_GetObjectItemCaseSensitive(
+                expected_error, "phase")->valuestring, "apply") == 0);
+            assert(tf_transform_apply_run(
+                apply_session, &table, &dense, &error) == expected);
+            assert(error != NULL && tf_transform_error_get_code(error) == expected);
+            tf_transform_error_destroy(&error);
+            assert(tf_transform_apply_run(
+                apply_session, &table, &dense, &error)
+                == TF_TRANSFORM_INVALID_STATE);
+            tf_transform_error_destroy(&error);
+        } else {
         assert(tf_transform_apply_run(
             apply_session, &table, &dense, &error) == TF_TRANSFORM_OK);
         {
@@ -1435,6 +2209,7 @@ static void execute_numeric_semantic_case(
             }
         }
         tf_owned_dense_free(&dense);
+        }
         tf_transform_apply_destroy(&apply_session);
         tf_transform_plan_destroy(&plan);
         tf_transform_analyzer_destroy(&analyzer);
@@ -1472,11 +2247,11 @@ static void test_shared_semantic_case_table(void) {
             continue;
         }
         assert(code == TF_TRANSFORM_OK && recipe != NULL && error == NULL);
-        execute_numeric_semantic_case(entry, recipe);
+        execute_semantic_case(entry, recipe);
         ++executed;
         tf_transform_recipe_destroy(&recipe);
     }
-    assert(executed == 12 && deferred == 3);
+    assert(executed == 18 && deferred == 3);
     cJSON_Delete(root);
     free(text);
 }
@@ -1966,7 +2741,8 @@ static void test_median_negative_zero_import_rejected(void) {
     uint8_t *mutated;
     size_t mutated_len = 0;
 
-    assert(tf_transform_double_bits(plan->states[0].impute_value) == 0);
+    assert(tf_transform_double_bits(
+        plan->states[0].value.numeric.impute_value) == 0);
     assert(tf_transform_plan_export(
         plan, NULL, &exported, &exported_len, &error) == TF_TRANSFORM_OK);
     assert(error == NULL && exported_len > 52);
@@ -1999,6 +2775,163 @@ static void test_median_negative_zero_import_rejected(void) {
     tf_transform_error_destroy(&error);
     free(mutated);
     tf_transform_bytes_free(&payload, &payload_len);
+    cJSON_Delete(root);
+    tf_transform_bytes_free(&exported, &exported_len);
+    tf_transform_plan_destroy(&plan);
+}
+
+static void assert_categorical_root_import_code(
+    const cJSON *root, const tf_transform_limits_v1 *import_limits,
+    tf_transform_code expected, int expect_no_json_growth) {
+    tf_transform_limits_v1 print_limits;
+    tf_transform_runtime_v1 runtime;
+    tf_transform_plan *plan = NULL;
+    tf_transform_error *error = NULL;
+    uint8_t *payload = NULL;
+    size_t payload_len = 0;
+    uint8_t *tftr;
+    size_t tftr_len = 0;
+    assert(tf_transform_limits_init_safe_v1(&print_limits, sizeof(print_limits))
+           == TF_TRANSFORM_OK);
+    assert(tf_transform_json_print_canonical(
+        root, &print_limits, &payload, &payload_len, &error) == TF_TRANSFORM_OK);
+    assert(error == NULL && payload != NULL);
+    tftr = wrap_tftr_test(
+        payload, payload_len, 1, 0, 52, payload_len, "TFTR", &tftr_len);
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.abi_version = 1;
+    runtime.struct_size = (uint32_t)sizeof(runtime);
+    runtime.limits = import_limits;
+    if (expect_no_json_growth) {
+        cJSON_Hooks hooks = {counting_cjson_malloc, counting_cjson_free};
+        cjson_test_allocations = 0;
+        cJSON_InitHooks(&hooks);
+    }
+    assert(tf_transform_plan_import(
+        tftr, tftr_len, import_limits ? &runtime : NULL, &plan, &error)
+        == expected);
+    if (expect_no_json_growth) {
+        cJSON_InitHooks(NULL);
+        assert(cjson_test_allocations == 0);
+    }
+    if (expected == TF_TRANSFORM_OK)
+        assert(plan != NULL && error == NULL);
+    else
+        assert(plan == NULL && error != NULL
+               && tf_transform_error_get_code(error) == expected);
+    tf_transform_error_destroy(&error);
+    tf_transform_plan_destroy(&plan);
+    free(tftr);
+    tf_transform_bytes_free(&payload, &payload_len);
+}
+
+static void test_categorical_import_validation_and_limits(void) {
+    const double values[] = {0.0, 1.0, 3.0, 1.0, 3.0};
+    tf_transform_plan *plan = fit_f64_plan(
+        "categorical_mode_none", values, 5, 2);
+    tf_transform_error *error = NULL;
+    uint8_t *exported = NULL;
+    size_t exported_len = 0;
+    cJSON *root;
+    tf_transform_limits_v1 limits;
+    uint8_t *limited_bytes = NULL;
+    size_t limited_len = 0;
+
+    assert(tf_transform_plan_export(
+        plan, NULL, &exported, &exported_len, &error) == TF_TRANSFORM_OK);
+    root = cJSON_ParseWithLength(
+        (const char *)exported + 52, exported_len - 52);
+    assert(root != NULL);
+    assert_categorical_root_import_code(root, NULL, TF_TRANSFORM_OK, 0);
+
+    for (int mutation = 0; mutation < 5; ++mutation) {
+        cJSON *copy = cJSON_Duplicate(root, 1);
+        cJSON *step = cJSON_GetArrayItem(
+            cJSON_GetObjectItemCaseSensitive(copy, "steps"), 0);
+        cJSON *categorical = cJSON_GetObjectItemCaseSensitive(
+            step, "categorical");
+        cJSON *categories = cJSON_GetObjectItemCaseSensitive(
+            categorical, "categories");
+        cJSON *first = cJSON_GetArrayItem(categories, 0);
+        cJSON *second = cJSON_GetArrayItem(categories, 1);
+        assert(copy && first && second);
+        if (mutation == 0) {
+            assert(cJSON_SetValuestring(
+                cJSON_GetObjectItemCaseSensitive(first, "v"),
+                "8000000000000000") != NULL);
+        } else if (mutation == 1) {
+            assert(cJSON_SetValuestring(
+                cJSON_GetObjectItemCaseSensitive(first, "t"), "f32") != NULL);
+        } else if (mutation == 2) {
+            assert(cJSON_SetValuestring(
+                cJSON_GetObjectItemCaseSensitive(second, "v"),
+                "0000000000000000") != NULL);
+        } else if (mutation == 3) {
+            assert(cJSON_SetValuestring(
+                cJSON_GetObjectItemCaseSensitive(first, "v"),
+                "3ff0000000000000") != NULL);
+            assert(cJSON_SetValuestring(
+                cJSON_GetObjectItemCaseSensitive(second, "v"),
+                "0000000000000000") != NULL);
+        } else {
+            cJSON *impute = cJSON_GetObjectItemCaseSensitive(
+                categorical, "impute");
+            cJSON *mode = cJSON_GetObjectItemCaseSensitive(impute, "value");
+            assert(cJSON_SetValuestring(
+                cJSON_GetObjectItemCaseSensitive(mode, "v"),
+                "4000000000000000") != NULL);
+        }
+        assert_categorical_root_import_code(
+            copy, NULL, TF_TRANSFORM_CORRUPT_PLAN, 0);
+        cJSON_Delete(copy);
+    }
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    limits.max_categories_per_column = 4;
+    limits.max_total_categories = 4;
+    assert_categorical_root_import_code(
+        root, &limits, TF_TRANSFORM_OK, 0);
+    limits.max_categories_per_column = 3;
+    limits.max_total_categories = 3;
+    assert_categorical_root_import_code(
+        root, &limits, TF_TRANSFORM_OK, 0);
+    limits.max_categories_per_column = 2;
+    assert(tf_transform_plan_export(
+        plan, &limits, &limited_bytes, &limited_len, &error)
+        == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(limited_bytes == NULL && limited_len == 0);
+    tf_transform_error_destroy(&error);
+    assert_categorical_root_import_code(
+        root, &limits, TF_TRANSFORM_RESOURCE_LIMIT, 1);
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    limits.max_total_categories = 2;
+    assert_categorical_root_import_code(
+        root, &limits, TF_TRANSFORM_RESOURCE_LIMIT, 1);
+    {
+        cJSON *copy = cJSON_Duplicate(root, 1);
+        cJSON *extra = cJSON_CreateObject();
+        cJSON *categories = cJSON_Duplicate(
+            cJSON_GetObjectItemCaseSensitive(
+                cJSON_GetObjectItemCaseSensitive(
+                    cJSON_GetArrayItem(
+                        cJSON_GetObjectItemCaseSensitive(copy, "steps"), 0),
+                    "categorical"),
+                "categories"),
+            1);
+        assert(copy && extra && categories);
+        assert(cJSON_AddItemToObject(extra, "categories", categories));
+        assert(cJSON_AddItemToObject(copy, "extra", extra));
+        assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+               == TF_TRANSFORM_OK);
+        limits.max_categories_per_column = 3;
+        limits.max_total_categories = 5;
+        assert_categorical_root_import_code(
+            copy, &limits, TF_TRANSFORM_RESOURCE_LIMIT, 1);
+        cJSON_Delete(copy);
+    }
+
     cJSON_Delete(root);
     tf_transform_bytes_free(&exported, &exported_len);
     tf_transform_plan_destroy(&plan);
@@ -2331,9 +3264,14 @@ int main(void) {
     test_sha256();
     test_recipe_vectors_and_canonical_json();
     test_fp_guard_restores_rounding();
+    test_guarded_callback_fp_mutation();
     test_numeric_lifecycle_and_schema();
     test_numeric_failure_is_terminal();
     test_numeric_vector_semantics();
+    test_categorical_mode_semantics();
+    test_categorical_subnormal_fp_environment();
+    test_categorical_mode_resources_and_cancellation();
+    test_wide_categorical_lifecycle_cancellation();
     test_median_blocks_limits_and_cancellation();
     test_shared_semantic_case_table();
     test_shared_validation_case_table();
@@ -2346,6 +3284,7 @@ int main(void) {
     test_valid_import_cancellation_sweep();
     test_tftr_baseline_and_malformed();
     test_median_negative_zero_import_rejected();
+    test_categorical_import_validation_and_limits();
     test_oversized_tagged_state_is_bounded();
     test_shared_tftr_case_table();
     puts("prepared transform primitive tests: OK");
