@@ -261,6 +261,146 @@
       },
       "version": 1
     },
+    "categorical_mode_onehot_error": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "error"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_mode_onehot_all_zero": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "all_zero"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_mode_onehot_other": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "other"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_mode_zero_onehot_all_zero": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "all_zero"
+            },
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
     "categorical_none_onehot_all_zero": {
       "columns": [
         {
@@ -678,6 +818,116 @@
     },
     {
       "analyze": {
+        "chunkSplits": [[3], [1, 2], [1, 1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"], [null]]
+      },
+      "apply": {
+        "expectedColumns": 2,
+        "expectedRows": [],
+        "rows": [["4008000000000000"]]
+      },
+      "expectedError": {
+        "code": 108,
+        "phase": "apply"
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": "3ff0000000000000",
+        "kind": "categorical",
+        "otherOrdinal": null,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"],
+        "unknown": "error"
+      },
+      "id": "categorical-mode-onehot-unknown-error",
+      "recipe": "categorical_mode_onehot_error"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[4], [1, 3], [2, 2]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"], ["4000000000000000"], [null]]
+      },
+      "apply": {
+        "expectedColumns": 2,
+        "expectedRows": [["3ff0000000000000", "0000000000000000"], ["0000000000000000", "0000000000000000"], ["0000000000000000", "3ff0000000000000"], ["0000000000000000", "3ff0000000000000"]],
+        "rows": [["3ff0000000000000"], ["4008000000000000"], [null], ["4000000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": "4000000000000000",
+        "kind": "categorical",
+        "otherOrdinal": null,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"],
+        "unknown": "all_zero"
+      },
+      "id": "categorical-mode-onehot-unknown-all-zero",
+      "recipe": "categorical_mode_onehot_all_zero"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[4], [2, 2], [1, 1, 1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"], ["4000000000000000"], [null]]
+      },
+      "apply": {
+        "expectedColumns": 3,
+        "expectedRows": [["3ff0000000000000", "0000000000000000", "0000000000000000"], ["0000000000000000", "0000000000000000", "3ff0000000000000"], ["0000000000000000", "3ff0000000000000", "0000000000000000"]],
+        "rows": [["3ff0000000000000"], ["4008000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": "4000000000000000",
+        "kind": "categorical",
+        "otherOrdinal": 2,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1", "x0%3Aonehot%3A2"],
+        "unknown": "other"
+      },
+      "id": "categorical-mode-onehot-unknown-other",
+      "recipe": "categorical_mode_onehot_other"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedColumns": 1,
+        "expectedRows": [["3ff0000000000000"], ["0000000000000000"]],
+        "rows": [[null], ["3ff0000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["0000000000000000"],
+        "impute": "0000000000000000",
+        "kind": "categorical",
+        "otherOrdinal": null,
+        "outputIds": ["x0%3Aonehot%3A0"],
+        "unknown": "all_zero"
+      },
+      "id": "categorical-mode-onehot-all-missing-zero",
+      "recipe": "categorical_mode_zero_onehot_all_zero"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[5], [2, 3], [1, 1, 1, 1, 1]],
+        "rows": [["b6a0000000000000"], ["8000000000000000"], ["0000000000000000"], ["36a0000000000000"], ["36a0000000000000"]]
+      },
+      "apply": {
+        "expectedColumns": 4,
+        "expectedRows": [["3ff0000000000000", "0000000000000000", "0000000000000000", "0000000000000000"], ["0000000000000000", "3ff0000000000000", "0000000000000000", "0000000000000000"], ["0000000000000000", "0000000000000000", "3ff0000000000000", "0000000000000000"], ["0000000000000000", "0000000000000000", "0000000000000000", "3ff0000000000000"], ["0000000000000000", "3ff0000000000000", "0000000000000000", "0000000000000000"]],
+        "rows": [["b6a0000000000000"], ["8000000000000000"], ["36a0000000000000"], ["3ff0000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["80000001", "00000000", "00000001"],
+        "impute": "00000000",
+        "kind": "categorical",
+        "otherOrdinal": 3,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1", "x0%3Aonehot%3A2", "x0%3Aonehot%3A3"],
+        "unknown": "other"
+      },
+      "id": "categorical-mode-onehot-f32-signed-zero-subnormal-order",
+      "inputDtype": "float32",
+      "recipe": "categorical_mode_onehot_other"
+    },
+    {
+      "analyze": {
         "chunkSplits": [[2], [1, 1]],
         "rows": [["4000000000000000"], ["3ff0000000000000"]]
       },
@@ -688,7 +938,9 @@
       "expectedPlan": {
         "categories": ["3ff0000000000000", "4000000000000000"],
         "kind": "categorical",
-        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"]
+        "otherOrdinal": null,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"],
+        "unknown": "all_zero"
       },
       "id": "categorical-onehot-unknown-and-missing-all-zero",
       "recipe": "categorical_none_onehot_all_zero"

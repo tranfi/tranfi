@@ -19,6 +19,7 @@ VECTOR_DIR = ROOT / "vectors"
 SEMANTIC_PATH = VECTOR_DIR / "prepared_transform_v1.json"
 TFTR_PATH = VECTOR_DIR / "tftr_malformed_v1.json"
 HEX64 = re.compile(r"^[0-9a-f]{16}$")
+HEX32 = re.compile(r"^[0-9a-f]{8}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 OK = 0
@@ -199,7 +200,7 @@ def validate_recipe(name: str, recipe: Any) -> int:
             else:
                 require(encode["op"] == "onehot"
                         and encode["sentinelLabel"] is None
-                        and encode["unknown"] == "all_zero",
+                        and encode["unknown"] in {"error", "all_zero", "other"},
                         f"recipe {name}: one-hot vector shape")
             impute = categorical["impute"]
             require(isinstance(impute, dict) and set(impute) == {
@@ -246,6 +247,9 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         case_ids.add(case_id)
         recipe_name = case.get("recipe")
         require(recipe_name in recipes, f"{case_id}: unknown recipe")
+        input_dtype = case.get("inputDtype", "float64")
+        require(input_dtype in {"float32", "float64"},
+                f"{case_id}: unsupported input dtype")
         width = widths[recipe_name]
         analyze = case.get("analyze")
         require(isinstance(analyze, dict), f"{case_id}: analyze")
@@ -291,6 +295,26 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
                     f"{case_id}: label unknown policy")
             require(expected_plan.get("sentinelLabel") == encode["sentinelLabel"],
                     f"{case_id}: label sentinel")
+        if (encode is not None and encode["op"] == "onehot"
+                and expected_plan is not None
+                and expected_plan.get("kind") == "categorical"):
+            categories = expected_plan.get("categories")
+            require(isinstance(categories, list) and categories,
+                    f"{case_id}: one-hot categories")
+            category_pattern = HEX32 if input_dtype == "float32" else HEX64
+            require(all(isinstance(bits, str)
+                        and category_pattern.fullmatch(bits) is not None
+                        for bits in categories),
+                    f"{case_id}: one-hot category bits")
+            expected_count = len(categories) + (encode["unknown"] == "other")
+            require(expected_plan.get("outputIds") == [
+                f"x0%3Aonehot%3A{ordinal}" for ordinal in range(expected_count)
+            ], f"{case_id}: generated one-hot output IDs")
+            require(expected_plan.get("unknown") == encode["unknown"],
+                    f"{case_id}: one-hot unknown policy")
+            require(expected_plan.get("otherOrdinal") == (
+                len(categories) if encode["unknown"] == "other" else None
+            ), f"{case_id}: one-hot other ordinal")
 
     sqrt_cases = document.get("sqrtCases")
     require(isinstance(sqrt_cases, list) and sqrt_cases, "sqrt cases required")
@@ -346,6 +370,10 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         "categorical-mode-label-unknown-other",
         "categorical-mode-label-all-missing-zero-other",
         "categorical-mode-label-sentinel-collision",
+        "categorical-mode-onehot-unknown-error",
+        "categorical-mode-onehot-unknown-all-zero",
+        "categorical-mode-onehot-unknown-other",
+        "categorical-mode-onehot-all-missing-zero",
     } <= case_ids, "categorical mode edge corpus incomplete")
     return len(semantic_cases), len(validation_cases), len(sqrt_cases)
 

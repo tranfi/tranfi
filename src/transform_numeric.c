@@ -1292,6 +1292,59 @@ static tf_transform_code finalize_numeric_column(
     return TF_TRANSFORM_OK;
 }
 
+static tf_transform_code finalize_plan_states(
+    tf_transform_analyzer *analyzer, tf_transform_plan *plan,
+    size_t state_bytes, tf_transform_error **error) {
+    tf_transform_code code;
+    if ((uint64_t)state_bytes > analyzer->runtime.limits.max_resident_state_bytes
+        || (uint64_t)state_bytes
+            > analyzer->runtime.limits.max_allocation_bytes)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_RESOURCE_LIMIT, "plan state exceeds limits");
+    code = tf_transform_poll_cancel(&analyzer->runtime, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    plan->states = (tf_transform_column_state *)calloc(
+        plan->input_schema.field_count, sizeof(*plan->states));
+    if (!plan->states)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_ALLOCATION, "plan state allocation failed");
+    for (size_t i = 0; i < plan->input_schema.field_count; ++i) {
+        double median_value = 0.0;
+        int has_median_value = 0;
+        if (i != 0 && i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = poll_and_recheck(&analyzer->runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+            plan->states[i].kind = TF_TRANSFORM_KIND_CATEGORICAL;
+            code = tf_transform_category_finalize(
+                analyzer, i, &plan->states[i].value.categorical, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            continue;
+        }
+        plan->states[i].kind = TF_TRANSFORM_KIND_NUMERIC;
+        if (plan->recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN
+            && analyzer->stats[i].observed != 0) {
+            tf_transform_median_store *store = analyzer->median_stores
+                ? &analyzer->median_stores[i] : NULL;
+            if (!store || store->count != analyzer->stats[i].observed)
+                return tf_transform_set_error(
+                    error, TF_TRANSFORM_INTERNAL,
+                    "median retained state does not match finalized statistics");
+            code = median_store_resolve(
+                store, &analyzer->runtime, &median_value, error);
+            if (code != TF_TRANSFORM_OK) return code;
+            has_median_value = 1;
+        }
+        code = finalize_numeric_column(
+            &plan->recipe->columns[i], &analyzer->stats[i],
+            median_value, has_median_value,
+            &plan->states[i].value.numeric, error);
+        if (code != TF_TRANSFORM_OK) return code;
+    }
+    return TF_TRANSFORM_OK;
+}
+
 tf_transform_code tf_transform_analyzer_finalize(
     tf_transform_analyzer *analyzer, tf_transform_plan **out,
     tf_transform_error **error) {
@@ -1310,6 +1363,8 @@ tf_transform_code tf_transform_analyzer_finalize(
     uint64_t plan_base_resident;
     uint64_t plan_resident;
     uint64_t plan_allocations;
+    uint64_t output_field_count = 0;
+    int has_onehot = 0;
 
     if (out) *out = NULL;
     tf_transform_clear_error(error);
@@ -1338,10 +1393,11 @@ tf_transform_code tf_transform_analyzer_finalize(
         &analyzer->runtime, 1, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = tf_transform_output_schema_requirements(
-        &analyzer->input_schema, analyzer->recipe, &analyzer->runtime,
-        &output_schema_resident, &output_schema_allocations,
-        &output_collision_bytes, error);
+        &analyzer->input_schema, analyzer->recipe, analyzer, NULL,
+        &analyzer->runtime, &output_field_count, &output_schema_resident,
+        &output_schema_allocations, &output_collision_bytes, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
+    (void)output_field_count;
     for (size_t i = 0; i < analyzer->input_schema.field_count; ++i) {
         uint64_t resident = 0;
         uint64_t allocations = 0;
@@ -1353,6 +1409,9 @@ tf_transform_code tf_transform_analyzer_finalize(
         if (analyzer->recipe->columns[i].kind
                 != TF_TRANSFORM_KIND_CATEGORICAL)
             continue;
+        if (analyzer->recipe->columns[i].categorical_encode
+                == TF_TRANSFORM_ENCODE_ONEHOT)
+            has_onehot = 1;
         code = tf_transform_category_check_observed(
             analyzer, i, analyzer->stats[i].observed, error);
         if (code != TF_TRANSFORM_OK) goto guarded_failed;
@@ -1404,8 +1463,17 @@ tf_transform_code tf_transform_analyzer_finalize(
     }
     plan_resident = plan_base_resident
         + (uint64_t)state_bytes + category_plan_resident;
-    if (plan_base_resident + output_collision_bytes > plan_resident)
+    if (has_onehot) {
+        if (output_collision_bytes > UINT64_MAX - plan_resident) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "one-hot plan construction resource count overflows");
+            goto guarded_failed;
+        }
+        plan_resident += output_collision_bytes;
+    } else if (plan_base_resident + output_collision_bytes > plan_resident) {
         plan_resident = plan_base_resident + output_collision_bytes;
+    }
     plan_allocations = 2 + schema_allocations + output_schema_allocations
         + category_plan_allocations;
     code = session_check_totals(
@@ -1425,63 +1493,20 @@ tf_transform_code tf_transform_analyzer_finalize(
         &analyzer->input_schema, &analyzer->runtime,
         &plan->input_schema, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
+    if (has_onehot) {
+        code = finalize_plan_states(analyzer, plan, state_bytes, error);
+        if (code != TF_TRANSFORM_OK) goto guarded_failed;
+    }
     code = tf_transform_output_schema_build(
-        &analyzer->input_schema, analyzer->recipe, &analyzer->runtime,
-        &plan->output_schema, error);
+        &analyzer->input_schema, analyzer->recipe, plan->states,
+        &analyzer->runtime, &plan->output_schema, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = tf_transform_output_schema_validate_contract(
-        &plan->input_schema, plan->recipe, &plan->output_schema,
+        &plan->input_schema, plan->recipe, plan->states, &plan->output_schema,
         &analyzer->runtime, NULL, TF_TRANSFORM_SCHEMA_MISMATCH, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
-    if ((uint64_t)state_bytes > analyzer->runtime.limits.max_resident_state_bytes
-        || (uint64_t)state_bytes > analyzer->runtime.limits.max_allocation_bytes) {
-        code = tf_transform_set_error(
-            error, TF_TRANSFORM_RESOURCE_LIMIT, "plan state exceeds limits");
-        goto guarded_failed;
-    }
-    code = tf_transform_poll_cancel(&analyzer->runtime, error);
-    if (code != TF_TRANSFORM_OK) goto guarded_failed;
-    plan->states = (tf_transform_column_state *)calloc(
-        plan->input_schema.field_count, sizeof(*plan->states));
-    if (!plan->states) {
-        code = tf_transform_set_error(
-            error, TF_TRANSFORM_ALLOCATION, "plan state allocation failed");
-        goto guarded_failed;
-    }
-    for (size_t i = 0; i < plan->input_schema.field_count; ++i) {
-        double median_value = 0.0;
-        int has_median_value = 0;
-        if (i != 0 && i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
-            code = poll_and_recheck(&analyzer->runtime, error);
-            if (code != TF_TRANSFORM_OK) goto guarded_failed;
-        }
-        if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_CATEGORICAL) {
-            plan->states[i].kind = TF_TRANSFORM_KIND_CATEGORICAL;
-            code = tf_transform_category_finalize(
-                analyzer, i, &plan->states[i].value.categorical, error);
-            if (code != TF_TRANSFORM_OK) goto guarded_failed;
-            continue;
-        }
-        plan->states[i].kind = TF_TRANSFORM_KIND_NUMERIC;
-        if (plan->recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN
-            && analyzer->stats[i].observed != 0) {
-            tf_transform_median_store *store = analyzer->median_stores
-                ? &analyzer->median_stores[i] : NULL;
-            if (!store || store->count != analyzer->stats[i].observed) {
-                code = tf_transform_set_error(
-                    error, TF_TRANSFORM_INTERNAL,
-                    "median retained state does not match finalized statistics");
-                goto guarded_failed;
-            }
-            code = median_store_resolve(
-                store, &analyzer->runtime, &median_value, error);
-            if (code != TF_TRANSFORM_OK) goto guarded_failed;
-            has_median_value = 1;
-        }
-        code = finalize_numeric_column(
-            &plan->recipe->columns[i], &analyzer->stats[i],
-            median_value, has_median_value,
-            &plan->states[i].value.numeric, error);
+    if (!has_onehot) {
+        code = finalize_plan_states(analyzer, plan, state_bytes, error);
         if (code != TF_TRANSFORM_OK) goto guarded_failed;
     }
     analyzer->runtime.fp_guard_active = 0;
@@ -1652,6 +1677,7 @@ tf_transform_code tf_transform_apply_run(
     code = poll_and_recheck(&apply->runtime, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     for (size_t row = 0; row < table->row_count; ++row) {
+        size_t output_column = 0;
         size_t element_poll_rows = TF_TRANSFORM_CANCEL_ELEMENTS_V1
             / apply->plan->output_schema.field_count;
         if (element_poll_rows == 0) element_poll_rows = 1;
@@ -1669,8 +1695,14 @@ tf_transform_code tf_transform_apply_run(
             double value;
             double centered;
             double transformed;
-            size_t output_index = row * pending.columns + column_index;
+            size_t output_index = row * pending.columns + output_column;
             int missing = !column_value_is_valid(column, row);
+            if (output_column >= pending.columns) {
+                code = tf_transform_set_error(
+                    error, TF_TRANSFORM_INTERNAL,
+                    "apply output column offset is inconsistent");
+                goto guarded_failed;
+            }
             if (column_index != 0
                 && column_index % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
                 code = poll_and_recheck(&apply->runtime, error);
@@ -1690,9 +1722,30 @@ tf_transform_code tf_transform_apply_run(
             if (column_state->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
                 const tf_transform_categorical_state *categorical
                     = &column_state->value.categorical;
+                size_t output_width = 1;
                 uint64_t bits;
                 size_t ordinal = 0;
                 int known = 0;
+                if (categorical->encode == TF_TRANSFORM_ENCODE_ONEHOT) {
+                    output_width = categorical->category_count
+                        + (categorical->has_other_ordinal ? 1u : 0u);
+                    if (output_width == 0
+                        || output_column > pending.columns
+                        || output_width > pending.columns - output_column) {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_INTERNAL,
+                            "one-hot output width is inconsistent");
+                        goto guarded_failed;
+                    }
+                    for (size_t emitted = 0; emitted < output_width; ++emitted) {
+                        if (emitted != 0
+                            && emitted % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                            code = poll_and_recheck(&apply->runtime, error);
+                            if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                        }
+                        ((double *)pending.data)[output_index + emitted] = 0.0;
+                    }
+                }
                 if (missing) {
                     if (!categorical->has_impute_value) {
                         code = tf_transform_set_error(
@@ -1712,8 +1765,38 @@ tf_transform_code tf_transform_apply_run(
                     categorical, bits, &apply->runtime,
                     &ordinal, &known, error);
                 if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                if (categorical->encode == TF_TRANSFORM_ENCODE_ONEHOT) {
+                    if (known) {
+                        if (ordinal >= categorical->category_count) {
+                            code = tf_transform_set_error(
+                                error, TF_TRANSFORM_INTERNAL,
+                                "one-hot category ordinal is inconsistent");
+                            goto guarded_failed;
+                        }
+                        ((double *)pending.data)[output_index + ordinal] = 1.0;
+                    } else if (categorical->unknown
+                               == TF_TRANSFORM_UNKNOWN_ALL_ZERO) {
+                        /* The output block is already canonical +0. */
+                    } else if (categorical->unknown
+                                   == TF_TRANSFORM_UNKNOWN_OTHER
+                               && categorical->has_other_ordinal
+                               && categorical->other_ordinal
+                                   < (uint64_t)output_width) {
+                        ((double *)pending.data)[
+                            output_index + (size_t)categorical->other_ordinal]
+                            = 1.0;
+                    } else {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_UNKNOWN_CATEGORY,
+                            "apply input contains an unknown category");
+                        goto guarded_failed;
+                    }
+                    output_column += output_width;
+                    continue;
+                }
                 if (known && categorical->encode == TF_TRANSFORM_ENCODE_LABEL) {
                     ((double *)pending.data)[output_index] = (double)ordinal;
+                    ++output_column;
                     continue;
                 }
                 if (!known) {
@@ -1722,6 +1805,7 @@ tf_transform_code tf_transform_apply_run(
                         && categorical->has_sentinel_label) {
                         ((double *)pending.data)[output_index]
                             = (double)categorical->sentinel_label;
+                        ++output_column;
                         continue;
                     }
                     if (categorical->encode == TF_TRANSFORM_ENCODE_LABEL
@@ -1729,6 +1813,7 @@ tf_transform_code tf_transform_apply_run(
                         && categorical->has_other_ordinal) {
                         ((double *)pending.data)[output_index]
                             = (double)categorical->other_ordinal;
+                        ++output_column;
                         continue;
                     }
                     code = tf_transform_set_error(
@@ -1743,12 +1828,14 @@ tf_transform_code tf_transform_apply_run(
                     goto guarded_failed;
                 }
                 ((double *)pending.data)[output_index] = value;
+                ++output_column;
                 continue;
             }
             state = &column_state->value.numeric;
             if (missing && !state->has_impute_value) {
                 ((double *)pending.data)[output_index] =
                     tf_transform_double_from_bits(UINT64_C(0x7ff8000000000000));
+                ++output_column;
                 continue;
             }
             if (missing) value = state->impute_value;
@@ -1762,6 +1849,13 @@ tf_transform_code tf_transform_apply_run(
                 goto guarded_failed;
             }
             ((double *)pending.data)[output_index] = transformed;
+            ++output_column;
+        }
+        if (output_column != pending.columns) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_INTERNAL,
+                "apply output width is inconsistent");
+            goto guarded_failed;
         }
     }
     apply->runtime.fp_guard_active = 0;

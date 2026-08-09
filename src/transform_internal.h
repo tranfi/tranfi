@@ -361,11 +361,15 @@ tf_transform_code tf_transform_schema_clone_runtime(
 void tf_transform_schema_clear(tf_transform_schema *schema);
 tf_transform_code tf_transform_output_schema_requirements(
     const tf_transform_schema *input, const tf_transform_recipe *recipe,
-    const tf_transform_runtime_copy *runtime, uint64_t *resident_bytes,
-    uint64_t *allocation_count, uint64_t *collision_bytes,
+    const tf_transform_analyzer *analyzer,
+    const tf_transform_column_state *states,
+    const tf_transform_runtime_copy *runtime, uint64_t *field_count,
+    uint64_t *resident_bytes, uint64_t *allocation_count,
+    uint64_t *collision_bytes,
     tf_transform_error **error);
 tf_transform_code tf_transform_output_schema_build(
     const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_column_state *states,
     const tf_transform_runtime_copy *runtime, tf_transform_schema *out,
     tf_transform_error **error);
 tf_transform_code tf_transform_output_schema_validate_collisions(
@@ -375,6 +379,7 @@ tf_transform_code tf_transform_output_schema_validate_collisions(
     tf_transform_error **error);
 tf_transform_code tf_transform_output_schema_validate_contract(
     const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_column_state *states,
     const tf_transform_schema *output,
     const tf_transform_runtime_copy *runtime,
     tf_transform_resource_ledger *ledger, tf_transform_code mismatch_code,

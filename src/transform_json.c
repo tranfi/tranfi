@@ -1298,6 +1298,18 @@ static tf_transform_code parse_recipe_column(
                 out->categorical_unknown = TF_TRANSFORM_UNKNOWN_SENTINEL;
                 out->categorical_has_sentinel_label = 1;
             } else goto invalid;
+        } else if (json_string_equals(required_item(encode, "op"), "onehot")) {
+            const cJSON *unknown = required_item(encode, "unknown");
+            if (!cJSON_IsNull(required_item(encode, "sentinelLabel")))
+                goto invalid;
+            out->categorical_encode = TF_TRANSFORM_ENCODE_ONEHOT;
+            if (json_string_equals(unknown, "error"))
+                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ERROR;
+            else if (json_string_equals(unknown, "all_zero"))
+                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ALL_ZERO;
+            else if (json_string_equals(unknown, "other"))
+                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_OTHER;
+            else goto invalid;
         } else goto invalid;
         out->categorical_discover = 1;
         return TF_TRANSFORM_OK;
@@ -1738,7 +1750,9 @@ static int build_budget_recipe(
                 || !build_budget_string_property(budget, "categories", 8)
                 || !build_budget_string_property(
                     budget, "op",
-                    column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL ? 5 : 4)
+                    column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL ? 5
+                    : column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT
+                        ? 6 : 4)
                 || !build_budget_primitive(budget, "sentinelLabel"))
                 return 0;
             if (column->categorical_unknown == TF_TRANSFORM_UNKNOWN_NONE) {
@@ -1746,7 +1760,9 @@ static int build_budget_recipe(
             } else if (!build_budget_string_property(
                     budget, "unknown",
                     column->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
-                        ? 8 : 5)) return 0;
+                        ? 8
+                        : column->categorical_unknown
+                              == TF_TRANSFORM_UNKNOWN_ALL_ZERO ? 8 : 5)) return 0;
             if (!build_budget_child(budget, "impute")
                 || !build_budget_object(budget, 3)
                 || !build_budget_string_property(budget, "allMissing", 5)
@@ -1816,14 +1832,17 @@ static int build_budget_step(
             || !build_budget_object(budget, 4)
             || !build_budget_string_property(
                 budget, "op",
-                state->encode == TF_TRANSFORM_ENCODE_LABEL ? 5 : 4)
+                state->encode == TF_TRANSFORM_ENCODE_LABEL ? 5
+                : state->encode == TF_TRANSFORM_ENCODE_ONEHOT ? 6 : 4)
             || !build_budget_primitive(budget, "otherOrdinal")
             || !build_budget_primitive(budget, "sentinelLabel")) return 0;
         if (state->unknown == TF_TRANSFORM_UNKNOWN_NONE) {
             if (!build_budget_primitive(budget, "unknown")) return 0;
         } else if (!build_budget_string_property(
                 budget, "unknown",
-                state->unknown == TF_TRANSFORM_UNKNOWN_SENTINEL ? 8 : 5)) return 0;
+                state->unknown == TF_TRANSFORM_UNKNOWN_SENTINEL ? 8
+                : state->unknown == TF_TRANSFORM_UNKNOWN_ALL_ZERO ? 8 : 5))
+            return 0;
         if (!build_budget_child(budget, "impute")
             || !build_budget_object(budget, 3)
             || !build_budget_string_property(budget, "allMissing", 5)
@@ -2035,7 +2054,10 @@ cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe) {
                     column->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
                         ? "sentinel"
                         : column->categorical_unknown == TF_TRANSFORM_UNKNOWN_OTHER
-                            ? "other" : "error");
+                            ? "other"
+                            : column->categorical_unknown
+                                  == TF_TRANSFORM_UNKNOWN_ALL_ZERO
+                                ? "all_zero" : "error");
             if (!entry || !kind || !categorical || !impute || !encode
                 || !sentinel || !unknown
                 || !add_item(kind, "maxCategories", json_null())
@@ -2046,7 +2068,10 @@ cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe) {
                 || !add_item(encode, "categories", json_string("discover"))
                 || !add_item(encode, "op", json_string(
                     column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL
-                        ? "label" : "none"))
+                        ? "label"
+                        : column->categorical_encode
+                              == TF_TRANSFORM_ENCODE_ONEHOT
+                            ? "onehot" : "none"))
                 || !transfer_item(encode, "sentinelLabel", &sentinel)
                 || !transfer_item(encode, "unknown", &unknown)
                 || !transfer_item(categorical, "encode", &encode)
@@ -2355,7 +2380,9 @@ static cJSON *categorical_step_to_json(
     cJSON *unknown = state->unknown == TF_TRANSFORM_UNKNOWN_NONE
         ? json_null() : json_string(
             state->unknown == TF_TRANSFORM_UNKNOWN_SENTINEL ? "sentinel"
-            : state->unknown == TF_TRANSFORM_UNKNOWN_OTHER ? "other" : "error");
+            : state->unknown == TF_TRANSFORM_UNKNOWN_OTHER ? "other"
+            : state->unknown == TF_TRANSFORM_UNKNOWN_ALL_ZERO
+                ? "all_zero" : "error");
     if (!step || !categorical || !categories || !encode || !impute
         || !other_ordinal || !sentinel || !unknown) goto fail;
     for (size_t i = 0; i < state->category_count; ++i) {
@@ -2368,7 +2395,8 @@ static cJSON *categorical_step_to_json(
     }
     if (!transfer_item(categorical, "categories", &categories)
         || !add_item(encode, "op", json_string(
-            state->encode == TF_TRANSFORM_ENCODE_LABEL ? "label" : "none"))
+            state->encode == TF_TRANSFORM_ENCODE_LABEL ? "label"
+            : state->encode == TF_TRANSFORM_ENCODE_ONEHOT ? "onehot" : "none"))
         || !transfer_item(encode, "otherOrdinal", &other_ordinal)
         || !transfer_item(encode, "sentinelLabel", &sentinel)
         || !transfer_item(encode, "unknown", &unknown)
@@ -2537,7 +2565,12 @@ static tf_transform_code parse_schema_json(
             goto done;
         }
         if (is_output) {
+            static const char *const other_keys[] = {"t"};
+            const cJSON *category = required_item(entry, "category");
+            const cJSON *role = required_item(entry, "role");
             const cJSON *source_id = required_item(entry, "sourceId");
+            uint64_t category_bits = 0;
+            uint32_t category_dtype = 0;
             size_t source_id_len = 0;
             if (cJSON_IsString(source_id) && source_id->valuestring) {
                 code = runtime_cstring_length(
@@ -2550,14 +2583,31 @@ static tf_transform_code parse_schema_json(
                 id->valuestring, (size_t)runtime->limits.max_string_bytes,
                 runtime, &id_len, error);
             if (code != TF_TRANSFORM_OK) goto done;
-            if (!cJSON_IsNull(required_item(entry, "category"))
-                || (!json_string_equals(required_item(entry, "role"), "value")
-                    && !json_string_equals(required_item(entry, "role"), "label"))
+            if ((!json_string_equals(role, "value")
+                 && !json_string_equals(role, "label")
+                 && !json_string_equals(role, "onehot"))
                 || !cJSON_IsString(source_id) || !source_id->valuestring
                 || !json_string_equals(dtype, "float64")) {
                 code = tf_transform_set_error(
                     error, TF_TRANSFORM_CORRUPT_PLAN,
                     "output schema metadata is invalid");
+                goto done;
+            }
+            if (json_string_equals(role, "onehot")) {
+                if (!parse_tagged_bits(
+                        category, &category_bits, &category_dtype)
+                    && !(exact_keys(category, other_keys, 1)
+                         && json_string_equals(
+                             required_item(category, "t"), "other"))) {
+                    code = tf_transform_set_error(
+                        error, TF_TRANSFORM_CORRUPT_PLAN,
+                        "one-hot output category is invalid");
+                    goto done;
+                }
+            } else if (!cJSON_IsNull(category)) {
+                code = tf_transform_set_error(
+                    error, TF_TRANSFORM_CORRUPT_PLAN,
+                    "non-one-hot output category is invalid");
                 goto done;
             }
         }
@@ -2595,6 +2645,9 @@ static tf_transform_code parse_schema_json(
     if (code == TF_TRANSFORM_OK && is_output) {
         entry = array->child;
         for (size_t i = 0; i < count; ++i, entry = entry->next) {
+            static const char *const other_keys[] = {"t"};
+            const cJSON *category = required_item(entry, "category");
+            const cJSON *role = required_item(entry, "role");
             const cJSON *source_id = required_item(entry, "sourceId");
             size_t source_id_len = 0;
             if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
@@ -2620,10 +2673,34 @@ static tf_transform_code parse_schema_json(
                 source_id_len + 1, runtime, error);
             if (code != TF_TRANSFORM_OK) break;
             out->fields[i].source_id_len = source_id_len;
-            out->fields[i].role = json_string_equals(
-                required_item(entry, "role"), "label")
-                ? TF_TRANSFORM_ROLE_LABEL : TF_TRANSFORM_ROLE_VALUE;
-            out->fields[i].category_kind = TF_TRANSFORM_SCHEMA_CATEGORY_NONE;
+            if (json_string_equals(role, "label"))
+                out->fields[i].role = TF_TRANSFORM_ROLE_LABEL;
+            else if (json_string_equals(role, "onehot"))
+                out->fields[i].role = TF_TRANSFORM_ROLE_ONEHOT;
+            else out->fields[i].role = TF_TRANSFORM_ROLE_VALUE;
+            if (out->fields[i].role == TF_TRANSFORM_ROLE_ONEHOT) {
+                uint64_t bits = 0;
+                uint32_t category_dtype = 0;
+                if (parse_tagged_bits(category, &bits, &category_dtype)) {
+                    out->fields[i].category_kind
+                        = TF_TRANSFORM_SCHEMA_CATEGORY_VALUE;
+                    out->fields[i].category_dtype = category_dtype;
+                    out->fields[i].category_bits = bits;
+                } else if (exact_keys(category, other_keys, 1)
+                           && json_string_equals(
+                               required_item(category, "t"), "other")) {
+                    out->fields[i].category_kind
+                        = TF_TRANSFORM_SCHEMA_CATEGORY_OTHER;
+                } else {
+                    code = tf_transform_set_error(
+                        error, TF_TRANSFORM_CORRUPT_PLAN,
+                        "one-hot output category is invalid");
+                    break;
+                }
+            } else {
+                out->fields[i].category_kind
+                    = TF_TRANSFORM_SCHEMA_CATEGORY_NONE;
+            }
         }
         if (code != TF_TRANSFORM_OK) tf_transform_schema_clear(out);
     }
@@ -2888,6 +2965,26 @@ static tf_transform_code parse_categorical_step(
                 || !json_string_equals(required_item(encode, "unknown"), "other"))
                 goto corrupt;
         } else goto corrupt;
+    } else if (recipe->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT) {
+        if (!json_string_equals(required_item(encode, "op"), "onehot")
+            || !cJSON_IsNull(required_item(encode, "sentinelLabel")))
+            goto corrupt;
+        if (recipe->categorical_unknown == TF_TRANSFORM_UNKNOWN_ERROR) {
+            if (!cJSON_IsNull(required_item(encode, "otherOrdinal"))
+                || !json_string_equals(
+                    required_item(encode, "unknown"), "error")) goto corrupt;
+        } else if (recipe->categorical_unknown
+                   == TF_TRANSFORM_UNKNOWN_ALL_ZERO) {
+            if (!cJSON_IsNull(required_item(encode, "otherOrdinal"))
+                || !json_string_equals(
+                    required_item(encode, "unknown"), "all_zero"))
+                goto corrupt;
+        } else if (recipe->categorical_unknown == TF_TRANSFORM_UNKNOWN_OTHER) {
+            if (!safe_uint64(
+                    required_item(encode, "otherOrdinal"), &other_ordinal)
+                || !json_string_equals(
+                    required_item(encode, "unknown"), "other")) goto corrupt;
+        } else goto corrupt;
     } else goto corrupt;
     cJSON_ArrayForEach(entry, categories) {
         if (count % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
@@ -2908,11 +3005,12 @@ static tf_transform_code parse_categorical_step(
         return tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
             "categorical plan state exceeds category limits");
-    if (recipe->categorical_encode == TF_TRANSFORM_ENCODE_LABEL
+    if ((recipe->categorical_encode == TF_TRANSFORM_ENCODE_LABEL
+         || recipe->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT)
         && (uint64_t)count > (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1)
         return tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
-            "categorical label count exceeds the safe-integer domain");
+            "categorical encoding count exceeds the safe-integer domain");
     bytes = count * sizeof(*out->categories);
     if ((uint64_t)bytes > runtime->limits.max_allocation_bytes)
         return tf_transform_set_error(
@@ -2995,11 +3093,13 @@ tf_transform_code tf_transform_plan_from_json(
     tf_transform_recipe *recipe = NULL;
     tf_transform_plan *plan = NULL;
     tf_transform_resource_ledger ledger;
+    tf_transform_runtime_copy recipe_runtime;
     tf_transform_code code;
     uint64_t version;
     char expected_fingerprint[65];
     const cJSON *steps;
     size_t step_count = 0;
+    size_t output_column_count = 0;
     uint64_t total_categories = 0;
     uint64_t ast_resident_bytes = 0;
     if (out) *out = NULL;
@@ -3046,8 +3146,12 @@ tf_transform_code tf_transform_plan_from_json(
             goto done;
         }
     }
+    recipe_runtime = *runtime;
+    recipe_runtime.limits.max_output_columns
+        = (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1;
     code = recipe_from_json_value(
-        required_item(root, "recipe"), runtime, &ledger, &recipe, error);
+        required_item(root, "recipe"), &recipe_runtime,
+        &ledger, &recipe, error);
     if (code != TF_TRANSFORM_OK) {
         if (code == TF_TRANSFORM_INVALID_RECIPE
             || code == TF_TRANSFORM_INVALID_ARGUMENT)
@@ -3082,13 +3186,33 @@ tf_transform_code tf_transform_plan_from_json(
         required_item(root, "inputSchema"), 0, runtime,
         &ledger, &plan->input_schema, error);
     if (code != TF_TRANSFORM_OK) goto done;
-    code = parse_schema_json(
-        required_item(root, "outputSchema"), 1, runtime,
-        &ledger, &plan->output_schema, error);
-    if (code != TF_TRANSFORM_OK) goto done;
+    {
+        const cJSON *output_schema = required_item(root, "outputSchema");
+        const cJSON *field;
+        if (!cJSON_IsArray(output_schema)) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_CORRUPT_PLAN,
+                "plan output schema is not an array");
+            goto done;
+        }
+        cJSON_ArrayForEach(field, output_schema) {
+            if (output_column_count % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = tf_transform_poll_cancel(runtime, error);
+                if (code != TF_TRANSFORM_OK) goto done;
+            }
+            if (output_column_count == SIZE_MAX) {
+                code = tf_transform_set_error(
+                    error, TF_TRANSFORM_CORRUPT_PLAN,
+                    "plan output schema column count overflows");
+                goto done;
+            }
+            ++output_column_count;
+        }
+    }
     if (plan->input_schema.field_count != plan->recipe->column_count
-        || plan->output_schema.field_count != plan->input_schema.field_count
-        || plan->output_schema.field_count > plan->recipe->max_output_columns) {
+        || output_column_count == 0
+        || (uint64_t)output_column_count
+            > plan->recipe->max_output_columns) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_CORRUPT_PLAN,
             "plan recipe and schema column counts disagree");
@@ -3116,10 +3240,6 @@ tf_transform_code tf_transform_plan_from_json(
             goto done;
         }
     }
-    code = tf_transform_output_schema_validate_contract(
-        &plan->input_schema, plan->recipe, &plan->output_schema,
-        runtime, &ledger, TF_TRANSFORM_CORRUPT_PLAN, error);
-    if (code != TF_TRANSFORM_OK) goto done;
     {
         int valid_fingerprint = 0;
         code = lowercase_sha256_string_runtime(
@@ -3168,6 +3288,84 @@ tf_transform_code tf_transform_plan_from_json(
             error, TF_TRANSFORM_CORRUPT_PLAN, "plan step count is invalid");
         goto done;
     }
+    {
+        const cJSON *step = steps->child;
+        uint64_t expected_output_columns = 0;
+        for (size_t i = 0; i < plan->input_schema.field_count;
+             ++i, step = step->next) {
+            const tf_transform_recipe_column *column
+                = &plan->recipe->columns[i];
+            uint64_t width = 1;
+            if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = tf_transform_poll_cancel(runtime, error);
+                if (code != TF_TRANSFORM_OK) goto done;
+            }
+            if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+                && column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT) {
+                const cJSON *categorical = required_item(step, "categorical");
+                const cJSON *categories = required_item(
+                    categorical, "categories");
+                const cJSON *category;
+                size_t count = 0;
+                if (!cJSON_IsArray(categories)) {
+                    code = tf_transform_set_error(
+                        error, TF_TRANSFORM_CORRUPT_PLAN,
+                        "one-hot plan categories are invalid");
+                    goto done;
+                }
+                cJSON_ArrayForEach(category, categories) {
+                    if (count % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                        code = tf_transform_poll_cancel(runtime, error);
+                        if (code != TF_TRANSFORM_OK) goto done;
+                    }
+                    if (count == SIZE_MAX) {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_CORRUPT_PLAN,
+                            "one-hot plan width overflows");
+                        goto done;
+                    }
+                    ++count;
+                }
+                if (count == 0) {
+                    code = tf_transform_set_error(
+                        error, TF_TRANSFORM_CORRUPT_PLAN,
+                        "one-hot plan has no categories");
+                    goto done;
+                }
+                width = (uint64_t)count;
+                if (column->categorical_unknown
+                        == TF_TRANSFORM_UNKNOWN_OTHER) {
+                    if (width == UINT64_MAX) {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_CORRUPT_PLAN,
+                            "one-hot plan width overflows");
+                        goto done;
+                    }
+                    ++width;
+                }
+            }
+            if (width > UINT64_MAX - expected_output_columns) {
+                code = tf_transform_set_error(
+                    error, TF_TRANSFORM_CORRUPT_PLAN,
+                    "plan output width overflows");
+                goto done;
+            }
+            expected_output_columns += width;
+        }
+        if (expected_output_columns > plan->recipe->max_output_columns
+            || expected_output_columns != (uint64_t)output_column_count) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_CORRUPT_PLAN,
+                "learned plan output width is inconsistent");
+            goto done;
+        }
+        if (expected_output_columns > runtime->limits.max_output_columns) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "learned plan output width exceeds host limits");
+            goto done;
+        }
+    }
     if (plan->input_schema.field_count > SIZE_MAX / sizeof(*plan->states)
         || (uint64_t)plan->input_schema.field_count * sizeof(*plan->states)
             > runtime->limits.max_allocation_bytes) {
@@ -3208,6 +3406,15 @@ tf_transform_code tf_transform_plan_from_json(
         if (code != TF_TRANSFORM_OK) goto done;
         }
     }
+    code = parse_schema_json(
+        required_item(root, "outputSchema"), 1, runtime,
+        &ledger, &plan->output_schema, error);
+    if (code != TF_TRANSFORM_OK) goto done;
+    code = tf_transform_output_schema_validate_contract(
+        &plan->input_schema, plan->recipe, plan->states,
+        &plan->output_schema, runtime, &ledger,
+        TF_TRANSFORM_CORRUPT_PLAN, error);
+    if (code != TF_TRANSFORM_OK) goto done;
     code = tf_transform_json_print_canonical_runtime_ledger(
         root, runtime, &ledger, canonical_out, canonical_len_out, error);
     if (code != TF_TRANSFORM_OK) goto done;

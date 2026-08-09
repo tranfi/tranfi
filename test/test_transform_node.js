@@ -13,6 +13,9 @@ const schema64 = [{ id: 'x0', dtype: 'float64' }]
 const supportedRecipes = new Set([
   'categorical_mode_label_other',
   'categorical_mode_label_sentinel',
+  'categorical_mode_onehot_all_zero',
+  'categorical_mode_onehot_other',
+  'categorical_mode_zero_onehot_all_zero',
   'categorical_mode_zero_label_other',
   'categorical_mode_none',
   'categorical_mode_zero_none',
@@ -225,17 +228,25 @@ function testSharedSemanticVectors() {
     supportedRecipes.has(item.recipe) && !item.expectedError
   )
   for (const item of cases) {
+    const inputDtype = item.inputDtype ?? 'float64'
+    const inputSchema = inputDtype === 'float32'
+      ? [{ id: 'x0', dtype: 'float32' }]
+      : schema64
+    const InputArray = inputDtype === 'float32' ? Float32Array : Float64Array
     const analyzeValues = item.analyze.rows.map((row) => doubleFromBits(row[0]))
     const applyValues = item.apply.rows.map((row) => doubleFromBits(row[0]))
-    const expected = item.apply.expectedRows.map((row) => row[0])
+    const expected = item.apply.expectedRows.flat()
+    const expectedColumns = item.apply.expectedColumns ?? 1
     let referenceBytes = null
 
     for (const split of item.analyze.chunkSplits) {
       const recipe = tf.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
-      const analyzer = recipe.analyzer(schema64)
+      const analyzer = recipe.analyzer(inputSchema)
       let offset = 0
       for (const count of split) {
-        analyzer.push(table(analyzeValues.slice(offset, offset + count)))
+        analyzer.push(table(
+          analyzeValues.slice(offset, offset + count), InputArray
+        ))
         offset += count
       }
       assert.equal(offset, analyzeValues.length, `${item.id}: consumed rows`)
@@ -245,19 +256,36 @@ function testSharedSemanticVectors() {
       else assert.deepEqual(bytes, referenceBytes, `${item.id}: chunk-invariant TFTR`)
       assert.equal(
         plan.schemaJSON('input').toString(),
-        '[{"dtype":"float64","id":"x0","name":"x0"}]'
+        `[{"dtype":"${inputDtype}","id":"x0","name":"x0"}]`
       )
       if (item.expectedPlan.outputIds) {
-        assert.equal(
-          plan.schemaJSON('output').toString(),
-          '[{"category":null,"dtype":"float64","id":"x0%3Alabel",' +
-            '"name":"x0%3Alabel","role":"label","sourceId":"x0"}]'
+        const outputSchema = JSON.parse(plan.schemaJSON('output').toString())
+        assert.deepEqual(
+          outputSchema.map((field) => field.id),
+          item.expectedPlan.outputIds
         )
+        if (vectors.recipes[item.recipe].columns[0].categorical.encode.op === 'onehot') {
+          assert.deepEqual(
+            outputSchema.map((field) => field.role),
+            item.expectedPlan.outputIds.map(() => 'onehot')
+          )
+          assert.deepEqual(
+            outputSchema.map((field) => field.category),
+            item.expectedPlan.categories.map((bits) => ({
+              t: inputDtype === 'float32' ? 'f32' : 'f64', v: bits
+            })).concat(
+              item.expectedPlan.otherOrdinal === null ? [] : [{ t: 'other' }]
+            )
+          )
+        } else {
+          assert.deepEqual(outputSchema.map((field) => field.category), [null])
+          assert.deepEqual(outputSchema.map((field) => field.role), ['label'])
+        }
       }
-      const apply = plan.apply(schema64)
-      const result = apply.run(table(applyValues))
+      const apply = plan.apply(inputSchema)
+      const result = apply.run(table(applyValues, InputArray))
       assert.equal(result.rows, applyValues.length)
-      assert.equal(result.columns, 1)
+      assert.equal(result.columns, expectedColumns)
       assert(result.data instanceof Float64Array)
       assert.deepEqual(Array.from(result.data, doubleBits), expected, `${item.id}: result bits`)
       closeAll(recipe, analyzer, plan, apply)
@@ -301,9 +329,12 @@ function testCategoricalModeErrorsLimitsAndFloat32() {
     closeAll(recipe, analyzer)
   }
 
-  {
+  for (const caseId of [
+    'categorical-mode-label-unknown-error',
+    'categorical-mode-onehot-unknown-error'
+  ]) {
     const item = vectors.semanticCases.find(
-      (entry) => entry.id === 'categorical-mode-label-unknown-error'
+      (entry) => entry.id === caseId
     )
     const recipe = tf.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
     const analyzer = recipe.analyzer(schema64)
@@ -451,6 +482,86 @@ function testCategoricalModeErrorsLimitsAndFloat32() {
   closeAll(
     subnormalRecipe, subnormalAnalyzer, subnormalPlan, subnormalSession
   )
+}
+
+function testOnehotExactLimitsAndUnicode() {
+  const values = Array.from({ length: 11 }, (_, index) => index)
+  const sourceId = 'é:🔥'
+  const unicodeConfig = structuredClone(
+    vectors.recipes.categorical_mode_onehot_all_zero
+  )
+  unicodeConfig.columns[0].sourceId = sourceId
+  const unicodeSchema = [{ id: sourceId, name: sourceId, dtype: 'float64' }]
+  const unicodeRecipe = tf.TransformRecipe.fromJSON(unicodeConfig)
+  const unicodeAnalyzer = unicodeRecipe.analyzer(unicodeSchema)
+  unicodeAnalyzer.push(table(values))
+  const unicodePlan = unicodeAnalyzer.finalize()
+  const unicodeOutput = JSON.parse(unicodePlan.schemaJSON('output'))
+  assert.equal(unicodeOutput.length, 11)
+  assert.equal(
+    unicodeOutput[10].id,
+    '%C3%A9%3A%F0%9F%94%A5%3Aonehot%3A10'
+  )
+  assert.equal(unicodeOutput[10].name, unicodeOutput[10].id)
+  const unicodeApply = unicodePlan.apply(unicodeSchema)
+  const unicodeResult = unicodeApply.run(table([10]))
+  assert.equal(unicodeResult.columns, 11)
+  assert.deepEqual(Array.from(unicodeResult.data), [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+  ])
+  closeAll(unicodeRecipe, unicodeAnalyzer, unicodePlan, unicodeApply)
+
+  const analyze = [1, 2]
+  const applyValues = [1, 3]
+  const recipe = tf.TransformRecipe.fromJSON(
+    vectors.recipes.categorical_mode_onehot_other
+  )
+  const analyzer = recipe.analyzer(schema64)
+  analyzer.push(table(analyze))
+  const plan = analyzer.finalize()
+  const bytes = plan.toBytes()
+  assert.throws(
+    () => tf.TransformPlan.fromBytes(bytes, {
+      limits: { maxOutputElementsPerCall: 134217727 }
+    }),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 104
+  )
+  tf.TransformPlan.fromBytes(bytes, {
+    limits: { maxOutputElementsPerCall: 134217728 }
+  }).close()
+  const hostUnder = plan.apply(schema64, {
+    limits: { maxOutputElementsPerCall: 5 }
+  })
+  assert.throws(
+    () => hostUnder.run(table(applyValues)),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 104
+  )
+  const hostExact = plan.apply(schema64, {
+    limits: { maxOutputElementsPerCall: 6 }
+  })
+  assert.equal(hostExact.run(table(applyValues)).data.length, 6)
+  closeAll(recipe, analyzer, plan, hostUnder, hostExact)
+
+  for (const semanticLimit of [5, 6]) {
+    const config = structuredClone(
+      vectors.recipes.categorical_mode_onehot_other
+    )
+    config.semanticLimits.maxOutputElementsPerApply = semanticLimit
+    const semanticRecipe = tf.TransformRecipe.fromJSON(config)
+    const semanticAnalyzer = semanticRecipe.analyzer(schema64)
+    semanticAnalyzer.push(table(analyze))
+    const semanticPlan = semanticAnalyzer.finalize()
+    const semanticApply = semanticPlan.apply(schema64)
+    if (semanticLimit === 5) {
+      assert.throws(
+        () => semanticApply.run(table(applyValues)),
+        (error) => error instanceof tf.TranfiTransformError && error.code === 104
+      )
+    } else {
+      assert.equal(semanticApply.run(table(applyValues)).data.length, 6)
+    }
+    closeAll(semanticRecipe, semanticAnalyzer, semanticPlan, semanticApply)
+  }
 }
 
 function testMedianErrorsAndLimits() {
@@ -919,6 +1030,7 @@ async function main() {
   testSharedSemanticVectors()
   testMedianErrorsAndLimits()
   testCategoricalModeErrorsLimitsAndFloat32()
+  testOnehotExactLimitsAndUnicode()
   testF32ValidityAndParentLifetime()
   testErrorsLimitsAndClosedState()
   await testInCallCancellation()

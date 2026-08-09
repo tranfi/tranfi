@@ -404,12 +404,14 @@ tf_transform_code tf_transform_category_plan_requirements(
                 "categorical mode has no observed values");
         count = 1;
     }
-    if (recipe->categorical_encode == TF_TRANSFORM_ENCODE_LABEL) {
+    if (recipe->categorical_encode == TF_TRANSFORM_ENCODE_LABEL
+        || recipe->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT) {
         if (count > (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1)
             return tf_transform_set_error(
                 error, TF_TRANSFORM_RESOURCE_LIMIT,
-                "categorical label count exceeds the safe-integer domain");
-        if (recipe->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
+                "categorical encoding count exceeds the safe-integer domain");
+        if (recipe->categorical_encode == TF_TRANSFORM_ENCODE_LABEL
+            && recipe->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
             && recipe->categorical_sentinel_label >= 0
             && (uint64_t)recipe->categorical_sentinel_label < count)
             return tf_transform_set_error(
@@ -501,12 +503,28 @@ static tf_transform_code category_finalize_encoding(
     out->unknown = recipe->categorical_unknown;
     out->sentinel_label = recipe->categorical_sentinel_label;
     out->has_sentinel_label = recipe->categorical_has_sentinel_label;
-    if (out->encode != TF_TRANSFORM_ENCODE_LABEL) return TF_TRANSFORM_OK;
+    if (out->encode != TF_TRANSFORM_ENCODE_LABEL
+        && out->encode != TF_TRANSFORM_ENCODE_ONEHOT)
+        return TF_TRANSFORM_OK;
     if ((uint64_t)out->category_count
             > (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1)
         return tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
-            "categorical label count exceeds the safe-integer domain");
+            "categorical encoding count exceeds the safe-integer domain");
+    if (out->encode == TF_TRANSFORM_ENCODE_ONEHOT) {
+        out->sentinel_label = 0;
+        out->has_sentinel_label = 0;
+        if (out->unknown == TF_TRANSFORM_UNKNOWN_OTHER) {
+            out->other_ordinal = (uint64_t)out->category_count;
+            out->has_other_ordinal = 1;
+        } else if (out->unknown != TF_TRANSFORM_UNKNOWN_ERROR
+                   && out->unknown != TF_TRANSFORM_UNKNOWN_ALL_ZERO) {
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INVALID_RECIPE,
+                "one-hot unknown-category policy is invalid");
+        }
+        return TF_TRANSFORM_OK;
+    }
     if (out->unknown == TF_TRANSFORM_UNKNOWN_SENTINEL) {
         if (!out->has_sentinel_label)
             return tf_transform_set_error(

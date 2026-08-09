@@ -32,6 +32,9 @@ SUPPORTED_CASES = [
     case for case in VECTORS['semanticCases']
     if case['recipe'] in {
         'categorical_mode_label_other', 'categorical_mode_label_sentinel',
+        'categorical_mode_onehot_all_zero',
+        'categorical_mode_onehot_other',
+        'categorical_mode_zero_onehot_all_zero',
         'categorical_mode_zero_label_other',
         'categorical_mode_none', 'categorical_mode_zero_none',
         'numeric_mean_standard', 'numeric_median_none',
@@ -136,16 +139,21 @@ def test_ctypes_layout_and_safe_limits():
 
 @pytest.mark.parametrize('case', SUPPORTED_CASES, ids=lambda case: case['id'])
 def test_semantic_vectors_chunk_plan_and_apply_parity(case):
+    input_dtype = case.get('inputDtype', 'float64')
+    input_schema = SCHEMA32 if input_dtype == 'float32' else SCHEMA64
+    array_code = 'f' if input_dtype == 'float32' else 'd'
     values = [double_from_bits(row[0]) for row in case['analyze']['rows']]
     apply_values = [double_from_bits(row[0]) for row in case['apply']['rows']]
-    expected = [row[0] for row in case['apply']['expectedRows']]
+    expected = [cell for row in case['apply']['expectedRows'] for cell in row]
+    expected_columns = case['apply'].get('expectedColumns', 1)
     reference_blob = None
     for split in case['analyze']['chunkSplits']:
         with tranfi.TransformRecipe.from_json(recipe_text(case['recipe'])) as recipe:
-            with recipe.analyzer(SCHEMA64) as analyzer:
+            with recipe.analyzer(input_schema) as analyzer:
                 offset = 0
                 for count in split:
-                    analyzer.push(make_table(values[offset:offset + count]))
+                    analyzer.push(make_table(
+                        values[offset:offset + count], dtype=array_code))
                     offset += count
                 assert offset == len(values)
                 with analyzer.finalize() as plan:
@@ -155,16 +163,35 @@ def test_semantic_vectors_chunk_plan_and_apply_parity(case):
                     else:
                         assert blob == reference_blob
                     assert plan.schema_json('input') == (
-                        b'[{"dtype":"float64","id":"x0","name":"x0"}]')
+                        ('[{"dtype":"' + input_dtype
+                         + '","id":"x0","name":"x0"}]').encode())
                     if case['expectedPlan'].get('outputIds'):
-                        assert plan.schema_json('output') == (
-                            b'[{"category":null,"dtype":"float64",'
-                            b'"id":"x0%3Alabel","name":"x0%3Alabel",'
-                            b'"role":"label","sourceId":"x0"}]')
-                    with plan.apply(SCHEMA64) as apply:
-                        result = apply.run(make_table(apply_values))
+                        output_schema = json.loads(plan.schema_json('output'))
+                        assert [field['id'] for field in output_schema] == (
+                            case['expectedPlan']['outputIds'])
+                        encode = VECTORS['recipes'][case['recipe']][
+                            'columns'][0]['categorical']['encode']['op']
+                        if encode == 'onehot':
+                            assert [field['role'] for field in output_schema] == (
+                                ['onehot'] * len(output_schema))
+                            categories = [
+                                {'t': ('f32' if input_dtype == 'float32'
+                                       else 'f64'), 'v': bits}
+                                for bits in case['expectedPlan']['categories']]
+                            if case['expectedPlan']['otherOrdinal'] is not None:
+                                categories.append({'t': 'other'})
+                            assert [field['category']
+                                    for field in output_schema] == categories
+                        else:
+                            assert [field['role'] for field in output_schema] == [
+                                'label']
+                            assert [field['category']
+                                    for field in output_schema] == [None]
+                    with plan.apply(input_schema) as apply:
+                        result = apply.run(make_table(
+                            apply_values, dtype=array_code))
                         assert result.rows == len(apply_values)
-                        assert result.columns == 1
+                        assert result.columns == expected_columns
                         actual = [double_bits(value) for value in result.data]
                         assert actual == expected
     with tranfi.TransformPlan.from_bytes(reference_blob) as loaded:
@@ -202,23 +229,30 @@ def test_categorical_mode_errors_limits_and_float32():
                     analyzer.finalize()
                 assert terminal.value.code == 112
 
-    case = next(
-        item for item in VECTORS['semanticCases']
-        if item['id'] == 'categorical-mode-label-unknown-error')
-    with tranfi.TransformRecipe.from_json(recipe_text(case['recipe'])) as recipe:
-        with recipe.analyzer(SCHEMA64) as analyzer:
-            analyzer.push(make_table([
-                double_from_bits(row[0]) for row in case['analyze']['rows']]))
-            with analyzer.finalize() as plan:
-                with plan.apply(SCHEMA64) as apply:
-                    with pytest.raises(tranfi.TranfiTransformError) as caught:
-                        apply.run(make_table([
-                            double_from_bits(row[0])
-                            for row in case['apply']['rows']]))
-                    assert caught.value.code == 108
-                    with pytest.raises(tranfi.TranfiTransformError) as terminal:
-                        apply.run(make_table([1.0]))
-                    assert terminal.value.code == 112
+    for case_id in (
+            'categorical-mode-label-unknown-error',
+            'categorical-mode-onehot-unknown-error'):
+        case = next(
+            item for item in VECTORS['semanticCases']
+            if item['id'] == case_id)
+        with tranfi.TransformRecipe.from_json(
+                recipe_text(case['recipe'])) as recipe:
+            with recipe.analyzer(SCHEMA64) as analyzer:
+                analyzer.push(make_table([
+                    double_from_bits(row[0])
+                    for row in case['analyze']['rows']]))
+                with analyzer.finalize() as plan:
+                    with plan.apply(SCHEMA64) as apply:
+                        with pytest.raises(
+                                tranfi.TranfiTransformError) as caught:
+                            apply.run(make_table([
+                                double_from_bits(row[0])
+                                for row in case['apply']['rows']]))
+                        assert caught.value.code == 108
+                        with pytest.raises(
+                                tranfi.TranfiTransformError) as terminal:
+                            apply.run(make_table([1.0]))
+                        assert terminal.value.code == 112
 
     for sentinel in (-9_007_199_254_740_991, 9_007_199_254_740_991):
         config = json.loads(recipe_text('categorical_mode_label_sentinel'))
@@ -333,6 +367,83 @@ def test_categorical_mode_errors_limits_and_float32():
                         'b6a0000000000000', 'b6a0000000000000',
                         '0000000000000000', '36a0000000000000',
                     ]
+
+
+def test_onehot_exact_limits_and_unicode():
+    values = list(range(11))
+    source_id = 'é:🔥'
+    config = json.loads(recipe_text('categorical_mode_onehot_all_zero'))
+    config['columns'][0]['sourceId'] = source_id
+    schema = [{'id': source_id, 'name': source_id, 'dtype': 'float64'}]
+    with tranfi.TransformRecipe.from_json(
+            json.dumps(config, separators=(',', ':'))) as recipe:
+        with recipe.analyzer(schema) as analyzer:
+            analyzer.push(make_table(values))
+            with analyzer.finalize() as plan:
+                output = json.loads(plan.schema_json('output'))
+                assert len(output) == 11
+                assert output[10]['id'] == (
+                    '%C3%A9%3A%F0%9F%94%A5%3Aonehot%3A10')
+                assert output[10]['name'] == output[10]['id']
+                with plan.apply(schema) as apply:
+                    result = apply.run(make_table([10.0]))
+                    assert result.columns == 11
+                    assert list(result.data) == [
+                        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 0.0, 1.0,
+                    ]
+
+    analyze_values = [1.0, 2.0]
+    apply_values = [1.0, 3.0]
+    with tranfi.TransformRecipe.from_json(
+            recipe_text('categorical_mode_onehot_other')) as recipe:
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            analyzer.push(make_table(analyze_values))
+            with analyzer.finalize() as plan:
+                blob = plan.to_bytes()
+                with pytest.raises(tranfi.TranfiTransformError) as caught:
+                    tranfi.TransformPlan.from_bytes(
+                        blob,
+                        limits=tranfi.TransformLimits(
+                            max_output_elements_per_call=134_217_727))
+                assert caught.value.code == 104
+                with tranfi.TransformPlan.from_bytes(
+                        blob,
+                        limits=tranfi.TransformLimits(
+                            max_output_elements_per_call=134_217_728)):
+                    pass
+                with plan.apply(
+                        SCHEMA64,
+                        limits=tranfi.TransformLimits(
+                            max_output_elements_per_call=5)) as apply:
+                    with pytest.raises(
+                            tranfi.TranfiTransformError) as caught:
+                        apply.run(make_table(apply_values))
+                    assert caught.value.code == 104
+                with plan.apply(
+                        SCHEMA64,
+                        limits=tranfi.TransformLimits(
+                            max_output_elements_per_call=6)) as apply:
+                    assert len(apply.run(make_table(apply_values)).data) == 6
+
+    for semantic_limit in (5, 6):
+        config = json.loads(recipe_text('categorical_mode_onehot_other'))
+        config['semanticLimits'][
+            'maxOutputElementsPerApply'] = semantic_limit
+        with tranfi.TransformRecipe.from_json(
+                json.dumps(config, separators=(',', ':'))) as recipe:
+            with recipe.analyzer(SCHEMA64) as analyzer:
+                analyzer.push(make_table(analyze_values))
+                with analyzer.finalize() as plan:
+                    with plan.apply(SCHEMA64) as apply:
+                        if semantic_limit == 5:
+                            with pytest.raises(
+                                    tranfi.TranfiTransformError) as caught:
+                                apply.run(make_table(apply_values))
+                            assert caught.value.code == 104
+                        else:
+                            assert len(apply.run(
+                                make_table(apply_values)).data) == 6
 
 
 def test_median_errors_and_retained_state_limits():

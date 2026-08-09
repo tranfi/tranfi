@@ -13,6 +13,9 @@ const schema64 = [{ id: 'x0', dtype: 'float64' }]
 const supportedRecipes = new Set([
   'categorical_mode_label_other',
   'categorical_mode_label_sentinel',
+  'categorical_mode_onehot_all_zero',
+  'categorical_mode_onehot_other',
+  'categorical_mode_zero_onehot_all_zero',
   'categorical_mode_zero_label_other',
   'categorical_mode_none',
   'categorical_mode_zero_none',
@@ -272,16 +275,24 @@ async function main() {
   for (const item of vectors.semanticCases.filter((entry) =>
     supportedRecipes.has(entry.recipe) && !entry.expectedError
   )) {
+    const inputDtype = item.inputDtype ?? 'float64'
+    const inputSchema = inputDtype === 'float32'
+      ? [{ id: 'x0', dtype: 'float32' }]
+      : schema64
+    const InputArray = inputDtype === 'float32' ? Float32Array : Float64Array
     const analyzeValues = item.analyze.rows.map((row) => doubleFromBits(row[0]))
     const applyValues = item.apply.rows.map((row) => doubleFromBits(row[0]))
-    const expected = item.apply.expectedRows.map((row) => row[0])
+    const expected = item.apply.expectedRows.flat()
+    const expectedColumns = item.apply.expectedColumns ?? 1
     let reference = null
     for (const split of item.analyze.chunkSplits) {
       const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
-      const analyzer = recipe.analyzer(schema64)
+      const analyzer = recipe.analyzer(inputSchema)
       let offset = 0
       for (const count of split) {
-        analyzer.push(table(analyzeValues.slice(offset, offset + count)))
+        analyzer.push(table(
+          analyzeValues.slice(offset, offset + count), InputArray
+        ))
         offset += count
       }
       const plan = analyzer.finalize()
@@ -293,25 +304,158 @@ async function main() {
       loadedNative.close()
       assert.equal(
         new TextDecoder().decode(plan.schemaJSON('input')),
-        '[{"dtype":"float64","id":"x0","name":"x0"}]'
+        `[{"dtype":"${inputDtype}","id":"x0","name":"x0"}]`
       )
       if (item.expectedPlan.outputIds) {
-        assert.equal(
-          new TextDecoder().decode(plan.schemaJSON('output')),
-          '[{"category":null,"dtype":"float64","id":"x0%3Alabel",' +
-            '"name":"x0%3Alabel","role":"label","sourceId":"x0"}]'
+        const outputSchema = JSON.parse(
+          new TextDecoder().decode(plan.schemaJSON('output'))
         )
+        assert.deepEqual(
+          outputSchema.map((field) => field.id),
+          item.expectedPlan.outputIds
+        )
+        if (vectors.recipes[item.recipe].columns[0].categorical.encode.op === 'onehot') {
+          assert.deepEqual(
+            outputSchema.map((field) => field.role),
+            item.expectedPlan.outputIds.map(() => 'onehot')
+          )
+          assert.deepEqual(
+            outputSchema.map((field) => field.category),
+            item.expectedPlan.categories.map((bits) => ({
+              t: inputDtype === 'float32' ? 'f32' : 'f64', v: bits
+            })).concat(
+              item.expectedPlan.otherOrdinal === null ? [] : [{ t: 'other' }]
+            )
+          )
+        } else {
+          assert.deepEqual(outputSchema.map((field) => field.category), [null])
+          assert.deepEqual(outputSchema.map((field) => field.role), ['label'])
+        }
       }
-      const apply = plan.apply(schema64)
-      const result = apply.run(table(applyValues))
+      const apply = plan.apply(inputSchema)
+      const result = apply.run(table(applyValues, InputArray))
       assert.equal(result.rows, applyValues.length)
-      assert.equal(result.columns, 1)
+      assert.equal(result.columns, expectedColumns)
       assert.deepEqual(Array.from(result.data, doubleBits), expected, `${item.id}: output`)
       closeAll(recipe, analyzer, plan, apply)
     }
     const loaded = wasm.TransformPlan.fromBytes(reference)
     assert.deepEqual(loaded.toBytes(), reference)
     loaded.close()
+    if (inputDtype === 'float32' &&
+        vectors.recipes[item.recipe].columns[0].categorical?.encode.op === 'onehot') {
+      const nativeRecipe = native.TransformRecipe.fromJSON(
+        vectors.recipes[item.recipe]
+      )
+      const nativeAnalyzer = nativeRecipe.analyzer(inputSchema)
+      nativeAnalyzer.push(table(analyzeValues, InputArray))
+      const nativePlan = nativeAnalyzer.finalize()
+      assert.deepEqual(
+        nativePlan.toBytes(),
+        Buffer.from(reference),
+        `${item.id}: independently fitted native/WASM TFTR bytes`
+      )
+      closeAll(nativeRecipe, nativeAnalyzer, nativePlan)
+    }
+  }
+
+  {
+    const values = Array.from({ length: 11 }, (_, index) => index)
+    const sourceId = 'é:🔥'
+    const config = structuredClone(
+      vectors.recipes.categorical_mode_onehot_all_zero
+    )
+    config.columns[0].sourceId = sourceId
+    const schema = [{ id: sourceId, name: sourceId, dtype: 'float64' }]
+    const wasmRecipe = wasm.TransformRecipe.fromJSON(config)
+    const wasmAnalyzer = wasmRecipe.analyzer(schema)
+    wasmAnalyzer.push(table(values))
+    const wasmPlan = wasmAnalyzer.finalize()
+    const nativeRecipe = native.TransformRecipe.fromJSON(config)
+    const nativeAnalyzer = nativeRecipe.analyzer(schema)
+    nativeAnalyzer.push(table(values))
+    const nativePlan = nativeAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(wasmPlan.toBytes()),
+      nativePlan.toBytes(),
+      'native/WASM Unicode multi-digit one-hot TFTR bytes'
+    )
+    const output = JSON.parse(new TextDecoder().decode(
+      wasmPlan.schemaJSON('output')
+    ))
+    assert.equal(output.length, 11)
+    assert.equal(
+      output[10].id,
+      '%C3%A9%3A%F0%9F%94%A5%3Aonehot%3A10'
+    )
+    assert.equal(output[10].name, output[10].id)
+    const apply = wasmPlan.apply(schema)
+    assert.deepEqual(Array.from(apply.run(table([10])).data), [
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+    ])
+    closeAll(
+      wasmRecipe, wasmAnalyzer, wasmPlan, apply,
+      nativeRecipe, nativeAnalyzer, nativePlan
+    )
+  }
+
+  {
+    const analyzeValues = [1, 2]
+    const applyValues = [1, 3]
+    const recipe = wasm.TransformRecipe.fromJSON(
+      vectors.recipes.categorical_mode_onehot_other
+    )
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table(analyzeValues))
+    const plan = analyzer.finalize()
+    const bytes = plan.toBytes()
+    assert.throws(
+      () => wasm.TransformPlan.fromBytes(bytes, {
+        limits: { maxOutputElementsPerCall: 134217727 }
+      }),
+      (error) => error instanceof native.TranfiTransformError
+        && error.code === 104
+    )
+    wasm.TransformPlan.fromBytes(bytes, {
+      limits: { maxOutputElementsPerCall: 134217728 }
+    }).close()
+    const hostUnder = plan.apply(schema64, {
+      limits: { maxOutputElementsPerCall: 5 }
+    })
+    assert.throws(
+      () => hostUnder.run(table(applyValues)),
+      (error) => error instanceof native.TranfiTransformError
+        && error.code === 104
+    )
+    const hostExact = plan.apply(schema64, {
+      limits: { maxOutputElementsPerCall: 6 }
+    })
+    assert.equal(hostExact.run(table(applyValues)).data.length, 6)
+    closeAll(recipe, analyzer, plan, hostUnder, hostExact)
+
+    for (const semanticLimit of [5, 6]) {
+      const config = structuredClone(
+        vectors.recipes.categorical_mode_onehot_other
+      )
+      config.semanticLimits.maxOutputElementsPerApply = semanticLimit
+      const semanticRecipe = wasm.TransformRecipe.fromJSON(config)
+      const semanticAnalyzer = semanticRecipe.analyzer(schema64)
+      semanticAnalyzer.push(table(analyzeValues))
+      const semanticPlan = semanticAnalyzer.finalize()
+      const semanticApply = semanticPlan.apply(schema64)
+      if (semanticLimit === 5) {
+        assert.throws(
+          () => semanticApply.run(table(applyValues)),
+          (error) => error instanceof native.TranfiTransformError
+            && error.code === 104
+        )
+      } else {
+        assert.equal(semanticApply.run(table(applyValues)).data.length, 6)
+      }
+      closeAll(
+        semanticRecipe, semanticAnalyzer, semanticPlan, semanticApply
+      )
+    }
   }
 
   for (const item of vectors.semanticCases.filter((entry) =>
@@ -347,9 +491,12 @@ async function main() {
     closeAll(recipe, analyzer)
   }
 
-  {
+  for (const caseId of [
+    'categorical-mode-label-unknown-error',
+    'categorical-mode-onehot-unknown-error'
+  ]) {
     const item = vectors.semanticCases.find(
-      (entry) => entry.id === 'categorical-mode-label-unknown-error'
+      (entry) => entry.id === caseId
     )
     const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
     const analyzer = recipe.analyzer(schema64)

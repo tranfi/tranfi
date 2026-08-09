@@ -47,6 +47,13 @@ function doubleBits(value) {
   return view.getBigUint64(0, false).toString(16).padStart(16, '0')
 }
 
+function float32FromBits(bits) {
+  const buffer = new ArrayBuffer(bits.length * 4)
+  const view = new DataView(buffer)
+  for (let i = 0; i < bits.length; ++i) view.setUint32(i * 4, bits[i], true)
+  return new Float32Array(buffer)
+}
+
 async function main() {
   const workerPath = path.join(__dirname, '../js/wasm/worker.js')
   const worker = new Worker(workerPath)
@@ -193,6 +200,88 @@ async function main() {
     labelNativePlan.close()
     labelAnalyzer.close()
     labelRecipe.close()
+
+    const onehotSchema = [{ id: 'x0', dtype: 'float32' }]
+    const onehotAnalyze = float32FromBits([
+      0x80000001, 0x80000000, 0x00000000, 0x00000001, 0x00000001
+    ])
+    const onehotChunks = [
+      { rows: 2, columns: [onehotAnalyze.slice(0, 2)] },
+      { rows: 3, columns: [onehotAnalyze.slice(2)] }
+    ]
+    const onehotPlanBytes = await client.analyzeTransform(
+      vectors.recipes.categorical_mode_onehot_other,
+      onehotSchema,
+      onehotChunks
+    )
+    const onehotRecipe = native.TransformRecipe.fromJSON(
+      vectors.recipes.categorical_mode_onehot_other
+    )
+    const onehotAnalyzer = onehotRecipe.analyzer(onehotSchema)
+    for (const chunk of onehotChunks) onehotAnalyzer.push(chunk)
+    const onehotNativePlan = onehotAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(onehotPlanBytes),
+      onehotNativePlan.toBytes(),
+      'worker and native categorical-onehot TFTR bytes'
+    )
+    assert.deepEqual(
+      JSON.parse(onehotNativePlan.schemaJSON('output').toString()),
+      [
+        {
+          category: { t: 'f32', v: '80000001' },
+          dtype: 'float64',
+          id: 'x0%3Aonehot%3A0',
+          name: 'x0%3Aonehot%3A0',
+          role: 'onehot',
+          sourceId: 'x0'
+        },
+        {
+          category: { t: 'f32', v: '00000000' },
+          dtype: 'float64',
+          id: 'x0%3Aonehot%3A1',
+          name: 'x0%3Aonehot%3A1',
+          role: 'onehot',
+          sourceId: 'x0'
+        },
+        {
+          category: { t: 'f32', v: '00000001' },
+          dtype: 'float64',
+          id: 'x0%3Aonehot%3A2',
+          name: 'x0%3Aonehot%3A2',
+          role: 'onehot',
+          sourceId: 'x0'
+        },
+        {
+          category: { t: 'other' },
+          dtype: 'float64',
+          id: 'x0%3Aonehot%3A3',
+          name: 'x0%3Aonehot%3A3',
+          role: 'onehot',
+          sourceId: 'x0'
+        }
+      ]
+    )
+    const onehotApply = float32FromBits([
+      0x80000001, 0x80000000, 0x00000001, 0x3f800000, 0x7fc00000
+    ])
+    const onehotResult = await client.applyTransform(
+      onehotPlanBytes,
+      onehotSchema,
+      { rows: 5, columns: [onehotApply] }
+    )
+    assert.equal(onehotResult.rows, 5)
+    assert.equal(onehotResult.columns, 4)
+    assert.deepEqual(Array.from(onehotResult.data, doubleBits), [
+      '3ff0000000000000', '0000000000000000', '0000000000000000', '0000000000000000',
+      '0000000000000000', '3ff0000000000000', '0000000000000000', '0000000000000000',
+      '0000000000000000', '0000000000000000', '3ff0000000000000', '0000000000000000',
+      '0000000000000000', '0000000000000000', '0000000000000000', '3ff0000000000000',
+      '0000000000000000', '3ff0000000000000', '0000000000000000', '0000000000000000'
+    ])
+    onehotNativePlan.close()
+    onehotAnalyzer.close()
+    onehotRecipe.close()
 
     if (typeof SharedArrayBuffer !== 'undefined') {
       const controller = new AbortController()
