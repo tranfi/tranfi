@@ -415,6 +415,9 @@ tf_transform_code tf_transform_schema_json_preflight(
 tf_transform_code tf_transform_plan_json_preflight(
     const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
     tf_transform_error **error);
+tf_transform_code tf_transform_plan_recipe_fingerprint(
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    char out[65], tf_transform_error **error);
 cJSON *tf_transform_plan_to_json(
     const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
     tf_transform_error **error);

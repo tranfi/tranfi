@@ -743,6 +743,16 @@ class TransformPlan(_OwnedHandle):
             lib.tf_transform_bytes_free(
                 ctypes.byref(pointer), ctypes.byref(length))
 
+    def recipe_sha256(self, *, limits=None):
+        """Return the engine-owned canonical recipe/input-schema fingerprint."""
+        fingerprint = (ctypes.c_uint8 * 65)()
+        error = ctypes.c_void_p()
+        code = _ffi._load_lib().tf_transform_plan_recipe_sha256(
+            self._require_open(), _limits_pointer(limits),
+            fingerprint, ctypes.byref(error))
+        _check(code, error)
+        return bytes(fingerprint[:64]).decode('ascii')
+
     def apply(self, schema, *, limits=None, cancel_token=None):
         effective_limits = _resolved_limits(limits)
         runtime, runtime_pointer = _runtime(

@@ -200,6 +200,7 @@ const fittedReference = apply.run({
   columns: [new Float64Array([1, NaN, 3])]
 })
 const planBytes = plan.toBytes() // canonical TFTR artifact
+const recipeSha256 = plan.recipeSha256() // canonical recipe + input-schema identity
 
 apply.close()
 plan.close()

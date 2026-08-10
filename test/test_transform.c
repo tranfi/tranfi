@@ -459,6 +459,7 @@ static void test_numeric_lifecycle_and_schema(void) {
     tf_field_view_v1 output_field;
     uint8_t *schema_json = NULL;
     size_t schema_json_len = 0;
+    uint8_t recipe_sha256[65];
     tf_transform_limits_v1 limits;
 
     make_x0_schema(TF_VIEW_FLOAT64, &field, &schema);
@@ -503,6 +504,23 @@ static void test_numeric_lifecycle_and_schema(void) {
         "\"name\":\"x0\",\"role\":\"value\",\"sourceId\":\"x0\"}]",
         schema_json_len) == 0);
     tf_transform_bytes_free(&schema_json, &schema_json_len);
+    memset(recipe_sha256, 0xa5, sizeof(recipe_sha256));
+    limits.max_allocation_bytes = 1;
+    assert(tf_transform_plan_recipe_sha256(
+        plan, &limits, recipe_sha256, &error)
+        == TF_TRANSFORM_RESOURCE_LIMIT);
+    for (size_t i = 0; i < sizeof(recipe_sha256); ++i)
+        assert(recipe_sha256[i] == 0);
+    assert(tf_transform_error_get_code(error) == TF_TRANSFORM_RESOURCE_LIMIT);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    assert(tf_transform_plan_recipe_sha256(
+        plan, &limits, recipe_sha256, &error) == TF_TRANSFORM_OK);
+    assert(strcmp(
+        (const char *)recipe_sha256,
+        "f4a516d2060f8c044a85e50bcf9428f0dd529f2d47274546b6822cd3361194a6")
+        == 0);
 
     assert(tf_transform_apply_create(plan, &schema, NULL, &apply, &error)
            == TF_TRANSFORM_OK);

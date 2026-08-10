@@ -176,6 +176,7 @@ with tf.TransformRecipe.from_json(json.dumps(recipe_spec)) as recipe:
             with plan.apply(schema) as apply:
                 fitted_reference = apply.run(reference)
             plan_bytes = plan.to_bytes()  # canonical TFTR artifact
+            recipe_sha256 = plan.recipe_sha256()
 ```
 
 Prepared-transform failures raise `TranfiTransformError`; its numeric `code` is stable across the C and Python APIs. `TransformLimits` starts from the C-owned safe profile and applies explicit overrides.

@@ -2015,6 +2015,29 @@ tf_transform_code tf_transform_plan_schema_json(
     return code;
 }
 
+tf_transform_code tf_transform_plan_recipe_sha256(
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    uint8_t out_hex[65], tf_transform_error **error) {
+    tf_transform_limits_v1 copied;
+    char fingerprint[65];
+    tf_transform_code code;
+    if (out_hex) memset(out_hex, 0, 65);
+    tf_transform_clear_error(error);
+    if (!plan || !out_hex)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INVALID_ARGUMENT,
+            "plan recipe SHA-256 argument is null");
+    code = tf_transform_copy_limits(limits, &copied, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    code = tf_transform_plan_json_preflight(plan, &copied, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    code = tf_transform_plan_recipe_fingerprint(
+        plan, &copied, fingerprint, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    memcpy(out_hex, fingerprint, sizeof(fingerprint));
+    return TF_TRANSFORM_OK;
+}
+
 static void write_u16_le(uint8_t *out, uint16_t value) {
     out[0] = (uint8_t)value;
     out[1] = (uint8_t)(value >> 8);

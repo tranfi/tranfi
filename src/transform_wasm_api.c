@@ -905,6 +905,45 @@ uint32_t tf_wasm_transform_plan_schema_json(
     return tf_wasm_wrap_bytes(&data, &len, &limits, out_handle_offset);
 }
 
+TF_WASM_EXPORT
+uint32_t tf_wasm_transform_plan_recipe_sha256(
+    uint32_t plan_handle, uint32_t limits_offset,
+    uint32_t out_handle_offset, uint32_t out_error_offset) {
+    tf_wasm_handle_slot *slot;
+    tf_transform_limits_v1 limits;
+    tf_transform_error *error = NULL;
+    uint8_t fingerprint[65];
+    uint8_t *data = NULL;
+    size_t len = 64;
+    tf_transform_code code = tf_wasm_prepare_outputs(
+        out_handle_offset, out_error_offset);
+    if (code != TF_TRANSFORM_OK) return code;
+    slot = tf_wasm_get_slot(plan_handle, TF_WASM_HANDLE_PLAN);
+    if (!slot) return TF_TRANSFORM_INVALID_ARGUMENT;
+    code = tf_wasm_read_limits(limits_offset, &limits, &error);
+    if (code != TF_TRANSFORM_OK)
+        return tf_wasm_transfer_error_safe(&error, out_error_offset, code);
+    if (limits.max_allocation_bytes < len) {
+        code = tf_transform_set_error(
+            &error, TF_TRANSFORM_RESOURCE_LIMIT,
+            "recipe fingerprint output exceeds allocation limit");
+        return tf_wasm_transfer_error(&error, &limits, out_error_offset, code);
+    }
+    code = tf_transform_plan_recipe_sha256(
+        (tf_transform_plan *)slot->pointer, &limits, fingerprint, &error);
+    if (code != TF_TRANSFORM_OK)
+        return tf_wasm_transfer_error(&error, &limits, out_error_offset, code);
+    data = (uint8_t *)malloc(len);
+    if (!data) {
+        code = tf_transform_set_error(
+            &error, TF_TRANSFORM_ALLOCATION,
+            "recipe fingerprint output allocation failed");
+        return tf_wasm_transfer_error(&error, &limits, out_error_offset, code);
+    }
+    memcpy(data, fingerprint, len);
+    return tf_wasm_wrap_bytes(&data, &len, &limits, out_handle_offset);
+}
+
 static tf_transform_code tf_wasm_get_schema_field(
     uint32_t plan_handle, uint32_t which, uint32_t index,
     tf_field_view_v1 *field, tf_transform_error **error,

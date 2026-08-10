@@ -305,6 +305,12 @@ class TransformPlan extends OwnedTransform {
     )
   }
 
+  recipeSha256({ limits } = {}) {
+    return callNative(
+      'transformPlanRecipeSha256', this._requireOpen(), normalizeLimits(limits)
+    )
+  }
+
   apply(schema, options = {}) {
     const planHandle = this._requireOpen()
     const runtime = normalizeRuntimeOptions(options)

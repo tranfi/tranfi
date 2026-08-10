@@ -312,11 +312,19 @@ async function main() {
       else assert.deepEqual(planBytes, reference, `${item.id}: chunk plan bytes`)
       const loadedNative = native.TransformPlan.fromBytes(planBytes)
       assert.deepEqual(loadedNative.toBytes(), Buffer.from(planBytes))
+      assert.equal(plan.recipeSha256(), loadedNative.recipeSha256())
       loadedNative.close()
       assert.equal(
         new TextDecoder().decode(plan.schemaJSON('input')),
         `[{"dtype":"${inputDtype}","id":"x0","name":"x0"}]`
       )
+      assert.match(plan.recipeSha256(), /^[0-9a-f]{64}$/)
+      if (item.recipe === 'numeric_none_none' && inputDtype === 'float64') {
+        assert.equal(
+          plan.recipeSha256(),
+          '12d0bfe06b5ceb8cdd63e857eff568b2ed0fbde4f1153490656b21558c621fda'
+        )
+      }
       if (item.expectedPlan.outputIds) {
         const outputSchema = JSON.parse(
           new TextDecoder().decode(plan.schemaJSON('output'))

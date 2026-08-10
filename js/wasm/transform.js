@@ -986,6 +986,20 @@ function createTransformAPI(wasm) {
       }
     }
 
+    recipeSha256(options) {
+      options = options || {}
+      var limits = limitsOwner(options.limits)
+      try {
+        return decoder.decode(bytesFromHandle(callForHandle(
+          'tf_wasm_transform_plan_recipe_sha256', [
+            this._requireOpen(), limits ? limits.pointer : 0
+          ]
+        )))
+      } finally {
+        free(limits)
+      }
+    }
+
     apply(schema, options) {
       var runtime = runtimeOptions(options)
       var schemaAllocation = null

@@ -737,6 +737,7 @@ static void test_prepared_transform_raw_wasm_onehot(void) {
     limits_offset = raw_alloc_odd(&heap, sizeof(safe));
     assert(tf_wasm_transform_limits_init_safe_v1(
         limits_offset, sizeof(safe)) == TF_TRANSFORM_OK);
+    memcpy(&safe, heap.bytes + limits_offset, sizeof(safe));
     recipe_offset = raw_put(
         &heap, recipe_json, (uint32_t)strlen(recipe_json), 1);
     {
@@ -808,6 +809,46 @@ static void test_prepared_transform_raw_wasm_onehot(void) {
             assert(memcmp(
                 heap.bytes + destination, expected_schema, schema_len) == 0);
             assert(tf_wasm_transform_handle_destroy(schema_bytes)
+                   == TF_TRANSFORM_OK);
+        }
+        {
+            uint32_t bytes_out = raw_alloc_odd(&heap, 4);
+            uint32_t size_out = raw_alloc_odd(&heap, 4);
+            uint32_t fingerprint_bytes;
+            uint32_t destination = raw_alloc(&heap, 64, 1);
+            tf_transform_limits_v1 restricted = safe;
+            uint32_t error_handle;
+            uint32_t code_out;
+            restricted.max_allocation_bytes = 1;
+            memcpy(heap.bytes + limits_offset, &restricted, sizeof(restricted));
+            memset(heap.bytes + bytes_out, 0xa5, 4);
+            assert(tf_wasm_transform_plan_recipe_sha256(
+                plan, limits_offset, bytes_out, error_out)
+                == TF_TRANSFORM_RESOURCE_LIMIT);
+            assert(raw_word(&heap, bytes_out) == 0);
+            error_handle = raw_word(&heap, error_out);
+            assert((error_handle >> 28) == TF_WASM_HANDLE_ERROR);
+            code_out = raw_alloc_odd(&heap, 4);
+            assert(tf_wasm_transform_error_code(error_handle, code_out)
+                   == TF_TRANSFORM_OK);
+            assert(raw_word(&heap, code_out) == TF_TRANSFORM_RESOURCE_LIMIT);
+            assert(tf_wasm_transform_handle_destroy(error_handle)
+                   == TF_TRANSFORM_OK);
+            memcpy(heap.bytes + limits_offset, &safe, sizeof(safe));
+            assert(tf_wasm_transform_plan_recipe_sha256(
+                plan, limits_offset, bytes_out, error_out)
+                == TF_TRANSFORM_OK);
+            fingerprint_bytes = raw_word(&heap, bytes_out);
+            assert(tf_wasm_transform_owned_bytes_size(
+                fingerprint_bytes, size_out) == TF_TRANSFORM_OK);
+            assert(raw_word(&heap, size_out) == 64);
+            assert(tf_wasm_transform_owned_bytes_copy(
+                fingerprint_bytes, destination, 64) == TF_TRANSFORM_OK);
+            for (size_t i = 0; i < 64; ++i) {
+                uint8_t c = heap.bytes[destination + i];
+                assert((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+            }
+            assert(tf_wasm_transform_handle_destroy(fingerprint_bytes)
                    == TF_TRANSFORM_OK);
         }
         assert(tf_wasm_transform_apply_create(

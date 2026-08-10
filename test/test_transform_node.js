@@ -286,6 +286,16 @@ function testSharedSemanticVectors() {
         plan.schemaJSON('input').toString(),
         `[{"dtype":"${inputDtype}","id":"x0","name":"x0"}]`
       )
+      assert.match(plan.recipeSha256(), /^[0-9a-f]{64}$/)
+      if (item.recipe === 'numeric_none_none' && inputDtype === 'float64') {
+        assert.equal(
+          plan.recipeSha256(),
+          '12d0bfe06b5ceb8cdd63e857eff568b2ed0fbde4f1153490656b21558c621fda'
+        )
+      }
+      const imported = tf.TransformPlan.fromBytes(bytes)
+      assert.equal(imported.recipeSha256(), plan.recipeSha256())
+      imported.close()
       if (item.expectedPlan.outputIds) {
         const outputSchema = JSON.parse(plan.schemaJSON('output').toString())
         assert.deepEqual(

@@ -364,6 +364,10 @@ def _load_lib():
         ctypes.POINTER(_TfTransformLimitsV1),
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t), error_out]
     _lib.tf_transform_plan_schema_json.restype = transform_code
+    _lib.tf_transform_plan_recipe_sha256.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_TfTransformLimitsV1),
+        ctypes.POINTER(ctypes.c_uint8), error_out]
+    _lib.tf_transform_plan_recipe_sha256.restype = transform_code
 
     return _lib
 

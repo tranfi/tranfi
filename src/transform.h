@@ -198,6 +198,9 @@ tf_transform_code tf_transform_plan_schema_json(
     const tf_transform_plan *plan, uint32_t which,
     const tf_transform_limits_v1 *limits,
     uint8_t **out, size_t *out_len, tf_transform_error **error);
+tf_transform_code tf_transform_plan_recipe_sha256(
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    uint8_t out_hex[65], tf_transform_error **error);
 
 #ifdef __cplusplus
 }

@@ -1441,6 +1441,36 @@ static napi_value napi_transform_plan_schema_json(
     return result;
 }
 
+static napi_value napi_transform_plan_recipe_sha256(
+    napi_env env, napi_callback_info info) {
+    napi_value argv[2] = {0};
+    size_t argc = 2;
+    napi_transform_handle *plan;
+    tf_transform_limits_v1 limits;
+    uint8_t fingerprint[65];
+    tf_transform_error *error = NULL;
+    tf_transform_code code;
+    int provided;
+    napi_value result;
+    if (!napi_transform_check(
+            env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL))) return NULL;
+    if (argc < 1) {
+        napi_throw_type_error(env, NULL, "transformPlanRecipeSha256 requires a plan");
+        return NULL;
+    }
+    plan = napi_transform_get_handle(env, argv[0], NAPI_TRANSFORM_PLAN);
+    if (!plan || !napi_transform_parse_limits(
+            env, argc >= 2 ? argv[1] : NULL, &limits, &provided)) return NULL;
+    code = tf_transform_plan_recipe_sha256(
+        (tf_transform_plan *)plan->pointer,
+        provided ? &limits : NULL, fingerprint, &error);
+    if (code != TF_TRANSFORM_OK)
+        return napi_transform_throw_error(env, code, &error);
+    if (!napi_transform_check(env, napi_create_string_utf8(
+            env, (const char *)fingerprint, 64, &result))) return NULL;
+    return result;
+}
+
 static napi_value napi_transform_apply_create(
     napi_env env, napi_callback_info info) {
     napi_value argv[3] = {0};
@@ -1603,6 +1633,8 @@ napi_status tranfi_napi_define_transform(napi_env env, napi_value exports) {
         {"transformPlanImport", NULL, napi_transform_plan_import,
          NULL, NULL, NULL, napi_default, NULL},
         {"transformPlanSchemaJson", NULL, napi_transform_plan_schema_json,
+         NULL, NULL, NULL, napi_default, NULL},
+        {"transformPlanRecipeSha256", NULL, napi_transform_plan_recipe_sha256,
          NULL, NULL, NULL, napi_default, NULL},
         {"transformApplyCreate", NULL, napi_transform_apply_create,
          NULL, NULL, NULL, napi_default, NULL},

@@ -172,6 +172,16 @@ def test_semantic_vectors_chunk_plan_and_apply_parity(case):
                     assert plan.schema_json('input') == (
                         ('[{"dtype":"' + input_dtype
                          + '","id":"x0","name":"x0"}]').encode())
+                    assert len(plan.recipe_sha256()) == 64
+                    assert all(c in '0123456789abcdef'
+                               for c in plan.recipe_sha256())
+                    if (case['recipe'] == 'numeric_none_none' and
+                            input_dtype == 'float64'):
+                        assert plan.recipe_sha256() == (
+                            '12d0bfe06b5ceb8cdd63e857eff568b2e'
+                            'd0fbde4f1153490656b21558c621fda')
+                    with tranfi.TransformPlan.from_bytes(blob) as imported:
+                        assert imported.recipe_sha256() == plan.recipe_sha256()
                     if case['expectedPlan'].get('outputIds'):
                         output_schema = json.loads(plan.schema_json('output'))
                         assert [field['id'] for field in output_schema] == (

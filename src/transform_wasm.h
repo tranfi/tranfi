@@ -110,6 +110,9 @@ uint32_t tf_wasm_transform_plan_import(
 uint32_t tf_wasm_transform_plan_schema_json(
     uint32_t plan_handle, uint32_t which, uint32_t limits_offset,
     uint32_t out_handle_offset, uint32_t out_error_offset);
+uint32_t tf_wasm_transform_plan_recipe_sha256(
+    uint32_t plan_handle, uint32_t limits_offset,
+    uint32_t out_handle_offset, uint32_t out_error_offset);
 uint32_t tf_wasm_transform_plan_schema_field_count(
     uint32_t plan_handle, uint32_t which, uint32_t out_count_offset,
     uint32_t out_error_offset);

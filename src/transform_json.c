@@ -2345,21 +2345,24 @@ static void digest_hex(const uint8_t digest[32], char out[65]) {
     out[64] = '\0';
 }
 
-static tf_transform_code plan_recipe_fingerprint(
-    const tf_transform_recipe *recipe, const tf_transform_schema *input_schema,
-    const tf_transform_limits_v1 *limits, char out[65],
-    tf_transform_error **error) {
-    cJSON *object = cJSON_CreateObject();
+tf_transform_code tf_transform_plan_recipe_fingerprint(
+    const tf_transform_plan *plan, const tf_transform_limits_v1 *limits,
+    char out[65], tf_transform_error **error) {
+    cJSON *object = NULL;
     cJSON *schema = NULL;
     cJSON *recipe_json = NULL;
     uint8_t *canonical = NULL;
     size_t canonical_len = 0;
     uint8_t digest[32];
     tf_transform_code code;
+    if (!plan || !limits || !out) return tf_transform_set_error(
+        error, TF_TRANSFORM_INVALID_ARGUMENT,
+        "recipe fingerprint argument is null");
+    object = cJSON_CreateObject();
     if (!object) return tf_transform_set_error(
         error, TF_TRANSFORM_ALLOCATION, "recipe fingerprint allocation failed");
-    schema = tf_transform_schema_to_json(input_schema);
-    recipe_json = tf_transform_recipe_to_json(recipe);
+    schema = tf_transform_schema_to_json(&plan->input_schema);
+    recipe_json = tf_transform_recipe_to_json(plan->recipe);
     if (!schema || !recipe_json
         || !transfer_item(object, "inputSchema", &schema)) goto allocation_failed;
     if (!add_item(object, "policyVersion", json_number(1))
@@ -2579,8 +2582,8 @@ cJSON *tf_transform_plan_to_json(
     root = cJSON_CreateObject();
     steps = cJSON_CreateArray();
     if (!root || !steps) goto allocation_failed;
-    code = plan_recipe_fingerprint(
-        plan->recipe, &plan->input_schema, limits, fingerprint, error);
+    code = tf_transform_plan_recipe_fingerprint(
+        plan, limits, fingerprint, error);
     if (code != TF_TRANSFORM_OK) goto failed;
     input_schema = tf_transform_schema_to_json(&plan->input_schema);
     output_schema = tf_transform_schema_to_json(&plan->output_schema);
