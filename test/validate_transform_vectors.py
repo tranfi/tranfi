@@ -275,7 +275,7 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         if "expectedError" in case:
             error = case["expectedError"]
             require(set(error) == {"code", "phase"}
-                    and error["phase"] in {"finalize", "apply"},
+                    and error["phase"] in {"analyze", "finalize", "apply"},
                     f"{case_id}: expected error shape")
             require(error["code"] in codes.values(), f"{case_id}: expected error code")
             if error["phase"] == "apply":
@@ -355,6 +355,12 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
     require("max-categories-one-invalid" in validation_ids, "missing maxCategories=1 boundary")
     require("max-categories-two-valid" in validation_ids, "missing maxCategories=2 boundary")
     require({
+        "max-categories-fractional-invalid",
+        "infer-rule-version-invalid",
+        "infer-numeric-branch-required",
+        "infer-categorical-branch-required",
+    } <= validation_ids, "missing inference recipe-shape boundaries")
+    require({
         "fractional-sentinel-label-invalid",
         "out-of-safe-range-sentinel-label-invalid",
     } <= validation_ids, "missing label sentinel validation boundaries")
@@ -374,7 +380,19 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         "categorical-mode-onehot-unknown-all-zero",
         "categorical-mode-onehot-unknown-other",
         "categorical-mode-onehot-all-missing-zero",
-    } <= case_ids, "categorical mode edge corpus incomplete")
+        "infer-third-distinct-becomes-numeric",
+        "infer-two-distinct-becomes-categorical",
+        "infer-categorical-defers-unused-numeric-overflow",
+        "infer-late-numeric-surfaces-deferred-overflow",
+        "infer-one-distinct-becomes-numeric",
+        "infer-all-missing-becomes-numeric",
+        "infer-noninteger-becomes-numeric",
+        "infer-f32-canonical-zero-categorical",
+        "infer-categorical-onehot-frozen-width",
+        "infer-numeric-collapses-onehot-width",
+        "infer-zero-rows-insufficient",
+        "infer-late-numeric-keeps-median-state",
+    } <= case_ids, "categorical/inference edge corpus incomplete")
     return len(semantic_cases), len(validation_cases), len(sqrt_cases)
 
 

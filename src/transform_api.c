@@ -1162,13 +1162,50 @@ static tf_transform_code generated_onehot_matches(
     return tf_transform_poll_cancel(runtime, error);
 }
 
+static tf_transform_code effective_column_kind(
+    const tf_transform_recipe *recipe,
+    const tf_transform_analyzer *analyzer,
+    const tf_transform_column_state *states, size_t index,
+    tf_transform_column_kind *out, tf_transform_error **error) {
+    const tf_transform_recipe_column *column;
+    if (!recipe || !out || index >= recipe->column_count)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "effective column-kind arguments are invalid");
+    column = &recipe->columns[index];
+    if (states) {
+        if (states[index].kind != TF_TRANSFORM_KIND_NUMERIC
+            && states[index].kind != TF_TRANSFORM_KIND_CATEGORICAL)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INTERNAL,
+                "learned column kind is invalid");
+        *out = states[index].kind;
+        return TF_TRANSFORM_OK;
+    }
+    if (analyzer)
+        return tf_transform_analyzer_resolve_kind(
+            analyzer, index, out, error);
+    if (column->kind == TF_TRANSFORM_KIND_NUMERIC
+        || column->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+        *out = column->kind;
+        return TF_TRANSFORM_OK;
+    }
+    return tf_transform_set_error(
+        error, TF_TRANSFORM_INTERNAL,
+        "inferred column has no resolved state");
+}
+
 static tf_transform_code output_column_width(
     const tf_transform_recipe *recipe,
     const tf_transform_analyzer *analyzer,
     const tf_transform_column_state *states, size_t index,
     uint64_t *width, tf_transform_error **error) {
     const tf_transform_recipe_column *column = &recipe->columns[index];
-    if (column->kind != TF_TRANSFORM_KIND_CATEGORICAL
+    tf_transform_column_kind resolved_kind;
+    tf_transform_code code = effective_column_kind(
+        recipe, analyzer, states, index, &resolved_kind, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    if (resolved_kind != TF_TRANSFORM_KIND_CATEGORICAL
         || column->categorical_encode != TF_TRANSFORM_ENCODE_ONEHOT) {
         *width = 1;
         return TF_TRANSFORM_OK;
@@ -1188,7 +1225,7 @@ static tf_transform_code output_column_width(
     if (analyzer) {
         uint64_t resident = 0;
         uint64_t allocations = 0;
-        tf_transform_code code = tf_transform_category_plan_requirements(
+        code = tf_transform_category_plan_requirements(
             analyzer, index, &resident, &allocations, error);
         (void)allocations;
         if (code != TF_TRANSFORM_OK) return code;
@@ -1232,6 +1269,7 @@ tf_transform_code tf_transform_output_schema_requirements(
             "output schema requirement arguments are invalid");
     for (size_t i = 0; i < input->field_count; ++i) {
         const tf_transform_recipe_column *column = &recipe->columns[i];
+        tf_transform_column_kind resolved_kind;
         uint64_t width = 0;
         tf_transform_code code;
         if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
@@ -1240,12 +1278,15 @@ tf_transform_code tf_transform_output_schema_requirements(
         }
         code = output_column_width(recipe, analyzer, states, i, &width, error);
         if (code != TF_TRANSFORM_OK) return code;
+        code = effective_column_kind(
+            recipe, analyzer, states, i, &resolved_kind, error);
+        if (code != TF_TRANSFORM_OK) return code;
         if (width > UINT64_MAX - count)
             return tf_transform_set_error(
                 error, TF_TRANSFORM_RESOURCE_LIMIT,
                 "output schema column count overflows");
         count += width;
-        if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+        if (resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL
             && column->categorical_encode != TF_TRANSFORM_ENCODE_NONE) {
             if (width > UINT64_MAX - generated)
                 return tf_transform_set_error(
@@ -1268,9 +1309,13 @@ tf_transform_code tf_transform_output_schema_requirements(
     for (size_t i = 0; i < input->field_count; ++i) {
         const tf_transform_schema_field_owned *source = &input->fields[i];
         const tf_transform_recipe_column *column = &recipe->columns[i];
+        tf_transform_column_kind resolved_kind;
         uint64_t width = 0;
         tf_transform_code code = output_column_width(
             recipe, analyzer, states, i, &width, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        code = effective_column_kind(
+            recipe, analyzer, states, i, &resolved_kind, error);
         if (code != TF_TRANSFORM_OK) return code;
         for (uint64_t ordinal = 0; ordinal < width; ++ordinal) {
             size_t id_len = source->id_len;
@@ -1280,13 +1325,13 @@ tf_transform_code tf_transform_output_schema_requirements(
                 code = tf_transform_poll_cancel(runtime, error);
                 if (code != TF_TRANSFORM_OK) return code;
             }
-            if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+            if (resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL
                 && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL) {
                 code = generated_label_length(
                     source->id, source->id_len, runtime, &id_len, error);
                 if (code != TF_TRANSFORM_OK) return code;
                 name_len = id_len;
-            } else if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+            } else if (resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL
                        && column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT) {
                 code = generated_onehot_length(
                     source->id, source->id_len, ordinal, runtime, &id_len, error);
@@ -1354,6 +1399,7 @@ tf_transform_code tf_transform_output_schema_requirements(
 
 tf_transform_code tf_transform_output_schema_build(
     const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_analyzer *analyzer,
     const tf_transform_column_state *states,
     const tf_transform_runtime_copy *runtime, tf_transform_schema *out,
     tf_transform_error **error) {
@@ -1368,7 +1414,7 @@ tf_transform_code tf_transform_output_schema_build(
         error, TF_TRANSFORM_INTERNAL, "output schema destination is null");
     memset(&result, 0, sizeof(result));
     code = tf_transform_output_schema_requirements(
-        input, recipe, NULL, states, runtime, &field_count, &resident,
+        input, recipe, analyzer, states, runtime, &field_count, &resident,
         &allocations, &collision_bytes, error);
     if (code != TF_TRANSFORM_OK) return code;
     (void)resident;
@@ -1384,17 +1430,24 @@ tf_transform_code tf_transform_output_schema_build(
         const tf_transform_schema_field_owned *source = &input->fields[i];
         const tf_transform_recipe_column *column = &recipe->columns[i];
         const tf_transform_categorical_state *categorical = NULL;
+        tf_transform_column_kind resolved_kind;
         uint64_t width = 0;
-        int label = column->kind == TF_TRANSFORM_KIND_CATEGORICAL
-            && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL;
-        int onehot = column->kind == TF_TRANSFORM_KIND_CATEGORICAL
-            && column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT;
+        int label;
+        int onehot;
         if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
             code = tf_transform_poll_cancel(runtime, error);
             if (code != TF_TRANSFORM_OK) goto failed;
         }
-        code = output_column_width(recipe, NULL, states, i, &width, error);
+        code = output_column_width(
+            recipe, analyzer, states, i, &width, error);
         if (code != TF_TRANSFORM_OK) goto failed;
+        code = effective_column_kind(
+            recipe, analyzer, states, i, &resolved_kind, error);
+        if (code != TF_TRANSFORM_OK) goto failed;
+        label = resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL;
+        onehot = resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT;
         if (onehot) categorical = &states[i].value.categorical;
         for (uint64_t ordinal = 0; ordinal < width; ++ordinal) {
             tf_transform_schema_field_owned *field;
@@ -1591,6 +1644,7 @@ done:
 
 tf_transform_code tf_transform_output_schema_validate_contract(
     const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_analyzer *analyzer,
     const tf_transform_column_state *states,
     const tf_transform_schema *output,
     const tf_transform_runtime_copy *runtime,
@@ -1606,15 +1660,21 @@ tf_transform_code tf_transform_output_schema_validate_contract(
         const tf_transform_schema_field_owned *source = &input->fields[i];
         const tf_transform_recipe_column *column = &recipe->columns[i];
         const tf_transform_categorical_state *categorical = NULL;
+        tf_transform_column_kind resolved_kind;
         uint64_t width = 1;
-        int label = column->kind == TF_TRANSFORM_KIND_CATEGORICAL
-            && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL;
-        int onehot = column->kind == TF_TRANSFORM_KIND_CATEGORICAL
-            && column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT;
+        int label;
+        int onehot;
         if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
             code = tf_transform_poll_cancel(runtime, error);
             if (code != TF_TRANSFORM_OK) return code;
         }
+        code = effective_column_kind(
+            recipe, analyzer, states, i, &resolved_kind, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        label = resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL;
+        onehot = resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT;
         if (onehot) {
             if (!states || states[i].kind != TF_TRANSFORM_KIND_CATEGORICAL
                 || states[i].value.categorical.encode

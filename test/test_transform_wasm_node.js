@@ -19,6 +19,9 @@ const supportedRecipes = new Set([
   'categorical_mode_zero_label_other',
   'categorical_mode_none',
   'categorical_mode_zero_none',
+  'infer_two_categories',
+  'infer_two_categories_median',
+  'infer_two_categories_onehot_all_zero',
   'numeric_mean_standard',
   'numeric_median_none',
   'numeric_median_zero_none',
@@ -360,6 +363,39 @@ async function main() {
   }
 
   {
+    const item = vectors.semanticCases.find((entry) =>
+      entry.id === 'infer-late-numeric-surfaces-deferred-overflow'
+    )
+    const values = item.analyze.rows.map((row) => doubleFromBits(row[0]))
+    for (const split of item.analyze.chunkSplits) {
+      const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+      const analyzer = recipe.analyzer(schema64)
+      let offset = 0
+      for (let index = 0; index < split.length; ++index) {
+        const count = split[index]
+        const input = table(values.slice(offset, offset + count))
+        offset += count
+        if (index + 1 === split.length) {
+          assert.throws(
+            () => analyzer.push(input),
+            (error) => error instanceof native.TranfiTransformError
+              && error.code === item.expectedError.code
+          )
+          assert.throws(
+            () => analyzer.push(input),
+            (error) => error instanceof native.TranfiTransformError
+              && error.code === 112
+          )
+        } else {
+          analyzer.push(input)
+        }
+      }
+      assert.equal(offset, values.length)
+      closeAll(recipe, analyzer)
+    }
+  }
+
+  {
     const values = Array.from({ length: 11 }, (_, index) => index)
     const sourceId = 'é:🔥'
     const config = structuredClone(
@@ -470,6 +506,55 @@ async function main() {
         && error.code === item.expectedError.code
     )
     closeAll(recipe, analyzer)
+  }
+
+  {
+    const item = vectors.semanticCases.find(
+      (entry) => entry.id === 'infer-zero-rows-insufficient'
+    )
+    const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table([]))
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof native.TranfiTransformError && error.code === 103
+    )
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof native.TranfiTransformError && error.code === 112
+    )
+    closeAll(recipe, analyzer)
+  }
+  for (const limits of [
+    { maxCategoriesPerColumn: 1 },
+    { maxTotalCategories: 1 }
+  ]) {
+    assert.throws(
+      () => wasm.TransformRecipe.fromJSON(
+        vectors.recipes.infer_two_categories, { limits }
+      ),
+      (error) => error instanceof native.TranfiTransformError && error.code === 104
+    )
+  }
+  {
+    const recipe = wasm.TransformRecipe.fromJSON(
+      vectors.recipes.infer_two_categories,
+      { limits: { maxCategoriesPerColumn: 2, maxTotalCategories: 2 } }
+    )
+    assert.throws(
+      () => recipe.analyzer(schema64, {
+        limits: { maxCategoriesPerColumn: 1 }
+      }),
+      (error) => error instanceof native.TranfiTransformError && error.code === 104
+    )
+    const analyzer = recipe.analyzer(schema64, {
+      limits: { maxCategoriesPerColumn: 2, maxTotalCategories: 2 }
+    })
+    analyzer.push(table([0, 1, 2]))
+    const plan = analyzer.finalize()
+    const apply = plan.apply(schema64)
+    assert.deepEqual(Array.from(apply.run(table([NaN])).data), [1])
+    closeAll(recipe, analyzer, plan, apply)
   }
 
   for (const item of vectors.semanticCases.filter((entry) =>

@@ -1195,6 +1195,124 @@ static int parse_tagged_constant(const cJSON *value, double *out, uint32_t *dtyp
     return tf_transform_double_is_finite(*out);
 }
 
+static int parse_numeric_recipe_branch(
+    const cJSON *numeric, tf_transform_recipe_column *out) {
+    static const char *const numeric_keys[] = {"impute", "normalize"};
+    static const char *const impute_keys[] = {"allMissing", "constant", "op"};
+    static const char *const normalize_keys[] = {"ddof", "op"};
+    const cJSON *impute;
+    const cJSON *normalize;
+    const cJSON *op;
+    const cJSON *policy;
+    const cJSON *constant;
+    if (!exact_keys(numeric, numeric_keys, 2)) return 0;
+    impute = required_item(numeric, "impute");
+    if (!exact_keys(impute, impute_keys, 3)) return 0;
+    op = required_item(impute, "op");
+    policy = required_item(impute, "allMissing");
+    constant = required_item(impute, "constant");
+    if (json_string_equals(op, "none")) {
+        if (!cJSON_IsNull(policy) || !cJSON_IsNull(constant)) return 0;
+        out->impute = TF_TRANSFORM_IMPUTE_NONE;
+    } else if (json_string_equals(op, "zero")) {
+        if (!cJSON_IsNull(policy) || !cJSON_IsNull(constant)) return 0;
+        out->impute = TF_TRANSFORM_IMPUTE_ZERO;
+        out->constant = 0.0;
+    } else if (json_string_equals(op, "constant")) {
+        if (!cJSON_IsNull(policy)
+            || !parse_tagged_constant(
+                constant, &out->constant, &out->constant_dtype)) return 0;
+        out->impute = TF_TRANSFORM_IMPUTE_CONSTANT;
+    } else if (json_string_equals(op, "mean")
+               || json_string_equals(op, "median")) {
+        if (!cJSON_IsNull(constant)) return 0;
+        if (json_string_equals(policy, "error"))
+            out->all_missing = TF_TRANSFORM_ALL_MISSING_ERROR;
+        else if (json_string_equals(policy, "zero"))
+            out->all_missing = TF_TRANSFORM_ALL_MISSING_ZERO;
+        else return 0;
+        out->impute = json_string_equals(op, "mean")
+            ? TF_TRANSFORM_IMPUTE_MEAN : TF_TRANSFORM_IMPUTE_MEDIAN;
+    } else return 0;
+    normalize = required_item(numeric, "normalize");
+    if (!exact_keys(normalize, normalize_keys, 2)) return 0;
+    op = required_item(normalize, "op");
+    if (json_string_equals(op, "none")) {
+        if (!cJSON_IsNull(required_item(normalize, "ddof"))) return 0;
+        out->normalize = TF_TRANSFORM_NORMALIZE_NONE;
+    } else if (json_string_equals(op, "minmax")) {
+        if (!cJSON_IsNull(required_item(normalize, "ddof"))) return 0;
+        out->normalize = TF_TRANSFORM_NORMALIZE_MINMAX;
+    } else if (json_string_equals(op, "standard")) {
+        uint64_t ddof;
+        if (!safe_uint64(required_item(normalize, "ddof"), &ddof) || ddof > 1)
+            return 0;
+        out->normalize = TF_TRANSFORM_NORMALIZE_STANDARD;
+        out->ddof = (int)ddof;
+    } else return 0;
+    return 1;
+}
+
+static int parse_categorical_recipe_branch(
+    const cJSON *categorical, tf_transform_recipe_column *out) {
+    static const char *const categorical_keys[] = {"encode", "impute"};
+    static const char *const impute_keys[] = {"allMissing", "constant", "op"};
+    static const char *const encode_keys[] = {
+        "categories", "op", "sentinelLabel", "unknown"
+    };
+    const cJSON *impute;
+    const cJSON *encode;
+    const cJSON *policy;
+    if (!exact_keys(categorical, categorical_keys, 2)) return 0;
+    impute = required_item(categorical, "impute");
+    encode = required_item(categorical, "encode");
+    if (!exact_keys(impute, impute_keys, 3)
+        || !json_string_equals(required_item(impute, "op"), "mode")
+        || !cJSON_IsNull(required_item(impute, "constant"))) return 0;
+    policy = required_item(impute, "allMissing");
+    if (json_string_equals(policy, "error"))
+        out->categorical_all_missing = TF_TRANSFORM_ALL_MISSING_ERROR;
+    else if (json_string_equals(policy, "zero"))
+        out->categorical_all_missing = TF_TRANSFORM_ALL_MISSING_ZERO;
+    else return 0;
+    out->categorical_impute = TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE;
+    if (!exact_keys(encode, encode_keys, 4)
+        || !json_string_equals(required_item(encode, "categories"), "discover"))
+        return 0;
+    if (json_string_equals(required_item(encode, "op"), "none")) {
+        if (!cJSON_IsNull(required_item(encode, "sentinelLabel"))
+            || !cJSON_IsNull(required_item(encode, "unknown"))) return 0;
+        out->categorical_encode = TF_TRANSFORM_ENCODE_NONE;
+        out->categorical_unknown = TF_TRANSFORM_UNKNOWN_NONE;
+    } else if (json_string_equals(required_item(encode, "op"), "label")) {
+        const cJSON *unknown = required_item(encode, "unknown");
+        const cJSON *sentinel = required_item(encode, "sentinelLabel");
+        out->categorical_encode = TF_TRANSFORM_ENCODE_LABEL;
+        if (json_string_equals(unknown, "error") && cJSON_IsNull(sentinel))
+            out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ERROR;
+        else if (json_string_equals(unknown, "other") && cJSON_IsNull(sentinel))
+            out->categorical_unknown = TF_TRANSFORM_UNKNOWN_OTHER;
+        else if (json_string_equals(unknown, "sentinel")
+                 && safe_int64(sentinel, &out->categorical_sentinel_label)) {
+            out->categorical_unknown = TF_TRANSFORM_UNKNOWN_SENTINEL;
+            out->categorical_has_sentinel_label = 1;
+        } else return 0;
+    } else if (json_string_equals(required_item(encode, "op"), "onehot")) {
+        const cJSON *unknown = required_item(encode, "unknown");
+        if (!cJSON_IsNull(required_item(encode, "sentinelLabel"))) return 0;
+        out->categorical_encode = TF_TRANSFORM_ENCODE_ONEHOT;
+        if (json_string_equals(unknown, "error"))
+            out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ERROR;
+        else if (json_string_equals(unknown, "all_zero"))
+            out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ALL_ZERO;
+        else if (json_string_equals(unknown, "other"))
+            out->categorical_unknown = TF_TRANSFORM_UNKNOWN_OTHER;
+        else return 0;
+    } else return 0;
+    out->categorical_discover = 1;
+    return 1;
+}
+
 static tf_transform_code parse_recipe_column(
     const cJSON *value, const tf_transform_runtime_copy *runtime,
     tf_transform_resource_ledger *ledger,
@@ -1205,22 +1323,15 @@ static tf_transform_code parse_recipe_column(
     static const char *const kind_keys[] = {
         "maxCategories", "op", "rule", "value"
     };
-    static const char *const numeric_keys[] = {"impute", "normalize"};
-    static const char *const impute_keys[] = {"allMissing", "constant", "op"};
-    static const char *const normalize_keys[] = {"ddof", "op"};
-    static const char *const categorical_keys[] = {"encode", "impute"};
-    static const char *const encode_keys[] = {
-        "categories", "op", "sentinelLabel", "unknown"
-    };
     const cJSON *kind;
     const cJSON *numeric;
     const cJSON *categorical;
-    const cJSON *impute;
-    const cJSON *normalize;
     const cJSON *source_id;
-    const cJSON *op;
-    const cJSON *policy;
-    const cJSON *constant;
+    const cJSON *kind_op;
+    const cJSON *kind_value;
+    uint64_t infer_max_categories = 0;
+    int has_numeric = 0;
+    int has_categorical = 0;
     size_t source_len;
     memset(out, 0, sizeof(*out));
     const tf_transform_limits_v1 *limits = &runtime->limits;
@@ -1229,13 +1340,50 @@ static tf_transform_code parse_recipe_column(
         return tf_transform_set_error(
             error, TF_TRANSFORM_INVALID_RECIPE, "recipe column shape is invalid");
     kind = required_item(value, "kind");
-    if (!exact_keys(kind, kind_keys, 4)
-        || !cJSON_IsNull(required_item(kind, "maxCategories"))
-        || !json_string_equals(required_item(kind, "op"), "declared")
-        || !cJSON_IsNull(required_item(kind, "rule")))
+    if (!exact_keys(kind, kind_keys, 4))
         return tf_transform_set_error(
             error, TF_TRANSFORM_INVALID_RECIPE,
-            "prepared transforms require a supported declared kind");
+            "prepared transform kind shape is invalid");
+    kind_op = required_item(kind, "op");
+    kind_value = required_item(kind, "value");
+    if (json_string_equals(kind_op, "declared")) {
+        if (!cJSON_IsNull(required_item(kind, "maxCategories"))
+            || !cJSON_IsNull(required_item(kind, "rule")))
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INVALID_RECIPE,
+                "declared transform kind is invalid");
+        if (json_string_equals(kind_value, "numeric")) {
+            out->kind = TF_TRANSFORM_KIND_NUMERIC;
+            has_numeric = 1;
+        } else if (json_string_equals(kind_value, "categorical")) {
+            out->kind = TF_TRANSFORM_KIND_CATEGORICAL;
+            has_categorical = 1;
+        } else return tf_transform_set_error(
+            error, TF_TRANSFORM_INVALID_RECIPE,
+            "declared transform kind value is invalid");
+    } else if (json_string_equals(kind_op, "infer")) {
+        if (!cJSON_IsNull(kind_value)
+            || !json_string_equals(
+                required_item(kind, "rule"),
+                "finite-integer-cardinality-v1")
+            || !safe_uint64(
+                required_item(kind, "maxCategories"), &infer_max_categories)
+            || infer_max_categories < 2)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INVALID_RECIPE,
+                "inferred transform kind is invalid");
+        if (infer_max_categories > limits->max_categories_per_column
+            || infer_max_categories > limits->max_total_categories)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "inferred category bound exceeds host limits");
+        out->kind = TF_TRANSFORM_KIND_INFER;
+        out->infer_max_categories = infer_max_categories;
+        has_numeric = 1;
+        has_categorical = 1;
+    } else return tf_transform_set_error(
+        error, TF_TRANSFORM_INVALID_RECIPE,
+        "transform kind operation is unsupported");
     source_id = required_item(value, "sourceId");
     if (!cJSON_IsString(source_id) || !source_id->valuestring)
         return tf_transform_set_error(
@@ -1257,112 +1405,14 @@ static tf_transform_code parse_recipe_column(
         runtime, error);
     if (code != TF_TRANSFORM_OK) goto cleanup;
     out->source_id_len = source_len;
-    if (json_string_equals(required_item(kind, "value"), "categorical")) {
-        const cJSON *encode;
-        out->kind = TF_TRANSFORM_KIND_CATEGORICAL;
-        if (!cJSON_IsNull(required_item(value, "numeric"))) goto invalid;
-        categorical = required_item(value, "categorical");
-        if (!exact_keys(categorical, categorical_keys, 2)) goto invalid;
-        impute = required_item(categorical, "impute");
-        encode = required_item(categorical, "encode");
-        if (!exact_keys(impute, impute_keys, 3)
-            || !json_string_equals(required_item(impute, "op"), "mode")
-            || !cJSON_IsNull(required_item(impute, "constant"))) goto invalid;
-        policy = required_item(impute, "allMissing");
-        if (json_string_equals(policy, "error"))
-            out->categorical_all_missing = TF_TRANSFORM_ALL_MISSING_ERROR;
-        else if (json_string_equals(policy, "zero"))
-            out->categorical_all_missing = TF_TRANSFORM_ALL_MISSING_ZERO;
-        else goto invalid;
-        out->categorical_impute = TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE;
-        if (!exact_keys(encode, encode_keys, 4)
-            || !json_string_equals(required_item(encode, "categories"), "discover"))
-            goto invalid;
-        if (json_string_equals(required_item(encode, "op"), "none")) {
-            if (!cJSON_IsNull(required_item(encode, "sentinelLabel"))
-                || !cJSON_IsNull(required_item(encode, "unknown"))) goto invalid;
-            out->categorical_encode = TF_TRANSFORM_ENCODE_NONE;
-            out->categorical_unknown = TF_TRANSFORM_UNKNOWN_NONE;
-        } else if (json_string_equals(required_item(encode, "op"), "label")) {
-            const cJSON *unknown = required_item(encode, "unknown");
-            const cJSON *sentinel = required_item(encode, "sentinelLabel");
-            out->categorical_encode = TF_TRANSFORM_ENCODE_LABEL;
-            if (json_string_equals(unknown, "error")
-                && cJSON_IsNull(sentinel))
-                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ERROR;
-            else if (json_string_equals(unknown, "other")
-                     && cJSON_IsNull(sentinel))
-                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_OTHER;
-            else if (json_string_equals(unknown, "sentinel")
-                     && safe_int64(sentinel, &out->categorical_sentinel_label)) {
-                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_SENTINEL;
-                out->categorical_has_sentinel_label = 1;
-            } else goto invalid;
-        } else if (json_string_equals(required_item(encode, "op"), "onehot")) {
-            const cJSON *unknown = required_item(encode, "unknown");
-            if (!cJSON_IsNull(required_item(encode, "sentinelLabel")))
-                goto invalid;
-            out->categorical_encode = TF_TRANSFORM_ENCODE_ONEHOT;
-            if (json_string_equals(unknown, "error"))
-                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ERROR;
-            else if (json_string_equals(unknown, "all_zero"))
-                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_ALL_ZERO;
-            else if (json_string_equals(unknown, "other"))
-                out->categorical_unknown = TF_TRANSFORM_UNKNOWN_OTHER;
-            else goto invalid;
-        } else goto invalid;
-        out->categorical_discover = 1;
-        return TF_TRANSFORM_OK;
-    }
-    if (!json_string_equals(required_item(kind, "value"), "numeric")
-        || !cJSON_IsNull(required_item(value, "categorical"))) goto invalid;
-    out->kind = TF_TRANSFORM_KIND_NUMERIC;
     numeric = required_item(value, "numeric");
-    if (!exact_keys(numeric, numeric_keys, 2)) goto invalid;
-    impute = required_item(numeric, "impute");
-    if (!exact_keys(impute, impute_keys, 3)) goto invalid;
-    op = required_item(impute, "op");
-    policy = required_item(impute, "allMissing");
-    constant = required_item(impute, "constant");
-    if (json_string_equals(op, "none")) {
-        if (!cJSON_IsNull(policy) || !cJSON_IsNull(constant)) goto invalid;
-        out->impute = TF_TRANSFORM_IMPUTE_NONE;
-    } else if (json_string_equals(op, "zero")) {
-        if (!cJSON_IsNull(policy) || !cJSON_IsNull(constant)) goto invalid;
-        out->impute = TF_TRANSFORM_IMPUTE_ZERO;
-        out->constant = 0.0;
-    } else if (json_string_equals(op, "constant")) {
-        if (!cJSON_IsNull(policy)
-            || !parse_tagged_constant(constant, &out->constant, &out->constant_dtype))
-            goto invalid;
-        out->impute = TF_TRANSFORM_IMPUTE_CONSTANT;
-    } else if (json_string_equals(op, "mean")
-               || json_string_equals(op, "median")) {
-        if (!cJSON_IsNull(constant)) goto invalid;
-        if (json_string_equals(policy, "error"))
-            out->all_missing = TF_TRANSFORM_ALL_MISSING_ERROR;
-        else if (json_string_equals(policy, "zero"))
-            out->all_missing = TF_TRANSFORM_ALL_MISSING_ZERO;
-        else goto invalid;
-        out->impute = json_string_equals(op, "mean")
-            ? TF_TRANSFORM_IMPUTE_MEAN : TF_TRANSFORM_IMPUTE_MEDIAN;
-    } else goto invalid;
-    normalize = required_item(numeric, "normalize");
-    if (!exact_keys(normalize, normalize_keys, 2)) goto invalid;
-    op = required_item(normalize, "op");
-    if (json_string_equals(op, "none")) {
-        if (!cJSON_IsNull(required_item(normalize, "ddof"))) goto invalid;
-        out->normalize = TF_TRANSFORM_NORMALIZE_NONE;
-    } else if (json_string_equals(op, "minmax")) {
-        if (!cJSON_IsNull(required_item(normalize, "ddof"))) goto invalid;
-        out->normalize = TF_TRANSFORM_NORMALIZE_MINMAX;
-    } else if (json_string_equals(op, "standard")) {
-        uint64_t ddof;
-        if (!safe_uint64(required_item(normalize, "ddof"), &ddof) || ddof > 1)
-            goto invalid;
-        out->normalize = TF_TRANSFORM_NORMALIZE_STANDARD;
-        out->ddof = (int)ddof;
-    } else goto invalid;
+    categorical = required_item(value, "categorical");
+    if (has_numeric) {
+        if (!parse_numeric_recipe_branch(numeric, out)) goto invalid;
+    } else if (!cJSON_IsNull(numeric)) goto invalid;
+    if (has_categorical) {
+        if (!parse_categorical_recipe_branch(categorical, out)) goto invalid;
+    } else if (!cJSON_IsNull(categorical)) goto invalid;
     return TF_TRANSFORM_OK;
 invalid:
     code = tf_transform_set_error(
@@ -1725,6 +1775,64 @@ static int build_budget_schema(
     return 1;
 }
 
+static int build_budget_numeric_recipe_branch(
+    const tf_transform_recipe_column *column, tf_json_build_budget *budget) {
+    uint64_t impute_bytes = column->impute == TF_TRANSFORM_IMPUTE_CONSTANT ? 8
+        : column->impute == TF_TRANSFORM_IMPUTE_MEDIAN ? 6 : 4;
+    uint64_t normalize_bytes
+        = column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD ? 8
+        : column->normalize == TF_TRANSFORM_NORMALIZE_MINMAX ? 6 : 4;
+    if (!build_budget_child(budget, "numeric")
+        || !build_budget_object(budget, 2)
+        || !build_budget_child(budget, "impute")
+        || !build_budget_object(budget, 3)) return 0;
+    if (column->impute == TF_TRANSFORM_IMPUTE_MEAN
+        || column->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
+        if (!build_budget_string_property(
+                budget, "allMissing",
+                column->all_missing == TF_TRANSFORM_ALL_MISSING_ZERO ? 4 : 5))
+            return 0;
+    } else if (!build_budget_primitive(budget, "allMissing")) return 0;
+    if (column->impute == TF_TRANSFORM_IMPUTE_CONSTANT) {
+        if (!build_budget_tagged(
+                budget, "constant",
+                column->constant_dtype == TF_VIEW_FLOAT32 ? 8 : 16)) return 0;
+    } else if (!build_budget_primitive(budget, "constant")) return 0;
+    return build_budget_string_property(budget, "op", impute_bytes)
+        && build_budget_child(budget, "normalize")
+        && build_budget_object(budget, 2)
+        && build_budget_primitive(budget, "ddof")
+        && build_budget_string_property(budget, "op", normalize_bytes);
+}
+
+static int build_budget_categorical_recipe_branch(
+    const tf_transform_recipe_column *column, tf_json_build_budget *budget) {
+    if (!build_budget_child(budget, "categorical")
+        || !build_budget_object(budget, 2)
+        || !build_budget_child(budget, "encode")
+        || !build_budget_object(budget, 4)
+        || !build_budget_string_property(budget, "categories", 8)
+        || !build_budget_string_property(
+            budget, "op",
+            column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL ? 5
+            : column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT ? 6 : 4)
+        || !build_budget_primitive(budget, "sentinelLabel")) return 0;
+    if (column->categorical_unknown == TF_TRANSFORM_UNKNOWN_NONE) {
+        if (!build_budget_primitive(budget, "unknown")) return 0;
+    } else if (!build_budget_string_property(
+            budget, "unknown",
+            column->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL ? 8
+            : column->categorical_unknown == TF_TRANSFORM_UNKNOWN_ALL_ZERO ? 8 : 5))
+        return 0;
+    return build_budget_child(budget, "impute")
+        && build_budget_object(budget, 3)
+        && build_budget_string_property(
+            budget, "allMissing",
+            column->categorical_all_missing == TF_TRANSFORM_ALL_MISSING_ZERO ? 4 : 5)
+        && build_budget_primitive(budget, "constant")
+        && build_budget_string_property(budget, "op", 4);
+}
+
 static int build_budget_recipe(
     const tf_transform_recipe *recipe, tf_json_build_budget *budget) {
     if (!recipe || !build_budget_object(budget, 6)
@@ -1735,67 +1843,29 @@ static int build_budget_recipe(
         if (!build_budget_object(budget, 4)
             || !build_budget_child(budget, "kind")
             || !build_budget_object(budget, 4)
-            || !build_budget_primitive(budget, "maxCategories")
-            || !build_budget_string_property(budget, "op", 8)
-            || !build_budget_primitive(budget, "rule")
-            || !build_budget_string_property(
-                budget, "value",
-                column->kind == TF_TRANSFORM_KIND_CATEGORICAL ? 11 : 7))
+            || (column->kind == TF_TRANSFORM_KIND_INFER
+                ? (!build_budget_primitive(budget, "maxCategories")
+                    || !build_budget_string_property(budget, "op", 5)
+                    || !build_budget_string_property(budget, "rule", 29)
+                    || !build_budget_primitive(budget, "value"))
+                : (!build_budget_primitive(budget, "maxCategories")
+                    || !build_budget_string_property(budget, "op", 8)
+                    || !build_budget_primitive(budget, "rule")
+                    || !build_budget_string_property(
+                        budget, "value",
+                        column->kind == TF_TRANSFORM_KIND_CATEGORICAL ? 11 : 7))))
             return 0;
-        if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
-            if (!build_budget_child(budget, "categorical")
-                || !build_budget_object(budget, 2)
-                || !build_budget_child(budget, "encode")
-                || !build_budget_object(budget, 4)
-                || !build_budget_string_property(budget, "categories", 8)
-                || !build_budget_string_property(
-                    budget, "op",
-                    column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL ? 5
-                    : column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT
-                        ? 6 : 4)
-                || !build_budget_primitive(budget, "sentinelLabel"))
-                return 0;
-            if (column->categorical_unknown == TF_TRANSFORM_UNKNOWN_NONE) {
-                if (!build_budget_primitive(budget, "unknown")) return 0;
-            } else if (!build_budget_string_property(
-                    budget, "unknown",
-                    column->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
-                        ? 8
-                        : column->categorical_unknown
-                              == TF_TRANSFORM_UNKNOWN_ALL_ZERO ? 8 : 5)) return 0;
-            if (!build_budget_child(budget, "impute")
-                || !build_budget_object(budget, 3)
-                || !build_budget_string_property(budget, "allMissing", 5)
-                || !build_budget_primitive(budget, "constant")
-                || !build_budget_string_property(budget, "op", 4)
-                || !build_budget_primitive(budget, "numeric")
-                || !build_budget_string_property(
-                    budget, "sourceId", (uint64_t)column->source_id_len))
-                return 0;
-            continue;
-        }
-        if (!build_budget_primitive(budget, "categorical")
-            || !build_budget_child(budget, "numeric")
-            || !build_budget_object(budget, 2)
-            || !build_budget_child(budget, "impute")
-            || !build_budget_object(budget, 3)) return 0;
-        if (column->impute == TF_TRANSFORM_IMPUTE_MEAN
-            || column->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
-            if (!build_budget_string_property(budget, "allMissing", 5)) return 0;
-        } else if (!build_budget_primitive(budget, "allMissing")) return 0;
-        if (column->impute == TF_TRANSFORM_IMPUTE_CONSTANT) {
-            if (!build_budget_tagged(
-                    budget, "constant",
-                    column->constant_dtype == TF_VIEW_FLOAT32 ? 8 : 16)) return 0;
-        } else if (!build_budget_primitive(budget, "constant")) return 0;
-        if (!build_budget_string_property(budget, "op", 8)
-            || !build_budget_child(budget, "normalize")
-            || !build_budget_object(budget, 2)) return 0;
-        if (column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD) {
-            if (!build_budget_primitive(budget, "ddof")) return 0;
-        } else if (!build_budget_primitive(budget, "ddof")) return 0;
-        if (!build_budget_string_property(budget, "op", 8)
-            || !build_budget_string_property(
+        if (column->kind == TF_TRANSFORM_KIND_NUMERIC) {
+            if (!build_budget_primitive(budget, "categorical")
+                || !build_budget_numeric_recipe_branch(column, budget)) return 0;
+        } else if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+            if (!build_budget_categorical_recipe_branch(column, budget)
+                || !build_budget_primitive(budget, "numeric")) return 0;
+        } else if (column->kind == TF_TRANSFORM_KIND_INFER) {
+            if (!build_budget_categorical_recipe_branch(column, budget)
+                || !build_budget_numeric_recipe_branch(column, budget)) return 0;
+        } else return 0;
+        if (!build_budget_string_property(
                 budget, "sourceId", (uint64_t)column->source_id_len)) return 0;
     }
     if (!build_budget_string_property(budget, "format", 23)
@@ -1814,7 +1884,7 @@ static int build_budget_step(
     const tf_transform_recipe_column *recipe,
     const tf_transform_column_state *column_state,
     tf_json_build_budget *budget) {
-    if (recipe->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+    if (column_state->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
         const tf_transform_categorical_state *state
             = &column_state->value.categorical;
         uint64_t digits = state->source_dtype == TF_VIEW_FLOAT32 ? 8 : 16;
@@ -1976,8 +2046,22 @@ tf_transform_code tf_transform_plan_json_preflight(
             "plan JSON structure exceeds configured limits");
     for (size_t i = 0; i < plan->input_schema.field_count; ++i) {
         uint64_t count;
+        if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_INFER
+            && (plan->recipe->columns[i].infer_max_categories
+                    > limits->max_categories_per_column
+                || plan->recipe->columns[i].infer_max_categories
+                    > limits->max_total_categories))
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "inferred category bound exceeds configured limits");
         if (plan->states[i].kind != TF_TRANSFORM_KIND_CATEGORICAL) continue;
         count = (uint64_t)plan->states[i].value.categorical.category_count;
+        if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_INFER
+            && (count < 2
+                || count > plan->recipe->columns[i].infer_max_categories))
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INTERNAL,
+                "inferred categorical plan state is inconsistent");
         if (count > limits->max_categories_per_column
             || total_categories > UINT64_MAX - count
             || total_categories + count > limits->max_total_categories)
@@ -2032,6 +2116,86 @@ overflow:
         "plan JSON construction estimate overflows");
 }
 
+static cJSON *recipe_numeric_branch_to_json(
+    const tf_transform_recipe_column *column) {
+    cJSON *numeric = cJSON_CreateObject();
+    cJSON *impute = cJSON_CreateObject();
+    cJSON *normalize = cJSON_CreateObject();
+    const char *impute_name;
+    const char *normalize_name;
+    if (!numeric || !impute || !normalize) goto fail;
+    if (column->impute == TF_TRANSFORM_IMPUTE_MEAN
+        || column->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
+        if (!add_item(impute, "allMissing", json_string(
+                column->all_missing == TF_TRANSFORM_ALL_MISSING_ZERO
+                    ? "zero" : "error"))) goto fail;
+    } else if (!add_item(impute, "allMissing", json_null())) goto fail;
+    if (column->impute == TF_TRANSFORM_IMPUTE_CONSTANT) {
+        if (!add_item(impute, "constant", tagged_constant(
+                column->constant, column->constant_dtype))) goto fail;
+    } else if (!add_item(impute, "constant", json_null())) goto fail;
+    impute_name = column->impute == TF_TRANSFORM_IMPUTE_NONE ? "none"
+        : column->impute == TF_TRANSFORM_IMPUTE_ZERO ? "zero"
+        : column->impute == TF_TRANSFORM_IMPUTE_CONSTANT ? "constant"
+        : column->impute == TF_TRANSFORM_IMPUTE_MEAN ? "mean" : "median";
+    if (!add_item(impute, "op", json_string(impute_name))
+        || !transfer_item(numeric, "impute", &impute)) goto fail;
+    if (column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD) {
+        if (!add_item(normalize, "ddof", json_number(column->ddof))) goto fail;
+    } else if (!add_item(normalize, "ddof", json_null())) goto fail;
+    normalize_name = column->normalize == TF_TRANSFORM_NORMALIZE_NONE ? "none"
+        : column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD
+            ? "standard" : "minmax";
+    if (!add_item(normalize, "op", json_string(normalize_name))
+        || !transfer_item(numeric, "normalize", &normalize)) goto fail;
+    return numeric;
+fail:
+    cJSON_Delete(numeric);
+    cJSON_Delete(impute);
+    cJSON_Delete(normalize);
+    return NULL;
+}
+
+static cJSON *recipe_categorical_branch_to_json(
+    const tf_transform_recipe_column *column) {
+    cJSON *categorical = cJSON_CreateObject();
+    cJSON *impute = cJSON_CreateObject();
+    cJSON *encode = cJSON_CreateObject();
+    cJSON *sentinel = column->categorical_has_sentinel_label
+        ? json_number((double)column->categorical_sentinel_label) : json_null();
+    cJSON *unknown = column->categorical_unknown == TF_TRANSFORM_UNKNOWN_NONE
+        ? json_null() : json_string(
+            column->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
+                ? "sentinel"
+                : column->categorical_unknown == TF_TRANSFORM_UNKNOWN_OTHER
+                    ? "other"
+                    : column->categorical_unknown == TF_TRANSFORM_UNKNOWN_ALL_ZERO
+                        ? "all_zero" : "error");
+    if (!categorical || !impute || !encode || !sentinel || !unknown
+        || !add_item(encode, "categories", json_string("discover"))
+        || !add_item(encode, "op", json_string(
+            column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL ? "label"
+            : column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT
+                ? "onehot" : "none"))
+        || !transfer_item(encode, "sentinelLabel", &sentinel)
+        || !transfer_item(encode, "unknown", &unknown)
+        || !transfer_item(categorical, "encode", &encode)
+        || !add_item(impute, "allMissing", json_string(
+            column->categorical_all_missing == TF_TRANSFORM_ALL_MISSING_ZERO
+                ? "zero" : "error"))
+        || !add_item(impute, "constant", json_null())
+        || !add_item(impute, "op", json_string("mode"))
+        || !transfer_item(categorical, "impute", &impute)) goto fail;
+    return categorical;
+fail:
+    cJSON_Delete(categorical);
+    cJSON_Delete(impute);
+    cJSON_Delete(encode);
+    cJSON_Delete(sentinel);
+    cJSON_Delete(unknown);
+    return NULL;
+}
+
 cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe) {
     cJSON *root = cJSON_CreateObject();
     cJSON *columns = cJSON_CreateArray();
@@ -2040,113 +2204,43 @@ cJSON *tf_transform_recipe_to_json(const tf_transform_recipe *recipe) {
     if (!transfer_item(root, "columns", &columns)) goto fail;
     for (size_t i = 0; i < recipe->column_count; ++i) {
         const tf_transform_recipe_column *column = &recipe->columns[i];
-        if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
-            cJSON *entry = cJSON_CreateObject();
-            cJSON *kind = cJSON_CreateObject();
-            cJSON *categorical = cJSON_CreateObject();
-            cJSON *impute = cJSON_CreateObject();
-            cJSON *encode = cJSON_CreateObject();
-            cJSON *sentinel = column->categorical_has_sentinel_label
-                ? json_number((double)column->categorical_sentinel_label)
-                : json_null();
-            cJSON *unknown = column->categorical_unknown == TF_TRANSFORM_UNKNOWN_NONE
-                ? json_null() : json_string(
-                    column->categorical_unknown == TF_TRANSFORM_UNKNOWN_SENTINEL
-                        ? "sentinel"
-                        : column->categorical_unknown == TF_TRANSFORM_UNKNOWN_OTHER
-                            ? "other"
-                            : column->categorical_unknown
-                                  == TF_TRANSFORM_UNKNOWN_ALL_ZERO
-                                ? "all_zero" : "error");
-            if (!entry || !kind || !categorical || !impute || !encode
-                || !sentinel || !unknown
-                || !add_item(kind, "maxCategories", json_null())
-                || !add_item(kind, "op", json_string("declared"))
-                || !add_item(kind, "rule", json_null())
-                || !add_item(kind, "value", json_string("categorical"))
-                || !transfer_item(entry, "kind", &kind)
-                || !add_item(encode, "categories", json_string("discover"))
-                || !add_item(encode, "op", json_string(
-                    column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL
-                        ? "label"
-                        : column->categorical_encode
-                              == TF_TRANSFORM_ENCODE_ONEHOT
-                            ? "onehot" : "none"))
-                || !transfer_item(encode, "sentinelLabel", &sentinel)
-                || !transfer_item(encode, "unknown", &unknown)
-                || !transfer_item(categorical, "encode", &encode)
-                || !add_item(impute, "allMissing", json_string(
-                    column->categorical_all_missing == TF_TRANSFORM_ALL_MISSING_ZERO
-                        ? "zero" : "error"))
-                || !add_item(impute, "constant", json_null())
-                || !add_item(impute, "op", json_string("mode"))
-                || !transfer_item(categorical, "impute", &impute)
-                || !transfer_item(entry, "categorical", &categorical)
-                || !add_item(entry, "numeric", json_null())
-                || !add_item(entry, "sourceId", json_string(column->source_id))
-                || !transfer_array_item(
-                    cJSON_GetObjectItemCaseSensitive(root, "columns"), &entry)) {
-                cJSON_Delete(entry);
-                cJSON_Delete(kind);
-                cJSON_Delete(categorical);
-                cJSON_Delete(impute);
-                cJSON_Delete(encode);
-                cJSON_Delete(sentinel);
-                cJSON_Delete(unknown);
-                goto fail;
-            }
-            continue;
-        }
         cJSON *entry = cJSON_CreateObject();
         cJSON *kind = cJSON_CreateObject();
-        cJSON *numeric = cJSON_CreateObject();
-        cJSON *impute = cJSON_CreateObject();
-        cJSON *normalize = cJSON_CreateObject();
-        const char *impute_name;
-        const char *normalize_name;
-        if (!entry || !kind || !numeric || !impute || !normalize) {
-            cJSON_Delete(entry); cJSON_Delete(kind); cJSON_Delete(numeric);
-            cJSON_Delete(impute); cJSON_Delete(normalize); goto fail;
+        cJSON *numeric = column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+            ? json_null() : recipe_numeric_branch_to_json(column);
+        cJSON *categorical = column->kind == TF_TRANSFORM_KIND_NUMERIC
+            ? json_null() : recipe_categorical_branch_to_json(column);
+        cJSON *max_categories = column->kind == TF_TRANSFORM_KIND_INFER
+            ? json_number((double)column->infer_max_categories) : json_null();
+        cJSON *rule = column->kind == TF_TRANSFORM_KIND_INFER
+            ? json_string("finite-integer-cardinality-v1") : json_null();
+        cJSON *kind_value = column->kind == TF_TRANSFORM_KIND_INFER
+            ? json_null() : json_string(
+                column->kind == TF_TRANSFORM_KIND_CATEGORICAL
+                    ? "categorical" : "numeric");
+        if (!entry || !kind || !numeric || !categorical || !max_categories
+            || !rule || !kind_value
+            || !transfer_item(entry, "categorical", &categorical)
+            || !transfer_item(kind, "maxCategories", &max_categories)
+            || !add_item(kind, "op", json_string(
+                column->kind == TF_TRANSFORM_KIND_INFER ? "infer" : "declared"))
+            || !transfer_item(kind, "rule", &rule)
+            || !transfer_item(kind, "value", &kind_value)
+            || !transfer_item(entry, "kind", &kind)
+            || !transfer_item(entry, "numeric", &numeric)
+            || !add_item(entry, "sourceId", json_string(column->source_id))
+            || !transfer_array_item(
+                cJSON_GetObjectItemCaseSensitive(root, "columns"), &entry)) {
+            cJSON_Delete(entry);
+            cJSON_Delete(kind);
+            cJSON_Delete(numeric);
+            cJSON_Delete(categorical);
+            cJSON_Delete(max_categories);
+            cJSON_Delete(rule);
+            cJSON_Delete(kind_value);
+            goto fail;
         }
-        if (!add_item(entry, "categorical", json_null())
-            || !add_item(kind, "maxCategories", json_null())
-            || !add_item(kind, "op", json_string("declared"))
-            || !add_item(kind, "rule", json_null())
-            || !add_item(kind, "value", json_string("numeric"))
-            || !transfer_item(entry, "kind", &kind)) goto entry_fail;
-        if (column->impute == TF_TRANSFORM_IMPUTE_MEAN
-            || column->impute == TF_TRANSFORM_IMPUTE_MEDIAN) {
-            if (!add_item(impute, "allMissing", json_string(
-                    column->all_missing == TF_TRANSFORM_ALL_MISSING_ZERO
-                        ? "zero" : "error"))) goto entry_fail;
-        } else if (!add_item(impute, "allMissing", json_null())) goto entry_fail;
-        if (column->impute == TF_TRANSFORM_IMPUTE_CONSTANT) {
-            if (!add_item(impute, "constant", tagged_constant(
-                    column->constant, column->constant_dtype))) goto entry_fail;
-        } else if (!add_item(impute, "constant", json_null())) goto entry_fail;
-        impute_name = column->impute == TF_TRANSFORM_IMPUTE_NONE ? "none"
-            : column->impute == TF_TRANSFORM_IMPUTE_ZERO ? "zero"
-            : column->impute == TF_TRANSFORM_IMPUTE_CONSTANT ? "constant"
-            : column->impute == TF_TRANSFORM_IMPUTE_MEAN ? "mean" : "median";
-        if (!add_item(impute, "op", json_string(impute_name))) goto entry_fail;
-        if (!transfer_item(numeric, "impute", &impute)) goto entry_fail;
-        if (column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD) {
-            if (!add_item(normalize, "ddof", json_number(column->ddof))) goto entry_fail;
-        } else if (!add_item(normalize, "ddof", json_null())) goto entry_fail;
-        normalize_name = column->normalize == TF_TRANSFORM_NORMALIZE_NONE ? "none"
-            : column->normalize == TF_TRANSFORM_NORMALIZE_STANDARD
-                ? "standard" : "minmax";
-        if (!add_item(normalize, "op", json_string(normalize_name))) goto entry_fail;
-        if (!transfer_item(numeric, "normalize", &normalize)) goto entry_fail;
-        if (!transfer_item(entry, "numeric", &numeric)) goto entry_fail;
-        if (!add_item(entry, "sourceId", json_string(column->source_id))) goto entry_fail;
-        if (!transfer_array_item(
-                cJSON_GetObjectItemCaseSensitive(root, "columns"), &entry))
-            goto entry_fail;
         continue;
-entry_fail:
-        cJSON_Delete(entry); cJSON_Delete(kind); cJSON_Delete(numeric);
-        cJSON_Delete(impute); cJSON_Delete(normalize); goto fail;
     }
     if (!add_item(root, "format", json_string("tranfi.transform-recipe"))
         || !add_item(root, "outputDtype", json_string("float64"))
@@ -2997,6 +3091,9 @@ static tf_transform_code parse_categorical_step(
         ++count;
     }
     if (count == 0) goto corrupt;
+    if (recipe->kind == TF_TRANSFORM_KIND_INFER
+        && (count < 2 || (uint64_t)count > recipe->infer_max_categories))
+        goto corrupt;
     if ((uint64_t)count > runtime->limits.max_categories_per_column
         || *total_categories > UINT64_MAX - (uint64_t)count
         || *total_categories + (uint64_t)count
@@ -3080,6 +3177,37 @@ corrupt:
         "categorical plan state is inconsistent");
 }
 
+static tf_transform_code imported_step_kind(
+    const cJSON *step, const tf_transform_recipe_column *recipe,
+    tf_transform_column_kind *out, tf_transform_error **error) {
+    const cJSON *kind;
+    tf_transform_column_kind resolved;
+    if (!step || !recipe || !out)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "imported step-kind arguments are invalid");
+    kind = required_item(step, "kind");
+    if (json_string_equals(kind, "numeric"))
+        resolved = TF_TRANSFORM_KIND_NUMERIC;
+    else if (json_string_equals(kind, "categorical"))
+        resolved = TF_TRANSFORM_KIND_CATEGORICAL;
+    else return tf_transform_set_error(
+        error, TF_TRANSFORM_CORRUPT_PLAN,
+        "plan step kind is invalid");
+    if ((recipe->kind == TF_TRANSFORM_KIND_NUMERIC
+            && resolved != TF_TRANSFORM_KIND_NUMERIC)
+        || (recipe->kind == TF_TRANSFORM_KIND_CATEGORICAL
+            && resolved != TF_TRANSFORM_KIND_CATEGORICAL)
+        || (recipe->kind != TF_TRANSFORM_KIND_NUMERIC
+            && recipe->kind != TF_TRANSFORM_KIND_CATEGORICAL
+            && recipe->kind != TF_TRANSFORM_KIND_INFER))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_CORRUPT_PLAN,
+            "plan step kind disagrees with its recipe");
+    *out = resolved;
+    return TF_TRANSFORM_OK;
+}
+
 tf_transform_code tf_transform_plan_from_json(
     const uint8_t *json, size_t json_len,
     const tf_transform_runtime_copy *runtime,
@@ -3148,6 +3276,10 @@ tf_transform_code tf_transform_plan_from_json(
     }
     recipe_runtime = *runtime;
     recipe_runtime.limits.max_output_columns
+        = (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1;
+    recipe_runtime.limits.max_categories_per_column
+        = (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1;
+    recipe_runtime.limits.max_total_categories
         = (uint64_t)TF_TRANSFORM_MAX_SAFE_INTEGER_V1;
     code = recipe_from_json_value(
         required_item(root, "recipe"), &recipe_runtime,
@@ -3231,7 +3363,7 @@ tf_transform_code tf_transform_plan_from_json(
             input->id, input->id_len, runtime, &source_equal, error);
         if (code != TF_TRANSFORM_OK) goto done;
         if (!source_equal
-            || (recipe_column->kind == TF_TRANSFORM_KIND_NUMERIC
+            || (recipe_column->kind != TF_TRANSFORM_KIND_CATEGORICAL
                 && recipe_column->impute == TF_TRANSFORM_IMPUTE_CONSTANT
                 && recipe_column->constant_dtype != input->dtype)) {
             code = tf_transform_set_error(
@@ -3295,13 +3427,16 @@ tf_transform_code tf_transform_plan_from_json(
              ++i, step = step->next) {
             const tf_transform_recipe_column *column
                 = &plan->recipe->columns[i];
+            tf_transform_column_kind resolved_kind;
             uint64_t width = 1;
             if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
                 code = tf_transform_poll_cancel(runtime, error);
                 if (code != TF_TRANSFORM_OK) goto done;
             }
-            if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL
-                && column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT) {
+            code = imported_step_kind(
+                step, column, &resolved_kind, error);
+            if (code != TF_TRANSFORM_OK) goto done;
+            if (resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL) {
                 const cJSON *categorical = required_item(step, "categorical");
                 const cJSON *categories = required_item(
                     categorical, "categories");
@@ -3310,7 +3445,7 @@ tf_transform_code tf_transform_plan_from_json(
                 if (!cJSON_IsArray(categories)) {
                     code = tf_transform_set_error(
                         error, TF_TRANSFORM_CORRUPT_PLAN,
-                        "one-hot plan categories are invalid");
+                        "categorical plan categories are invalid");
                     goto done;
                 }
                 cJSON_ArrayForEach(category, categories) {
@@ -3321,27 +3456,33 @@ tf_transform_code tf_transform_plan_from_json(
                     if (count == SIZE_MAX) {
                         code = tf_transform_set_error(
                             error, TF_TRANSFORM_CORRUPT_PLAN,
-                            "one-hot plan width overflows");
+                            "categorical plan width overflows");
                         goto done;
                     }
                     ++count;
                 }
-                if (count == 0) {
+                if (count == 0
+                    || (column->kind == TF_TRANSFORM_KIND_INFER
+                        && (count < 2
+                            || (uint64_t)count
+                                > column->infer_max_categories))) {
                     code = tf_transform_set_error(
                         error, TF_TRANSFORM_CORRUPT_PLAN,
-                        "one-hot plan has no categories");
+                        "inferred categorical plan cardinality is inconsistent");
                     goto done;
                 }
-                width = (uint64_t)count;
-                if (column->categorical_unknown
-                        == TF_TRANSFORM_UNKNOWN_OTHER) {
-                    if (width == UINT64_MAX) {
-                        code = tf_transform_set_error(
-                            error, TF_TRANSFORM_CORRUPT_PLAN,
-                            "one-hot plan width overflows");
-                        goto done;
+                if (column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT) {
+                    width = (uint64_t)count;
+                    if (column->categorical_unknown
+                            == TF_TRANSFORM_UNKNOWN_OTHER) {
+                        if (width == UINT64_MAX) {
+                            code = tf_transform_set_error(
+                                error, TF_TRANSFORM_CORRUPT_PLAN,
+                                "one-hot plan width overflows");
+                            goto done;
+                        }
+                        ++width;
                     }
-                    ++width;
                 }
             }
             if (width > UINT64_MAX - expected_output_columns) {
@@ -3358,6 +3499,18 @@ tf_transform_code tf_transform_plan_from_json(
                 error, TF_TRANSFORM_CORRUPT_PLAN,
                 "learned plan output width is inconsistent");
             goto done;
+        }
+        for (size_t i = 0; i < plan->recipe->column_count; ++i) {
+            if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_INFER
+                && (plan->recipe->columns[i].infer_max_categories
+                        > runtime->limits.max_categories_per_column
+                    || plan->recipe->columns[i].infer_max_categories
+                        > runtime->limits.max_total_categories)) {
+                code = tf_transform_set_error(
+                    error, TF_TRANSFORM_RESOURCE_LIMIT,
+                    "inferred category bound exceeds host limits");
+                goto done;
+            }
         }
         if (expected_output_columns > runtime->limits.max_output_columns) {
             code = tf_transform_set_error(
@@ -3386,24 +3539,27 @@ tf_transform_code tf_transform_plan_from_json(
         const cJSON *step = steps->child;
         for (size_t i = 0; i < plan->input_schema.field_count;
              ++i, step = step->next) {
-        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
-            code = tf_transform_poll_cancel(runtime, error);
+            tf_transform_column_kind resolved_kind;
+            if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = tf_transform_poll_cancel(runtime, error);
+                if (code != TF_TRANSFORM_OK) goto done;
+            }
+            code = imported_step_kind(
+                step, &plan->recipe->columns[i], &resolved_kind, error);
             if (code != TF_TRANSFORM_OK) goto done;
-        }
-        if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_CATEGORICAL) {
-            plan->states[i].kind = TF_TRANSFORM_KIND_CATEGORICAL;
-            code = parse_categorical_step(
-                step, &plan->recipe->columns[i],
-                plan->input_schema.fields[i].dtype,
-                runtime, &ledger, &total_categories,
-                &plan->states[i].value.categorical, error);
-        } else {
-            plan->states[i].kind = TF_TRANSFORM_KIND_NUMERIC;
-            code = parse_numeric_step(
-                step, &plan->recipe->columns[i], runtime,
-                &plan->states[i].value.numeric, error);
-        }
-        if (code != TF_TRANSFORM_OK) goto done;
+            plan->states[i].kind = resolved_kind;
+            if (resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+                code = parse_categorical_step(
+                    step, &plan->recipe->columns[i],
+                    plan->input_schema.fields[i].dtype,
+                    runtime, &ledger, &total_categories,
+                    &plan->states[i].value.categorical, error);
+            } else {
+                code = parse_numeric_step(
+                    step, &plan->recipe->columns[i], runtime,
+                    &plan->states[i].value.numeric, error);
+            }
+            if (code != TF_TRANSFORM_OK) goto done;
         }
     }
     code = parse_schema_json(
@@ -3411,7 +3567,7 @@ tf_transform_code tf_transform_plan_from_json(
         &ledger, &plan->output_schema, error);
     if (code != TF_TRANSFORM_OK) goto done;
     code = tf_transform_output_schema_validate_contract(
-        &plan->input_schema, plan->recipe, plan->states,
+        &plan->input_schema, plan->recipe, NULL, plan->states,
         &plan->output_schema, runtime, &ledger,
         TF_TRANSFORM_CORRUPT_PLAN, error);
     if (code != TF_TRANSFORM_OK) goto done;

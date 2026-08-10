@@ -1904,6 +1904,93 @@ static void test_categorical_mode_resources_and_cancellation(void) {
     free(values);
 }
 
+static void test_kind_inference_release_and_domain(void) {
+    const double candidate_values[] = {0.0, 1.0};
+    const double extra_value[] = {2.0};
+    const double infinity[] = {
+        tf_transform_double_from_bits(UINT64_C(0x7ff0000000000000))
+    };
+    tf_transform_recipe *recipe = load_vector_recipe("infer_two_categories");
+    tf_field_view_v1 field;
+    tf_schema_view_v1 schema;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_plan *plan = NULL;
+    tf_transform_error *error = NULL;
+    tf_transform_limits_v1 limits;
+    tf_transform_runtime_v1 runtime;
+    uint64_t base_resident;
+    uint64_t candidate_resident;
+    uint64_t candidate_allocations;
+
+    make_x0_schema(TF_VIEW_FLOAT64, &field, &schema);
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.abi_version = 1;
+    runtime.struct_size = (uint32_t)sizeof(runtime);
+    runtime.limits = &limits;
+
+    limits.max_categories_per_column = 1;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error)
+        == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(analyzer == NULL);
+    tf_transform_error_destroy(&error);
+
+    limits.max_categories_per_column = 2;
+    limits.max_total_categories = 1;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error)
+        == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(analyzer == NULL);
+    tf_transform_error_destroy(&error);
+
+    limits.max_total_categories = 2;
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    base_resident = analyzer->resident_state_bytes;
+    make_f64_table(candidate_values, 2, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    candidate_resident = analyzer->resident_state_bytes;
+    candidate_allocations = analyzer->allocation_count;
+    assert(candidate_resident > base_resident
+           && analyzer->total_categories == 2);
+
+    make_f64_table(extra_value, 1, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_OK);
+    assert(analyzer->resident_state_bytes == base_resident
+           && analyzer->total_categories == 0
+           && analyzer->allocation_count == candidate_allocations);
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error)
+           == TF_TRANSFORM_OK);
+    assert(plan != NULL && plan->states[0].kind == TF_TRANSFORM_KIND_NUMERIC
+           && plan->states[0].value.numeric.has_impute_value
+           && tf_transform_double_bits(
+                plan->states[0].value.numeric.impute_value)
+                == UINT64_C(0x3ff0000000000000));
+    tf_transform_plan_destroy(&plan);
+    tf_transform_analyzer_destroy(&analyzer);
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    assert(tf_transform_analyzer_create(
+        recipe, &schema, &runtime, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f64_table(infinity, 1, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_NUMERIC_DOMAIN);
+    assert(analyzer->state == TF_ANALYZER_FAILED);
+    tf_transform_error_destroy(&error);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+           == TF_TRANSFORM_INVALID_STATE);
+    tf_transform_error_destroy(&error);
+    tf_transform_analyzer_destroy(&analyzer);
+    tf_transform_recipe_destroy(&recipe);
+}
+
 static void test_wide_categorical_lifecycle_cancellation(void) {
     const size_t column_count = TF_TRANSFORM_CANCEL_ITERS_V1 * 3 + 1;
     wide_categorical_fixture fixture;
@@ -2202,12 +2289,14 @@ static void execute_semantic_case(
         tf_transform_plan *plan = NULL;
         tf_transform_apply *apply_session = NULL;
         tf_transform_error *error = NULL;
+        tf_transform_code code;
         size_t offset = 0;
         tf_column_view_v1 column;
         tf_table_view_v1 table;
         tf_owned_dense_v1 dense;
         uint8_t *plan_bytes = NULL;
         size_t plan_len = 0;
+        int analyze_failed = 0;
         make_x0_schema(input_f32 ? TF_VIEW_FLOAT32 : TF_VIEW_FLOAT64,
                        &field, &schema);
         assert(tf_transform_analyzer_create(
@@ -2227,11 +2316,32 @@ static void execute_semantic_case(
                 make_f64_table(
                     chunk_rows ? analyze_values + offset : NULL,
                     chunk_rows, &column, &table);
-            assert(tf_transform_analyzer_push(analyzer, &table, &error)
-                   == TF_TRANSFORM_OK);
+            code = tf_transform_analyzer_push(analyzer, &table, &error);
             offset += chunk_rows;
+            if (expected_error
+                && strcmp(cJSON_GetObjectItemCaseSensitive(
+                    expected_error, "phase")->valuestring, "analyze") == 0) {
+                tf_transform_code expected = (tf_transform_code)
+                    cJSON_GetObjectItemCaseSensitive(
+                        expected_error, "code")->valueint;
+                if (chunk_index + 1 == cJSON_GetArraySize(split)) {
+                    assert(code == expected && error != NULL
+                           && tf_transform_error_get_code(error) == expected);
+                    tf_transform_error_destroy(&error);
+                    assert(tf_transform_analyzer_push(analyzer, &table, &error)
+                           == TF_TRANSFORM_INVALID_STATE);
+                    tf_transform_error_destroy(&error);
+                    analyze_failed = 1;
+                    break;
+                }
+            }
+            assert(code == TF_TRANSFORM_OK);
         }
         assert(offset == analyze_count);
+        if (analyze_failed) {
+            tf_transform_analyzer_destroy(&analyzer);
+            continue;
+        }
         if (expected_error
             && strcmp(cJSON_GetObjectItemCaseSensitive(
                 expected_error, "phase")->valuestring, "finalize") == 0) {
@@ -2463,7 +2573,7 @@ static void test_shared_semantic_case_table(void) {
         ++executed;
         tf_transform_recipe_destroy(&recipe);
     }
-    assert(executed == 28 && deferred == 2);
+    assert(executed == 40 && deferred == 1);
     cJSON_Delete(root);
     free(text);
 }
@@ -2501,11 +2611,21 @@ static cJSON *mutated_validation_recipe(
         const cJSON *value = cJSON_GetObjectItemCaseSensitive(mutation, "value");
         cJSON *column = cJSON_GetArrayItem(
             cJSON_GetObjectItemCaseSensitive(copy, "columns"), 0);
-        assert(cJSON_IsString(path) && cJSON_IsNumber(value));
+        assert(cJSON_IsString(path) && value != NULL);
         if (strcmp(path->valuestring, "/columns/0/kind/maxCategories") == 0) {
             cJSON *kind = cJSON_GetObjectItemCaseSensitive(column, "kind");
             assert(cJSON_ReplaceItemInObjectCaseSensitive(
-                kind, "maxCategories", cJSON_CreateNumber(value->valuedouble)));
+                kind, "maxCategories", cJSON_Duplicate(value, 1)));
+        } else if (strcmp(path->valuestring, "/columns/0/kind/rule") == 0) {
+            cJSON *kind = cJSON_GetObjectItemCaseSensitive(column, "kind");
+            assert(cJSON_ReplaceItemInObjectCaseSensitive(
+                kind, "rule", cJSON_Duplicate(value, 1)));
+        } else if (strcmp(path->valuestring, "/columns/0/numeric") == 0) {
+            assert(cJSON_ReplaceItemInObjectCaseSensitive(
+                column, "numeric", cJSON_Duplicate(value, 1)));
+        } else if (strcmp(path->valuestring, "/columns/0/categorical") == 0) {
+            assert(cJSON_ReplaceItemInObjectCaseSensitive(
+                column, "categorical", cJSON_Duplicate(value, 1)));
         } else if (strcmp(
                 path->valuestring,
                 "/columns/0/categorical/encode/sentinelLabel") == 0) {
@@ -2555,17 +2675,11 @@ static void test_shared_validation_case_table(void) {
         cJSON_Delete(recipe_json);
         assert(cJSON_IsString(phase));
         if (strcmp(phase->valuestring, "recipe") == 0) {
-            if (expected == TF_TRANSFORM_OK
-                && strcmp(recipe_name, "infer_two_categories") == 0) {
-                assert(code == TF_TRANSFORM_INVALID_RECIPE && recipe == NULL);
-                ++deferred;
-            } else {
-                if (code != expected) fprintf(
-                    stderr, "validation case %d (%s): got %d expected %d\n",
-                    i, recipe_name, (int)code, (int)expected);
-                assert(code == expected);
-                ++executed;
-            }
+            if (code != expected) fprintf(
+                stderr, "validation case %d (%s): got %d expected %d\n",
+                i, recipe_name, (int)code, (int)expected);
+            assert(code == expected);
+            ++executed;
             tf_transform_error_destroy(&error);
             tf_transform_recipe_destroy(&recipe);
             continue;
@@ -2601,7 +2715,7 @@ static void test_shared_validation_case_table(void) {
         ++executed;
         tf_transform_recipe_destroy(&recipe);
     }
-    assert(executed == 6 && deferred == 1);
+    assert(executed == 11 && deferred == 0);
     cJSON_Delete(root);
     free(text);
 }
@@ -3082,6 +3196,93 @@ static void update_recipe_fingerprint_for_test(cJSON *root) {
     assert(cJSON_SetValuestring(fingerprint, hex) != NULL);
     tf_transform_bytes_free(&canonical, &canonical_len);
     cJSON_Delete(object);
+}
+
+static void test_kind_inference_import_contract(void) {
+    const double categorical_values[] = {0.0, 1.0, 0.0};
+    const double numeric_values[] = {0.0, 1.0, 2.0};
+    tf_transform_plan *categorical_plan = fit_f64_plan(
+        "infer_two_categories", categorical_values, 3, 1);
+    tf_transform_plan *numeric_plan = fit_f64_plan(
+        "infer_two_categories", numeric_values, 3, 1);
+    tf_transform_error *error = NULL;
+    tf_transform_limits_v1 limits;
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    cJSON *categorical_root;
+    cJSON *numeric_root;
+    cJSON *recipe_kind;
+    cJSON *step;
+
+    assert(categorical_plan->states[0].kind == TF_TRANSFORM_KIND_CATEGORICAL
+           && numeric_plan->states[0].kind == TF_TRANSFORM_KIND_NUMERIC);
+    assert(tf_transform_plan_export(
+        categorical_plan, NULL, &bytes, &bytes_len, &error) == TF_TRANSFORM_OK);
+    categorical_root = cJSON_ParseWithLength(
+        (const char *)bytes + 52, bytes_len - 52);
+    assert(categorical_root != NULL);
+    tf_transform_bytes_free(&bytes, &bytes_len);
+
+    recipe_kind = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(categorical_root, "recipe"),
+            "columns"), 0),
+        "kind");
+    step = cJSON_GetArrayItem(
+        cJSON_GetObjectItemCaseSensitive(categorical_root, "steps"), 0);
+    assert(cJSON_IsString(cJSON_GetObjectItemCaseSensitive(recipe_kind, "op"))
+           && strcmp(cJSON_GetObjectItemCaseSensitive(
+                recipe_kind, "op")->valuestring, "infer") == 0
+           && strcmp(cJSON_GetObjectItemCaseSensitive(
+                recipe_kind, "rule")->valuestring,
+                "finite-integer-cardinality-v1") == 0
+           && cJSON_GetObjectItemCaseSensitive(
+                recipe_kind, "maxCategories")->valuedouble == 2.0
+           && cJSON_IsString(cJSON_GetObjectItemCaseSensitive(step, "kind"))
+           && strcmp(cJSON_GetObjectItemCaseSensitive(
+                step, "kind")->valuestring, "categorical") == 0);
+    assert_categorical_root_import_code(
+        categorical_root, NULL, TF_TRANSFORM_OK, 0);
+
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits))
+           == TF_TRANSFORM_OK);
+    limits.max_categories_per_column = 1;
+    limits.max_total_categories = 1;
+    assert_categorical_root_import_code(
+        categorical_root, &limits, TF_TRANSFORM_RESOURCE_LIMIT, 0);
+    {
+        cJSON *copy = cJSON_Duplicate(categorical_root, 1);
+        cJSON *categories = cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(
+                cJSON_GetArrayItem(
+                    cJSON_GetObjectItemCaseSensitive(copy, "steps"), 0),
+                "categorical"),
+            "categories");
+        assert(copy != NULL && cJSON_GetArraySize(categories) == 2);
+        cJSON_DeleteItemFromArray(categories, 1);
+        assert(cJSON_GetArraySize(categories) == 1);
+        assert_categorical_root_import_code(
+            copy, &limits, TF_TRANSFORM_CORRUPT_PLAN, 0);
+        cJSON_Delete(copy);
+    }
+
+    assert(tf_transform_plan_export(
+        numeric_plan, NULL, &bytes, &bytes_len, &error) == TF_TRANSFORM_OK);
+    numeric_root = cJSON_ParseWithLength(
+        (const char *)bytes + 52, bytes_len - 52);
+    assert(numeric_root != NULL);
+    step = cJSON_GetArrayItem(
+        cJSON_GetObjectItemCaseSensitive(numeric_root, "steps"), 0);
+    assert(strcmp(cJSON_GetObjectItemCaseSensitive(
+        step, "kind")->valuestring, "numeric") == 0);
+    assert_categorical_root_import_code(
+        numeric_root, NULL, TF_TRANSFORM_OK, 0);
+
+    cJSON_Delete(numeric_root);
+    cJSON_Delete(categorical_root);
+    tf_transform_bytes_free(&bytes, &bytes_len);
+    tf_transform_plan_destroy(&numeric_plan);
+    tf_transform_plan_destroy(&categorical_plan);
 }
 
 static void test_categorical_import_validation_and_limits(void) {
@@ -4699,6 +4900,7 @@ int main(void) {
     test_categorical_mode_semantics();
     test_categorical_subnormal_fp_environment();
     test_categorical_mode_resources_and_cancellation();
+    test_kind_inference_release_and_domain();
     test_wide_categorical_lifecycle_cancellation();
     test_median_blocks_limits_and_cancellation();
     test_shared_semantic_case_table();
@@ -4712,6 +4914,7 @@ int main(void) {
     test_valid_import_cancellation_sweep();
     test_tftr_baseline_and_malformed();
     test_median_negative_zero_import_rejected();
+    test_kind_inference_import_contract();
     test_categorical_import_validation_and_limits();
     test_categorical_label_schema_collisions_and_boundaries();
     test_categorical_onehot_schema_resources_and_import();

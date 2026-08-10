@@ -842,6 +842,105 @@ static void test_prepared_transform_raw_wasm_onehot(void) {
     printf("  %-42s PASS\n", "prepared-transform raw one-hot parity");
 }
 
+static void test_prepared_transform_raw_wasm_inference(void) {
+    static const char recipe_json[] =
+        "{\"columns\":[{\"categorical\":{\"encode\":{\"categories\":"
+        "\"discover\",\"op\":\"label\",\"sentinelLabel\":null,"
+        "\"unknown\":\"error\"},\"impute\":{\"allMissing\":\"error\","
+        "\"constant\":null,\"op\":\"mode\"}},\"kind\":{\"maxCategories\":2,"
+        "\"op\":\"infer\",\"rule\":\"finite-integer-cardinality-v1\","
+        "\"value\":null},\"numeric\":{\"impute\":{\"allMissing\":\"zero\","
+        "\"constant\":null,\"op\":\"mean\"},\"normalize\":{\"ddof\":null,"
+        "\"op\":\"none\"}},\"sourceId\":\"x0\"}],\"format\":"
+        "\"tranfi.transform-recipe\",\"outputDtype\":\"float64\","
+        "\"policyVersion\":1,\"semanticLimits\":{\"maxOutputColumns\":64,"
+        "\"maxOutputElementsPerApply\":1024},\"version\":1}";
+    const double analyze_values[] = {0.0, 1.0, 2.0};
+    const double apply_values[] = {NAN, 3.0};
+    const uint64_t expected[] = {
+        UINT64_C(0x3ff0000000000000), UINT64_C(0x4008000000000000)
+    };
+    raw_heap heap = {0};
+    tf_transform_limits_v1 safe;
+    uint32_t limits_offset;
+    uint32_t recipe_offset;
+    uint32_t schema_offset;
+    uint32_t analyze_table;
+    uint32_t apply_table;
+    uint32_t error_out;
+    uint32_t recipe;
+    uint32_t analyzer;
+    uint32_t plan;
+    uint32_t apply;
+    uint32_t dense;
+
+    heap.size = 1024u * 1024u;
+    heap.bytes = (uint8_t *)calloc(1, heap.size);
+    assert(heap.bytes != NULL);
+    heap.next = 1;
+    tf_wasm_transform_test_set_heap(heap.bytes, heap.size);
+    limits_offset = raw_alloc_odd(&heap, sizeof(safe));
+    assert(tf_wasm_transform_limits_init_safe_v1(
+        limits_offset, sizeof(safe)) == TF_TRANSFORM_OK);
+    recipe_offset = raw_put(
+        &heap, recipe_json, (uint32_t)strlen(recipe_json), 1);
+    schema_offset = raw_schema_x0(&heap);
+    analyze_table = raw_table_x0(&heap, analyze_values, 3, 0);
+    apply_table = raw_table_x0(&heap, apply_values, 2, 0);
+    error_out = raw_alloc_odd(&heap, 4);
+    recipe = raw_create_recipe(
+        &heap, recipe_offset, (uint32_t)strlen(recipe_json), limits_offset);
+    {
+        uint32_t analyzer_out = raw_alloc_odd(&heap, 4);
+        uint32_t plan_out = raw_alloc_odd(&heap, 4);
+        assert(tf_wasm_transform_analyzer_create(
+            recipe, schema_offset, limits_offset, 0,
+            analyzer_out, error_out) == TF_TRANSFORM_OK);
+        analyzer = raw_word(&heap, analyzer_out);
+        assert(tf_wasm_transform_analyzer_push(
+            analyzer, analyze_table, error_out) == TF_TRANSFORM_OK);
+        assert(tf_wasm_transform_analyzer_finalize(
+            analyzer, plan_out, error_out) == TF_TRANSFORM_OK);
+        plan = raw_word(&heap, plan_out);
+    }
+    {
+        uint32_t apply_out = raw_alloc_odd(&heap, 4);
+        uint32_t dense_out = raw_alloc_odd(&heap, 4);
+        uint32_t info_out = raw_alloc_odd(
+            &heap, sizeof(tf_wasm_dense_info_v1));
+        tf_wasm_dense_info_v1 info;
+        assert(tf_wasm_transform_apply_create(
+            plan, schema_offset, limits_offset, 0,
+            apply_out, error_out) == TF_TRANSFORM_OK);
+        apply = raw_word(&heap, apply_out);
+        assert(tf_wasm_transform_apply_run(
+            apply, apply_table, dense_out, error_out) == TF_TRANSFORM_OK);
+        dense = raw_word(&heap, dense_out);
+        assert(tf_wasm_transform_owned_dense_info(dense, info_out)
+               == TF_TRANSFORM_OK);
+        memcpy(&info, heap.bytes + info_out, sizeof(info));
+        assert(info.rows == 2 && info.columns == 1
+               && info.data_bytes == 2 * sizeof(double));
+        {
+            uint32_t data_out = raw_alloc(&heap, info.data_bytes, 8);
+            double actual[2];
+            assert(tf_wasm_transform_owned_dense_copy(
+                dense, data_out, info.data_bytes) == TF_TRANSFORM_OK);
+            memcpy(actual, heap.bytes + data_out, sizeof(actual));
+            for (size_t i = 0; i < 2; ++i)
+                assert(raw_double_bits(actual[i]) == expected[i]);
+        }
+    }
+    assert(tf_wasm_transform_handle_destroy(dense) == TF_TRANSFORM_OK);
+    assert(tf_wasm_transform_handle_destroy(apply) == TF_TRANSFORM_OK);
+    assert(tf_wasm_transform_handle_destroy(plan) == TF_TRANSFORM_OK);
+    assert(tf_wasm_transform_handle_destroy(analyzer) == TF_TRANSFORM_OK);
+    assert(tf_wasm_transform_handle_destroy(recipe) == TF_TRANSFORM_OK);
+    free(heap.bytes);
+    tf_wasm_transform_test_set_heap(NULL, 0);
+    printf("  %-42s PASS\n", "prepared-transform raw kind inference");
+}
+
 int main(void) {
     printf("Tranfi WASM ABI Tests\n");
     printf("=====================\n");
@@ -849,6 +948,7 @@ int main(void) {
     test_wasm_sql_error_propagation();
     test_prepared_transform_raw_wasm_abi();
     test_prepared_transform_raw_wasm_onehot();
+    test_prepared_transform_raw_wasm_inference();
     printf("\nWASM ABI tests passed\n");
     return 0;
 }

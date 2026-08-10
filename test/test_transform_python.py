@@ -37,6 +37,8 @@ SUPPORTED_CASES = [
         'categorical_mode_zero_onehot_all_zero',
         'categorical_mode_zero_label_other',
         'categorical_mode_none', 'categorical_mode_zero_none',
+        'infer_two_categories', 'infer_two_categories_median',
+        'infer_two_categories_onehot_all_zero',
         'numeric_mean_standard', 'numeric_median_none',
         'numeric_median_zero_none',
         'numeric_none_none', 'numeric_zero_minmax'
@@ -198,16 +200,74 @@ def test_semantic_vectors_chunk_plan_and_apply_parity(case):
         assert loaded.to_bytes() == reference_blob
 
 
-def test_empty_analysis_preserves_insufficient_data_code():
+def test_inference_deferred_numeric_domain_error_is_terminal():
     case = next(
         item for item in VECTORS['semanticCases']
-        if item['id'] == 'empty-analysis-insufficient')
-    with tranfi.TransformRecipe.from_json(recipe_text(case['recipe'])) as recipe:
-        with recipe.analyzer(SCHEMA64) as analyzer:
-            analyzer.push(make_table([]))
-            with pytest.raises(tranfi.TranfiTransformError) as caught:
-                analyzer.finalize()
-            assert caught.value.code == case['expectedError']['code']
+        if item['id'] == 'infer-late-numeric-surfaces-deferred-overflow')
+    values = [double_from_bits(row[0]) for row in case['analyze']['rows']]
+    for split in case['analyze']['chunkSplits']:
+        with tranfi.TransformRecipe.from_json(
+                recipe_text(case['recipe'])) as recipe:
+            with recipe.analyzer(SCHEMA64) as analyzer:
+                offset = 0
+                for index, count in enumerate(split):
+                    input_table = make_table(values[offset:offset + count])
+                    offset += count
+                    if index + 1 == len(split):
+                        with pytest.raises(
+                                tranfi.TranfiTransformError) as caught:
+                            analyzer.push(input_table)
+                        assert caught.value.code == case['expectedError']['code']
+                        with pytest.raises(
+                                tranfi.TranfiTransformError) as terminal:
+                            analyzer.push(input_table)
+                        assert terminal.value.code == 112
+                    else:
+                        analyzer.push(input_table)
+                assert offset == len(values)
+
+
+def test_empty_analysis_preserves_insufficient_data_code():
+    for case_id in ('empty-analysis-insufficient',
+                    'infer-zero-rows-insufficient'):
+        case = next(
+            item for item in VECTORS['semanticCases']
+            if item['id'] == case_id)
+        with tranfi.TransformRecipe.from_json(
+                recipe_text(case['recipe'])) as recipe:
+            with recipe.analyzer(SCHEMA64) as analyzer:
+                analyzer.push(make_table([]))
+                with pytest.raises(tranfi.TranfiTransformError) as caught:
+                    analyzer.finalize()
+                assert caught.value.code == case['expectedError']['code']
+                with pytest.raises(tranfi.TranfiTransformError) as terminal:
+                    analyzer.finalize()
+                assert terminal.value.code == 112
+
+
+def test_inference_host_category_bounds_are_preflighted():
+    for limits in (
+            tranfi.TransformLimits(max_categories_per_column=1),
+            tranfi.TransformLimits(max_total_categories=1)):
+        with pytest.raises(tranfi.TranfiTransformError) as caught:
+            tranfi.TransformRecipe.from_json(
+                recipe_text('infer_two_categories'), limits=limits)
+        assert caught.value.code == 104
+
+    exact = tranfi.TransformLimits(
+        max_categories_per_column=2, max_total_categories=2)
+    with tranfi.TransformRecipe.from_json(
+            recipe_text('infer_two_categories'), limits=exact) as recipe:
+        with pytest.raises(tranfi.TranfiTransformError) as caught:
+            recipe.analyzer(
+                SCHEMA64,
+                limits=tranfi.TransformLimits(max_categories_per_column=1))
+        assert caught.value.code == 104
+        with recipe.analyzer(SCHEMA64, limits=exact) as analyzer:
+            analyzer.push(make_table([0.0, 1.0, 2.0]))
+            with analyzer.finalize() as plan:
+                with plan.apply(SCHEMA64) as apply:
+                    assert list(apply.run(make_table([float('nan')])).data) == [1.0]
 
 
 def test_categorical_mode_errors_limits_and_float32():

@@ -18,7 +18,8 @@ typedef enum tf_transform_impute_op {
 
 typedef enum tf_transform_column_kind {
     TF_TRANSFORM_KIND_NUMERIC = 0,
-    TF_TRANSFORM_KIND_CATEGORICAL
+    TF_TRANSFORM_KIND_CATEGORICAL,
+    TF_TRANSFORM_KIND_INFER
 } tf_transform_column_kind;
 
 typedef enum tf_transform_categorical_impute_op {
@@ -69,6 +70,7 @@ typedef struct tf_transform_recipe_column {
     char *source_id;
     size_t source_id_len;
     tf_transform_column_kind kind;
+    uint64_t infer_max_categories;
     tf_transform_impute_op impute;
     tf_transform_all_missing all_missing;
     double constant;
@@ -169,6 +171,7 @@ typedef struct tf_transform_running_stats {
     double minimum;
     double maximum;
     int has_value;
+    int numeric_domain_failed;
 } tf_transform_running_stats;
 
 typedef struct tf_transform_median_store {
@@ -311,6 +314,13 @@ void tf_transform_category_stores_clear(tf_transform_analyzer *analyzer);
 tf_transform_code tf_transform_category_observe(
     tf_transform_analyzer *analyzer, size_t column_index,
     double value, uint32_t dtype, tf_transform_error **error);
+tf_transform_code tf_transform_category_infer_observe(
+    tf_transform_analyzer *analyzer, size_t column_index,
+    double value, uint32_t dtype, int is_integer, uint64_t max_categories,
+    int *resolved_numeric, tf_transform_error **error);
+tf_transform_code tf_transform_analyzer_resolve_kind(
+    const tf_transform_analyzer *analyzer, size_t column_index,
+    tf_transform_column_kind *out, tf_transform_error **error);
 tf_transform_code tf_transform_category_check_observed(
     const tf_transform_analyzer *analyzer, size_t column_index,
     uint64_t observed, tf_transform_error **error);
@@ -369,6 +379,7 @@ tf_transform_code tf_transform_output_schema_requirements(
     tf_transform_error **error);
 tf_transform_code tf_transform_output_schema_build(
     const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_analyzer *analyzer,
     const tf_transform_column_state *states,
     const tf_transform_runtime_copy *runtime, tf_transform_schema *out,
     tf_transform_error **error);
@@ -379,6 +390,7 @@ tf_transform_code tf_transform_output_schema_validate_collisions(
     tf_transform_error **error);
 tf_transform_code tf_transform_output_schema_validate_contract(
     const tf_transform_schema *input, const tf_transform_recipe *recipe,
+    const tf_transform_analyzer *analyzer,
     const tf_transform_column_state *states,
     const tf_transform_schema *output,
     const tf_transform_runtime_copy *runtime,

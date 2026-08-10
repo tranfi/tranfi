@@ -16,6 +16,7 @@ struct tf_transform_category_store {
     size_t category_count;
     uint64_t observed;
     uint32_t dtype;
+    int inference_numeric;
 };
 
 static tf_transform_code category_poll(
@@ -152,7 +153,7 @@ tf_transform_code tf_transform_category_stores_init(
                sizeof(analyzer->category_stores[i]));
         analyzer->category_stores_initialized = i + 1;
         if (analyzer->recipe->columns[i].kind
-                == TF_TRANSFORM_KIND_CATEGORICAL)
+                != TF_TRANSFORM_KIND_NUMERIC)
             analyzer->category_stores[i].dtype
                 = analyzer->input_schema.fields[i].dtype;
     }
@@ -362,6 +363,132 @@ tf_transform_code tf_transform_category_observe(
     return TF_TRANSFORM_OK;
 }
 
+static tf_transform_code category_inference_resolve_numeric(
+    tf_transform_analyzer *analyzer, tf_transform_category_store *store,
+    tf_transform_error **error) {
+    uint64_t slot_bytes;
+    uint32_t dtype;
+    if (!analyzer || !store)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "categorical inference state is unavailable");
+    if (store->inference_numeric) return TF_TRANSFORM_OK;
+    if (store->capacity > SIZE_MAX / sizeof(*store->slots))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "categorical inference capacity is inconsistent");
+    slot_bytes = (uint64_t)(store->capacity * sizeof(*store->slots));
+    if (slot_bytes > analyzer->resident_state_bytes
+        || (uint64_t)store->category_count > analyzer->total_categories)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "categorical inference accounting is inconsistent");
+    dtype = store->dtype;
+    free(store->slots);
+    analyzer->resident_state_bytes -= slot_bytes;
+    analyzer->total_categories -= (uint64_t)store->category_count;
+    memset(store, 0, sizeof(*store));
+    store->dtype = dtype;
+    store->inference_numeric = 1;
+    return category_poll(&analyzer->runtime, error);
+}
+
+tf_transform_code tf_transform_category_infer_observe(
+    tf_transform_analyzer *analyzer, size_t column_index,
+    double value, uint32_t dtype, int is_integer, uint64_t max_categories,
+    int *resolved_numeric, tf_transform_error **error) {
+    tf_transform_category_store *store;
+    uint64_t bits = 0;
+    size_t slot_index = 0;
+    int found = 0;
+    tf_transform_code code;
+    if (!analyzer || !analyzer->category_stores
+        || column_index >= analyzer->input_schema.field_count
+        || analyzer->recipe->columns[column_index].kind
+            != TF_TRANSFORM_KIND_INFER
+        || max_categories < 2 || !resolved_numeric)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "categorical inference arguments are invalid");
+    store = &analyzer->category_stores[column_index];
+    *resolved_numeric = 0;
+    if (store->dtype != dtype)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "categorical inference dtype drifted");
+    if (store->inference_numeric) {
+        *resolved_numeric = 1;
+        return TF_TRANSFORM_OK;
+    }
+    if (!is_integer) {
+        code = category_inference_resolve_numeric(analyzer, store, error);
+        if (code == TF_TRANSFORM_OK) *resolved_numeric = 1;
+        return code;
+    }
+    code = tf_transform_category_key(value, dtype, &bits, error);
+    if (code != TF_TRANSFORM_OK) return code;
+    if (store->slots) {
+        code = category_find_slot(
+            store, bits, &analyzer->runtime, &slot_index, &found, error);
+        if (code != TF_TRANSFORM_OK) return code;
+    }
+    if (found) {
+        if (store->slots[slot_index].count == UINT64_MAX
+            || store->observed == UINT64_MAX)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "categorical inference count overflows");
+        ++store->slots[slot_index].count;
+        ++store->observed;
+        return TF_TRANSFORM_OK;
+    }
+    if ((uint64_t)store->category_count >= max_categories) {
+        code = category_inference_resolve_numeric(analyzer, store, error);
+        if (code == TF_TRANSFORM_OK) *resolved_numeric = 1;
+        return code;
+    }
+    return tf_transform_category_observe(
+        analyzer, column_index, value, dtype, error);
+}
+
+tf_transform_code tf_transform_analyzer_resolve_kind(
+    const tf_transform_analyzer *analyzer, size_t column_index,
+    tf_transform_column_kind *out, tf_transform_error **error) {
+    const tf_transform_recipe_column *recipe;
+    const tf_transform_category_store *store;
+    if (!analyzer || !out
+        || column_index >= analyzer->input_schema.field_count)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "column-kind resolution arguments are invalid");
+    recipe = &analyzer->recipe->columns[column_index];
+    if (recipe->kind == TF_TRANSFORM_KIND_NUMERIC
+        || recipe->kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+        *out = recipe->kind;
+        return TF_TRANSFORM_OK;
+    }
+    if (recipe->kind != TF_TRANSFORM_KIND_INFER
+        || !analyzer->category_stores)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "column-kind inference state is unavailable");
+    if (analyzer->total_rows == 0)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INSUFFICIENT_DATA,
+            "kind inference requires at least one analyzed row");
+    store = &analyzer->category_stores[column_index];
+    if (store->inference_numeric || store->category_count < 2) {
+        *out = TF_TRANSFORM_KIND_NUMERIC;
+        return TF_TRANSFORM_OK;
+    }
+    if ((uint64_t)store->category_count > recipe->infer_max_categories)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "categorical inference cardinality is inconsistent");
+    *out = TF_TRANSFORM_KIND_CATEGORICAL;
+    return TF_TRANSFORM_OK;
+}
+
 tf_transform_code tf_transform_category_check_observed(
     const tf_transform_analyzer *analyzer, size_t column_index,
     uint64_t observed, tf_transform_error **error) {
@@ -370,6 +497,9 @@ tf_transform_code tf_transform_category_check_observed(
         return tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
             "categorical analyzer state is unavailable");
+    if (analyzer->recipe->columns[column_index].kind == TF_TRANSFORM_KIND_INFER
+        && analyzer->category_stores[column_index].inference_numeric)
+        return TF_TRANSFORM_OK;
     if (analyzer->category_stores[column_index].observed != observed)
         return tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
@@ -397,6 +527,11 @@ tf_transform_code tf_transform_category_plan_requirements(
             error, TF_TRANSFORM_INSUFFICIENT_DATA,
             "categorical mode requires at least one analyzed row");
     count = (uint64_t)store->category_count;
+    if (recipe->kind == TF_TRANSFORM_KIND_INFER
+        && (count < 2 || count > recipe->infer_max_categories))
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_INTERNAL,
+            "inferred categorical cardinality is inconsistent");
     if (count == 0) {
         if (recipe->categorical_all_missing != TF_TRANSFORM_ALL_MISSING_ZERO)
             return tf_transform_set_error(

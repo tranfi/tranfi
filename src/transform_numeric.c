@@ -2,6 +2,7 @@
 
 #include <float.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -732,7 +733,7 @@ tf_transform_code tf_transform_analyzer_create(
             &runtime_copy, &comparison, error);
         if (code != TF_TRANSFORM_OK) goto fail;
         if (comparison != 0
-            || (column->kind == TF_TRANSFORM_KIND_NUMERIC
+            || (column->kind != TF_TRANSFORM_KIND_CATEGORICAL
                 && column->impute == TF_TRANSFORM_IMPUTE_CONSTANT
                 && column->constant_dtype != schema.fields[i].dtype)) {
             code = tf_transform_set_error(
@@ -740,9 +741,20 @@ tf_transform_code tf_transform_analyzer_create(
                 "recipe source or constant dtype does not match schema");
             goto fail;
         }
-        if (column->kind == TF_TRANSFORM_KIND_CATEGORICAL)
+        if (column->kind == TF_TRANSFORM_KIND_INFER
+            && (column->infer_max_categories
+                    > runtime_copy.limits.max_categories_per_column
+                || column->infer_max_categories
+                    > runtime_copy.limits.max_total_categories)) {
+            code = tf_transform_set_error(
+                error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "inferred category bound exceeds analyzer limits");
+            goto fail;
+        }
+        if (column->kind != TF_TRANSFORM_KIND_NUMERIC)
             uses_categorical = 1;
-        else if (column->impute == TF_TRANSFORM_IMPUTE_MEDIAN)
+        if (column->kind != TF_TRANSFORM_KIND_CATEGORICAL
+            && column->impute == TF_TRANSFORM_IMPUTE_MEDIAN)
             uses_median = 1;
     }
     code = checked_mul_size(
@@ -988,6 +1000,9 @@ tf_transform_code tf_transform_analyzer_push(
             }
             if (analyzer->recipe->columns[i].impute
                     == TF_TRANSFORM_IMPUTE_MEDIAN
+                && !(analyzer->recipe->columns[i].kind
+                        == TF_TRANSFORM_KIND_INFER
+                    && analyzer->stats[i].numeric_domain_failed)
                 && analyzer->median_stores[i].count
                     != analyzer->stats[i].observed) {
                 code = tf_transform_set_error(
@@ -1004,7 +1019,7 @@ tf_transform_code tf_transform_analyzer_push(
                 if (code != TF_TRANSFORM_OK) goto guarded_failed;
             }
             if (analyzer->recipe->columns[i].kind
-                    != TF_TRANSFORM_KIND_CATEGORICAL)
+                    == TF_TRANSFORM_KIND_NUMERIC)
                 continue;
             code = tf_transform_category_check_observed(
                 analyzer, i, analyzer->stats[i].observed, error);
@@ -1027,6 +1042,7 @@ tf_transform_code tf_transform_analyzer_push(
             double term;
             double m2;
             uint64_t observed;
+            int infer_numeric = 0;
 
             if (column_index != 0
                 && column_index % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
@@ -1076,6 +1092,34 @@ tf_transform_code tf_transform_analyzer_push(
                 ++stats->observed;
                 continue;
             }
+            if (analyzer->recipe->columns[column_index].kind
+                    == TF_TRANSFORM_KIND_INFER) {
+                double integer_part;
+                int is_integer = modf(value, &integer_part) == 0.0;
+                code = tf_transform_category_infer_observe(
+                    analyzer, column_index, value,
+                    analyzer->input_schema.fields[column_index].dtype,
+                    is_integer,
+                    analyzer->recipe->columns[column_index].infer_max_categories,
+                    &infer_numeric, error);
+                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                if (stats->numeric_domain_failed) {
+                    if (infer_numeric) {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_NUMERIC_DOMAIN,
+                            "deferred numeric analyzer state is invalid");
+                        goto guarded_failed;
+                    }
+                    if (stats->observed == UINT64_MAX) {
+                        code = tf_transform_set_error(
+                            error, TF_TRANSFORM_RESOURCE_LIMIT,
+                            "observed-value counter overflows");
+                        goto guarded_failed;
+                    }
+                    ++stats->observed;
+                    continue;
+                }
+            }
             if (stats->observed == UINT64_MAX) {
                 code = tf_transform_set_error(
                     error, TF_TRANSFORM_RESOURCE_LIMIT,
@@ -1093,6 +1137,13 @@ tf_transform_code tf_transform_analyzer_push(
                 || !tf_transform_double_is_finite(delta2)
                 || !tf_transform_double_is_finite(term)
                 || !tf_transform_double_is_finite(m2)) {
+                if (analyzer->recipe->columns[column_index].kind
+                        == TF_TRANSFORM_KIND_INFER
+                    && !infer_numeric) {
+                    stats->numeric_domain_failed = 1;
+                    stats->observed = observed;
+                    continue;
+                }
                 code = tf_transform_set_error(
                     error, TF_TRANSFORM_NUMERIC_DOMAIN,
                     "numeric analyzer state became nonfinite");
@@ -1311,17 +1362,25 @@ static tf_transform_code finalize_plan_states(
     for (size_t i = 0; i < plan->input_schema.field_count; ++i) {
         double median_value = 0.0;
         int has_median_value = 0;
+        tf_transform_column_kind resolved_kind;
         if (i != 0 && i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
             code = poll_and_recheck(&analyzer->runtime, error);
             if (code != TF_TRANSFORM_OK) return code;
         }
-        if (plan->recipe->columns[i].kind == TF_TRANSFORM_KIND_CATEGORICAL) {
+        code = tf_transform_analyzer_resolve_kind(
+            analyzer, i, &resolved_kind, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        if (resolved_kind == TF_TRANSFORM_KIND_CATEGORICAL) {
             plan->states[i].kind = TF_TRANSFORM_KIND_CATEGORICAL;
             code = tf_transform_category_finalize(
                 analyzer, i, &plan->states[i].value.categorical, error);
             if (code != TF_TRANSFORM_OK) return code;
             continue;
         }
+        if (analyzer->stats[i].numeric_domain_failed)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_NUMERIC_DOMAIN,
+                "deferred numeric analyzer state is invalid");
         plan->states[i].kind = TF_TRANSFORM_KIND_NUMERIC;
         if (plan->recipe->columns[i].impute == TF_TRANSFORM_IMPUTE_MEDIAN
             && analyzer->stats[i].observed != 0) {
@@ -1402,12 +1461,15 @@ tf_transform_code tf_transform_analyzer_finalize(
         uint64_t resident = 0;
         uint64_t allocations = 0;
         uint64_t count;
+        tf_transform_column_kind resolved_kind;
         if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
             code = poll_and_recheck(&analyzer->runtime, error);
             if (code != TF_TRANSFORM_OK) goto guarded_failed;
         }
-        if (analyzer->recipe->columns[i].kind
-                != TF_TRANSFORM_KIND_CATEGORICAL)
+        code = tf_transform_analyzer_resolve_kind(
+            analyzer, i, &resolved_kind, error);
+        if (code != TF_TRANSFORM_OK) goto guarded_failed;
+        if (resolved_kind != TF_TRANSFORM_KIND_CATEGORICAL)
             continue;
         if (analyzer->recipe->columns[i].categorical_encode
                 == TF_TRANSFORM_ENCODE_ONEHOT)
@@ -1498,11 +1560,12 @@ tf_transform_code tf_transform_analyzer_finalize(
         if (code != TF_TRANSFORM_OK) goto guarded_failed;
     }
     code = tf_transform_output_schema_build(
-        &analyzer->input_schema, analyzer->recipe, plan->states,
+        &analyzer->input_schema, analyzer->recipe, analyzer, plan->states,
         &analyzer->runtime, &plan->output_schema, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     code = tf_transform_output_schema_validate_contract(
-        &plan->input_schema, plan->recipe, plan->states, &plan->output_schema,
+        &plan->input_schema, plan->recipe, analyzer, plan->states,
+        &plan->output_schema,
         &analyzer->runtime, NULL, TF_TRANSFORM_SCHEMA_MISMATCH, error);
     if (code != TF_TRANSFORM_OK) goto guarded_failed;
     if (!has_onehot) {

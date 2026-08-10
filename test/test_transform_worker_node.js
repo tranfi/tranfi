@@ -162,6 +162,45 @@ async function main() {
     categoricalAnalyzer.close()
     categoricalRecipe.close()
 
+    const inferenceChunks = [
+      { rows: 2, columns: [new Float64Array([0, 1])] },
+      { rows: 1, columns: [new Float64Array([0])] }
+    ]
+    const inferencePlanBytes = await client.analyzeTransform(
+      vectors.recipes.infer_two_categories_onehot_all_zero,
+      schema,
+      inferenceChunks,
+      { limits: { maxCategoriesPerColumn: 2, maxTotalCategories: 2 } }
+    )
+    const inferenceRecipe = native.TransformRecipe.fromJSON(
+      vectors.recipes.infer_two_categories_onehot_all_zero,
+      { limits: { maxCategoriesPerColumn: 2, maxTotalCategories: 2 } }
+    )
+    const inferenceAnalyzer = inferenceRecipe.analyzer(schema, {
+      limits: { maxCategoriesPerColumn: 2, maxTotalCategories: 2 }
+    })
+    for (const chunk of inferenceChunks) inferenceAnalyzer.push(chunk)
+    const inferenceNativePlan = inferenceAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(inferencePlanBytes),
+      inferenceNativePlan.toBytes(),
+      'worker and native inferred-one-hot TFTR bytes'
+    )
+    const inferenceResult = await client.applyTransform(
+      inferencePlanBytes,
+      schema,
+      { rows: 2, columns: [new Float64Array([NaN, 3])] }
+    )
+    assert.deepEqual(Array.from(inferenceResult.data, doubleBits), [
+      '3ff0000000000000',
+      '0000000000000000',
+      '0000000000000000',
+      '0000000000000000'
+    ])
+    inferenceNativePlan.close()
+    inferenceAnalyzer.close()
+    inferenceRecipe.close()
+
     const labelChunks = [
       { rows: 2, columns: [new Float64Array([1, 2])] },
       { rows: 2, columns: [new Float64Array([2, NaN])] }

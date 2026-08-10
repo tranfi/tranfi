@@ -481,6 +481,96 @@
       },
       "version": 1
     },
+    "infer_two_categories_median": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": null,
+              "unknown": "error"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": 2,
+            "op": "infer",
+            "rule": "finite-integer-cardinality-v1",
+            "value": null
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "median"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "none"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "infer_two_categories_onehot_all_zero": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "all_zero"
+            },
+            "impute": {
+              "allMissing": "error",
+              "constant": null,
+              "op": "mode"
+            }
+          },
+          "kind": {
+            "maxCategories": 2,
+            "op": "infer",
+            "rule": "finite-integer-cardinality-v1",
+            "value": null
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": "zero",
+              "constant": null,
+              "op": "mean"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "none"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
     "numeric_mean_standard": {
       "columns": [
         {
@@ -951,16 +1041,221 @@
         "rows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]]
       },
       "apply": {
-        "expectedRows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]],
-        "rows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]]
+        "expectedRows": [["3ff0000000000000"], ["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]],
+        "rows": [[null], ["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]]
       },
       "expectedPlan": {
+        "impute": "3ff0000000000000",
         "kind": "numeric",
         "location": "0000000000000000",
         "scale": "3ff0000000000000"
       },
       "id": "infer-third-distinct-becomes-numeric",
       "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[4], [1, 2, 1], [2, 2]],
+        "rows": [["0000000000000000"], ["8000000000000000"], ["3ff0000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["3ff0000000000000"], ["0000000000000000"]],
+        "rows": [["8000000000000000"], ["3ff0000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["0000000000000000", "3ff0000000000000"],
+        "impute": "0000000000000000",
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "error"
+      },
+      "id": "infer-two-distinct-becomes-categorical",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["7fefffffffffffff"], ["ffefffffffffffff"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["3ff0000000000000"], ["0000000000000000"]],
+        "rows": [["ffefffffffffffff"], ["7fefffffffffffff"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["ffefffffffffffff", "7fefffffffffffff"],
+        "impute": "ffefffffffffffff",
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "error"
+      },
+      "id": "infer-categorical-defers-unused-numeric-overflow",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [2, 1]],
+        "rows": [["7fefffffffffffff"], ["ffefffffffffffff"], ["0000000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 107,
+        "phase": "analyze"
+      },
+      "id": "infer-late-numeric-surfaces-deferred-overflow",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 2], [1, 1, 1]],
+        "rows": [["4000000000000000"], ["4000000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["4000000000000000"], ["4008000000000000"]],
+        "rows": [[null], ["4008000000000000"]]
+      },
+      "expectedPlan": {
+        "impute": "4000000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "infer-one-distinct-becomes-numeric",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "0000000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "infer-all-missing-becomes-numeric",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[4], [2, 2], [1, 1, 1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"], ["3ff8000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["3ff8000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "3ff8000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "infer-noninteger-becomes-numeric",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 2], [1, 1, 1]],
+        "rows": [["8000000000000000"], ["0000000000000000"], ["3ff0000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["3ff0000000000000"], ["0000000000000000"]],
+        "rows": [["8000000000000000"], ["3ff0000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["00000000", "3f800000"],
+        "impute": "00000000",
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "error"
+      },
+      "id": "infer-f32-canonical-zero-categorical",
+      "inputDtype": "float32",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[4], [1, 3], [2, 1, 1]],
+        "rows": [["0000000000000000"], ["3ff0000000000000"], ["0000000000000000"], [null]]
+      },
+      "apply": {
+        "expectedColumns": 2,
+        "expectedRows": [["3ff0000000000000", "0000000000000000"], ["0000000000000000", "3ff0000000000000"], ["0000000000000000", "0000000000000000"], ["3ff0000000000000", "0000000000000000"]],
+        "rows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["0000000000000000", "3ff0000000000000"],
+        "impute": "0000000000000000",
+        "kind": "categorical",
+        "otherOrdinal": null,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"],
+        "unknown": "all_zero"
+      },
+      "id": "infer-categorical-onehot-frozen-width",
+      "recipe": "infer_two_categories_onehot_all_zero"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 2], [1, 1, 1]],
+        "rows": [["0000000000000000"], ["3ff0000000000000"], ["4000000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["3ff0000000000000"], ["4008000000000000"]],
+        "rows": [[null], ["4008000000000000"]]
+      },
+      "expectedPlan": {
+        "impute": "3ff0000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "infer-numeric-collapses-onehot-width",
+      "recipe": "infer_two_categories_onehot_all_zero"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[0]],
+        "rows": []
+      },
+      "apply": {
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 103,
+        "phase": "finalize"
+      },
+      "id": "infer-zero-rows-insufficient",
+      "recipe": "infer_two_categories"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 2], [1, 1, 1]],
+        "rows": [["4010000000000000"], ["3ff0000000000000"], ["4022000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["4010000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": "4010000000000000",
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "infer-late-numeric-keeps-median-state",
+      "recipe": "infer_two_categories_median"
     },
     {
       "analyze": {
@@ -1271,6 +1566,46 @@
       "expectedCode": 0,
       "id": "max-categories-two-valid",
       "recipe": "infer_two_categories",
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "max-categories-fractional-invalid",
+      "mutation": {
+        "path": "/columns/0/kind/maxCategories",
+        "recipe": "infer_two_categories",
+        "value": 2.5
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "infer-rule-version-invalid",
+      "mutation": {
+        "path": "/columns/0/kind/rule",
+        "recipe": "infer_two_categories",
+        "value": "finite-integer-cardinality-v2"
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "infer-numeric-branch-required",
+      "mutation": {
+        "path": "/columns/0/numeric",
+        "recipe": "infer_two_categories",
+        "value": null
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "infer-categorical-branch-required",
+      "mutation": {
+        "path": "/columns/0/categorical",
+        "recipe": "infer_two_categories",
+        "value": null
+      },
       "phase": "recipe"
     },
     {

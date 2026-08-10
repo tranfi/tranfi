@@ -19,6 +19,9 @@ const supportedRecipes = new Set([
   'categorical_mode_zero_label_other',
   'categorical_mode_none',
   'categorical_mode_zero_none',
+  'infer_two_categories',
+  'infer_two_categories_median',
+  'infer_two_categories_onehot_all_zero',
   'numeric_mean_standard',
   'numeric_median_none',
   'numeric_median_zero_none',
@@ -65,6 +68,23 @@ function categoricalNegativeZeroPlan(planBytes) {
   const original = Buffer.from(planBytes)
   const decoded = JSON.parse(original.subarray(52).toString('utf8'))
   decoded.steps[0].categorical.categories[0].v = '8000000000000000'
+  const payload = Buffer.from(JSON.stringify(decoded))
+  const mutated = Buffer.alloc(52 + payload.length)
+  original.copy(mutated, 0, 0, 20)
+  mutated.writeBigUInt64LE(BigInt(payload.length), 12)
+  createHash('sha256').update(payload).digest().copy(mutated, 20)
+  payload.copy(mutated, 52)
+  return mutated
+}
+
+function inferredSingleCategoryPlan(planBytes) {
+  const original = Buffer.from(planBytes)
+  const decoded = JSON.parse(original.subarray(52).toString('utf8'))
+  assert.deepEqual(decoded.recipe, vectors.recipes.infer_two_categories)
+  assert.equal(decoded.recipe.columns[0].kind.op, 'infer')
+  assert.equal(decoded.steps[0].kind, 'categorical')
+  assert.equal(decoded.steps[0].categorical.categories.length, 2)
+  decoded.steps[0].categorical.categories.pop()
   const payload = Buffer.from(JSON.stringify(decoded))
   const mutated = Buffer.alloc(52 + payload.length)
   original.copy(mutated, 0, 0, 20)
@@ -294,6 +314,20 @@ function testSharedSemanticVectors() {
     const loaded = tf.TransformPlan.fromBytes(referenceBytes)
     assert.deepEqual(loaded.toBytes(), referenceBytes, `${item.id}: imported TFTR`)
     loaded.close()
+    if (item.id === 'infer-two-distinct-becomes-categorical') {
+      assert.throws(
+        () => tf.TransformPlan.fromBytes(referenceBytes, {
+          limits: { maxCategoriesPerColumn: 1, maxTotalCategories: 1 }
+        }),
+        (error) => error instanceof tf.TranfiTransformError && error.code === 104
+      )
+      assert.throws(
+        () => tf.TransformPlan.fromBytes(inferredSingleCategoryPlan(referenceBytes), {
+          limits: { maxCategoriesPerColumn: 1, maxTotalCategories: 1 }
+        }),
+        (error) => error instanceof tf.TranfiTransformError && error.code === 106
+      )
+    }
     if (item.id === 'numeric-signed-zero-median') {
       assert.throws(
         () => tf.TransformPlan.fromBytes(medianNegativeZeroPlan(referenceBytes)),
@@ -309,7 +343,88 @@ function testSharedSemanticVectors() {
   }
 }
 
+function testInferenceDeferredNumericDomain() {
+  const item = vectors.semanticCases.find((entry) =>
+    entry.id === 'infer-late-numeric-surfaces-deferred-overflow'
+  )
+  const values = item.analyze.rows.map((row) => doubleFromBits(row[0]))
+  for (const split of item.analyze.chunkSplits) {
+    const recipe = tf.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    let offset = 0
+    for (let index = 0; index < split.length; ++index) {
+      const count = split[index]
+      const input = table(values.slice(offset, offset + count))
+      offset += count
+      if (index + 1 === split.length) {
+        assert.throws(
+          () => analyzer.push(input),
+          (error) => error instanceof tf.TranfiTransformError
+            && error.code === item.expectedError.code
+        )
+        assert.throws(
+          () => analyzer.push(input),
+          (error) => error instanceof tf.TranfiTransformError && error.code === 112
+        )
+      } else {
+        analyzer.push(input)
+      }
+    }
+    assert.equal(offset, values.length)
+    closeAll(recipe, analyzer)
+  }
+}
+
 function testCategoricalModeErrorsLimitsAndFloat32() {
+  {
+    const item = vectors.semanticCases.find(
+      (entry) => entry.id === 'infer-zero-rows-insufficient'
+    )
+    const recipe = tf.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
+    const analyzer = recipe.analyzer(schema64)
+    analyzer.push(table([]))
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof tf.TranfiTransformError && error.code === 103
+    )
+    assert.throws(
+      () => analyzer.finalize(),
+      (error) => error instanceof tf.TranfiTransformError && error.code === 112
+    )
+    closeAll(recipe, analyzer)
+  }
+  for (const limits of [
+    { maxCategoriesPerColumn: 1 },
+    { maxTotalCategories: 1 }
+  ]) {
+    assert.throws(
+      () => tf.TransformRecipe.fromJSON(vectors.recipes.infer_two_categories, {
+        limits
+      }),
+      (error) => error instanceof tf.TranfiTransformError && error.code === 104
+    )
+  }
+  {
+    const recipe = tf.TransformRecipe.fromJSON(
+      vectors.recipes.infer_two_categories,
+      { limits: { maxCategoriesPerColumn: 2, maxTotalCategories: 2 } }
+    )
+    assert.throws(
+      () => recipe.analyzer(schema64, {
+        limits: { maxCategoriesPerColumn: 1 }
+      }),
+      (error) => error instanceof tf.TranfiTransformError && error.code === 104
+    )
+    const analyzer = recipe.analyzer(schema64, {
+      limits: { maxCategoriesPerColumn: 2, maxTotalCategories: 2 }
+    })
+    analyzer.push(table([0, 1, 2]))
+    const plan = analyzer.finalize()
+    const apply = plan.apply(schema64)
+    assert.deepEqual(Array.from(apply.run(table([NaN])).data), [1])
+    closeAll(recipe, analyzer, plan, apply)
+  }
+
   for (const item of vectors.semanticCases.filter((entry) =>
     entry.recipe.startsWith('categorical_mode_') && entry.expectedError &&
       entry.expectedError.phase === 'finalize'
@@ -1028,6 +1143,7 @@ async function testInCallCancellation() {
 async function main() {
   testSafeLimits()
   testSharedSemanticVectors()
+  testInferenceDeferredNumericDomain()
   testMedianErrorsAndLimits()
   testCategoricalModeErrorsLimitsAndFloat32()
   testOnehotExactLimitsAndUnicode()
