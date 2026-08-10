@@ -436,6 +436,261 @@
       },
       "version": 1
     },
+    "categorical_none_none": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": null,
+              "op": "none",
+              "sentinelLabel": null,
+              "unknown": null
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_none_label_error": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": null,
+              "unknown": "error"
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_none_label_sentinel": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": -1,
+              "unknown": "sentinel"
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_none_label_other": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "label",
+              "sentinelLabel": null,
+              "unknown": "other"
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_none_onehot_error": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "error"
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "categorical_none_onehot_other": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": "discover",
+              "op": "onehot",
+              "sentinelLabel": null,
+              "unknown": "other"
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": null,
+            "op": "declared",
+            "rule": null,
+            "value": "categorical"
+          },
+          "numeric": null,
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
+    "infer_two_categories_none": {
+      "columns": [
+        {
+          "categorical": {
+            "encode": {
+              "categories": null,
+              "op": "none",
+              "sentinelLabel": null,
+              "unknown": null
+            },
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            }
+          },
+          "kind": {
+            "maxCategories": 2,
+            "op": "infer",
+            "rule": "finite-integer-cardinality-v1",
+            "value": null
+          },
+          "numeric": {
+            "impute": {
+              "allMissing": null,
+              "constant": null,
+              "op": "none"
+            },
+            "normalize": {
+              "ddof": null,
+              "op": "none"
+            }
+          },
+          "sourceId": "x0"
+        }
+      ],
+      "format": "tranfi.transform-recipe",
+      "outputDtype": "float64",
+      "policyVersion": 1,
+      "semanticLimits": {
+        "maxOutputColumns": 65536,
+        "maxOutputElementsPerApply": 134217728
+      },
+      "version": 1
+    },
     "infer_two_categories": {
       "columns": [
         {
@@ -1022,11 +1277,13 @@
         "rows": [["4000000000000000"], ["3ff0000000000000"]]
       },
       "apply": {
+        "expectedColumns": 2,
         "expectedRows": [["3ff0000000000000", "0000000000000000"], ["0000000000000000", "3ff0000000000000"], ["0000000000000000", "0000000000000000"], ["0000000000000000", "0000000000000000"]],
         "rows": [["3ff0000000000000"], ["4000000000000000"], ["4008000000000000"], [null]]
       },
       "expectedPlan": {
         "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": null,
         "kind": "categorical",
         "otherOrdinal": null,
         "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"],
@@ -1034,6 +1291,223 @@
       },
       "id": "categorical-onehot-unknown-and-missing-all-zero",
       "recipe": "categorical_none_onehot_all_zero"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[0]],
+        "rows": []
+      },
+      "apply": {
+        "expectedRows": [["8000000000000000"], ["4008000000000000"], ["7ff8000000000000"]],
+        "rows": [["8000000000000000"], ["4008000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": [],
+        "impute": null,
+        "kind": "categorical",
+        "outputIds": ["x0"]
+      },
+      "id": "categorical-none-encode-none-zero-row-pass-through",
+      "recipe": "categorical_none_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[0]],
+        "rows": []
+      },
+      "apply": {
+        "expectedRows": [["8000000000000000"], ["36a0000000000000"], ["7ff8000000000000"]],
+        "rows": [["8000000000000000"], ["36a0000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": [],
+        "impute": null,
+        "kind": "categorical",
+        "outputIds": ["x0"]
+      },
+      "id": "categorical-none-encode-none-f32-widening",
+      "inputDtype": "float32",
+      "recipe": "categorical_none_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [["7ff8000000000000"], ["3ff0000000000000"]],
+        "rows": [[null], ["3ff0000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": [],
+        "impute": null,
+        "kind": "categorical",
+        "outputIds": ["x0"]
+      },
+      "id": "categorical-none-encode-none-all-missing",
+      "recipe": "categorical_none_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["4000000000000000"], ["3ff0000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["bff0000000000000"], ["bff0000000000000"]],
+        "rows": [["3ff0000000000000"], ["4008000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": null,
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": -1,
+        "unknown": "sentinel"
+      },
+      "id": "categorical-none-label-sentinel-missing",
+      "recipe": "categorical_none_label_sentinel"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["4000000000000000"], ["3ff0000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [["0000000000000000"], ["4000000000000000"], ["4000000000000000"]],
+        "rows": [["3ff0000000000000"], ["4008000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": null,
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "other"
+      },
+      "id": "categorical-none-label-other-missing",
+      "recipe": "categorical_none_label_other"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"]]
+      },
+      "apply": {
+        "expectedRows": [],
+        "rows": [[null]]
+      },
+      "expectedError": {
+        "code": 108,
+        "phase": "apply"
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": null,
+        "kind": "categorical",
+        "outputIds": ["x0%3Alabel"],
+        "sentinelLabel": null,
+        "unknown": "error"
+      },
+      "id": "categorical-none-label-error-missing",
+      "recipe": "categorical_none_label_error"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["4000000000000000"], ["3ff0000000000000"]]
+      },
+      "apply": {
+        "expectedColumns": 3,
+        "expectedRows": [["3ff0000000000000", "0000000000000000", "0000000000000000"], ["0000000000000000", "0000000000000000", "3ff0000000000000"], ["0000000000000000", "0000000000000000", "3ff0000000000000"]],
+        "rows": [["3ff0000000000000"], ["4008000000000000"], [null]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": null,
+        "kind": "categorical",
+        "otherOrdinal": 2,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1", "x0%3Aonehot%3A2"],
+        "unknown": "other"
+      },
+      "id": "categorical-none-onehot-other-missing",
+      "recipe": "categorical_none_onehot_other"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [["3ff0000000000000"], ["4000000000000000"]]
+      },
+      "apply": {
+        "expectedColumns": 2,
+        "expectedRows": [],
+        "rows": [[null]]
+      },
+      "expectedError": {
+        "code": 108,
+        "phase": "apply"
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": null,
+        "kind": "categorical",
+        "otherOrdinal": null,
+        "outputIds": ["x0%3Aonehot%3A0", "x0%3Aonehot%3A1"],
+        "unknown": "error"
+      },
+      "id": "categorical-none-onehot-error-missing",
+      "recipe": "categorical_none_onehot_error"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [],
+        "rows": []
+      },
+      "expectedError": {
+        "code": 103,
+        "phase": "finalize"
+      },
+      "id": "categorical-none-discovered-empty-insufficient",
+      "recipe": "categorical_none_label_other"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[3], [1, 2], [2, 1]],
+        "rows": [["4000000000000000"], ["3ff0000000000000"], [null]]
+      },
+      "apply": {
+        "expectedRows": [["8000000000000000"], ["4008000000000000"], ["7ff8000000000000"], ["3ff0000000000000"]],
+        "rows": [["8000000000000000"], ["4008000000000000"], [null], ["3ff0000000000000"]]
+      },
+      "expectedPlan": {
+        "categories": ["3ff0000000000000", "4000000000000000"],
+        "impute": null,
+        "kind": "categorical",
+        "outputIds": ["x0"]
+      },
+      "id": "infer-categorical-none-retains-kind-evidence",
+      "recipe": "infer_two_categories_none"
+    },
+    {
+      "analyze": {
+        "chunkSplits": [[2], [1, 1]],
+        "rows": [[null], [null]]
+      },
+      "apply": {
+        "expectedRows": [["7ff8000000000000"]],
+        "rows": [[null]]
+      },
+      "expectedPlan": {
+        "impute": null,
+        "kind": "numeric",
+        "location": "0000000000000000",
+        "scale": "3ff0000000000000"
+      },
+      "id": "infer-none-all-missing-resolves-numeric",
+      "recipe": "infer_two_categories_none"
     },
     {
       "analyze": {
@@ -1625,6 +2099,36 @@
         "path": "/columns/0/categorical/encode/sentinelLabel",
         "recipe": "categorical_mode_label_sentinel",
         "value": 10000000000000000
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "categorical-none-encode-none-discover-invalid",
+      "mutation": {
+        "path": "/columns/0/categorical/encode/categories",
+        "recipe": "categorical_none_none",
+        "value": "discover"
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "categorical-none-label-null-categories-invalid",
+      "mutation": {
+        "path": "/columns/0/categorical/encode/categories",
+        "recipe": "categorical_none_label_other",
+        "value": null
+      },
+      "phase": "recipe"
+    },
+    {
+      "expectedCode": 101,
+      "id": "categorical-none-all-missing-policy-invalid",
+      "mutation": {
+        "path": "/columns/0/categorical/impute/allMissing",
+        "recipe": "categorical_none_none",
+        "value": "error"
       },
       "phase": "recipe"
     },

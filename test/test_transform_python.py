@@ -37,7 +37,12 @@ SUPPORTED_CASES = [
         'categorical_mode_zero_onehot_all_zero',
         'categorical_mode_zero_label_other',
         'categorical_mode_none', 'categorical_mode_zero_none',
+        'categorical_none_label_error', 'categorical_none_label_other',
+        'categorical_none_label_sentinel', 'categorical_none_none',
+        'categorical_none_onehot_all_zero',
+        'categorical_none_onehot_error', 'categorical_none_onehot_other',
         'infer_two_categories', 'infer_two_categories_median',
+        'infer_two_categories_none',
         'infer_two_categories_onehot_all_zero',
         'numeric_mean_standard', 'numeric_median_none',
         'numeric_median_zero_none',
@@ -184,9 +189,14 @@ def test_semantic_vectors_chunk_plan_and_apply_parity(case):
                                 categories.append({'t': 'other'})
                             assert [field['category']
                                     for field in output_schema] == categories
-                        else:
+                        elif encode == 'label':
                             assert [field['role'] for field in output_schema] == [
                                 'label']
+                            assert [field['category']
+                                    for field in output_schema] == [None]
+                        else:
+                            assert [field['role'] for field in output_schema] == [
+                                'value']
                             assert [field['category']
                                     for field in output_schema] == [None]
                     with plan.apply(input_schema) as apply:
@@ -274,7 +284,8 @@ def test_categorical_mode_errors_limits_and_float32():
     for case_id in (
             'categorical-mode-all-missing-error',
             'categorical-mode-empty-analysis-zero-policy',
-            'categorical-mode-label-sentinel-collision'):
+            'categorical-mode-label-sentinel-collision',
+            'categorical-none-discovered-empty-insufficient'):
         case = next(item for item in VECTORS['semanticCases']
                     if item['id'] == case_id)
         values = [double_from_bits(row[0]) for row in case['analyze']['rows']]
@@ -291,7 +302,9 @@ def test_categorical_mode_errors_limits_and_float32():
 
     for case_id in (
             'categorical-mode-label-unknown-error',
-            'categorical-mode-onehot-unknown-error'):
+            'categorical-mode-onehot-unknown-error',
+            'categorical-none-label-error-missing',
+            'categorical-none-onehot-error-missing'):
         case = next(
             item for item in VECTORS['semanticCases']
             if item['id'] == case_id)
@@ -664,6 +677,7 @@ def test_python_transferred_handles_are_destroyed_on_wrapper_failure(monkeypatch
     class FailingRecipe(module.TransformRecipe):
         def __init__(self, *args):
             del args
+            assert not self._handle.value
             raise MemoryError('injected recipe wrapper failure')
 
     with pytest.raises(MemoryError):
@@ -713,6 +727,7 @@ def test_python_transferred_handles_are_destroyed_on_wrapper_failure(monkeypatch
                 class FailingPlan(module.TransformPlan):
                     def __init__(self, *args):
                         del args
+                        assert not self._handle.value
                         raise MemoryError('injected imported-plan wrapper failure')
 
                 with pytest.raises(MemoryError):

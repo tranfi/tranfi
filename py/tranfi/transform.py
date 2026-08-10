@@ -548,6 +548,16 @@ class _TableOwner:
 class _OwnedHandle:
     _destroy_name = None
 
+    def __new__(cls, *args, **kwargs):
+        del args, kwargs
+        instance = super().__new__(cls)
+        # A subclass constructor can fail before _OwnedHandle.__init__ runs.
+        # Keep the inherited finalizer safe for that partially initialized
+        # object; ownership of a transferred non-null handle remains with
+        # _adopt_transferred_handle until construction succeeds.
+        instance._handle = ctypes.c_void_p()
+        return instance
+
     def __init__(self, handle):
         self._handle = (handle if isinstance(handle, ctypes.c_void_p)
                         else ctypes.c_void_p(handle))

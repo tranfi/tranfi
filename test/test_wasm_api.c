@@ -693,8 +693,8 @@ static void test_prepared_transform_raw_wasm_onehot(void) {
     static const char recipe_json[] =
         "{\"columns\":[{\"categorical\":{\"encode\":{\"categories\":"
         "\"discover\",\"op\":\"onehot\",\"sentinelLabel\":null,"
-        "\"unknown\":\"other\"},\"impute\":{\"allMissing\":\"error\","
-        "\"constant\":null,\"op\":\"mode\"}},\"kind\":{"
+        "\"unknown\":\"other\"},\"impute\":{\"allMissing\":null,"
+        "\"constant\":null,\"op\":\"none\"}},\"kind\":{"
         "\"maxCategories\":null,\"op\":\"declared\",\"rule\":null,"
         "\"value\":\"categorical\"},\"numeric\":null,\"sourceId\":\"x0\"}],"
         "\"format\":\"tranfi.transform-recipe\",\"outputDtype\":\"float64\","
@@ -713,7 +713,7 @@ static void test_prepared_transform_raw_wasm_onehot(void) {
         0, UINT64_C(0x3ff0000000000000), 0, 0,
         0, 0, UINT64_C(0x3ff0000000000000), 0,
         0, 0, 0, UINT64_C(0x3ff0000000000000),
-        0, UINT64_C(0x3ff0000000000000), 0, 0
+        0, 0, 0, UINT64_C(0x3ff0000000000000)
     };
     raw_heap heap = {0};
     tf_transform_limits_v1 safe;
@@ -839,7 +839,7 @@ static void test_prepared_transform_raw_wasm_onehot(void) {
     assert(tf_wasm_transform_handle_destroy(recipe) == TF_TRANSFORM_OK);
     free(heap.bytes);
     tf_wasm_transform_test_set_heap(NULL, 0);
-    printf("  %-42s PASS\n", "prepared-transform raw one-hot parity");
+    printf("  %-42s PASS\n", "prepared-transform raw categorical none");
 }
 
 static void test_prepared_transform_raw_wasm_inference(void) {

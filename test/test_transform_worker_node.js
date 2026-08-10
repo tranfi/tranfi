@@ -162,6 +162,40 @@ async function main() {
     categoricalAnalyzer.close()
     categoricalRecipe.close()
 
+    const noneOnehotChunks = [
+      { rows: 1, columns: [new Float64Array([2])] },
+      { rows: 2, columns: [new Float64Array([1, NaN])] }
+    ]
+    const noneOnehotPlanBytes = await client.analyzeTransform(
+      vectors.recipes.categorical_none_onehot_all_zero,
+      schema,
+      noneOnehotChunks
+    )
+    const noneOnehotRecipe = native.TransformRecipe.fromJSON(
+      vectors.recipes.categorical_none_onehot_all_zero
+    )
+    const noneOnehotAnalyzer = noneOnehotRecipe.analyzer(schema)
+    for (const chunk of noneOnehotChunks) noneOnehotAnalyzer.push(chunk)
+    const noneOnehotNativePlan = noneOnehotAnalyzer.finalize()
+    assert.deepEqual(
+      Buffer.from(noneOnehotPlanBytes),
+      noneOnehotNativePlan.toBytes(),
+      'worker and native categorical-impute-none TFTR bytes'
+    )
+    const noneOnehotResult = await client.applyTransform(
+      noneOnehotPlanBytes,
+      schema,
+      { rows: 3, columns: [new Float64Array([1, 3, NaN])] }
+    )
+    assert.deepEqual(Array.from(noneOnehotResult.data, doubleBits), [
+      '3ff0000000000000', '0000000000000000',
+      '0000000000000000', '0000000000000000',
+      '0000000000000000', '0000000000000000'
+    ])
+    noneOnehotNativePlan.close()
+    noneOnehotAnalyzer.close()
+    noneOnehotRecipe.close()
+
     const inferenceChunks = [
       { rows: 2, columns: [new Float64Array([0, 1])] },
       { rows: 1, columns: [new Float64Array([0])] }

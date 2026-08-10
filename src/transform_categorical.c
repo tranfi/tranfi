@@ -497,6 +497,13 @@ tf_transform_code tf_transform_category_check_observed(
         return tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
             "categorical analyzer state is unavailable");
+    if (analyzer->recipe->columns[column_index].kind
+            == TF_TRANSFORM_KIND_CATEGORICAL
+        && analyzer->recipe->columns[column_index].categorical_impute
+            == TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE
+        && analyzer->recipe->columns[column_index].categorical_encode
+            == TF_TRANSFORM_ENCODE_NONE)
+        return TF_TRANSFORM_OK;
     if (analyzer->recipe->columns[column_index].kind == TF_TRANSFORM_KIND_INFER
         && analyzer->category_stores[column_index].inference_numeric)
         return TF_TRANSFORM_OK;
@@ -522,6 +529,13 @@ tf_transform_code tf_transform_category_plan_requirements(
             "categorical plan requirement arguments are invalid");
     store = &analyzer->category_stores[column_index];
     recipe = &analyzer->recipe->columns[column_index];
+    if (recipe->kind == TF_TRANSFORM_KIND_CATEGORICAL
+        && recipe->categorical_impute == TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE
+        && recipe->categorical_encode == TF_TRANSFORM_ENCODE_NONE) {
+        *resident_bytes = 0;
+        *allocation_count = 0;
+        return TF_TRANSFORM_OK;
+    }
     if (analyzer->total_rows == 0)
         return tf_transform_set_error(
             error, TF_TRANSFORM_INSUFFICIENT_DATA,
@@ -533,7 +547,8 @@ tf_transform_code tf_transform_category_plan_requirements(
             error, TF_TRANSFORM_INTERNAL,
             "inferred categorical cardinality is inconsistent");
     if (count == 0) {
-        if (recipe->categorical_all_missing != TF_TRANSFORM_ALL_MISSING_ZERO)
+        if (recipe->categorical_impute != TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE
+            || recipe->categorical_all_missing != TF_TRANSFORM_ALL_MISSING_ZERO)
             return tf_transform_set_error(
                 error, TF_TRANSFORM_INSUFFICIENT_DATA,
                 "categorical mode has no observed values");
@@ -704,11 +719,21 @@ tf_transform_code tf_transform_category_finalize(
     out->encode = recipe->categorical_encode;
     out->source_dtype = analyzer->input_schema.fields[column_index].dtype;
     out->category_count = (size_t)(resident / sizeof(*out->categories));
-    if (out->category_count == 0
-        || resident % sizeof(*out->categories) != 0)
+    if (resident % sizeof(*out->categories) != 0)
         return tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
             "categorical plan requirement count is invalid");
+    if (out->category_count == 0) {
+        if (recipe->kind != TF_TRANSFORM_KIND_CATEGORICAL
+            || recipe->categorical_impute != TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE
+            || recipe->categorical_encode != TF_TRANSFORM_ENCODE_NONE)
+            return tf_transform_set_error(
+                error, TF_TRANSFORM_INTERNAL,
+                "categorical plan has an illegal empty dictionary");
+        code = category_finalize_encoding(recipe, out, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        return category_poll(&analyzer->runtime, error);
+    }
     code = category_poll(&analyzer->runtime, error);
     if (code != TF_TRANSFORM_OK) return code;
     out->categories = (tf_transform_category_value *)calloc(
@@ -748,7 +773,9 @@ tf_transform_code tf_transform_category_finalize(
             best_bits = slot->bits;
         }
     }
-    if (output_index != out->category_count || best_count == 0) {
+    if (output_index != out->category_count
+        || (recipe->categorical_impute == TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE
+            && best_count == 0)) {
         code = tf_transform_set_error(
             error, TF_TRANSFORM_INTERNAL,
             "categorical plan state is incomplete");
@@ -758,8 +785,10 @@ tf_transform_code tf_transform_category_finalize(
         out->categories, out->category_count, out->source_dtype,
         &analyzer->runtime, error);
     if (code != TF_TRANSFORM_OK) goto failed;
-    out->impute_bits = best_bits;
-    out->has_impute_value = 1;
+    if (recipe->categorical_impute == TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE) {
+        out->impute_bits = best_bits;
+        out->has_impute_value = 1;
+    }
     code = category_finalize_encoding(recipe, out, error);
     if (code != TF_TRANSFORM_OK) goto failed;
     return TF_TRANSFORM_OK;

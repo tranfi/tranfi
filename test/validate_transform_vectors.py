@@ -180,8 +180,6 @@ def validate_recipe(name: str, recipe: Any) -> int:
             require(isinstance(encode, dict) and set(encode) == {
                 "categories", "op", "sentinelLabel", "unknown",
             }, f"recipe {name}: categorical encode shape")
-            require(encode["categories"] == "discover",
-                    f"recipe {name}: only discovered categories are in V1 vectors")
             if encode["op"] == "none":
                 require(encode["sentinelLabel"] is None
                         and encode["unknown"] is None,
@@ -214,6 +212,10 @@ def validate_recipe(name: str, recipe: Any) -> int:
                 require(impute == {
                     "allMissing": None, "constant": None, "op": "none",
                 }, f"recipe {name}: categorical impute-none policy")
+            require(encode["categories"] is None
+                    if impute["op"] == "none" and encode["op"] == "none"
+                    else encode["categories"] == "discover",
+                    f"recipe {name}: category source policy")
     return len(columns)
 
 
@@ -315,6 +317,14 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
             require(expected_plan.get("otherOrdinal") == (
                 len(categories) if encode["unknown"] == "other" else None
             ), f"{case_id}: one-hot other ordinal")
+        if (encode is not None and encode["op"] == "none"
+                and recipe_column["categorical"]["impute"]["op"] == "none"
+                and expected_plan is not None
+                and expected_plan.get("kind") == "categorical"):
+            require(expected_plan.get("outputIds") == ["x0"],
+                    f"{case_id}: passthrough output ID")
+            require(expected_plan.get("impute") is None,
+                    f"{case_id}: categorical impute-none state")
 
     sqrt_cases = document.get("sqrtCases")
     require(isinstance(sqrt_cases, list) and sqrt_cases, "sqrt cases required")
@@ -365,6 +375,11 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         "out-of-safe-range-sentinel-label-invalid",
     } <= validation_ids, "missing label sentinel validation boundaries")
     require({
+        "categorical-none-encode-none-discover-invalid",
+        "categorical-none-label-null-categories-invalid",
+        "categorical-none-all-missing-policy-invalid",
+    } <= validation_ids, "missing categorical impute-none recipe boundaries")
+    require({
         "categorical-mode-tie-smallest-signed-zero",
         "categorical-mode-subnormal-order",
         "categorical-mode-all-missing-zero",
@@ -380,6 +395,18 @@ def validate_semantic_vectors(document: dict[str, Any]) -> tuple[int, int, int]:
         "categorical-mode-onehot-unknown-all-zero",
         "categorical-mode-onehot-unknown-other",
         "categorical-mode-onehot-all-missing-zero",
+        "categorical-onehot-unknown-and-missing-all-zero",
+        "categorical-none-encode-none-zero-row-pass-through",
+        "categorical-none-encode-none-all-missing",
+        "categorical-none-encode-none-f32-widening",
+        "categorical-none-label-sentinel-missing",
+        "categorical-none-label-other-missing",
+        "categorical-none-label-error-missing",
+        "categorical-none-onehot-other-missing",
+        "categorical-none-onehot-error-missing",
+        "categorical-none-discovered-empty-insufficient",
+        "infer-categorical-none-retains-kind-evidence",
+        "infer-none-all-missing-resolves-numeric",
         "infer-third-distinct-becomes-numeric",
         "infer-two-distinct-becomes-categorical",
         "infer-categorical-defers-unused-numeric-overflow",

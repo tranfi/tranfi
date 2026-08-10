@@ -1085,6 +1085,15 @@ tf_transform_code tf_transform_analyzer_push(
                         "categorical observed-value counter overflows");
                     goto guarded_failed;
                 }
+                if (analyzer->recipe->columns[column_index].kind
+                        == TF_TRANSFORM_KIND_CATEGORICAL
+                    && analyzer->recipe->columns[column_index].categorical_impute
+                        == TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE
+                    && analyzer->recipe->columns[column_index].categorical_encode
+                        == TF_TRANSFORM_ENCODE_NONE) {
+                    ++stats->observed;
+                    continue;
+                }
                 code = tf_transform_category_observe(
                     analyzer, column_index, value,
                     analyzer->input_schema.fields[column_index].dtype, error);
@@ -1809,25 +1818,34 @@ tf_transform_code tf_transform_apply_run(
                         ((double *)pending.data)[output_index + emitted] = 0.0;
                     }
                 }
+                if (categorical->impute == TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE
+                    && categorical->encode == TF_TRANSFORM_ENCODE_NONE) {
+                    ((double *)pending.data)[output_index] = missing
+                        ? tf_transform_double_from_bits(
+                            UINT64_C(0x7ff8000000000000))
+                        : value;
+                    ++output_column;
+                    continue;
+                }
                 if (missing) {
-                    if (!categorical->has_impute_value) {
-                        code = tf_transform_set_error(
-                            error, TF_TRANSFORM_INTERNAL,
-                            "categorical plan has no mode value");
-                        goto guarded_failed;
+                    if (categorical->has_impute_value) {
+                        bits = categorical->impute_bits;
+                        value = tf_transform_category_decode(
+                            categorical->impute_bits, categorical->source_dtype);
+                    } else {
+                        known = 0;
                     }
-                    bits = categorical->impute_bits;
-                    value = tf_transform_category_decode(
-                        categorical->impute_bits, categorical->source_dtype);
                 } else {
                     code = tf_transform_category_key(
                         value, categorical->source_dtype, &bits, error);
                     if (code != TF_TRANSFORM_OK) goto guarded_failed;
                 }
-                code = tf_transform_category_lookup(
-                    categorical, bits, &apply->runtime,
-                    &ordinal, &known, error);
-                if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                if (!missing || categorical->has_impute_value) {
+                    code = tf_transform_category_lookup(
+                        categorical, bits, &apply->runtime,
+                        &ordinal, &known, error);
+                    if (code != TF_TRANSFORM_OK) goto guarded_failed;
+                }
                 if (categorical->encode == TF_TRANSFORM_ENCODE_ONEHOT) {
                     if (known) {
                         if (ordinal >= categorical->category_count) {

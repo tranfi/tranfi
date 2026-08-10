@@ -19,7 +19,15 @@ const supportedRecipes = new Set([
   'categorical_mode_zero_label_other',
   'categorical_mode_none',
   'categorical_mode_zero_none',
+  'categorical_none_label_error',
+  'categorical_none_label_other',
+  'categorical_none_label_sentinel',
+  'categorical_none_none',
+  'categorical_none_onehot_all_zero',
+  'categorical_none_onehot_error',
+  'categorical_none_onehot_other',
   'infer_two_categories',
+  'infer_two_categories_none',
   'infer_two_categories_median',
   'infer_two_categories_onehot_all_zero',
   'numeric_mean_standard',
@@ -317,7 +325,8 @@ async function main() {
           outputSchema.map((field) => field.id),
           item.expectedPlan.outputIds
         )
-        if (vectors.recipes[item.recipe].columns[0].categorical.encode.op === 'onehot') {
+        const encodeOp = vectors.recipes[item.recipe].columns[0].categorical.encode.op
+        if (encodeOp === 'onehot') {
           assert.deepEqual(
             outputSchema.map((field) => field.role),
             item.expectedPlan.outputIds.map(() => 'onehot')
@@ -330,9 +339,12 @@ async function main() {
               item.expectedPlan.otherOrdinal === null ? [] : [{ t: 'other' }]
             )
           )
-        } else {
+        } else if (encodeOp === 'label') {
           assert.deepEqual(outputSchema.map((field) => field.category), [null])
           assert.deepEqual(outputSchema.map((field) => field.role), ['label'])
+        } else {
+          assert.deepEqual(outputSchema.map((field) => field.category), [null])
+          assert.deepEqual(outputSchema.map((field) => field.role), ['value'])
         }
       }
       const apply = plan.apply(inputSchema)
@@ -558,7 +570,7 @@ async function main() {
   }
 
   for (const item of vectors.semanticCases.filter((entry) =>
-    entry.recipe.startsWith('categorical_mode_') && entry.expectedError &&
+    entry.recipe.startsWith('categorical_') && entry.expectedError &&
       entry.expectedError.phase === 'finalize'
   )) {
     const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes[item.recipe])
@@ -578,7 +590,9 @@ async function main() {
 
   for (const caseId of [
     'categorical-mode-label-unknown-error',
-    'categorical-mode-onehot-unknown-error'
+    'categorical-mode-onehot-unknown-error',
+    'categorical-none-label-error-missing',
+    'categorical-none-onehot-error-missing'
   ]) {
     const item = vectors.semanticCases.find(
       (entry) => entry.id === caseId
