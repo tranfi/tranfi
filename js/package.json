@@ -1,6 +1,6 @@
 {
   "name": "tranfi",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Streaming ETL language + runtime",
   "type": "commonjs",
   "main": "src/index.js",

@@ -24,7 +24,7 @@ from .transform import (DenseResult, TranfiTransformError, TransformAnalyzer,
                         TransformPlan, TransformRecipe, safe_transform_limits)
 from . import _ffi
 
-__version__ = '0.1.2'
+__version__ = '0.2.0'
 
 
 def recipes():
