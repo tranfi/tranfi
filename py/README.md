@@ -1,6 +1,13 @@
 # tranfi (Python)
 
-Streaming ETL in Python, powered by a native C11 core. Process CSV, JSONL, and text data with composable pipelines that run in constant memory, no matter how large the input.
+Streaming-first ETL in Python, powered by a native C11 core. Tranfi processes
+CSV, JSONL, and text byte streams; it is not an in-memory pandas-style DataFrame.
+Row-local operations stream, bounded operators declare their limits, and
+full-input operators require an explicit blocking or spill policy.
+
+> **Unreleased main:** The prepared-transform API documented below targets
+> Tranfi 0.2. Current PyPI 0.1.x installs do not include it; build this branch
+> from source until 0.2 is published.
 
 ```python
 import tranfi as tf
@@ -8,7 +15,7 @@ import tranfi as tf
 result = tf.pipeline([
     tf.codec.csv(),
     tf.ops.filter(tf.expr("col('age') > 25")),
-    tf.ops.sort(['-age']),
+    tf.ops.top(100, 'age'),
     tf.ops.derive({'label': tf.expr("if(col('age')>30, 'senior', 'junior')")}),
     tf.ops.select(['name', 'age', 'label']),
     tf.codec.csv_encode(),
@@ -36,17 +43,24 @@ pip install tranfi
 Or from source:
 
 ```bash
-cd build && cmake .. && make
+cmake -S . -B build
+cmake --build build
 pip install -e py/
 ```
+
+Use `pipeline(...)` for byte-stream ETL. The separate
+`TransformRecipe -> TransformAnalyzer -> TransformPlan -> TransformApply`
+lifecycle is for typed batches whose learned state must be frozen and reused.
+Calling `.run()` collects output for convenience; use `iter_chunks()` or an
+`on_output` callback with `collect_output=False` for large outputs.
 
 ## CLI
 
 Installing the package also installs the `tranfi` command:
 
 ```bash
-# Filter and sort
-tranfi 'csv | filter "age > 25" | top-k 100 age | csv' < data.csv
+# Filter and retain the top 100 rows by age
+tranfi -q 'csv | filter "age > 25" | top-k 100 age | csv' < data.csv
 
 # Built-in recipe
 tranfi profile < data.csv
@@ -64,7 +78,7 @@ Run `tranfi -h` for all options.
 
 ### Two APIs
 
-**Builder API** -- composable, type-safe, IDE-friendly:
+**Builder API** -- composable and structured:
 
 ```python
 p = tf.pipeline([

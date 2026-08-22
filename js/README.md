@@ -1,14 +1,26 @@
 # tranfi (Node.js / WASM)
 
-Streaming ETL in JavaScript, powered by a native C11 core via N-API (Node.js) or WASM (browsers). Process CSV, JSONL, and text data with composable pipelines that run in constant memory, no matter how large the input.
+Streaming-first ETL in JavaScript, powered by a native C11 core via N-API
+(Node.js) or WASM (browsers). Tranfi processes CSV, JSONL, and text byte streams;
+it is not an in-memory DataFrame API. Row-local operations stream, bounded
+operators declare their limits, and full-input operators require an explicit
+blocking or spill policy.
+
+> **Unreleased main:** The prepared-transform API documented below targets
+> Tranfi 0.2. Current npm 0.1.x installs do not include it; build this branch
+> from source until 0.2 is published.
+
+Save this example as `quickstart.mjs`:
 
 ```js
-import { pipeline, codec, ops, expr } from 'tranfi'
+import tranfi from 'tranfi'
+
+const { pipeline, codec, ops, expr } = tranfi
 
 const result = await pipeline([
   codec.csv(),
   ops.filter(expr("col('age') > 25")),
-  ops.sort(['-age']),
+  ops.top(100, 'age'),
   ops.derive({ label: expr("if(col('age')>30, 'senior', 'junior')") }),
   ops.select(['name', 'age', 'label']),
   codec.csvEncode(),
@@ -41,17 +53,23 @@ intentional WASM-only/browser installation, set
 pipeline can execute with WASM, but root-entry prepared transforms require the
 native addon.
 
+Use `pipeline(...)` for byte-stream ETL. The separate
+`TransformRecipe -> TransformAnalyzer -> TransformPlan -> TransformApply`
+lifecycle is for typed batches whose learned state must be frozen and reused.
+Calling `.run()` collects output for convenience; use `writeTo()` or
+`toReadable()` for large outputs.
+
 ## CLI
 
 Installing the package also provides the `tranfi` command:
 
 ```bash
 # Via npx (no install)
-echo 'name,age\nAlice,30\nBob,25' | npx tranfi 'csv | filter "age > 25" | csv'
+echo 'name,age\nAlice,30\nBob,25' | npx tranfi -q 'csv | filter "age > 25" | csv'
 
 # Or install globally
 npm i -g tranfi
-tranfi 'csv | filter "age > 25" | top-k 100 age | csv' < data.csv
+tranfi -q 'csv | filter "age > 25" | top-k 100 age | csv' < data.csv
 tranfi profile < data.csv
 tranfi -R  # list recipes
 ```
@@ -62,7 +80,7 @@ Run `tranfi -h` for all options.
 
 ### Two APIs
 
-**Builder API** -- composable, type-safe, IDE-friendly:
+**Builder API** -- composable, structured, and IDE-friendly:
 
 ```js
 const p = pipeline([

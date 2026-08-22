@@ -1,10 +1,19 @@
 # tranfi
 
-Streaming ETL language in C11. Pipe DSL, push/pull API, columnar batches, 73 built-in transforms plus 7 codecs. Bindings for Python, Node.js, R, and WASM.
+Streaming ETL language in C11. Pipe DSL, push/pull API, columnar batches,
+built-in transforms, and seven codecs. Bindings for Python, Node.js, and WASM.
+
+> **Unreleased main:** The prepared-transform API documented below targets
+> Tranfi 0.2. Current npm/PyPI 0.1.x installs provide the byte-stream pipeline
+> API but not prepared transforms; build this branch from source until 0.2 is
+> published.
 
 ```bash
-tranfi 'csv | filter "age > 25" | sort -name | derive label=if(col(age)>30,"senior","junior") | csv' < people.csv
+tranfi -q "csv | filter \"age > 25\" | top-k 100 age | derive label=if(col(age)>30,'senior','junior') | csv" < people.csv
 ```
+
+The CLI writes run and step statistics to stderr by default; `-q` keeps a simple
+first run quiet without changing the transformed stdout data.
 
 ## Install
 
@@ -25,20 +34,34 @@ For an intentionally WASM-only/browser install, set
 byte-stream pipeline can use WASM, but the prepared-transform classes exported
 from the root Node entry require the native addon.
 
-**Binary** (prebuilt, no dependencies):
+**Binary** (prebuilt Linux x64 CLI; no local compilation):
 
 ```bash
 curl -fsSL https://github.com/tranfi/tranfi/releases/latest/download/tranfi-linux-x64.tar.gz \
   | tar xz && sudo mv tranfi-linux-x64 /usr/local/bin/tranfi
 ```
 
+## Choose the right surface
+
+Tranfi is a streaming data-processing engine, not an in-memory DataFrame API.
+It exposes two related but distinct surfaces:
+
+| Goal | Use | Data and result |
+|------|-----|-----------------|
+| Filter, derive, join, aggregate, or encode CSV/JSONL/text | CLI or `pipeline(...)` | byte streams in; streamed chunks or collected output bytes/text out |
+| Learn reusable imputation, scaling, or category state | prepared transforms | typed columnar batches in; a frozen portable TFTR plan and dense float64 matrix results out |
+
+Start with `pipeline(...)` for ordinary ETL. Use the prepared lifecycle only
+when an operation must learn from a reference dataset and then be replayed
+without changing its state or output schema.
+
 ## Quick start
 
 ### CLI
 
 ```bash
-# Filter and sort
-tranfi 'csv | filter "age > 25" | top-k 100 age | csv' < data.csv
+# Filter and retain the top 100 rows by age
+tranfi -q 'csv | filter "age > 25" | top-k 100 age | csv' < data.csv
 
 # Built-in recipes
 tranfi profile < data.csv
@@ -93,18 +116,26 @@ result = tf.pipeline([
 ```js
 const { pipeline, codec, ops, expr } = require('tranfi')
 
-// DSL string
-const result = await pipeline('csv | filter "age > 25" | top-k 100 age | csv')
-  .run({ inputFile: 'data.csv' })
-console.log(result.outputText)
+async function main() {
+  // DSL string
+  const result = await pipeline('csv | filter "age > 25" | top-k 100 age | csv')
+    .run({ inputFile: 'data.csv' })
+  console.log(result.outputText)
 
-// Builder API
-const result2 = await pipeline([
-  codec.csv(),
-  ops.filter(expr("col('age') > 25")),
-  ops.top(100, 'age'),
-  codec.csvEncode(),
-]).run({ inputFile: 'data.csv' })
+  // Builder API: the same plan expressed as structured operations.
+  const result2 = await pipeline([
+    codec.csv(),
+    ops.filter(expr("col('age') > 25")),
+    ops.top(100, 'age'),
+    codec.csvEncode(),
+  ]).run({ inputFile: 'data.csv' })
+  console.log(result2.outputText)
+}
+
+main().catch(error => {
+  console.error(error)
+  process.exitCode = 1
+})
 ```
 
 ### Prepared reusable transforms
@@ -115,9 +146,26 @@ Tranfi also has a separate typed-table lifecycle for data-dependent reusable tra
 recipe -> analyze reference batches -> finalize immutable plan -> apply
 ```
 
-`apply` can run over a second pass of the original reference data (the streaming equivalent of `fit_transform`) as well as over later compatible batches. The plan contains the learned state, resolved operations, and frozen input/output schemas; it can be exported as a canonical TFTR artifact and imported by another supported binding. `plan.recipeSha256()` / `plan.recipe_sha256()` expose the engine-owned canonical recipe and input-schema identity for artifact wrappers without requiring them to parse private TFTR bytes. This API does not replace the ordinary `create -> push -> finish -> pull` byte-stream pipeline.
+In estimator terminology, analysis plus finalization is `fit`, application is
+`transform`, and applying the plan to a replayed reference stream is
+`fit_transform`. `apply` can therefore run over a second pass of the original
+data as well as over later compatible batches. The plan contains learned state,
+resolved operations, and frozen input/output schemas; it can be exported as a
+canonical TFTR artifact and imported by another supported binding.
+`plan.recipeSha256()` / `plan.recipe_sha256()` expose the engine-owned canonical
+recipe and input-schema identity for artifact wrappers without requiring them to
+parse private TFTR bytes. This API does not replace the ordinary
+`create -> push -> finish -> pull` byte-stream pipeline.
 
-The current prepared-transform slice is deliberately narrow: declared `float32`/`float64` columns with numeric none/zero/constant/mean/exact-median imputation and none/standard/min-max normalization, plus declared categorical columns with deterministic mode or no imputation and discovered finite categories when an encoder needs them. A versioned `finite-integer-cardinality-v1` rule can infer between both declared branches: missing/NaN values are ignored, finite integers resolve categorical only with `2..maxCategories` distinct canonical values, and zero/one distinct value, a noninteger, or the next distinct value resolves numeric without retaining the dataset. Categorical output can freeze zero-based sorted label ordinals with `encode=label` or emit source-ordered one-hot blocks with `encode=onehot`. The `impute=none` plus `encode=none` combination passes every finite value through and emits canonical qNaN for missing input. Mode plus `encode=none` retains its learned dictionary and rejects unseen finite values with code `108`. With no categorical imputation, missing label/one-hot input follows the selected encoder's unknown policy. Label unknowns can fail with code `108`, emit a noncolliding safe-integer sentinel, or emit the reserved ordinal after the known categories. One-hot unknowns can fail, leave an all-zero block, or select an appended `other` field. Generated label/one-hot fields have deterministic percent-encoded IDs, names, source/category metadata, and collision rejection rather than suffixing. Mode ties choose the smallest typed value; zero is canonicalized for lookup while a known nonmissing `-0` keeps its sign in pass-through float64 output. Exact median obeys the configured allocation and resident-state limits; inference, categorical discovery, and output expansion also obey category, output-width, allocation, and resident-state limits. Prepared-transform host-policy and spill fields are reserved but not implemented: a non-null host policy or nonempty spill path currently fails with unsupported-runtime code `113` rather than being ignored. Native Node, standalone WASM/Worker, raw WASM, and Python bindings expose the same plan/schema bytes, output/error semantics, resource limits, deterministic disposal, and stable numeric `TranfiTransformError.code`. Fixed dictionaries and categorical constant imputation remain future phases. See the [Node/WASM](js/) and [Python](py/) package guides for examples.
+See the [Node/WASM](js/#prepared-reusable-transforms) and
+[Python](py/#prepared-reusable-transforms) guides for complete examples.
+
+<details>
+<summary>Current prepared-transform capabilities and limits</summary>
+
+The current prepared-transform slice is deliberately narrow: declared `float32`/`float64` columns with numeric none/zero/constant/mean/exact-median imputation and none/standard/min-max normalization, plus declared categorical columns with deterministic mode or no imputation and discovered finite categories when an encoder needs them. A versioned `finite-integer-cardinality-v1` rule can infer between both declared branches: missing/NaN values are ignored, finite integers resolve categorical only with `2..maxCategories` distinct canonical values, and zero/one distinct value, a noninteger, or the next distinct value resolves numeric without retaining the dataset. Categorical output can freeze zero-based sorted label ordinals with `encode=label` or emit source-ordered one-hot blocks with `encode=onehot`. The `impute=none` plus `encode=none` combination passes every finite value through and emits canonical qNaN for missing input. Mode plus `encode=none` retains its learned dictionary and rejects unseen finite values with code `108`. With no categorical imputation, missing label/one-hot input follows the selected encoder's unknown policy. Label unknowns can fail with code `108`, emit a noncolliding safe-integer sentinel, or emit the reserved ordinal after the known categories. One-hot unknowns can fail, leave an all-zero block, or select an appended `other` field. Generated label/one-hot fields have deterministic percent-encoded IDs, names, source/category metadata, and collision rejection rather than suffixing. Mode ties choose the smallest typed value; zero is canonicalized for lookup while a known nonmissing `-0` keeps its sign in pass-through float64 output. Exact median obeys the configured allocation and resident-state limits; inference, categorical discovery, and output expansion also obey category, output-width, allocation, and resident-state limits. Prepared-transform host-policy and spill fields are reserved but not implemented: a non-null host policy or nonempty spill path currently fails with unsupported-runtime code `113` rather than being ignored. Native Node, standalone WASM/Worker, raw WASM, and Python bindings expose the same plan/schema bytes, output/error semantics, resource limits, deterministic disposal, and stable numeric `TranfiTransformError.code`. Fixed dictionaries and categorical constant imputation remain future phases.
+
+</details>
 
 Prepared runtime option objects reject unknown fields. Native Node uses
 `cancelFlag`; standalone WASM uses `cancelToken`. The two cancellation spellings
@@ -541,8 +589,8 @@ tranfi 'csv | datetime date year,month,day | csv'
 tranfi 'csv | derive upper_name=upper(col(name)) initials=slice(col(name),0,1) | csv'
 
 # Conditional expressions
-tranfi 'csv | derive label=if(col(age)>25,"senior","junior") | csv'
-tranfi 'csv | derive band=case_when(col(age)<18,"minor",col(age)<65,"adult","senior") region=case_match(col(city),"NY","east","LA","west","other") | csv'
+tranfi "csv | derive label=if(col(age)>25,'senior','junior') | csv"
+tranfi "csv | derive band=case_when(col(age)<18,'minor',col(age)<65,'adult','senior') region=case_match(col(city),'NY','east','LA','west','other') | csv"
 tranfi 'csv | filter "if_any(col(score1)>90,col(score2)>90)" | csv'
 
 # Regex grep and replace
@@ -789,7 +837,6 @@ tf_pipeline_run_fd(p, in_fd, out_fd, 64 * 1024);
 
 - **Python**: `pip install tranfi` — [full API docs](py/)
 - **Node.js / WASM**: `npm install tranfi` — [full API docs](js/)
-- **R**: see [r/](r/)
 
 ## Testing
 
@@ -832,11 +879,10 @@ node test/test_node.js   # Node.js tests (inc. SQL transpiler, DuckDB, WASM)
 ## Project structure
 
 ```
-src/                 C11 core (55 transforms, 7 codecs, DSL parser, IR->SQL transpiler)
+src/                 C11 core (transforms, codecs, DSL parser, IR->SQL transpiler)
 app/                 Vue + Vite frontend (WASM mode + server mode)
 js/                  Node.js N-API + WASM bindings (full API docs)
 py/                  Python ctypes bindings (full API docs)
-r/                   R bindings
 bench/               Benchmarks
 test/                Tests (C, Python, Node.js)
 Makefile             Build orchestration
