@@ -281,10 +281,44 @@ function createTransformAPI(wasm) {
     return value
   }
 
-  function encodeUtf8(value, label, cancelToken) {
-    assertWellFormedUnicode(value, label, cancelToken, true)
-    var chunks = []
-    var total = 0
+  function utf8ByteLength(value, label, cancelToken, rejectNul, maxBytes) {
+    var bytes = 0
+    for (var index = 0; index < value.length; index++) {
+      if (index % 4096 === 0) throwIfCancelled(cancelToken)
+      var unit = value.charCodeAt(index)
+      if (rejectNul && unit === 0) {
+        throw new TypeError(label + ' must not contain NUL')
+      }
+      if (unit <= 0x7f) {
+        bytes += 1
+      } else if (unit <= 0x7ff) {
+        bytes += 2
+      } else if (unit >= 0xd800 && unit <= 0xdbff) {
+        var next = index + 1 < value.length ? value.charCodeAt(index + 1) : 0
+        if (next < 0xdc00 || next > 0xdfff) {
+          throw new TypeError(label + ' must not contain an unpaired UTF-16 surrogate')
+        }
+        bytes += 4
+        index++
+      } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+        throw new TypeError(label + ' must not contain an unpaired UTF-16 surrogate')
+      } else {
+        bytes += 3
+      }
+      if (maxBytes !== undefined && bytes > maxBytes) {
+        throw resourceLimit(label + ' exceeds its configured byte limit')
+      }
+    }
+    throwIfCancelled(cancelToken)
+    return bytes
+  }
+
+  function encodeUtf8(value, label, cancelToken, maxBytes, knownLength) {
+    var total = knownLength === undefined
+      ? utf8ByteLength(value, label, cancelToken, true, maxBytes)
+      : knownLength
+    var encoded = new Uint8Array(total)
+    var destination = 0
     for (var offset = 0; offset < value.length;) {
       throwIfCancelled(cancelToken)
       var end = Math.min(offset + 4096, value.length)
@@ -292,20 +326,18 @@ function createTransformAPI(wasm) {
         var last = value.charCodeAt(end - 1)
         if (last >= 0xd800 && last <= 0xdbff) end--
       }
-      var chunk = encoder.encode(value.slice(offset, end))
-      chunks.push(chunk)
-      total += chunk.byteLength
+      var chunk = value.slice(offset, end)
+      var result = encoder.encodeInto(chunk, encoded.subarray(destination))
+      if (result.read !== chunk.length) {
+        throw new Error('internal UTF-8 destination mismatch for ' + label)
+      }
+      destination += result.written
       offset = end
     }
     throwIfCancelled(cancelToken)
-    var encoded = new Uint8Array(total)
-    var destination = 0
-    chunks.forEach(function(chunk) {
-      throwIfCancelled(cancelToken)
-      encoded.set(chunk, destination)
-      destination += chunk.byteLength
-    })
-    throwIfCancelled(cancelToken)
+    if (destination !== total) {
+      throw new Error('internal UTF-8 length mismatch for ' + label)
+    }
     return encoded
   }
 
@@ -335,10 +367,6 @@ function createTransformAPI(wasm) {
       if (typeof name !== 'string' || !name) {
         throw new TypeError('schema field ' + index + ' name must be a nonempty string')
       }
-      if (id.length > limits.maxStringBytes
-          || name.length > limits.maxStringBytes) {
-        throw resourceLimit('prepared-transform schema string limit exceeded')
-      }
       assertWellFormedUnicode(
         id, 'schema field ' + index + ' id', cancelToken, true
       )
@@ -361,25 +389,43 @@ function createTransformAPI(wasm) {
       throw resourceLimit('prepared-transform schema allocation limit exceeded')
     }
     var decodedBytes = 0
-    var encodedFields = fields.map(function(field, index) {
+    var preparedFields = fields.map(function(field, index) {
       if (index % 4096 === 0) throwIfCancelled(cancelToken)
-      if (field.id.length > limits.maxStringBytes
-          || field.name.length > limits.maxStringBytes) {
-        throw resourceLimit('prepared-transform schema string limit exceeded')
-      }
-      var id = encodeUtf8(field.id, 'schema field ' + index + ' id', cancelToken)
-      var name = encodeUtf8(field.name, 'schema field ' + index + ' name', cancelToken)
-      if (id.byteLength > limits.maxStringBytes
-          || name.byteLength > limits.maxStringBytes
-          || id.byteLength > limits.maxAllocationBytes
-          || name.byteLength > limits.maxAllocationBytes) {
-        throw resourceLimit('prepared-transform schema string limit exceeded')
-      }
-      decodedBytes += id.byteLength + name.byteLength
-      if (decodedBytes > limits.maxDecodedStringBytes) {
+      var maxEncodedBytes = Math.min(
+        limits.maxStringBytes, limits.maxAllocationBytes - 1
+      )
+      var idLength = utf8ByteLength(
+        field.id, 'schema field ' + index + ' id', cancelToken, true,
+        maxEncodedBytes
+      )
+      var nameLength = utf8ByteLength(
+        field.name, 'schema field ' + index + ' name', cancelToken, true,
+        maxEncodedBytes
+      )
+      if (decodedBytes + idLength + nameLength > limits.maxDecodedStringBytes) {
         throw resourceLimit('prepared-transform decoded string limit exceeded')
       }
-      return { field: field, id: id, name: name }
+      decodedBytes += idLength + nameLength
+      return { field: field, idLength: idLength, nameLength: nameLength }
+    })
+    throwIfCancelled(cancelToken)
+    var encodedFields = preparedFields.map(function(prepared, index) {
+      if (index % 4096 === 0) throwIfCancelled(cancelToken)
+      var field = prepared.field
+      var maxEncodedBytes = Math.min(
+        limits.maxStringBytes, limits.maxAllocationBytes - 1
+      )
+      return {
+        field: field,
+        id: encodeUtf8(
+          field.id, 'schema field ' + index + ' id', cancelToken,
+          maxEncodedBytes, prepared.idLength
+        ),
+        name: encodeUtf8(
+          field.name, 'schema field ' + index + ' name', cancelToken,
+          maxEncodedBytes, prepared.nameLength
+        )
+      }
     })
     var allocations = []
     var dtypes = []
@@ -643,16 +689,13 @@ function createTransformAPI(wasm) {
 
   function normalizeRecipeJSON(recipe, limits) {
     if (typeof recipe === 'string') {
-      assertWellFormedUnicode(recipe, 'recipe')
-      if (recipe.length > limits.maxRecipeBytes) {
-        throw resourceLimit('prepared-transform recipe byte limit exceeded')
-      }
-      var encoded = encoder.encode(recipe)
-      if (encoded.byteLength > limits.maxRecipeBytes
-          || encoded.byteLength > limits.maxAllocationBytes) {
-        throw resourceLimit('prepared-transform recipe byte limit exceeded')
-      }
-      return encoded
+      var stringLimit = Math.min(
+        limits.maxRecipeBytes, limits.maxAllocationBytes - 1
+      )
+      var stringLength = utf8ByteLength(
+        recipe, 'recipe', null, false, stringLimit
+      )
+      return encodeUtf8(recipe, 'recipe', null, stringLimit, stringLength)
     }
     if (recipe instanceof Uint8Array) {
       if (recipe.byteLength > limits.maxRecipeBytes
@@ -671,19 +714,36 @@ function createTransformAPI(wasm) {
       }
       return value
     })
-    if (text.length > limits.maxRecipeBytes) {
-      throw resourceLimit('prepared-transform recipe byte limit exceeded')
-    }
-    var bytes = encoder.encode(text)
-    if (bytes.byteLength > limits.maxRecipeBytes
-        || bytes.byteLength > limits.maxAllocationBytes) {
-      throw resourceLimit('prepared-transform recipe byte limit exceeded')
-    }
-    return bytes
+    var textLimit = Math.min(
+      limits.maxRecipeBytes, limits.maxAllocationBytes - 1
+    )
+    var textLength = utf8ByteLength(
+      text, 'recipe', null, false, textLimit
+    )
+    return encodeUtf8(text, 'recipe', null, textLimit, textLength)
   }
 
   function runtimeOptions(options) {
-    options = options || {}
+    if (options === undefined) options = {}
+    if (typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('transform runtime options must be an object')
+    }
+    Object.keys(options).forEach(function(name) {
+      if (['limits', 'cancelToken', 'hostPolicy', 'spillDir'].indexOf(name) < 0) {
+        throw new TypeError('unknown transform runtime option: ' + name)
+      }
+    })
+    if (options.hostPolicy !== undefined && options.hostPolicy !== null) {
+      throw new TranfiTransformError(
+        113, 'prepared-transform hostPolicy is reserved but not implemented'
+      )
+    }
+    if (options.spillDir !== undefined && options.spillDir !== null
+        && options.spillDir !== '') {
+      throw new TranfiTransformError(
+        113, 'prepared-transform spillDir is reserved but not implemented'
+      )
+    }
     return {
       limits: options.limits,
       cancelToken: options.cancelToken || null

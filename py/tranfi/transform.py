@@ -202,8 +202,9 @@ def _check(code, error):
 
 def _input_bytes(value, name, *, max_bytes=None, cancel_token=None):
     if isinstance(value, str):
-        if max_bytes is not None and len(value) > max_bytes:
-            _resource_limit(f'{name} exceeds its byte limit')
+        _utf8_length(
+            value, name, cancel_token, max_bytes=max_bytes,
+            reject_nul=False, surrogate_encoding_error=True)
         value = value.encode('utf-8')
     try:
         view = memoryview(value)
@@ -230,9 +231,43 @@ def _input_bytes(value, name, *, max_bytes=None, cancel_token=None):
     return owner, typed_pointer, byte_view.nbytes
 
 
-def _utf8_chunks(value, label, cancel_token):
-    if not isinstance(value, str) or not value:
-        raise TypeError(f'{label} must be a nonempty string')
+def _utf8_length(
+        value, label, cancel_token, *, max_bytes=None, reject_nul=True,
+        surrogate_encoding_error=True):
+    if not isinstance(value, str):
+        raise TypeError(f'{label} must be a string')
+    total = 0
+    for index, character in enumerate(value):
+        if index % _CANCEL_ITERS == 0:
+            _raise_if_cancelled(cancel_token)
+        codepoint = ord(character)
+        if reject_nul and codepoint == 0:
+            raise TypeError(f'{label} must not contain NUL')
+        if codepoint <= 0x7f:
+            total += 1
+        elif codepoint <= 0x7ff:
+            total += 2
+        elif 0xd800 <= codepoint <= 0xdfff:
+            if surrogate_encoding_error:
+                raise UnicodeEncodeError(
+                    'utf-8', value, index, index + 1,
+                    'surrogates not allowed')
+            raise TypeError(f'{label} must not contain a Unicode surrogate')
+        elif codepoint <= 0xffff:
+            total += 3
+        else:
+            total += 4
+        if max_bytes is not None and total > max_bytes:
+            _resource_limit(f'{label} exceeds its byte limit')
+    _raise_if_cancelled(cancel_token)
+    return total
+
+
+def _utf8_chunks(
+        value, label, cancel_token, *, max_bytes=None, known_length=None):
+    expected = (known_length if known_length is not None else
+                _utf8_length(
+                    value, label, cancel_token, max_bytes=max_bytes))
     chunks = []
     total = 0
     chunk_chars = min(_CANCEL_ITERS, _CANCEL_BYTES // 4)
@@ -244,6 +279,8 @@ def _utf8_chunks(value, label, cancel_token):
         chunks.append(chunk)
         total += len(chunk)
     _raise_if_cancelled(cancel_token)
+    if total != expected:
+        raise RuntimeError(f'internal UTF-8 length mismatch for {label}')
     return chunks, total
 
 
@@ -289,35 +326,37 @@ class _SchemaOwner:
             if not isinstance(name, str) or not name:
                 raise TypeError(
                     f'schema field {index} name must be a nonempty string')
-            if (len(identifier) > limits.max_string_bytes
-                    or len(name) > limits.max_string_bytes):
-                _resource_limit(
-                    'prepared-transform schema string limit exceeded')
-            id_chunks, id_len = _utf8_chunks(
-                identifier, f'schema field {index} id', cancel_token)
-            name_chunks, name_len = _utf8_chunks(
-                name, f'schema field {index} name', cancel_token)
+            max_encoded_bytes = min(
+                limits.max_string_bytes, limits.max_allocation_bytes - 1)
+            id_len = _utf8_length(
+                identifier, f'schema field {index} id', cancel_token,
+                max_bytes=max_encoded_bytes)
+            name_len = _utf8_length(
+                name, f'schema field {index} name', cancel_token,
+                max_bytes=max_encoded_bytes)
             if dtype not in _DTYPE_CODES:
                 raise TypeError(
                     f'schema field {index} dtype must be float32 or float64')
-            if (id_len > limits.max_string_bytes
-                    or name_len > limits.max_string_bytes
-                    or id_len > limits.max_allocation_bytes
-                    or name_len > limits.max_allocation_bytes):
-                _resource_limit(
-                    'prepared-transform schema string limit exceeded')
-            decoded_bytes += id_len + name_len
-            if decoded_bytes > limits.max_decoded_string_bytes:
+            if (decoded_bytes + id_len + name_len >
+                    limits.max_decoded_string_bytes):
                 _resource_limit(
                     'prepared-transform decoded string limit exceeded')
-            prepared.append((dtype, id_chunks, id_len, name_chunks, name_len))
+            decoded_bytes += id_len + name_len
+            prepared.append((
+                dtype, identifier, id_len, name, name_len, max_encoded_bytes))
 
         _raise_if_cancelled(cancel_token)
         self._fields = (_ffi._TfFieldViewV1 * len(fields))()
-        for index, (dtype, id_chunks, id_len,
-                    name_chunks, name_len) in enumerate(prepared):
+        for index, (dtype, identifier, id_len, name, name_len,
+                    max_encoded_bytes) in enumerate(prepared):
             if index % _CANCEL_ITERS == 0:
                 _raise_if_cancelled(cancel_token)
+            id_chunks, _ = _utf8_chunks(
+                identifier, f'schema field {index} id', cancel_token,
+                max_bytes=max_encoded_bytes, known_length=id_len)
+            name_chunks, _ = _utf8_chunks(
+                name, f'schema field {index} name', cancel_token,
+                max_bytes=max_encoded_bytes, known_length=name_len)
             id_owner = _chunks_owner(id_chunks, id_len, cancel_token)
             name_owner = _chunks_owner(name_chunks, name_len, cancel_token)
             self._strings.extend((id_owner, name_owner))
@@ -605,7 +644,7 @@ class TransformRecipe(_OwnedHandle):
         effective_limits = _resolved_limits(limits)
         max_bytes = min(
             effective_limits.max_recipe_bytes,
-            effective_limits.max_allocation_bytes)
+            effective_limits.max_allocation_bytes - 1)
         owner, pointer, length = _input_bytes(
             recipe_json, 'recipe_json', max_bytes=max_bytes)
         handle = ctypes.c_void_p()

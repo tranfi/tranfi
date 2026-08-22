@@ -933,6 +933,11 @@ def test_python_preflights_limits_before_c_transport():
             lambda: recipe.analyzer(
                 [*SCHEMA64, {'id': 'x1', 'dtype': 'float64'}],
                 limits=tranfi.TransformLimits(max_input_columns=1)))
+        assert_not_called(
+            'tf_transform_analyzer_create',
+            lambda: recipe.analyzer(
+                [{'id': '🔥', 'name': 'x0', 'dtype': 'float64'}],
+                limits=tranfi.TransformLimits(max_string_bytes=3)))
         limits = tranfi.TransformLimits(
             max_analyzer_rows=1, max_analyzer_input_bytes=8)
         with recipe.analyzer(SCHEMA64, limits=limits) as analyzer:

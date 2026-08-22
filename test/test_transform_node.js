@@ -734,6 +734,29 @@ function testMedianErrorsAndLimits() {
   closeAll(recipe, analyzer)
 }
 
+function testReservedRuntimeOptions() {
+  const recipe = tf.TransformRecipe.fromJSON(vectors.recipes.numeric_none_none)
+  for (const options of [
+    null,
+    0,
+    { cancelToken: {} },
+    { unknownRuntimeField: 1 },
+  ]) {
+    assert.throws(() => recipe.analyzer(schema64, options), TypeError)
+  }
+  for (const options of [
+    { hostPolicy: {} },
+    { spillDir: '/tmp/tranfi-reserved-spill' },
+  ]) {
+    assert.throws(
+      () => recipe.analyzer(schema64, options),
+      (error) => error instanceof tf.TranfiTransformError && error.code === 113
+    )
+  }
+  const analyzer = recipe.analyzer(schema64, { spillDir: '' })
+  closeAll(recipe, analyzer)
+}
+
 function testF32ValidityAndParentLifetime() {
   const schema = [{ id: 'x0', name: 'feature', dtype: 'float32' }]
   const config = structuredClone(vectors.recipes.numeric_median_none)
@@ -953,6 +976,13 @@ function testErrorsLimitsAndClosedState() {
     () => schemaLimitedRecipe.analyzer(schema64, { limits: { maxStringBytes: 1 } }),
     (error) => error instanceof tf.TranfiTransformError && error.code === 104
   )
+  assert.throws(
+    () => schemaLimitedRecipe.analyzer(
+      [{ id: '🔥', name: 'x0', dtype: 'float64' }],
+      { limits: { maxStringBytes: 3 } }
+    ),
+    (error) => error instanceof tf.TranfiTransformError && error.code === 104
+  )
   schemaLimitedRecipe.close()
 
   const native = require('../js/build/Release/tranfi_napi.node')
@@ -1169,6 +1199,7 @@ async function main() {
   testSharedSemanticVectors()
   testInferenceDeferredNumericDomain()
   testMedianErrorsAndLimits()
+  testReservedRuntimeOptions()
   testCategoricalModeErrorsLimitsAndFloat32()
   testOnehotExactLimitsAndUnicode()
   testF32ValidityAndParentLifetime()

@@ -1080,6 +1080,38 @@ static void test_runtime_safe_points_and_parser_limits(void) {
     free(payload);
 }
 
+static void test_runtime_rejects_unimplemented_host_features(void) {
+    static const uint8_t spill_dir[] = {'.'};
+    tf_transform_runtime_v1 runtime;
+    tf_transform_runtime_copy copied;
+    tf_transform_error *error = NULL;
+    tf_host_policy policy;
+
+    memset(&runtime, 0, sizeof(runtime));
+    runtime.abi_version = 1;
+    runtime.struct_size = (uint32_t)sizeof(runtime);
+    memset(&policy, 0, sizeof(policy));
+    runtime.host_policy = &policy;
+    assert(tf_transform_copy_runtime(&runtime, &copied, &error)
+           == TF_TRANSFORM_UNSUPPORTED_RUNTIME);
+    assert(error != NULL);
+    tf_transform_error_destroy(&error);
+
+    runtime.host_policy = NULL;
+    runtime.spill_dir_utf8 = spill_dir;
+    runtime.spill_dir_bytes = sizeof(spill_dir);
+    assert(tf_transform_copy_runtime(&runtime, &copied, &error)
+           == TF_TRANSFORM_UNSUPPORTED_RUNTIME);
+    assert(error != NULL);
+    tf_transform_error_destroy(&error);
+
+    runtime.spill_dir_bytes = 0;
+    assert(tf_transform_copy_runtime(&runtime, &copied, &error)
+           == TF_TRANSFORM_INVALID_ARGUMENT);
+    assert(error != NULL);
+    tf_transform_error_destroy(&error);
+}
+
 static void test_session_allocation_limits(void) {
     const double value[] = {1.0};
     tf_transform_recipe *recipe = load_vector_recipe("numeric_none_none");
@@ -5141,6 +5173,7 @@ int main(void) {
     test_shared_validation_case_table();
     test_f32_stride_validity_and_apply_terminal();
     test_numeric_cancellation_is_terminal();
+    test_runtime_rejects_unimplemented_host_features();
     test_runtime_safe_points_and_parser_limits();
     test_session_allocation_limits();
     test_json_construction_preflight_limits();

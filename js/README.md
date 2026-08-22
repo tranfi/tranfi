@@ -34,7 +34,12 @@ const result = await pipeline('csv | filter "col(age) > 25" | top-k 100 age | cs
 npm install tranfi
 ```
 
-Uses N-API natively in Node.js, falls back to WASM in browsers automatically.
+The default install compiles the N-API addon and reports a nonzero failure if
+the native toolchain or synchronized C sources are unavailable. For an
+intentional WASM-only/browser installation, set
+`TRANFI_SKIP_NATIVE_BUILD=1` and import `tranfi/wasm` explicitly. The ordinary
+pipeline can execute with WASM, but root-entry prepared transforms require the
+native addon.
 
 ## CLI
 
@@ -163,7 +168,12 @@ The bundled Tranfi app runner is also preview-bounded by default: file chunks ar
 
 Prepared transforms are a separate typed-table API for operations whose parameters must be learned from reference data. `analyze` accumulates bounded statistics over one or more batches, `finalize` freezes an immutable plan and output schema, and `apply` runs that plan either over a second pass of the original data (`fit_transform`-style) or over later compatible batches. It does not replace the byte-stream pipeline API.
 
-The current slice accepts declared `float32`/`float64` columns. It supports numeric none/zero/constant/mean/exact-median imputation and none/standard/min-max normalization. Declared categorical columns support mode imputation with `allMissing: 'error' | 'zero'` or `impute.op: 'none'`; encoders discover finite typed categories, while the no-imputation/no-encoding combination needs no learned dictionary. A column may instead provide both branches with `kind.op: 'infer'`, `kind.rule: 'finite-integer-cardinality-v1'`, and `kind.maxCategories >= 2`: missing/NaN values are ignored, `2..maxCategories` distinct finite integers resolve categorical, while zero/one distinct value, any noninteger, or the next distinct value resolves numeric. `impute.op: 'none'` with `encode.op: 'none'` passes every finite value through and emits canonical qNaN for missing input. Mode with `encode.op: 'none'` retains its learned dictionary and rejects unseen finite values with code `108`. `encode.op: 'label'` freezes zero-based sorted ordinals and supports `unknown: 'error' | 'sentinel' | 'other'`; `encode.op: 'onehot'` emits source-ordered category blocks and supports `unknown: 'error' | 'all_zero' | 'other'`. Without categorical imputation, missing label/one-hot input follows that encoder's unknown policy. The label sentinel must be a safe integer outside the learned ordinal range; label/one-hot `other` appends the reserved ordinal/field after known categories. Generated output IDs/names and one-hot category metadata are deterministic, and collisions fail with code `102`. Exact median obeys the configured allocation and resident-state limits; inference, categorical discovery, and output expansion obey category, output-width, allocation, and resident-state limits. Limit failures use resource code `104`, and none of these operations spills without host authority. Fixed dictionaries and categorical constant imputation are not implemented yet.
+The current slice accepts declared `float32`/`float64` columns. It supports numeric none/zero/constant/mean/exact-median imputation and none/standard/min-max normalization. Declared categorical columns support mode imputation with `allMissing: 'error' | 'zero'` or `impute.op: 'none'`; encoders discover finite typed categories, while the no-imputation/no-encoding combination needs no learned dictionary. A column may instead provide both branches with `kind.op: 'infer'`, `kind.rule: 'finite-integer-cardinality-v1'`, and `kind.maxCategories >= 2`: missing/NaN values are ignored, `2..maxCategories` distinct finite integers resolve categorical, while zero/one distinct value, any noninteger, or the next distinct value resolves numeric. `impute.op: 'none'` with `encode.op: 'none'` passes every finite value through and emits canonical qNaN for missing input. Mode with `encode.op: 'none'` retains its learned dictionary and rejects unseen finite values with code `108`. `encode.op: 'label'` freezes zero-based sorted ordinals and supports `unknown: 'error' | 'sentinel' | 'other'`; `encode.op: 'onehot'` emits source-ordered category blocks and supports `unknown: 'error' | 'all_zero' | 'other'`. Without categorical imputation, missing label/one-hot input follows that encoder's unknown policy. The label sentinel must be a safe integer outside the learned ordinal range; label/one-hot `other` appends the reserved ordinal/field after known categories. Generated output IDs/names and one-hot category metadata are deterministic, and collisions fail with code `102`. Exact median obeys the configured allocation and resident-state limits; inference, categorical discovery, and output expansion obey category, output-width, allocation, and resident-state limits. Limit failures use resource code `104`. Prepared-transform host-policy and spill fields are reserved but not implemented; nonempty use fails with unsupported-runtime code `113` instead of being silently ignored. Fixed dictionaries and categorical constant imputation are not implemented yet.
+
+Prepared runtime option objects reject unknown fields. Native Node accepts
+`limits`, `cancelFlag`, `hostPolicy`, and `spillDir`; standalone WASM accepts
+`limits`, `cancelToken`, `hostPolicy`, and `spillDir`. The host/spill fields are
+reserved as described above, and cancellation spellings are not interchangeable.
 
 ```js
 const tf = require('tranfi')

@@ -1123,6 +1123,10 @@ async function main() {
       { limits: { maxInputColumns: 1 } }
     ))
     assert.equal(overLimitReads, 0)
+    assertResourceBeforeMalloc(() => recipe.analyzer(
+      [{ id: '🔥', name: 'x0', dtype: 'float64' }],
+      { limits: { maxStringBytes: 3 } }
+    ))
     const analyzer = recipe.analyzer(schema64, {
       limits: { maxAnalyzerRows: 1, maxAnalyzerInputBytes: 8 }
     })
@@ -1158,6 +1162,29 @@ async function main() {
     assertResourceBeforeMalloc(() => apply.run(table([1, 2])))
     assert.deepEqual(Array.from(apply.run(table([2])).data), [2])
     closeAll(recipe, analyzer, plan, apply, emptyApply)
+  }
+
+  {
+    const recipe = wasm.TransformRecipe.fromJSON(vectors.recipes.numeric_none_none)
+    for (const options of [
+      null,
+      0,
+      { cancelFlag: new Int32Array(new SharedArrayBuffer(4)) },
+      { unknownRuntimeField: 1 },
+    ]) {
+      assert.throws(() => recipe.analyzer(schema64, options), TypeError)
+    }
+    for (const options of [
+      { hostPolicy: {} },
+      { spillDir: '/tmp/tranfi-reserved-spill' },
+    ]) {
+      assert.throws(
+        () => recipe.analyzer(schema64, options),
+        (error) => error instanceof native.TranfiTransformError && error.code === 113
+      )
+    }
+    const analyzer = recipe.analyzer(schema64, { spillDir: '' })
+    closeAll(recipe, analyzer)
   }
 
   console.log('prepared-transform WASM Node tests passed')

@@ -36,6 +36,9 @@ const LIMIT_FIELDS = new Set([
   'maxLiveHandles',
   'maxRetiredHandleSlots'
 ])
+const RUNTIME_OPTION_FIELDS = new Set([
+  'limits', 'cancelFlag', 'hostPolicy', 'spillDir'
+])
 
 function requireNative() {
   if (!nativeBinding || typeof nativeBinding.transformRecipeFromJson !== 'function') {
@@ -83,6 +86,38 @@ function assertWellFormedUnicode(value, label, runtime, rejectNul = false) {
   return value
 }
 
+function utf8ByteLength(value, label, runtime, rejectNul = false, maxBytes = null) {
+  let bytes = 0
+  for (let index = 0; index < value.length; index++) {
+    if (index % 4096 === 0) throwIfCancelled(runtime)
+    const unit = value.charCodeAt(index)
+    if (rejectNul && unit === 0) {
+      throw new TypeError(`${label} must not contain NUL`)
+    }
+    if (unit <= 0x7f) {
+      bytes += 1
+    } else if (unit <= 0x7ff) {
+      bytes += 2
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = index + 1 < value.length ? value.charCodeAt(index + 1) : 0
+      if (next < 0xdc00 || next > 0xdfff) {
+        throw new TypeError(`${label} must not contain an unpaired UTF-16 surrogate`)
+      }
+      bytes += 4
+      index++
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new TypeError(`${label} must not contain an unpaired UTF-16 surrogate`)
+    } else {
+      bytes += 3
+    }
+    if (maxBytes !== null && bytes > maxBytes) {
+      throw new TranfiTransformError(104, `${label} exceeds its configured byte limit`)
+    }
+  }
+  throwIfCancelled(runtime)
+  return bytes
+}
+
 function normalizeLimits(limits) {
   if (limits === undefined || limits === null) return undefined
   assertPlainObject(limits, 'limits')
@@ -117,6 +152,22 @@ function normalizeRuntimeOptions(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     throw new TypeError('transform runtime options must be an object')
   }
+  for (const name of Object.keys(options)) {
+    if (!RUNTIME_OPTION_FIELDS.has(name)) {
+      throw new TypeError(`unknown transform runtime option: ${name}`)
+    }
+  }
+  if (options.hostPolicy !== undefined && options.hostPolicy !== null) {
+    throw new TranfiTransformError(
+      113, 'prepared-transform hostPolicy is reserved but not implemented'
+    )
+  }
+  if (options.spillDir !== undefined && options.spillDir !== null &&
+      options.spillDir !== '') {
+    throw new TranfiTransformError(
+      113, 'prepared-transform spillDir is reserved but not implemented'
+    )
+  }
   const limits = normalizeLimits(options.limits)
   const cancelFlag = normalizeCancelFlag(options.cancelFlag)
   if (limits === undefined && cancelFlag === undefined) return undefined
@@ -130,10 +181,12 @@ function throwIfCancelled(runtime) {
   }
 }
 
-function encodeUtf8(value, label, runtime) {
-  assertWellFormedUnicode(value, label, runtime, true)
-  const chunks = []
-  let total = 0
+function encodeUtf8(value, label, runtime, maxBytes, knownLength = null) {
+  const total = knownLength === null
+    ? utf8ByteLength(value, label, runtime, true, maxBytes)
+    : knownLength
+  const encoded = Buffer.allocUnsafe(total)
+  let destination = 0
   for (let offset = 0; offset < value.length;) {
     throwIfCancelled(runtime)
     let end = Math.min(offset + 4096, value.length)
@@ -141,20 +194,15 @@ function encodeUtf8(value, label, runtime) {
       const last = value.charCodeAt(end - 1)
       if (last >= 0xd800 && last <= 0xdbff) end--
     }
-    const chunk = Buffer.from(value.slice(offset, end), 'utf8')
-    chunks.push(chunk)
-    total += chunk.byteLength
+    destination += encoded.write(
+      value.slice(offset, end), destination, total - destination, 'utf8'
+    )
     offset = end
   }
   throwIfCancelled(runtime)
-  const encoded = Buffer.allocUnsafe(total)
-  let destination = 0
-  for (const chunk of chunks) {
-    throwIfCancelled(runtime)
-    chunk.copy(encoded, destination)
-    destination += chunk.byteLength
+  if (destination !== total) {
+    throw new Error(`internal UTF-8 length mismatch for ${label}`)
   }
-  throwIfCancelled(runtime)
   return encoded
 }
 
@@ -170,7 +218,7 @@ function normalizeSchema(schema, runtime, limits) {
   if (fields.length > limits.maxInputColumns) {
     throw new TranfiTransformError(104, 'prepared-transform input column limit exceeded')
   }
-  const normalized = []
+  const prepared = []
   let decodedBytes = 0
   for (let index = 0; index < fields.length; index++) {
     if (index % 4096 === 0) throwIfCancelled(runtime)
@@ -185,24 +233,39 @@ function normalizeSchema(schema, runtime, limits) {
     if (typeof name !== 'string' || name.length === 0) {
       throw new TypeError(`schema field ${index} name must be a nonempty string`)
     }
-    if (id.length > limits.maxStringBytes || name.length > limits.maxStringBytes) {
-      throw new TranfiTransformError(104, 'prepared-transform schema string limit exceeded')
-    }
-    const idBytes = encodeUtf8(id, `schema field ${index} id`, runtime)
-    const nameBytes = encodeUtf8(name, `schema field ${index} name`, runtime)
-    if (idBytes.byteLength > limits.maxStringBytes
-        || nameBytes.byteLength > limits.maxStringBytes
-        || idBytes.byteLength >= limits.maxAllocationBytes
-        || nameBytes.byteLength >= limits.maxAllocationBytes) {
-      throw new TranfiTransformError(104, 'prepared-transform schema string limit exceeded')
-    }
-    decodedBytes += idBytes.byteLength + nameBytes.byteLength
-    if (decodedBytes > limits.maxDecodedStringBytes) {
-      throw new TranfiTransformError(104, 'prepared-transform decoded string limit exceeded')
-    }
     if (dtype !== 'float32' && dtype !== 'float64') {
       throw new TypeError(`schema field ${index} dtype must be float32 or float64`)
     }
+    const maxEncodedBytes = Math.min(
+      limits.maxStringBytes, limits.maxAllocationBytes - 1
+    )
+    const idLength = utf8ByteLength(
+      id, `schema field ${index} id`, runtime, true, maxEncodedBytes
+    )
+    const nameLength = utf8ByteLength(
+      name, `schema field ${index} name`, runtime, true, maxEncodedBytes
+    )
+    if (decodedBytes + idLength + nameLength > limits.maxDecodedStringBytes) {
+      throw new TranfiTransformError(104, 'prepared-transform decoded string limit exceeded')
+    }
+    decodedBytes += idLength + nameLength
+    prepared.push({ id, name, dtype, idLength, nameLength })
+  }
+  throwIfCancelled(runtime)
+
+  const normalized = []
+  for (let index = 0; index < prepared.length; index++) {
+    if (index % 4096 === 0) throwIfCancelled(runtime)
+    const { id, name, dtype, idLength, nameLength } = prepared[index]
+    const maxEncodedBytes = Math.min(
+      limits.maxStringBytes, limits.maxAllocationBytes - 1
+    )
+    const idBytes = encodeUtf8(
+      id, `schema field ${index} id`, runtime, maxEncodedBytes, idLength
+    )
+    const nameBytes = encodeUtf8(
+      name, `schema field ${index} name`, runtime, maxEncodedBytes, nameLength
+    )
     normalized.push({ id: idBytes, name: nameBytes, dtype })
   }
   throwIfCancelled(runtime)

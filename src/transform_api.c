@@ -217,15 +217,12 @@ tf_transform_code tf_transform_copy_runtime(
         || (source->spill_dir_bytes == 0 && source->spill_dir_utf8))
         return tf_transform_set_error(
             error, TF_TRANSFORM_INVALID_ARGUMENT, "invalid spill directory span");
+    if (source->host_policy || source->spill_dir_bytes != 0)
+        return tf_transform_set_error(
+            error, TF_TRANSFORM_UNSUPPORTED_RUNTIME,
+            "prepared transforms do not implement host policy or spill storage");
     code = tf_transform_copy_limits(source->limits, &out->limits, error);
     if (code != TF_TRANSFORM_OK) return code;
-    if (source->spill_dir_bytes > out->limits.max_string_bytes
-        || (source->spill_dir_bytes != 0
-            && !tf_transform_valid_utf8(
-                source->spill_dir_utf8, source->spill_dir_bytes)))
-        return tf_transform_set_error(
-            error, TF_TRANSFORM_INVALID_ARGUMENT,
-            "spill directory is not bounded valid UTF-8");
     out->cancel = source->cancel;
     out->cancel_user = source->cancel_user;
     return TF_TRANSFORM_OK;
