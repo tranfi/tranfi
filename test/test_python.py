@@ -26,7 +26,8 @@ import tranfi as tf
 
 def test_version():
     v = tf.version()
-    assert v == '0.1.2'
+    assert v == '0.2.0'
+    assert tf.__version__ == v
 
 
 def test_csv_passthrough():

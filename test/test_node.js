@@ -14,6 +14,7 @@ const { Readable, Writable } = require('stream')
 const { gzipSync } = require('zlib')
 
 const fixturesDir = join(__dirname, 'fixtures')
+const nativeBinding = require('../js/src/native.js')
 
 if (!process.env.TMPDIR && !process.env.TEMP && !process.env.TMP) {
   process.env.TMPDIR = join(__dirname, '..', 'build', 'tmp', 'test-node')
@@ -74,6 +75,12 @@ async function main() {
 
 console.log('Tranfi Node.js Tests')
 console.log('====================\n')
+
+await test('native runtime version', async () => {
+  assert(nativeBinding, 'native binding should be built for the native test lane')
+  const v = nativeBinding.version()
+  assert(v === '0.2.0', `expected 0.2.0, got ${v}`)
+})
 
 console.log('CSV:')
 
@@ -4747,7 +4754,7 @@ if (createTranfi) {
 
   await test('wasm version', async () => {
     const v = tf.version()
-    assert(v === '0.1.2', `expected 0.1.2, got ${v}`)
+    assert(v === '0.2.0', `expected 0.2.0, got ${v}`)
   })
 
   await test('wasm compileToSql', async () => {

@@ -127,40 +127,6 @@ static int fail_text_record_limit(text_decoder_state *st,
     return TF_ERROR;
 }
 
-static int check_text_incoming_record_limit(text_decoder_state *st,
-                                            const uint8_t *data, size_t len,
-                                            tf_side_channels *side) {
-    if (st->max_record_bytes == 0 || len == 0) return TF_OK;
-
-    size_t prefix_len = tf_buffer_readable(&st->line_buf);
-    const uint8_t *prefix = prefix_len > 0 ? st->line_buf.data + st->line_buf.read_pos : NULL;
-    size_t incoming_base = st->byte_offset + prefix_len;
-    size_t line_no = st->line_number + 1;
-    size_t line_offset = st->byte_offset;
-    size_t segment_start = 0;
-    size_t current_len = prefix_len;
-
-    for (size_t i = 0; i < len; i++) {
-        if (data[i] == '\n') {
-            prefix = NULL;
-            prefix_len = 0;
-            current_len = 0;
-            segment_start = i + 1;
-            line_offset = incoming_base + i + 1;
-            line_no++;
-            continue;
-        }
-        current_len++;
-        if (current_len > st->max_record_bytes) {
-            size_t suffix_len = i - segment_start + 1;
-            return fail_text_record_limit(st, prefix, prefix_len,
-                                          data + segment_start, suffix_len,
-                                          line_no, line_offset, current_len, side);
-        }
-    }
-    return TF_OK;
-}
-
 static int check_text_buffer_record_limit(text_decoder_state *st, size_t observed_len,
                                           size_t line_no, size_t byte_offset,
                                           tf_side_channels *side) {
@@ -193,63 +159,134 @@ static int text_append_output_batch(tf_batch ***out, size_t *n_out,
     return TF_OK;
 }
 
+static int text_check_segment_record_limit(text_decoder_state *st,
+                                           const uint8_t *segment, size_t segment_len,
+                                           tf_side_channels *side) {
+    if (st->max_record_bytes == 0) return TF_OK;
+
+    size_t prefix_len = tf_buffer_readable(&st->line_buf);
+    size_t total = 0;
+    if (tf_size_add(prefix_len, segment_len, &total) == TF_OK &&
+        total <= st->max_record_bytes) {
+        return TF_OK;
+    }
+
+    size_t suffix_len = segment_len;
+    size_t observed_len = total;
+    if (prefix_len >= st->max_record_bytes) {
+        suffix_len = segment_len > 0 ? 1 : 0;
+        if (tf_size_add(prefix_len, suffix_len, &observed_len) != TF_OK)
+            observed_len = st->max_record_bytes + 1;
+    } else {
+        size_t allowed = st->max_record_bytes - prefix_len;
+        suffix_len = allowed + 1;
+        if (suffix_len > segment_len) suffix_len = segment_len;
+        observed_len = prefix_len + suffix_len;
+    }
+
+    const uint8_t *prefix = prefix_len > 0
+        ? st->line_buf.data + st->line_buf.read_pos
+        : NULL;
+    return fail_text_record_limit(st, prefix, prefix_len, segment, suffix_len,
+                                  st->line_number + 1, st->byte_offset,
+                                  observed_len, side);
+}
+
+static int text_emit_line(text_decoder_state *st, const uint8_t *data, size_t len,
+                          tf_batch ***out, size_t *n_out, size_t *out_cap) {
+    if (!st->batch) {
+        st->batch = make_text_batch(st->batch_size);
+        if (!st->batch) return TF_ERROR;
+    }
+
+    size_t row = st->batch->n_rows;
+    size_t need_rows = 0;
+    if (tf_size_add(row, 1, &need_rows) != TF_OK ||
+        tf_batch_ensure_capacity(st->batch, need_rows) != TF_OK)
+        return TF_ERROR;
+
+    if (text_set_line_cell(st->batch, row, data, len) != TF_OK)
+        return TF_ERROR;
+    if (tf_batch_expose_row(st->batch, row) != TF_OK)
+        return TF_ERROR;
+    st->rows_buffered++;
+
+    if (st->rows_buffered >= st->batch_size) {
+        if (text_append_output_batch(out, n_out, out_cap, st->batch) != TF_OK)
+            return TF_ERROR;
+        st->batch = NULL;
+        st->rows_buffered = 0;
+    }
+    return TF_OK;
+}
+
+static int text_emit_complete_segment(text_decoder_state *st,
+                                      const uint8_t *segment, size_t segment_len,
+                                      tf_batch ***out, size_t *n_out,
+                                      size_t *out_cap) {
+    size_t prefix_len = tf_buffer_readable(&st->line_buf);
+    const uint8_t *line = segment;
+    size_t line_len = segment_len;
+
+    if (prefix_len > 0) {
+        if (segment_len > 0 &&
+            tf_buffer_write(&st->line_buf, segment, segment_len) != TF_OK)
+            return TF_ERROR;
+        line = st->line_buf.data + st->line_buf.read_pos;
+        line_len = tf_buffer_readable(&st->line_buf);
+    }
+
+    if (line_len > 0 && line[line_len - 1] == '\r')
+        line_len--;
+
+    if (text_emit_line(st, line, line_len, out, n_out, out_cap) != TF_OK)
+        return TF_ERROR;
+
+    if (prefix_len > 0) {
+        st->line_buf.read_pos = 0;
+        st->line_buf.len = 0;
+    }
+    return TF_OK;
+}
+
 static int text_decode(tf_decoder *self, const uint8_t *data, size_t len,
                        tf_batch ***out, size_t *n_out, tf_side_channels *side) {
-    (void)side;
     text_decoder_state *st = self->state;
     *out = NULL;
     *n_out = 0;
 
-    if (check_text_incoming_record_limit(st, data, len, side) != TF_OK) return TF_ERROR;
-    if (tf_buffer_write(&st->line_buf, data, len) != TF_OK) return TF_ERROR;
-
     size_t out_cap = 0;
-    uint8_t *buf = st->line_buf.data + st->line_buf.read_pos;
-    size_t buf_len = st->line_buf.len - st->line_buf.read_pos;
+    size_t pos = 0;
 
-    size_t line_start = 0;
-    for (size_t i = 0; i < buf_len; i++) {
-        if (buf[i] == '\n') {
-            size_t line_len = i - line_start;
-            size_t line_no = ++st->line_number;
-            /* Strip trailing \r for CRLF */
-            if (line_len > 0 && buf[line_start + line_len - 1] == '\r')
-                line_len--;
+    while (pos < len) {
+        const uint8_t *start = data + pos;
+        const uint8_t *nl = memchr(start, '\n', len - pos);
+        size_t segment_len = nl ? (size_t)(nl - start) : len - pos;
 
-            (void)line_no;
-            if (!st->batch) {
-                st->batch = make_text_batch(st->batch_size);
-                if (!st->batch) return TF_ERROR;
-            }
+        if (text_check_segment_record_limit(st, start, segment_len, side) != TF_OK)
+            return TF_ERROR;
 
-            size_t row = st->batch->n_rows;
-            size_t need_rows = 0;
-            if (tf_size_add(row, 1, &need_rows) != TF_OK ||
-                tf_batch_ensure_capacity(st->batch, need_rows) != TF_OK)
+        if (nl) {
+            size_t prefix_len = tf_buffer_readable(&st->line_buf);
+            if (text_emit_complete_segment(st, start, segment_len,
+                                           out, n_out, &out_cap) != TF_OK)
                 return TF_ERROR;
-
-            /* Copy line into batch */
-            if (text_set_line_cell(st->batch, row, buf + line_start, line_len) != TF_OK)
+            size_t advance = 0;
+            size_t new_offset = 0;
+            if (tf_size_add(prefix_len, segment_len, &advance) != TF_OK ||
+                tf_size_add(advance, 1, &advance) != TF_OK ||
+                tf_size_add(st->byte_offset, advance, &new_offset) != TF_OK)
                 return TF_ERROR;
-            if (tf_batch_expose_row(st->batch, row) != TF_OK)
+            st->line_number++;
+            st->byte_offset = new_offset;
+            pos += segment_len + 1;
+        } else {
+            if (segment_len > 0 &&
+                tf_buffer_write(&st->line_buf, start, segment_len) != TF_OK)
                 return TF_ERROR;
-            st->rows_buffered++;
-
-            line_start = i + 1;
-
-            /* Emit batch if full */
-            if (st->rows_buffered >= st->batch_size) {
-                if (text_append_output_batch(out, n_out, &out_cap, st->batch) != TF_OK)
-                    return TF_ERROR;
-                st->batch = NULL;
-                st->rows_buffered = 0;
-            }
+            pos = len;
         }
     }
-
-    st->line_buf.read_pos += line_start;
-    st->byte_offset += line_start;
-    tf_buffer_compact(&st->line_buf);
     return TF_OK;
 }
 
@@ -293,7 +330,10 @@ static int text_flush(tf_decoder *self, tf_batch ***out, size_t *n_out, tf_side_
         st->rows_buffered++;
 
         st->line_buf.read_pos = st->line_buf.len;
-        st->byte_offset += remaining;
+        size_t new_offset = 0;
+        if (tf_size_add(st->byte_offset, remaining, &new_offset) != TF_OK)
+            return TF_ERROR;
+        st->byte_offset = new_offset;
     }
 
     /* Emit remaining batch */

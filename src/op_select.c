@@ -78,13 +78,8 @@ static int select_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
     }
 
-    for (size_t r = 0; r < in->n_rows; r++) {
-        if (tf_batch_copy_selected_row(ob, r, in, r, selected_cols, n_indices) != TF_OK) {
-            free(selected_cols); free(indices); tf_batch_free(ob); return TF_ERROR;
-        }
-        if (tf_batch_expose_row(ob, r) != TF_OK) {
-            free(selected_cols); free(indices); tf_batch_free(ob); return TF_ERROR;
-        }
+    if (tf_batch_copy_selected_columns(ob, in, selected_cols, n_indices) != TF_OK) {
+        free(selected_cols); free(indices); tf_batch_free(ob); return TF_ERROR;
     }
 
     free(selected_cols);
@@ -263,15 +258,9 @@ static int relocate_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
     }
 
-    for (size_t r = 0; r < in->n_rows; r++) {
-        if (tf_batch_copy_selected_row(ob, r, in, r, selected_cols, n_in) != TF_OK) {
-            free(selected_cols); free(move_idx); free(is_moving); free(order); tf_batch_free(ob);
-            return TF_ERROR;
-        }
-        if (tf_batch_expose_row(ob, r) != TF_OK) {
-            free(selected_cols); free(move_idx); free(is_moving); free(order); tf_batch_free(ob);
-            return TF_ERROR;
-        }
+    if (tf_batch_copy_selected_columns(ob, in, selected_cols, n_in) != TF_OK) {
+        free(selected_cols); free(move_idx); free(is_moving); free(order); tf_batch_free(ob);
+        return TF_ERROR;
     }
 
     free(selected_cols);

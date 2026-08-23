@@ -108,6 +108,40 @@ jobs:
       - name: Package audits and clean install smokes
         run: make test-packaging
 
+      - name: Upload packed npm artifact for Windows WASM smoke
+        uses: actions/upload-artifact@v4
+        with:
+          name: tranfi-npm-tarball
+          path: build/npm-install-smoke/tranfi-*.tgz
+          if-no-files-found: error
+
+  windows-packed-wasm:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    needs: bindings-and-packaging
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tranfi-npm-tarball
+          path: build/windows-package
+
+      - name: Install packed WASM lane and run streaming/prepared smoke
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/windows-consumer | Out-Null
+          Set-Location build/windows-consumer
+          npm init --yes | Out-Null
+          $package = (Get-ChildItem ../windows-package/tranfi-*.tgz).FullName
+          $env:TRANFI_SKIP_NATIVE_BUILD = '1'
+          npm install $package
+          node ../../test/smoke_windows_wasm.js
+
   fuzz-smoke:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest

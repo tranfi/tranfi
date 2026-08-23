@@ -703,36 +703,152 @@ tf_decoder *tf_jsonl_decoder_create(const cJSON *args) {
  * JSONL Encoder
  * ================================================================ */
 
+typedef struct {
+    char  **names;
+    char  **key_prefixes;
+    size_t *key_prefix_lens;
+    size_t  n_cols;
+} jsonl_encoder_state;
+
+static int jsonl_write_hex_escape(tf_buffer *out, unsigned char ch) {
+    static const char hex[] = "0123456789abcdef";
+    char esc[6] = {
+        '\\', 'u', '0', '0',
+        hex[(ch >> 4) & 0x0f],
+        hex[ch & 0x0f]
+    };
+    return tf_buffer_write(out, (const uint8_t *)esc, sizeof(esc));
+}
+
 static int jsonl_write_escaped_string(tf_buffer *out, const char *s) {
     if (tf_buffer_write(out, (const uint8_t *)"\"", 1) != TF_OK) return TF_ERROR;
-    for (const char *p = s ? s : ""; *p; p++) {
+    const unsigned char *start = (const unsigned char *)(s ? s : "");
+    const unsigned char *p = start;
+    while (*p) {
+        unsigned char ch = *p;
+        int needs_escape = ch < 0x20 || ch == '"' || ch == '\\';
+        if (!needs_escape) {
+            p++;
+            continue;
+        }
+
+        if (p > start && tf_buffer_write(out, start, (size_t)(p - start)) != TF_OK)
+            return TF_ERROR;
+
         int rc = TF_OK;
-        switch (*p) {
+        switch (ch) {
             case '"':  rc = tf_buffer_write_str(out, "\\\""); break;
             case '\\': rc = tf_buffer_write_str(out, "\\\\"); break;
+            case '\b': rc = tf_buffer_write_str(out, "\\b"); break;
+            case '\f': rc = tf_buffer_write_str(out, "\\f"); break;
             case '\n': rc = tf_buffer_write_str(out, "\\n"); break;
             case '\r': rc = tf_buffer_write_str(out, "\\r"); break;
             case '\t': rc = tf_buffer_write_str(out, "\\t"); break;
-            default:   rc = tf_buffer_write(out, (const uint8_t *)p, 1); break;
+            default:   rc = jsonl_write_hex_escape(out, ch); break;
         }
         if (rc != TF_OK) return TF_ERROR;
+        p++;
+        start = p;
     }
+    if (p > start && tf_buffer_write(out, start, (size_t)(p - start)) != TF_OK)
+        return TF_ERROR;
     return tf_buffer_write(out, (const uint8_t *)"\"", 1);
 }
 
+static void jsonl_encoder_clear_cache(jsonl_encoder_state *st) {
+    if (!st) return;
+    if (st->names) {
+        for (size_t i = 0; i < st->n_cols; i++) free(st->names[i]);
+    }
+    if (st->key_prefixes) {
+        for (size_t i = 0; i < st->n_cols; i++) free(st->key_prefixes[i]);
+    }
+    free(st->names);
+    free(st->key_prefixes);
+    free(st->key_prefix_lens);
+    st->names = NULL;
+    st->key_prefixes = NULL;
+    st->key_prefix_lens = NULL;
+    st->n_cols = 0;
+}
+
+static int jsonl_encoder_cache_matches(const jsonl_encoder_state *st, const tf_batch *in) {
+    if (!st || !in || st->n_cols != in->n_cols || !st->names) return 0;
+    for (size_t c = 0; c < in->n_cols; c++) {
+        const char *name = in->col_names[c] ? in->col_names[c] : "";
+        if (strcmp(st->names[c], name) != 0) return 0;
+    }
+    return 1;
+}
+
+static int jsonl_build_key_prefix(const char *name, int comma,
+                                  char **out_prefix, size_t *out_len) {
+    tf_buffer tmp;
+    tf_buffer_init(&tmp);
+    int rc = TF_ERROR;
+    if (comma && tf_buffer_write(&tmp, (const uint8_t *)",", 1) != TF_OK) goto done;
+    if (jsonl_write_escaped_string(&tmp, name) != TF_OK) goto done;
+    if (tf_buffer_write(&tmp, (const uint8_t *)":", 1) != TF_OK) goto done;
+
+    size_t len = tf_buffer_readable(&tmp);
+    size_t bytes = 0;
+    if (tf_size_add(len, 1, &bytes) != TF_OK) goto done;
+    char *copy = tf_mallocarray_checked(bytes, sizeof(char));
+    if (!copy) goto done;
+    if (len > 0) memcpy(copy, tmp.data + tmp.read_pos, len);
+    copy[len] = '\0';
+    *out_prefix = copy;
+    *out_len = len;
+    rc = TF_OK;
+done:
+    tf_buffer_free(&tmp);
+    return rc;
+}
+
+static int jsonl_encoder_build_cache(jsonl_encoder_state *st, const tf_batch *in) {
+    jsonl_encoder_clear_cache(st);
+    size_t n = in->n_cols;
+    st->names = tf_callocarray_checked(n ? n : 1, sizeof(char *));
+    st->key_prefixes = tf_callocarray_checked(n ? n : 1, sizeof(char *));
+    st->key_prefix_lens = tf_callocarray_checked(n ? n : 1, sizeof(size_t));
+    if (!st->names || !st->key_prefixes || !st->key_prefix_lens) {
+        jsonl_encoder_clear_cache(st);
+        return TF_ERROR;
+    }
+    st->n_cols = n;
+
+    for (size_t c = 0; c < n; c++) {
+        const char *name = in->col_names[c] ? in->col_names[c] : "";
+        st->names[c] = tf_strdup_checked(name);
+        if (!st->names[c]) {
+            jsonl_encoder_clear_cache(st);
+            return TF_ERROR;
+        }
+        if (jsonl_build_key_prefix(name, c > 0, &st->key_prefixes[c],
+                                   &st->key_prefix_lens[c]) != TF_OK) {
+            jsonl_encoder_clear_cache(st);
+            return TF_ERROR;
+        }
+    }
+    return TF_OK;
+}
+
+static int jsonl_encoder_ensure_cache(jsonl_encoder_state *st, const tf_batch *in) {
+    if (jsonl_encoder_cache_matches(st, in)) return TF_OK;
+    return jsonl_encoder_build_cache(st, in);
+}
+
 static int jsonl_encode(tf_encoder *self, tf_batch *in, tf_buffer *out) {
-    (void)self;
+    jsonl_encoder_state *st = self->state;
+    if (jsonl_encoder_ensure_cache(st, in) != TF_OK) return TF_ERROR;
     char numbuf[64];
 #define JSONL_WRITE(expr) do { if ((expr) != TF_OK) return TF_ERROR; } while (0)
 
     for (size_t r = 0; r < in->n_rows; r++) {
         JSONL_WRITE(tf_buffer_write(out, (const uint8_t *)"{", 1));
         for (size_t c = 0; c < in->n_cols; c++) {
-            if (c > 0) JSONL_WRITE(tf_buffer_write(out, (const uint8_t *)",", 1));
-
-            /* Key */
-            JSONL_WRITE(jsonl_write_escaped_string(out, in->col_names[c]));
-            JSONL_WRITE(tf_buffer_write(out, (const uint8_t *)":", 1));
+            JSONL_WRITE(tf_buffer_write(out, (const uint8_t *)st->key_prefixes[c],
+                                        st->key_prefix_lens[c]));
 
             /* Value */
             if (tf_batch_is_null(in, r, c)) {
@@ -786,16 +902,26 @@ static int jsonl_encoder_flush(tf_encoder *self, tf_buffer *out) {
 }
 
 static void jsonl_encoder_destroy(tf_encoder *self) {
+    jsonl_encoder_state *st = self->state;
+    if (st) {
+        jsonl_encoder_clear_cache(st);
+        free(st);
+    }
     free(self);
 }
 
 tf_encoder *tf_jsonl_encoder_create(const cJSON *args) {
     (void)args;
+    jsonl_encoder_state *st = calloc(1, sizeof(jsonl_encoder_state));
+    if (!st) return NULL;
     tf_encoder *enc = malloc(sizeof(tf_encoder));
-    if (!enc) return NULL;
+    if (!enc) {
+        free(st);
+        return NULL;
+    }
     enc->encode = jsonl_encode;
     enc->flush = jsonl_encoder_flush;
     enc->destroy = jsonl_encoder_destroy;
-    enc->state = NULL;
+    enc->state = st;
     return enc;
 }

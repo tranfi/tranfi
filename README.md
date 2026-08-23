@@ -34,6 +34,13 @@ For an intentionally WASM-only/browser install, set
 byte-stream pipeline can use WASM, but the prepared-transform classes exported
 from the root Node entry require the native addon.
 
+Platform support is deliberately narrower than the WASM portability suggests.
+The native CLI, Python extension, and Node addon are built and tested on Linux.
+The Windows release lane installs the packed npm artifact with native compilation
+disabled and tests `tranfi/wasm`; it does not claim Windows support for the native
+addon, Python package, or CLI. Native support on other operating systems is not a
+published 0.2 contract until it has an equivalent build-and-test lane.
+
 **Binary** (prebuilt Linux x64 CLI; no local compilation):
 
 ```bash

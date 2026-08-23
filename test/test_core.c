@@ -568,6 +568,48 @@ static void test_batch_schema_copy_helpers(void) {
     tf_batch_free(src);
 }
 
+static void test_batch_copy_selected_columns(void) {
+    tf_batch *src = tf_batch_create(3, 3);
+    assert(src != NULL);
+    assert(tf_batch_set_schema(src, 0, "name", TF_TYPE_STRING) == TF_OK);
+    assert(tf_batch_set_schema(src, 1, "age", TF_TYPE_INT64) == TF_OK);
+    assert(tf_batch_set_schema(src, 2, "active", TF_TYPE_BOOL) == TF_OK);
+    assert(tf_batch_set_string(src, 0, 0, "Alice") == TF_OK);
+    assert(tf_batch_set_int64(src, 0, 1, 30) == TF_OK);
+    assert(tf_batch_set_bool(src, 0, 2, true) == TF_OK);
+    assert(tf_batch_expose_row(src, 0) == TF_OK);
+    assert(tf_batch_set_null(src, 1, 0) == TF_OK);
+    assert(tf_batch_set_int64(src, 1, 1, 41) == TF_OK);
+    assert(tf_batch_set_bool(src, 1, 2, false) == TF_OK);
+    assert(tf_batch_expose_row(src, 1) == TF_OK);
+    assert(tf_batch_set_string(src, 2, 0, "Carol") == TF_OK);
+    assert(tf_batch_set_int64(src, 2, 1, 52) == TF_OK);
+    assert(tf_batch_set_bool(src, 2, 2, true) == TF_OK);
+    assert(tf_batch_expose_row(src, 2) == TF_OK);
+
+    tf_batch *dst = tf_batch_create(4, 1);
+    assert(dst != NULL);
+    assert(tf_batch_set_schema(dst, 0, "age", TF_TYPE_INT64) == TF_OK);
+    assert(tf_batch_set_schema(dst, 1, "name", TF_TYPE_STRING) == TF_OK);
+    assert(tf_batch_set_schema(dst, 2, "age2", TF_TYPE_INT64) == TF_OK);
+    assert(tf_batch_set_schema(dst, 3, "missing", TF_TYPE_NULL) == TF_OK);
+    size_t cols[] = {1, 0, 1, SIZE_MAX};
+    assert(tf_batch_copy_selected_columns(dst, src, cols, 4) == TF_OK);
+    assert(dst->n_rows == 3);
+    assert(tf_batch_get_int64(dst, 0, 0) == 30);
+    assert(tf_batch_get_int64(dst, 2, 2) == 52);
+    assert(strcmp(tf_batch_get_string(dst, 0, 1), "Alice") == 0);
+    assert(tf_batch_get_string(dst, 0, 1) != tf_batch_get_string(src, 0, 0));
+    assert(tf_batch_is_null(dst, 1, 1));
+    assert(tf_batch_is_null(dst, 0, 3));
+
+    cols[0] = 2;
+    assert(tf_batch_copy_selected_columns(dst, src, cols, 4) == TF_ERROR);
+
+    tf_batch_free(dst);
+    tf_batch_free(src);
+}
+
 static void test_report_format_stats_csv(void) {
     const char stats[] =
         "column,count,avg,min,max,stddev,median,p25,p75,distinct,hist,sample\n"
@@ -1794,6 +1836,33 @@ static void test_pipeline_jsonl_passthrough(void) {
     tf_pipeline_free(p);
 }
 
+static void test_jsonl_encoder_escapes_controls(void) {
+    tf_batch *batch = tf_batch_create(2, 1);
+    assert(batch != NULL);
+    assert(tf_batch_set_schema(batch, 0, "a\b\f\x01", TF_TYPE_STRING) == TF_OK);
+    assert(tf_batch_set_schema(batch, 1, "plain", TF_TYPE_INT64) == TF_OK);
+    const char value[] = "x\b\f\x01\n\t\\\"";
+    assert(tf_batch_set_string_len(batch, 0, 0, value, sizeof(value) - 1) == TF_OK);
+    assert(tf_batch_set_int64(batch, 0, 1, 7) == TF_OK);
+    assert(tf_batch_expose_row(batch, 0) == TF_OK);
+
+    tf_encoder *enc = tf_jsonl_encoder_create(NULL);
+    assert(enc != NULL);
+    tf_buffer out;
+    tf_buffer_init(&out);
+    assert(enc->encode(enc, batch, &out) == TF_OK);
+    assert(tf_buffer_write(&out, (const uint8_t *)"\0", 1) == TF_OK);
+
+    const char *text = (const char *)out.data;
+    assert(strstr(text, "\"a\\b\\f\\u0001\":") != NULL);
+    assert(strstr(text, "\"x\\b\\f\\u0001\\n\\t\\\\\\\"\"") != NULL);
+    assert(strstr(text, "\"plain\":7") != NULL);
+
+    tf_buffer_free(&out);
+    enc->destroy(enc);
+    tf_batch_free(batch);
+}
+
 
 static void test_pipeline_jsonl_malformed_default_skip(void) {
     const char *plan =
@@ -2776,10 +2845,14 @@ static void test_pipeline_text_max_record_bytes(void) {
     tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
     assert(p != NULL);
 
-    const char *part1 = "ok\n1234";
-    const char *part2 = "56789";
+    /* Split the first record too: its buffered prefix must count toward the
+     * physical byte offset reported for the oversized second record. */
+    const char *part1 = "o";
+    const char *part2 = "k\n1234";
+    const char *part3 = "56789";
     assert(tf_pipeline_push(p, (const uint8_t *)part1, strlen(part1)) == TF_OK);
-    assert(tf_pipeline_push(p, (const uint8_t *)part2, strlen(part2)) == TF_ERROR);
+    assert(tf_pipeline_push(p, (const uint8_t *)part2, strlen(part2)) == TF_OK);
+    assert(tf_pipeline_push(p, (const uint8_t *)part3, strlen(part3)) == TF_ERROR);
     const char *err = tf_pipeline_error(p);
     assert(err != NULL);
     assert(strstr(err, "text record exceeds max_record_bytes at line 2") != NULL);
@@ -2797,6 +2870,29 @@ static void test_pipeline_text_max_record_bytes(void) {
     assert(strstr((char *)errors, "\"observed_bytes\":9") != NULL);
     assert(strstr((char *)errors, "\"raw\":\"12345\"") != NULL);
     assert(strstr((char *)errors, "\"truncated\":true") != NULL);
+
+    tf_pipeline_free(p);
+}
+
+static void test_pipeline_text_crlf_and_tail_across_chunks(void) {
+    const char *plan =
+        "{\"steps\":["
+        "{\"op\":\"codec.text.decode\",\"args\":{\"batch_size\":2}},"
+        "{\"op\":\"codec.text.encode\",\"args\":{}}"
+        "]}";
+
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+
+    assert(tf_pipeline_push(p, (const uint8_t *)"alpha\r", 6) == TF_OK);
+    assert(tf_pipeline_push(p, (const uint8_t *)"\nbeta\ntrail", 11) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+
+    uint8_t out[1024];
+    size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out) - 1);
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strcmp((char *)out, "alpha\nbeta\ntrail\n") == 0);
 
     tf_pipeline_free(p);
 }
@@ -3406,7 +3502,7 @@ static void test_pipeline_key_state_caps(void) {
 static void test_version(void) {
     const char *v = tf_version();
     assert(v != NULL);
-    assert(strlen(v) > 0);
+    assert(strcmp(v, "0.2.0") == 0);
 }
 
 static void test_pipeline_combined(void) {
@@ -9341,6 +9437,21 @@ static void test_pipeline_top(void) {
     assert(strstr((char *)out, "Charlie") == NULL);
     tf_pipeline_free(p);
 
+    p = tf_pipeline_create(plan, strlen(plan));
+    assert(p != NULL);
+    const char *tied_csv =
+        "name,score\n"
+        "first,92\n"
+        "second,92\n"
+        "third,92\n";
+    assert(tf_pipeline_push(p, (const uint8_t *)tied_csv, strlen(tied_csv)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    n = tf_pipeline_pull(p, TF_CHAN_MAIN, out, sizeof(out));
+    assert(n > 0);
+    out[n] = '\0';
+    assert(strcmp((char *)out, "name,score\nfirst,92\nsecond,92\n") == 0);
+    tf_pipeline_free(p);
+
     const char *bad_plan =
         "{\"steps\":["
         "{\"op\":\"codec.csv.decode\",\"args\":{}},"
@@ -13701,6 +13812,7 @@ int main(int argc, char **argv) {
     TEST(test_batch_set_get);
     TEST(test_batch_setters_report_failures);
     TEST(test_batch_schema_copy_helpers);
+    TEST(test_batch_copy_selected_columns);
     TEST(test_report_format_stats_csv);
     TEST(test_batch_col_index);
     TEST(test_batch_allocation_overflow_guards);
@@ -13752,6 +13864,7 @@ int main(int argc, char **argv) {
 
     printf("\nPipeline (JSONL):\n");
     TEST(test_pipeline_jsonl_passthrough);
+    TEST(test_jsonl_encoder_escapes_controls);
     TEST(test_pipeline_jsonl_malformed_default_skip);
     TEST(test_pipeline_jsonl_malformed_warn_errors);
     TEST(test_pipeline_jsonl_malformed_quarantine_truncates);
@@ -13786,6 +13899,7 @@ int main(int argc, char **argv) {
     TEST(test_pipeline_text_grep_invert);
     TEST(test_pipeline_text_grep_regex);
     TEST(test_pipeline_text_max_record_bytes);
+    TEST(test_pipeline_text_crlf_and_tail_across_chunks);
 
     printf("\nMisc:\n");
     TEST(test_pipeline_stats_channel);

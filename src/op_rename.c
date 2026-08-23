@@ -43,16 +43,17 @@ static int rename_process(tf_step *self, tf_batch *in, tf_batch **out,
         }
     }
 
-    /* Copy all rows */
-    for (size_t r = 0; r < in->n_rows; r++) {
-        if (tf_batch_copy_row(ob, r, in, r) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
-        if (tf_batch_expose_row(ob, r) != TF_OK) {
-            tf_batch_free(ob);
-            return TF_ERROR;
-        }
+    size_t *cols = tf_mallocarray_checked(in->n_cols ? in->n_cols : 1, sizeof(size_t));
+    if (!cols) {
+        tf_batch_free(ob);
+        return TF_ERROR;
+    }
+    for (size_t i = 0; i < in->n_cols; i++) cols[i] = i;
+    int rc = tf_batch_copy_selected_columns(ob, in, cols, in->n_cols);
+    free(cols);
+    if (rc != TF_OK) {
+        tf_batch_free(ob);
+        return TF_ERROR;
     }
 
     *out = ob;

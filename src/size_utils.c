@@ -2,6 +2,10 @@
  * size_utils.c -- checked size arithmetic and JSON size arguments.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "internal.h"
 #include "cJSON.h"
 #include <stdio.h>
@@ -125,9 +129,8 @@ static void tf_sort_indices_sift_down(size_t *indices, size_t start, size_t end,
     }
 }
 
-void tf_sort_indices(size_t *indices, size_t n, tf_index_compare_fn compare, const void *ctx) {
-    if (!indices || !compare || n < 2) return;
-
+static void tf_sort_indices_heap_range(size_t *indices, size_t n,
+                                       tf_index_compare_fn compare, const void *ctx) {
     size_t start = (n - 2) / 2 + 1;
     while (start > 0) {
         start--;
@@ -140,6 +143,131 @@ void tf_sort_indices(size_t *indices, size_t n, tf_index_compare_fn compare, con
         end--;
         if (end > 0) tf_sort_indices_sift_down(indices, 0, end, compare, ctx);
     }
+}
+
+static void tf_sort_indices_insertion_range(size_t *indices, size_t lo, size_t hi,
+                                            tf_index_compare_fn compare, const void *ctx) {
+    for (size_t i = lo + 1; i < hi; i++) {
+        size_t v = indices[i];
+        size_t j = i;
+        while (j > lo && compare(ctx, v, indices[j - 1]) < 0) {
+            indices[j] = indices[j - 1];
+            j--;
+        }
+        indices[j] = v;
+    }
+}
+
+static size_t tf_sort_indices_median3(size_t *indices, size_t a, size_t b, size_t c,
+                                      tf_index_compare_fn compare, const void *ctx) {
+    size_t va = indices[a];
+    size_t vb = indices[b];
+    size_t vc = indices[c];
+
+    if (compare(ctx, va, vb) < 0) {
+        if (compare(ctx, vb, vc) < 0) return vb;
+        return compare(ctx, va, vc) < 0 ? vc : va;
+    }
+    if (compare(ctx, va, vc) < 0) return va;
+    return compare(ctx, vb, vc) < 0 ? vc : vb;
+}
+
+static size_t tf_sort_indices_partition(size_t *indices, size_t lo, size_t hi, size_t pivot,
+                                        tf_index_compare_fn compare, const void *ctx) {
+    size_t i = lo;
+    size_t j = hi;
+    for (;;) {
+        while (compare(ctx, indices[i], pivot) < 0) i++;
+        do {
+            j--;
+        } while (compare(ctx, pivot, indices[j]) < 0);
+        if (i >= j) return i;
+        tf_index_swap(&indices[i], &indices[j]);
+        i++;
+    }
+}
+
+static size_t tf_sort_indices_depth_limit(size_t n) {
+    size_t depth = 0;
+    while (n > 1) {
+        depth++;
+        n >>= 1;
+    }
+    return depth * 2;
+}
+
+static void tf_sort_indices_intro_loop(size_t *indices, size_t lo, size_t hi, size_t depth_limit,
+                                       tf_index_compare_fn compare, const void *ctx) {
+    enum { INSERTION_THRESHOLD = 16 };
+
+    while (hi - lo > INSERTION_THRESHOLD) {
+        if (depth_limit == 0) {
+            tf_sort_indices_heap_range(indices + lo, hi - lo, compare, ctx);
+            return;
+        }
+        depth_limit--;
+
+        size_t mid = lo + (hi - lo) / 2;
+        size_t pivot = tf_sort_indices_median3(indices, lo, mid, hi - 1, compare, ctx);
+        size_t cut = tf_sort_indices_partition(indices, lo, hi, pivot, compare, ctx);
+        if (cut <= lo || cut >= hi) {
+            tf_sort_indices_heap_range(indices + lo, hi - lo, compare, ctx);
+            return;
+        }
+
+        if (cut - lo < hi - cut) {
+            tf_sort_indices_intro_loop(indices, lo, cut, depth_limit, compare, ctx);
+            lo = cut;
+        } else {
+            tf_sort_indices_intro_loop(indices, cut, hi, depth_limit, compare, ctx);
+            hi = cut;
+        }
+    }
+    tf_sort_indices_insertion_range(indices, lo, hi, compare, ctx);
+}
+
+typedef struct {
+    tf_index_compare_fn compare;
+    const void *ctx;
+} tf_sort_indices_qsort_ctx;
+
+static int tf_sort_indices_total_compare(const void *ctx, size_t ia, size_t ib) {
+    const tf_sort_indices_qsort_ctx *qctx = (const tf_sort_indices_qsort_ctx *)ctx;
+    int result = qctx->compare(qctx->ctx, ia, ib);
+    if (result != 0) return result;
+    return ia < ib ? -1 : ia > ib ? 1 : 0;
+}
+
+#if defined(__GLIBC__)
+static int tf_sort_indices_qsort_compare_glibc(const void *a, const void *b, void *thunk) {
+    const tf_sort_indices_qsort_ctx *qctx = (const tf_sort_indices_qsort_ctx *)thunk;
+    size_t ia = *(const size_t *)a;
+    size_t ib = *(const size_t *)b;
+    return tf_sort_indices_total_compare(qctx, ia, ib);
+}
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+static int tf_sort_indices_qsort_compare_bsd(void *thunk, const void *a, const void *b) {
+    const tf_sort_indices_qsort_ctx *qctx = (const tf_sort_indices_qsort_ctx *)thunk;
+    size_t ia = *(const size_t *)a;
+    size_t ib = *(const size_t *)b;
+    return tf_sort_indices_total_compare(qctx, ia, ib);
+}
+#endif
+
+void tf_sort_indices(size_t *indices, size_t n, tf_index_compare_fn compare, const void *ctx) {
+    if (!indices || !compare || n < 2) return;
+
+#if defined(__GLIBC__)
+    tf_sort_indices_qsort_ctx qctx = { compare, ctx };
+    qsort_r(indices, n, sizeof(size_t), tf_sort_indices_qsort_compare_glibc, &qctx);
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    tf_sort_indices_qsort_ctx qctx = { compare, ctx };
+    qsort_r(indices, n, sizeof(size_t), &qctx, tf_sort_indices_qsort_compare_bsd);
+#else
+    tf_sort_indices_qsort_ctx qctx = { compare, ctx };
+    tf_sort_indices_intro_loop(indices, 0, n, tf_sort_indices_depth_limit(n),
+                               tf_sort_indices_total_compare, &qctx);
+#endif
 }
 
 int tf_check_byte_limit(size_t n, size_t max_value,

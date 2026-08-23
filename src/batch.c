@@ -521,6 +521,77 @@ int tf_batch_copy_selected_row(tf_batch *dst, size_t dst_row,
     return TF_OK;
 }
 
+int tf_batch_copy_selected_columns(tf_batch *dst,
+                                   const tf_batch *src,
+                                   const size_t *cols,
+                                   size_t n_cols) {
+    if (!dst || !src || !cols || dst->n_cols < n_cols) return TF_ERROR;
+    if (tf_batch_ensure_capacity(dst, src->n_rows) != TF_OK) return TF_ERROR;
+    dst->n_rows = 0;
+
+    for (size_t dc = 0; dc < n_cols; dc++) {
+        size_t sc = cols[dc];
+        if (sc == SIZE_MAX) {
+            if (dst->nulls[dc] && src->n_rows > 0)
+                memset(dst->nulls[dc], 1, src->n_rows);
+            continue;
+        }
+        if (sc >= src->n_cols || dst->col_types[dc] != src->col_types[sc])
+            return TF_ERROR;
+
+        if (src->n_rows == 0 || dst->col_types[dc] == TF_TYPE_NULL)
+            continue;
+        if (!dst->columns[dc] || !dst->nulls[dc] || !src->columns[sc] || !src->nulls[sc])
+            return TF_ERROR;
+
+        memcpy(dst->nulls[dc], src->nulls[sc], src->n_rows);
+        size_t bytes = 0;
+        switch (dst->col_types[dc]) {
+            case TF_TYPE_BOOL:
+                if (tf_size_mul(src->n_rows, sizeof(uint8_t), &bytes) != TF_OK) return TF_ERROR;
+                memcpy(dst->columns[dc], src->columns[sc], bytes);
+                break;
+            case TF_TYPE_INT64:
+            case TF_TYPE_TIMESTAMP:
+                if (tf_size_mul(src->n_rows, sizeof(int64_t), &bytes) != TF_OK) return TF_ERROR;
+                memcpy(dst->columns[dc], src->columns[sc], bytes);
+                break;
+            case TF_TYPE_FLOAT64:
+                if (tf_size_mul(src->n_rows, sizeof(double), &bytes) != TF_OK) return TF_ERROR;
+                memcpy(dst->columns[dc], src->columns[sc], bytes);
+                break;
+            case TF_TYPE_DATE:
+                if (tf_size_mul(src->n_rows, sizeof(int32_t), &bytes) != TF_OK) return TF_ERROR;
+                memcpy(dst->columns[dc], src->columns[sc], bytes);
+                break;
+            case TF_TYPE_STRING: {
+                char **dst_col = (char **)dst->columns[dc];
+                char **src_col = (char **)src->columns[sc];
+                for (size_t r = 0; r < src->n_rows; r++) {
+                    if (src->nulls[sc][r]) continue;
+                    const char *value = src_col[r] ? src_col[r] : "";
+                    size_t len = 0, alloc_bytes = 0;
+                    if (tf_string_length_bounded(value, TF_MAX_CELL_BYTES,
+                                                 &len, "batch", "cell") != TF_OK ||
+                        tf_size_add(len, 1, &alloc_bytes) != TF_OK)
+                        return TF_ERROR;
+                    char *copy = tf_arena_alloc(dst->arena, alloc_bytes);
+                    if (!copy) return TF_ERROR;
+                    memcpy(copy, value, alloc_bytes);
+                    dst_col[r] = copy;
+                }
+                break;
+            }
+            default:
+                return TF_ERROR;
+        }
+    }
+
+    if (src->n_rows > 0 && tf_batch_expose_row(dst, src->n_rows - 1) != TF_OK)
+        return TF_ERROR;
+    return TF_OK;
+}
+
 int tf_batch_copy_row(tf_batch *dst, size_t dst_row,
                       const tf_batch *src, size_t src_row) {
     if (!dst || !src || src_row >= src->n_rows || dst->n_cols < src->n_cols) return TF_ERROR;

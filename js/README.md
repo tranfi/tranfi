@@ -53,6 +53,11 @@ intentional WASM-only/browser installation, set
 pipeline can execute with WASM, but root-entry prepared transforms require the
 native addon.
 
+The native addon is currently built and tested on Linux. Windows is supported
+through the packed package's `tranfi/wasm` entry with
+`TRANFI_SKIP_NATIVE_BUILD=1`; the release CI runs streaming and prepared-transform
+smokes in that configuration. This is not a Windows native-addon support claim.
+
 Use `pipeline(...)` for byte-stream ETL. The separate
 `TransformRecipe -> TransformAnalyzer -> TransformPlan -> TransformApply`
 lifecycle is for typed batches whose learned state must be frozen and reused.

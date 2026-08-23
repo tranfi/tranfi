@@ -213,6 +213,10 @@ TF_WARN_UNUSED int tf_batch_copy_cell_as_string(tf_batch *dst, size_t dst_row, s
 TF_WARN_UNUSED int tf_batch_copy_selected_row(tf_batch *dst, size_t dst_row,
                                               const tf_batch *src, size_t src_row,
                                               const size_t *cols, size_t n_cols);
+TF_WARN_UNUSED int tf_batch_copy_selected_columns(tf_batch *dst,
+                                                  const tf_batch *src,
+                                                  const size_t *cols,
+                                                  size_t n_cols);
 TF_WARN_UNUSED int tf_batch_copy_row(tf_batch *dst, size_t dst_row,
                                      const tf_batch *src, size_t src_row);
 TF_WARN_UNUSED int tf_batch_clone_with_selected_extra_cols(tf_batch *dst,
