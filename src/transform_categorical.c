@@ -26,6 +26,20 @@ static tf_transform_code category_poll(
     return tf_transform_check_runtime_fp(error);
 }
 
+static tf_transform_code fixed_category_known(
+    const tf_transform_recipe_column *recipe, uint64_t bits,
+    const tf_transform_runtime_copy *runtime, int *known,
+    tf_transform_error **error) {
+    /* Borrow immutable recipe storage; lookup never owns or modifies it. */
+    tf_transform_categorical_state dictionary = {0};
+    size_t ordinal = 0;
+    dictionary.categories = recipe->categorical_fixed;
+    dictionary.category_count = recipe->categorical_fixed_count;
+    dictionary.source_dtype = recipe->categorical_fixed_dtype;
+    return tf_transform_category_lookup(
+        &dictionary, bits, runtime, &ordinal, known, error);
+}
+
 static uint64_t category_hash(uint64_t value) {
     value ^= value >> 30;
     value *= UINT64_C(0xbf58476d1ce4e5b9);
@@ -304,6 +318,32 @@ tf_transform_code tf_transform_category_observe(
             "categorical analyzer hash state is inconsistent");
     code = tf_transform_category_key(value, dtype, &bits, error);
     if (code != TF_TRANSFORM_OK) return code;
+    const tf_transform_recipe_column *recipe = &analyzer->recipe->columns[column_index];
+    if (recipe->categorical_fixed_count) {
+        int known = 0;
+        code = fixed_category_known(recipe, bits, &analyzer->runtime, &known, error);
+        if (code != TF_TRANSFORM_OK) return code;
+        if (!known) {
+            if (recipe->categorical_unknown == TF_TRANSFORM_UNKNOWN_ERROR
+                || recipe->categorical_unknown == TF_TRANSFORM_UNKNOWN_NONE)
+                return tf_transform_set_error(error, TF_TRANSFORM_UNKNOWN_CATEGORY,
+                    "analyzed value is outside the fixed dictionary");
+            if (store->observed == UINT64_MAX)
+                return tf_transform_set_error(error, TF_TRANSFORM_RESOURCE_LIMIT,
+                    "categorical observed count overflows");
+            /* Accepted unknowns count as observations, but never as mode votes. */
+            ++store->observed;
+            return TF_TRANSFORM_OK;
+        }
+        if (recipe->categorical_impute == TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE) {
+            /* The dictionary is already frozen; only mode needs learned counts. */
+            if (store->observed == UINT64_MAX)
+                return tf_transform_set_error(error, TF_TRANSFORM_RESOURCE_LIMIT,
+                    "categorical observed count overflows");
+            ++store->observed;
+            return TF_TRANSFORM_OK;
+        }
+    }
     if (store->slots) {
         code = category_find_slot(
             store, bits, &analyzer->runtime,
@@ -536,11 +576,14 @@ tf_transform_code tf_transform_category_plan_requirements(
         *allocation_count = 0;
         return TF_TRANSFORM_OK;
     }
-    if (analyzer->total_rows == 0)
+    if (analyzer->total_rows == 0
+        && !(recipe->categorical_fixed_count
+             && recipe->categorical_impute == TF_TRANSFORM_CATEGORICAL_IMPUTE_NONE))
         return tf_transform_set_error(
             error, TF_TRANSFORM_INSUFFICIENT_DATA,
             "categorical mode requires at least one analyzed row");
-    count = (uint64_t)store->category_count;
+    count = recipe->categorical_fixed_count
+        ? (uint64_t)recipe->categorical_fixed_count : (uint64_t)store->category_count;
     if (recipe->kind == TF_TRANSFORM_KIND_INFER
         && (count < 2 || count > recipe->infer_max_categories))
         return tf_transform_set_error(
@@ -742,6 +785,43 @@ tf_transform_code tf_transform_category_finalize(
         return tf_transform_set_error(
             error, TF_TRANSFORM_ALLOCATION,
             "categorical plan allocation failed");
+    if (recipe->categorical_fixed_count) {
+        code = tf_transform_copy_bytes_runtime(
+            out->categories, recipe->categorical_fixed, (size_t)resident,
+            &analyzer->runtime, error);
+        if (code != TF_TRANSFORM_OK) goto failed;
+        for (size_t i = 0; i < store->capacity; ++i) {
+            if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+                code = category_poll(&analyzer->runtime, error);
+                if (code != TF_TRANSFORM_OK) goto failed;
+            }
+            const tf_transform_category_slot *slot = &store->slots[i];
+            if (slot->occupied && (slot->count > best_count
+                || (slot->count == best_count && tf_transform_category_compare(
+                    slot->bits, best_bits, store->dtype) < 0))) {
+                best_count = slot->count;
+                best_bits = slot->bits;
+            }
+        }
+        if (recipe->categorical_impute == TF_TRANSFORM_CATEGORICAL_IMPUTE_MODE) {
+            if (!best_count) {
+                int zero_known = 0;
+                code = fixed_category_known(recipe, 0, &analyzer->runtime, &zero_known, error);
+                if (code != TF_TRANSFORM_OK) goto failed;
+                if (recipe->categorical_all_missing != TF_TRANSFORM_ALL_MISSING_ZERO || !zero_known) {
+                    code = tf_transform_set_error(error, TF_TRANSFORM_INSUFFICIENT_DATA,
+                        "fixed dictionary mode has no known observations or declared zero fallback");
+                    goto failed;
+                }
+                best_bits = 0;
+            }
+            out->impute_bits = best_bits;
+            out->has_impute_value = 1;
+        }
+        code = category_finalize_encoding(recipe, out, error);
+        if (code != TF_TRANSFORM_OK) goto failed;
+        return category_poll(&analyzer->runtime, error);
+    }
     if (store->category_count == 0) {
         out->categories[0].bits = 0;
         out->impute_bits = 0;

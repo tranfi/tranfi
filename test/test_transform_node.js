@@ -1194,7 +1194,45 @@ async function testInCallCancellation() {
   closeAll(imported, apply)
 }
 
+
+function testObjectRecipePreflight(tf) {
+  const recipe = { oversized: 'é'.repeat(4096) }
+  Object.defineProperty(recipe, 'later', {
+    enumerable: true,
+    get() { throw new Error('visited after recipe byte limit') }
+  })
+  assert.throws(() => tf.TransformRecipe.fromJSON(recipe, {
+    limits: { maxRecipeBytes: 1024 }
+  }), error => error.code === 104)
+  const { stringifyRecipe } = require('../js/src/recipe_json.js')
+  const limits = tf.safeTransformLimits()
+  const cases = [
+    { text: 'é😀\n\u0001"\\', array: [null, , undefined, true, NaN, -0, 1e100] },
+    { empty: {}, nested: [{ a: 1 }, { b: 2 }], omitted: undefined },
+    { n: new Number(3), s: new String('é'), b: new Boolean(false) },
+    require('node:vm').runInNewContext('({s: new String("é"), n: new Number(5)})')
+  ]
+  for (const value of cases) {
+    const expected = JSON.stringify(value)
+    const size = Buffer.byteLength(expected)
+    assert.equal(stringifyRecipe(value, { ...limits, maxRecipeBytes: size }), expected)
+    assert.throws(() => stringifyRecipe(value, { ...limits, maxRecipeBytes: size - 1 }),
+      error => error.code === 104)
+  }
+  let gets = 0
+  const value = { get a() { gets++; return { toJSON() { gets++; return 'ok' } } } }
+  assert.equal(stringifyRecipe(value, limits), '{"a":"ok"}')
+  assert.equal(gets, 2)
+  const cycle = {}; cycle.self = cycle
+  assert.throws(() => stringifyRecipe(cycle, limits), TypeError)
+  assert.throws(() => stringifyRecipe({ a: { b: {} } }, { ...limits, maxJsonDepth: 2 }),
+    error => error.code === 104)
+
+}
+
 async function main() {
+  require("./fixed_transform").check(tf)
+  testObjectRecipePreflight(tf)
   testSafeLimits()
   testSharedSemanticVectors()
   testInferenceDeferredNumericDomain()

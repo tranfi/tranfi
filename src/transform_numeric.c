@@ -724,6 +724,7 @@ tf_transform_code tf_transform_analyzer_create(
             "recipe columns do not match the input schema");
         goto fail;
     }
+    uint64_t fixed_categories = 0;
     for (size_t i = 0; i < schema.field_count; ++i) {
         const tf_transform_recipe_column *column = &recipe->columns[i];
         int comparison;
@@ -733,6 +734,8 @@ tf_transform_code tf_transform_analyzer_create(
             &runtime_copy, &comparison, error);
         if (code != TF_TRANSFORM_OK) goto fail;
         if (comparison != 0
+            || (column->categorical_fixed_count
+                && column->categorical_fixed_dtype != schema.fields[i].dtype)
             || (column->kind != TF_TRANSFORM_KIND_CATEGORICAL
                 && column->impute == TF_TRANSFORM_IMPUTE_CONSTANT
                 && column->constant_dtype != schema.fields[i].dtype)) {
@@ -741,6 +744,14 @@ tf_transform_code tf_transform_analyzer_create(
                 "recipe source or constant dtype does not match schema");
             goto fail;
         }
+        if ((uint64_t)column->categorical_fixed_count > runtime_copy.limits.max_categories_per_column
+            || (uint64_t)column->categorical_fixed_count > runtime_copy.limits.max_total_categories
+            || fixed_categories > runtime_copy.limits.max_total_categories - (uint64_t)column->categorical_fixed_count) {
+            code = tf_transform_set_error(error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "fixed dictionary exceeds analyzer category limits");
+            goto fail;
+        }
+        fixed_categories += (uint64_t)column->categorical_fixed_count;
         if (column->kind == TF_TRANSFORM_KIND_INFER
             && (column->infer_max_categories
                     > runtime_copy.limits.max_categories_per_column

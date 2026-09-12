@@ -19,9 +19,7 @@ void tf_buffer_init(tf_buffer *b) {
     b->read_pos = 0;
 }
 
-static int buffer_ensure(tf_buffer *b, size_t extra) {
-    size_t needed = 0;
-    if (tf_size_add(b->len, extra, &needed) != TF_OK) return TF_ERROR;
+static int buffer_ensure(tf_buffer *b, size_t needed) {
     if (needed <= b->cap) return TF_OK;
     size_t new_cap = 0;
     if (tf_size_grow_pow2(b->cap, needed, INITIAL_CAP, &new_cap) != TF_OK) return TF_ERROR;
@@ -34,9 +32,9 @@ static int buffer_ensure(tf_buffer *b, size_t extra) {
 
 int tf_buffer_write(tf_buffer *b, const uint8_t *data, size_t len) {
     if (len == 0) return TF_OK;
-    if (buffer_ensure(b, len) != TF_OK) return TF_ERROR;
     size_t new_len = 0;
     if (tf_size_add(b->len, len, &new_len) != TF_OK) return TF_ERROR;
+    if (buffer_ensure(b, new_len) != TF_OK) return TF_ERROR;
     memcpy(b->data + b->len, data, len);
     b->len = new_len;
     return TF_OK;

@@ -66,6 +66,10 @@ typedef enum tf_transform_all_missing {
     TF_TRANSFORM_ALL_MISSING_ZERO
 } tf_transform_all_missing;
 
+typedef struct tf_transform_category_value {
+    uint64_t bits;
+} tf_transform_category_value;
+
 typedef struct tf_transform_recipe_column {
     char *source_id;
     size_t source_id_len;
@@ -81,6 +85,9 @@ typedef struct tf_transform_recipe_column {
     tf_transform_all_missing categorical_all_missing;
     tf_transform_encode_op categorical_encode;
     int categorical_discover;
+    uint32_t categorical_fixed_dtype;
+    size_t categorical_fixed_count;
+    tf_transform_category_value *categorical_fixed;
     tf_transform_unknown_policy categorical_unknown;
     int64_t categorical_sentinel_label;
     int categorical_has_sentinel_label;
@@ -124,10 +131,6 @@ typedef struct tf_transform_numeric_state {
     double location;
     double scale;
 } tf_transform_numeric_state;
-
-typedef struct tf_transform_category_value {
-    uint64_t bits;
-} tf_transform_category_value;
 
 typedef struct tf_transform_categorical_state {
     tf_transform_categorical_impute_op impute;

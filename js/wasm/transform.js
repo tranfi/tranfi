@@ -1,5 +1,7 @@
 'use strict'
 
+const { stringifyRecipe } = require('../src/recipe_json.js')
+
 const { TranfiTransformError } = require('../src/transform_error.js')
 
 const VIEW_FLOAT32 = 0x0101
@@ -707,13 +709,7 @@ function createTransformAPI(wasm) {
     if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe)) {
       throw new TypeError('recipe must be an object, string, or Uint8Array')
     }
-    var text = JSON.stringify(recipe, function(key, value) {
-      assertWellFormedUnicode(key, 'recipe key')
-      if (typeof value === 'string') {
-        assertWellFormedUnicode(value, 'recipe string')
-      }
-      return value
-    })
+    var text = stringifyRecipe(recipe, limits)
     var textLimit = Math.min(
       limits.maxRecipeBytes, limits.maxAllocationBytes - 1
     )
@@ -829,6 +825,11 @@ function createTransformAPI(wasm) {
       if (typeof observer !== 'function') return
       var poll = cancelPolls.get(this._hostSlot)
       if (poll) poll.observer = observer
+    }
+
+    get requested() {
+      this._requireOpen()
+      return this._isRequested()
     }
 
     _isRequested() {

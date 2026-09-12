@@ -4144,7 +4144,7 @@ import json as json_mod
 import urllib.request
 
 def _find_app_dir():
-    app_dist = os.path.join(os.path.dirname(__file__), '..', '..', 'app', 'dist')
+    app_dist = os.path.join(os.path.dirname(__file__), '..', 'app', 'dist')
     if os.path.isfile(os.path.join(app_dist, 'index.html')):
         return os.path.abspath(app_dist)
     return None
@@ -4331,3 +4331,84 @@ def test_serve_api_endpoints():
 if __name__ == '__main__':
     import pytest
     pytest.main([__file__, '-v'])
+
+
+def test_find_app_dir_uses_repository_root(tmp_path, monkeypatch):
+    test_dir = tmp_path / 'test'
+    test_dir.mkdir()
+    app_dir = tmp_path / 'app' / 'dist'
+    app_dir.mkdir(parents=True)
+    (app_dir / 'index.html').write_text('<html></html>')
+    monkeypatch.setitem(_find_app_dir.__globals__, '__file__',
+                        str(test_dir / 'test_python.py'))
+    assert _find_app_dir() == str(app_dir)
+
+
+@pytest.mark.parametrize('phase', ['push', 'finish'])
+def test_benchmark_failure_exits_nonzero(tmp_path, phase):
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    cc = shutil.which('cc')
+    archive = root / 'build' / 'libtranfi_core.a'
+    if not cc or not archive.is_file():
+        pytest.skip('benchmark fault injection requires cc and build/libtranfi_core.a')
+    signature = ('tf_pipeline *p, const uint8_t *data, size_t len'
+                 if phase == 'push' else 'tf_pipeline *p')
+    source = tmp_path / 'benchmark_failure.c'
+    source.write_text(
+        f'#define tf_pipeline_{phase} injected_failure\n'
+        '#define main benchmark_main\n'
+        f'#include "{root / "bench" / "bench.c"}"\n'
+        '#undef main\n'
+        f'int injected_failure({signature}) {{ return TF_ERROR; }}\n'
+        'int main(void) { char *args[] = {"bench", "10"}; '
+        'return benchmark_main(2, args); }\n')
+    executable = tmp_path / 'benchmark_failure'
+    subprocess.run([cc, '-std=c11', '-D_POSIX_C_SOURCE=200809L',
+                    '-I', str(root / 'src'), str(source), str(archive),
+                    '-lm', '-pthread', '-o', str(executable)], check=True,
+                   capture_output=True)
+    result = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert f'FAIL ({phase}' in result.stderr
+    assert 'Krows/s' not in result.stdout
+
+
+def test_benchmark_js_entrypoints_parse():
+    import subprocess
+    from pathlib import Path
+    if not shutil.which('node'):
+        pytest.skip('Node is required for JS benchmark syntax checks')
+    root = Path(__file__).resolve().parent.parent
+    for script in (root / 'bench').glob('*.js'):
+        subprocess.run(['node', '--check', str(script)], check=True,
+                       capture_output=True)
+
+
+@pytest.mark.parametrize('codec', ['jsonl', 'csv'])
+def test_codec_fuzz_harness_creates_pipeline(tmp_path, codec):
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    cc = shutil.which('cc')
+    archive = root / 'build' / 'libtranfi_core.a'
+    if not cc or not archive.is_file():
+        pytest.skip('fuzz harness check requires cc and build/libtranfi_core.a')
+    source = tmp_path / 'fuzz_harness_check.c'
+    source.write_text(
+        '#include <assert.h>\n'
+        '#define tf_pipeline_create checked_create\n'
+        f'#include "{root / "test" / f"fuzz_{codec}.c"}"\n'
+        '#undef tf_pipeline_create\n'
+        'extern tf_pipeline *tf_pipeline_create(const char *, size_t);\n'
+        'tf_pipeline *checked_create(const char *s, size_t n) { '
+        'tf_pipeline *p = tf_pipeline_create(s, n); assert(p); return p; }\n'
+        'int main(void) { const uint8_t data[] = "{\\"x\\":1}"; '
+        'return LLVMFuzzerTestOneInput(data, sizeof(data) - 1); }\n')
+    executable = tmp_path / 'fuzz_harness_check'
+    subprocess.run([cc, '-std=c11', '-D_POSIX_C_SOURCE=200809L',
+                    '-I', str(root / 'src'), str(source), str(archive),
+                    '-lm', '-pthread', '-o', str(executable)], check=True,
+                   capture_output=True)
+    subprocess.run([str(executable)], check=True, capture_output=True)

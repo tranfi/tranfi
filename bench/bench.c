@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #define PULL_BUF (64 * 1024)
 
@@ -91,24 +92,27 @@ typedef struct {
     const char *dsl;
 } bench_case;
 
-static void run_bench(const char *label, const char *dsl,
+static int run_bench(const char *label, const char *dsl,
                       const char *csv, size_t csv_len, size_t n_rows) {
     /* Compile pipeline */
     char *err = NULL;
     tf_ir_plan *ir = tf_dsl_parse(dsl, strlen(dsl), &err);
     if (!ir) {
-        fprintf(stderr, "  %-28s  SKIP (parse: %s)\n", label, err ? err : "?");
+        fprintf(stderr, "  %-28s  FAIL (parse: %s)\n", label, err ? err : "?");
         free(err);
-        return;
+        return 1;
     }
-    tf_ir_validate(ir);
-    tf_ir_infer_schema(ir);
+    if (tf_ir_validate(ir) != TF_OK || tf_ir_infer_schema(ir) != TF_OK) {
+        fprintf(stderr, "  %-28s  FAIL (validation/schema)\n", label);
+        tf_ir_plan_free(ir);
+        return 1;
+    }
     tf_pipeline *p = tf_pipeline_create_from_ir(ir);
     tf_ir_plan_free(ir);
     if (!p) {
-        fprintf(stderr, "  %-28s  SKIP (compile: %s)\n", label,
+        fprintf(stderr, "  %-28s  FAIL (compile: %s)\n", label,
                 tf_last_error() ? tf_last_error() : "?");
-        return;
+        return 1;
     }
 
     /* Push data in 64KB chunks */
@@ -122,12 +126,17 @@ static void run_bench(const char *label, const char *dsl,
         if (tf_pipeline_push(p, (const uint8_t *)csv + off, n) != TF_OK) {
             fprintf(stderr, "  %-28s  FAIL (push)\n", label);
             tf_pipeline_free(p);
-            return;
+            return 1;
         }
         off += n;
         out_bytes += drain(p);
     }
-    tf_pipeline_finish(p);
+    if (tf_pipeline_finish(p) != TF_OK) {
+        fprintf(stderr, "  %-28s  FAIL (finish: %s)\n", label,
+                tf_last_error() ? tf_last_error() : "?");
+        tf_pipeline_free(p);
+        return 1;
+    }
     out_bytes += drain(p);
     double elapsed = now_sec() - t0;
 
@@ -140,11 +149,23 @@ static void run_bench(const char *label, const char *dsl,
            mb_in / elapsed, mb_out);
 
     tf_pipeline_free(p);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     size_t n_rows = 1000000;
-    if (argc > 1) n_rows = (size_t)atol(argv[1]);
+    if (argc > 1) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long value = strtoull(argv[1], &end, 10);
+        if (errno || !argv[1][0] || argv[1][0] == '-' || *end ||
+            value == 0 || value > (SIZE_MAX - 64) / 64) {
+            fprintf(stderr, "rows must be a positive, representable count\n");
+            return 1;
+        }
+        n_rows = (size_t)value;
+    }
+    int failed = 0;
 
     printf("Generating %zu rows of CSV data...\n", n_rows);
     size_t csv_len = 0;
@@ -208,7 +229,7 @@ int main(int argc, char **argv) {
     printf("  %s\n", "----------------------------  ---------  -------------  ------------  ------------");
 
     for (size_t i = 0; i < n_cases; i++) {
-        run_bench(cases[i].label, cases[i].dsl, csv, csv_len, n_rows);
+        failed |= run_bench(cases[i].label, cases[i].dsl, csv, csv_len, n_rows);
     }
 
     /* Text codec benchmarks */
@@ -235,12 +256,15 @@ int main(int argc, char **argv) {
         };
         size_t n_text_cases = sizeof(text_cases) / sizeof(text_cases[0]);
         for (size_t i = 0; i < n_text_cases; i++) {
-            run_bench(text_cases[i].label, text_cases[i].dsl, text, text_len, n_rows);
+            failed |= run_bench(text_cases[i].label, text_cases[i].dsl, text, text_len, n_rows);
         }
         free(text);
+    } else {
+        fprintf(stderr, "Failed to generate text data\n");
+        failed = 1;
     }
 
     printf("\nDone.\n");
     free(csv);
-    return 0;
+    return failed;
 }

@@ -1051,3 +1051,136 @@ def test_python_size_t_boundaries_do_not_wrap():
                     'validity_bit_stride': size_max,
                 }],
             })
+
+
+def fixed_recipe(values=(0.0, 2.0, 5.0), *, encode='label', impute='mode',
+                 unknown='sentinel', all_missing='error', dtype='f64'):
+    recipe = json.loads(json.dumps(VECTORS['recipes']['categorical_mode_label_sentinel']))
+    branch = recipe['columns'][0]['categorical']
+    branch['encode'] = {
+        'op': encode,
+        'categories': [{'t': dtype, 'v': struct.pack('>d' if dtype == 'f64' else '>f', value).hex()}
+                       for value in values],
+        'unknown': None if encode == 'none' else unknown,
+        'sentinelLabel': -1 if unknown == 'sentinel' and encode == 'label' else None,
+    }
+    branch['impute'] = {'op': impute, 'constant': None,
+                        'allMissing': all_missing if impute == 'mode' else None}
+    return recipe
+
+
+def test_fixed_dictionary_preserves_unobserved_categories():
+    with tranfi.TransformRecipe.from_json(json.dumps(fixed_recipe())) as recipe:
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            analyzer.push({'rows': 4, 'columns': [array('d', [2, 2, 99, 5])]})
+            with analyzer.finalize() as plan:
+                data = plan.to_bytes()
+                with tranfi.TransformPlan.from_bytes(data) as restored:
+                    assert restored.to_bytes() == data
+                    with restored.apply(SCHEMA64) as apply:
+                        result = apply.run({'rows': 5, 'columns': [array('d', [0, 2, 5, 99, math.nan])]})
+                        assert list(result.data) == [0, 1, 2, -1, 1]
+
+
+@pytest.mark.parametrize('dtype,schema,typecode', [('f64', SCHEMA64, 'd'), ('f32', SCHEMA32, 'f')])
+@pytest.mark.parametrize('unknown,width', [('all_zero', 3), ('other', 4)])
+def test_fixed_onehot_without_training(dtype, schema, typecode, unknown, width):
+    spec = fixed_recipe(encode='onehot', impute='none', unknown=unknown, dtype=dtype)
+    with tranfi.TransformRecipe.from_json(json.dumps(spec)) as recipe:
+        with recipe.analyzer(schema) as analyzer, analyzer.finalize() as plan:
+            with tranfi.TransformPlan.from_bytes(plan.to_bytes()) as restored, restored.apply(schema) as apply:
+                result = apply.run(make_table([0, 2, 5, 99, math.nan], typecode))
+                expected = [1, 0, 0] + ([0] if width == 4 else [])
+                expected += [0, 1, 0] + ([0] if width == 4 else [])
+                expected += [0, 0, 1] + ([0] if width == 4 else [])
+                expected += [0, 0, 0] + ([1] if width == 4 else [])
+                expected += [0, 0, 0] + ([1] if width == 4 else [])
+                assert list(result.data) == expected
+
+
+@pytest.mark.parametrize('values', [(), (2, 0), (0, 0), (-0.0, 2), (math.inf,), (math.nan,)])
+def test_fixed_dictionary_rejects_noncanonical_values(values):
+    with pytest.raises(tranfi.TranfiTransformError) as error:
+        tranfi.TransformRecipe.from_json(json.dumps(fixed_recipe(values)))
+    assert error.value.code == 101
+
+
+@pytest.mark.parametrize('values,policy,expected', [((0, 2), 'zero', 0), ((2, 5), 'zero', None), ((0, 2), 'error', None)])
+def test_fixed_mode_unknown_only_fallback(values, policy, expected):
+    with tranfi.TransformRecipe.from_json(json.dumps(fixed_recipe(values, all_missing=policy))) as recipe:
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            analyzer.push(make_table([99, math.nan]))
+            if expected is None:
+                with pytest.raises(tranfi.TranfiTransformError) as error:
+                    analyzer.finalize()
+                assert error.value.code == 103
+            else:
+                with analyzer.finalize() as plan, plan.apply(SCHEMA64) as apply:
+                    assert list(apply.run(make_table([math.nan, 99])).data) == [expected, -1]
+
+
+def test_fixed_unknown_error_is_terminal_and_dtype_must_match():
+    with tranfi.TransformRecipe.from_json(json.dumps(fixed_recipe(unknown='error'))) as recipe:
+        with pytest.raises(tranfi.TranfiTransformError) as error:
+            recipe.analyzer(SCHEMA32)
+        assert error.value.code == 102
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            with pytest.raises(tranfi.TranfiTransformError) as error:
+                analyzer.push(make_table([2, 99]))
+            assert error.value.code == 108
+            with pytest.raises(tranfi.TranfiTransformError) as error:
+                analyzer.finalize()
+            assert error.value.code == 112
+
+
+def test_fixed_category_limits_include_unobserved_and_multiple_columns():
+    spec = fixed_recipe()
+    for limit in ('max_categories_per_column', 'max_total_categories'):
+        with pytest.raises(tranfi.TranfiTransformError) as error:
+            tranfi.TransformRecipe.from_json(json.dumps(spec), limits=tranfi.TransformLimits(**{limit: 2}))
+        assert error.value.code == 104
+        with tranfi.TransformRecipe.from_json(json.dumps(spec)) as recipe:
+            with pytest.raises(tranfi.TranfiTransformError) as error:
+                recipe.analyzer(SCHEMA64, limits=tranfi.TransformLimits(**{limit: 2}))
+            assert error.value.code == 104
+    spec['columns'].append(json.loads(json.dumps(spec['columns'][0])))
+    spec['columns'][1]['sourceId'] = 'x1'
+    with pytest.raises(tranfi.TranfiTransformError) as error:
+        tranfi.TransformRecipe.from_json(json.dumps(spec), limits=tranfi.TransformLimits(max_total_categories=5))
+    assert error.value.code == 104
+
+
+def test_fixed_import_rejects_self_consistent_dictionary_substitution():
+    import hashlib
+    with tranfi.TransformRecipe.from_json(json.dumps(fixed_recipe())) as recipe:
+        with recipe.analyzer(SCHEMA64) as analyzer:
+            analyzer.push(make_table([2, 2]))
+            with analyzer.finalize() as plan:
+                original = plan.to_bytes()
+    payload = json.loads(original[52:])
+    payload['steps'][0]['categorical']['categories'][2]['v'] = double_bits(6)
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+    corrupt = original[:12] + struct.pack('<Q', len(encoded)) + hashlib.sha256(encoded).digest() + encoded
+    with pytest.raises(tranfi.TranfiTransformError) as error:
+        tranfi.TransformPlan.from_bytes(corrupt)
+    assert error.value.code == 106
+
+
+@pytest.mark.parametrize('mutation', ['mixed_dtype', 'infer', 'sentinel_collision'])
+def test_fixed_dictionary_rejects_conflicting_contracts(mutation):
+    spec = fixed_recipe()
+    if mutation == 'mixed_dtype':
+        spec['columns'][0]['categorical']['encode']['categories'][1] = {'t': 'f32', 'v': '40000000'}
+    elif mutation == 'infer':
+        inferred = json.loads(recipe_text('infer_two_categories'))
+        inferred['columns'][0]['categorical']['encode']['categories'] = spec['columns'][0]['categorical']['encode']['categories']
+        spec = inferred
+    else:
+        spec['columns'][0]['categorical']['encode']['sentinelLabel'] = 2
+    with pytest.raises(tranfi.TranfiTransformError) as error:
+        with tranfi.TransformRecipe.from_json(json.dumps(spec)) as recipe:
+            with recipe.analyzer(SCHEMA64) as analyzer:
+                analyzer.push(make_table([0, 0]))
+                with analyzer.finalize():
+                    pass
+    assert error.value.code == 101

@@ -5153,7 +5153,84 @@ static void test_shared_tftr_case_table(void) {
     free(text);
 }
 
+static void test_fixed_dictionary_lifecycle(void) {
+    const char *json = "{\"columns\":[{\"categorical\":{\"encode\":{\"categories\":[{\"t\":\"f64\",\"v\":\"0000000000000000\"},{\"t\":\"f64\",\"v\":\"4000000000000000\"},{\"t\":\"f64\",\"v\":\"4014000000000000\"}],\"op\":\"label\",\"sentinelLabel\":-1,\"unknown\":\"sentinel\"},\"impute\":{\"allMissing\":\"error\",\"constant\":null,\"op\":\"mode\"}},\"kind\":{\"maxCategories\":null,\"op\":\"declared\",\"rule\":null,\"value\":\"categorical\"},\"numeric\":null,\"sourceId\":\"x0\"}],\"format\":\"tranfi.transform-recipe\",\"outputDtype\":\"float64\",\"policyVersion\":1,\"semanticLimits\":{\"maxOutputColumns\":65536,\"maxOutputElementsPerApply\":134217728},\"version\":1}";
+    const double values[] = {2, 2, 99, 5};
+    const double apply_values[] = {0, 2, 5, 99, tf_transform_double_from_bits(UINT64_C(0x7ff8000000000000))};
+    const uint64_t expected[] = {0, UINT64_C(0x3ff0000000000000),
+        UINT64_C(0x4000000000000000), UINT64_C(0xbff0000000000000),
+        UINT64_C(0x3ff0000000000000)};
+    tf_transform_recipe *recipe = NULL;
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_plan *plan = NULL, *restored = NULL;
+    tf_transform_error *error = NULL;
+    tf_field_view_v1 field;
+    tf_schema_view_v1 schema;
+    tf_column_view_v1 column;
+    tf_table_view_v1 table;
+    tf_transform_limits_v1 limits;
+    tf_transform_runtime_v1 runtime = {0};
+    cancel_counter counter = {0, 0};
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    runtime.abi_version = 1;
+    runtime.struct_size = sizeof(runtime);
+    runtime.cancel = cancel_on_call;
+    runtime.cancel_user = &counter;
+    assert(tf_transform_recipe_from_json((const uint8_t *)json, strlen(json), NULL, &recipe, &error) == TF_TRANSFORM_OK);
+    make_x0_schema(TF_VIEW_FLOAT64, &field, &schema);
+    assert(tf_transform_analyzer_create(recipe, &schema, NULL, &analyzer, &error) == TF_TRANSFORM_OK);
+    make_f64_table(values, 4, &column, &table);
+    assert(tf_transform_analyzer_push(analyzer, &table, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error) == TF_TRANSFORM_OK);
+    tf_transform_analyzer_destroy(&analyzer);
+    tf_transform_recipe_destroy(&recipe);
+    assert_apply_bits(plan, apply_values, 5, expected);
+    assert(tf_transform_plan_export(plan, NULL, &bytes, &len, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_plan_import(bytes, len, NULL, &restored, &error) == TF_TRANSFORM_OK);
+    assert_apply_bits(restored, apply_values, 5, expected);
+    tf_transform_plan_destroy(&restored);
+    assert(tf_transform_plan_import(bytes, len, &runtime, &restored, &error) == TF_TRANSFORM_OK);
+    size_t import_polls = counter.calls;
+    tf_transform_plan_destroy(&restored);
+    for (size_t cancel_at = 1; cancel_at <= import_polls; ++cancel_at) {
+        counter.calls = 0;
+        counter.cancel_at = cancel_at;
+        assert(tf_transform_plan_import(bytes, len, &runtime, &restored, &error) == TF_TRANSFORM_CANCELLED);
+        assert(restored == NULL);
+        tf_transform_error_destroy(&error);
+    }
+    tf_transform_plan_destroy(&plan);
+    tf_transform_bytes_free(&bytes, &len);
+    assert(tf_transform_limits_init_safe_v1(&limits, sizeof(limits)) == TF_TRANSFORM_OK);
+    limits.max_categories_per_column = 2;
+    assert(tf_transform_recipe_from_json((const uint8_t *)json, strlen(json), &limits, &recipe, NULL) == TF_TRANSFORM_RESOURCE_LIMIT);
+    assert(recipe == NULL);
+    cJSON *root = cJSON_Parse(json);
+    cJSON *spec = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "columns"), 0);
+    cJSON *impute = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(spec, "categorical"), "impute");
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(impute, "op", cJSON_CreateString("none")));
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(impute, "allMissing", cJSON_CreateNull()));
+    char *serialized = cJSON_PrintUnformatted(root);
+    assert(serialized != NULL);
+    assert(tf_transform_recipe_from_json((const uint8_t *)serialized, strlen(serialized), NULL, &recipe, &error) == TF_TRANSFORM_OK);
+    assert(tf_transform_analyzer_create(recipe, &schema, NULL, &analyzer, &error) == TF_TRANSFORM_OK);
+    uint64_t base_resident = analyzer->resident_state_bytes;
+    assert(tf_transform_analyzer_push(analyzer, &table, &error) == TF_TRANSFORM_OK);
+    /* A fixed encoder without mode needs no learned category-count table. */
+    assert(analyzer->resident_state_bytes == base_resident);
+    assert(tf_transform_analyzer_finalize(analyzer, &plan, &error) == TF_TRANSFORM_OK);
+    tf_transform_plan_destroy(&plan);
+    tf_transform_analyzer_destroy(&analyzer);
+    tf_transform_recipe_destroy(&recipe);
+    cJSON_Delete(root);
+    free(serialized);
+
+}
+
 int main(void) {
+    test_fixed_dictionary_lifecycle();
     test_abi_and_limits();
     test_sqrt_vectors();
     test_sha256();

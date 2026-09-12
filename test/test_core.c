@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -149,6 +150,12 @@ static void test_buffer_partial_read(void) {
     tf_buffer_init(&b);
 
     ASSERT_OK(tf_buffer_write(&b, (const uint8_t *)"abcdefgh", 8));
+    uint8_t *original_data = b.data;
+    size_t original_cap = b.cap;
+    assert(tf_buffer_write(&b, (const uint8_t *)"x", SIZE_MAX) == TF_ERROR);
+    assert(b.data == original_data && b.cap == original_cap);
+    assert(b.len == 8 && b.read_pos == 0);
+    assert(memcmp(b.data, "abcdefgh", 8) == 0);
 
     uint8_t out[4];
     size_t n = tf_buffer_read(&b, out, 4);
@@ -1863,6 +1870,87 @@ static void test_jsonl_encoder_escapes_controls(void) {
     tf_batch_free(batch);
 }
 
+
+
+static void test_jsonl_strict_records(void) {
+    const char *bad[] = {
+        "{\"x\":\"a\\u0000b\"}", "{\"a\\u0000b\":1}",
+        "{\"x\":1}junk", "{\"x\":1}{\"x\":2}", "{\"x\":01}",
+        "{\"x\":1.}", "{\"x\":1e}", "{\"x\":1e999}",
+        "{\"x\":[{\"y\":1e999}]}", "{\"x\":\"a\tb\"}",
+        "{\"x\":\"\xc0\xaf\"}", "{\"x\":1}\v"
+    };
+    const char *plan = "{\"steps\":[{\"op\":\"codec.jsonl.decode\",\"args\":{\"on_error\":\"fail\"}},{\"op\":\"codec.jsonl.encode\",\"args\":{}}]}";
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        /* Exercise both an accumulated record and the final unterminated tail. */
+        for (int chunked = 0; chunked < 2; chunked++) {
+            tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+            assert(p);
+            int rc = TF_OK;
+            for (size_t j = 0; j < strlen(bad[i]) && rc == TF_OK;) {
+                size_t n = chunked ? 1 : strlen(bad[i]);
+                rc = tf_pipeline_push(p, (const uint8_t *)bad[i] + j, n);
+                j += n;
+            }
+            if (rc == TF_OK) rc = tf_pipeline_finish(p);
+            assert(rc == TF_ERROR);
+            tf_pipeline_free(p);
+        }
+    }
+    const char *good = "{\"x\":1e100,\"s\":\"a\\\\u0000b\"} \t";
+    tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+    assert(p);
+    assert(tf_pipeline_push(p, (const uint8_t *)good, strlen(good)) == TF_OK);
+    assert(tf_pipeline_finish(p) == TF_OK);
+    tf_pipeline_free(p);
+}
+
+
+static void test_jsonl_index_and_error_policy(void) {
+    const char *actions[] = {"skip", "warn", "quarantine"};
+    for (size_t i = 0; i < 3; i++) {
+        char plan[256];
+        snprintf(plan, sizeof(plan),
+            "{\"steps\":[{\"op\":\"codec.jsonl.decode\",\"args\":{\"on_error\":\"%s\"}},"
+            "{\"op\":\"codec.csv.encode\",\"args\":{}}]}", actions[i]);
+        const char *input =
+            "{\"poison\\u0000key\":1}\n"
+            "{\"b\":1,\"a\":2,\"b\":3}\n"
+            "{\"b\":\"poison\",\"extra\":[1e999]}\n"
+            "{\"extra\":8,\"a\":4,\"b\":5}\n"
+            "{\"a\":6}\n";
+        tf_pipeline *p = tf_pipeline_create(plan, strlen(plan));
+        assert(p);
+        for (size_t k = 0; k < strlen(input); k++)
+            assert(tf_pipeline_push(p, (const uint8_t *)input + k, 1) == TF_OK);
+        assert(tf_pipeline_finish(p) == TF_OK);
+        char output[256];
+        size_t n = tf_pipeline_pull(p, TF_CHAN_MAIN, (uint8_t *)output, sizeof(output) - 1);
+        output[n] = 0;
+        assert(strcmp(output, "b,a,b\n1,2,1\n5,4,5\n,6,\n") == 0);
+        n = tf_pipeline_pull(p, TF_CHAN_ERRORS, (uint8_t *)output, sizeof(output));
+        assert(i == 0 ? n == 0 : n > 0);
+        tf_pipeline_free(p);
+    }
+}
+
+static void test_jsonl_encoder_rejects_nonfinite(void) {
+    const double values[] = {INFINITY, -INFINITY, NAN};
+    for (size_t i = 0; i < 3; i++) {
+        tf_batch *b = tf_batch_create(1, 1);
+        assert(b);
+        assert(tf_batch_set_schema(b, 0, "x", TF_TYPE_FLOAT64) == TF_OK);
+        assert(tf_batch_set_float64(b, 0, 0, values[i]) == TF_OK);
+        assert(tf_batch_expose_row(b, 0) == TF_OK);
+        tf_encoder *enc = tf_jsonl_encoder_create(NULL);
+        tf_buffer out;
+        tf_buffer_init(&out);
+        assert(enc && enc->encode(enc, b, &out) == TF_ERROR);
+        tf_buffer_free(&out);
+        enc->destroy(enc);
+        tf_batch_free(b);
+    }
+}
 
 static void test_pipeline_jsonl_malformed_default_skip(void) {
     const char *plan =
@@ -13865,6 +13953,9 @@ int main(int argc, char **argv) {
     printf("\nPipeline (JSONL):\n");
     TEST(test_pipeline_jsonl_passthrough);
     TEST(test_jsonl_encoder_escapes_controls);
+    TEST(test_jsonl_strict_records);
+    TEST(test_jsonl_index_and_error_policy);
+    TEST(test_jsonl_encoder_rejects_nonfinite);
     TEST(test_pipeline_jsonl_malformed_default_skip);
     TEST(test_pipeline_jsonl_malformed_warn_errors);
     TEST(test_pipeline_jsonl_malformed_quarantine_truncates);

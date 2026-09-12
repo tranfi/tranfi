@@ -435,8 +435,10 @@ void tf_transform_recipe_release(tf_transform_recipe *recipe) {
     if (atomic_fetch_sub_explicit(&recipe->refcount, 1u, memory_order_acq_rel) != 1u)
         return;
     if (recipe->columns) {
-        for (size_t i = 0; i < recipe->column_count; ++i)
+        for (size_t i = 0; i < recipe->column_count; ++i) {
             free(recipe->columns[i].source_id);
+            free(recipe->columns[i].categorical_fixed);
+        }
     }
     free(recipe->columns);
     free(recipe);

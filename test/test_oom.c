@@ -9,6 +9,7 @@
  */
 
 #include "tranfi.h"
+#include "transform.h"
 #include "report.h"
 #include <assert.h>
 #include <errno.h>
@@ -490,7 +491,79 @@ static void run_report_format_with_oom(void) {
     free(baseline);
 }
 
+static tf_transform_code run_fixed_transform_once(void) {
+    const char *json = "{\"columns\":[{\"categorical\":{\"encode\":{\"categories\":[{\"t\":\"f64\",\"v\":\"0000000000000000\"},{\"t\":\"f64\",\"v\":\"4000000000000000\"},{\"t\":\"f64\",\"v\":\"4014000000000000\"}],\"op\":\"onehot\",\"sentinelLabel\":null,\"unknown\":\"all_zero\"},\"impute\":{\"allMissing\":\"error\",\"constant\":null,\"op\":\"mode\"}},\"kind\":{\"maxCategories\":null,\"op\":\"declared\",\"rule\":null,\"value\":\"categorical\"},\"numeric\":null,\"sourceId\":\"x0\"}],\"format\":\"tranfi.transform-recipe\",\"outputDtype\":\"float64\",\"policyVersion\":1,\"semanticLimits\":{\"maxOutputColumns\":65536,\"maxOutputElementsPerApply\":134217728},\"version\":1}";
+    double values[] = {2, 2, 99, 5};
+    tf_field_view_v1 field = {
+        .abi_version = 1, .struct_size = sizeof(field), .dtype = TF_VIEW_FLOAT64,
+        .id_utf8 = (const uint8_t *)"x0", .id_bytes = 2,
+        .name_utf8 = (const uint8_t *)"x0", .name_bytes = 2
+    };
+    tf_schema_view_v1 schema = {
+        .abi_version = 1, .struct_size = sizeof(schema),
+        .column_count = 1, .fields = &field, .fields_bytes = sizeof(field)
+    };
+    tf_column_view_v1 column = {
+        .abi_version = 1, .struct_size = sizeof(column),
+        .data = values, .data_bytes = sizeof(values), .stride_bytes = sizeof(double)
+    };
+    tf_table_view_v1 table = {
+        .abi_version = 1, .struct_size = sizeof(table), .row_count = 4,
+        .column_count = 1, .columns = &column, .columns_bytes = sizeof(column)
+    };
+    tf_transform_recipe *recipe = NULL;
+    tf_transform_analyzer *analyzer = NULL;
+    tf_transform_plan *plan = NULL, *restored = NULL;
+    tf_transform_apply *apply = NULL;
+    tf_transform_error *error = NULL;
+    tf_owned_dense_v1 dense = {0};
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    tf_transform_code code = tf_transform_recipe_from_json(
+        (const uint8_t *)json, strlen(json), NULL, &recipe, &error);
+    if (code == TF_TRANSFORM_OK) code = tf_transform_analyzer_create(recipe, &schema, NULL, &analyzer, &error);
+    if (code == TF_TRANSFORM_OK) code = tf_transform_analyzer_push(analyzer, &table, &error);
+    if (code == TF_TRANSFORM_OK) code = tf_transform_analyzer_finalize(analyzer, &plan, &error);
+    if (code == TF_TRANSFORM_OK) code = tf_transform_plan_export(plan, NULL, &bytes, &len, &error);
+    if (code == TF_TRANSFORM_OK) code = tf_transform_plan_import(bytes, len, NULL, &restored, &error);
+    if (code == TF_TRANSFORM_OK) code = tf_transform_apply_create(restored, &schema, NULL, &apply, &error);
+    if (code == TF_TRANSFORM_OK) code = tf_transform_apply_run(apply, &table, &dense, &error);
+    if (code == TF_TRANSFORM_OK) {
+        const double expected[] = {0,1,0, 0,1,0, 0,0,0, 0,0,1};
+        assert(dense.rows == 4 && dense.columns == 3 && dense.data_bytes == sizeof(expected));
+        assert(memcmp(dense.data, expected, sizeof(expected)) == 0);
+    }
+    tf_owned_dense_free(&dense);
+    tf_transform_apply_destroy(&apply);
+    tf_transform_plan_destroy(&restored);
+    tf_transform_plan_destroy(&plan);
+    tf_transform_analyzer_destroy(&analyzer);
+    tf_transform_recipe_destroy(&recipe);
+    tf_transform_bytes_free(&bytes, &len);
+    tf_transform_error_destroy(&error);
+    return code;
+}
+
+static void run_fixed_transform_with_oom(void) {
+    oom_enabled = 1;
+    oom_alloc_count = 0;
+    oom_fail_at = SIZE_MAX;
+    assert(run_fixed_transform_once() == TF_TRANSFORM_OK);
+    size_t allocations = oom_alloc_count;
+    assert(allocations > 0);
+    for (size_t i = 1; i <= allocations; ++i) {
+        oom_fail_at = i;
+        oom_alloc_count = 0;
+        oom_failed = 0;
+        (void)run_fixed_transform_once();
+        assert(oom_failed);
+    }
+    oom_enabled = 0;
+    printf("fixed_dictionary: PASS (%zu allocation failure points)\n", allocations);
+}
+
 int main(void) {
+    run_fixed_transform_with_oom();
     const char *people =
         "name,age,city,score,tags,x,y,color\n"
         " Alice ,30,NY,10,a|b,1,4,red\n"

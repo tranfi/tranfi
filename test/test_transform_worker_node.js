@@ -59,6 +59,11 @@ async function main() {
   const worker = new Worker(workerPath)
   const client = createWorkerClient(worker, { terminateOnDispose: true })
   try {
+    const fixed = require('./fixed_transform')
+    const fixedBytes = await client.analyzeTransform(fixed.recipe(), fixed.schema, [fixed.table([2, 2, 99, 5])])
+    assert.deepEqual(Buffer.from(fixedBytes), fixed.check(native))
+    const fixedResult = await client.applyTransform(fixedBytes, fixed.schema, fixed.table([0, 2, 5, 99, NaN]))
+    assert.deepEqual(Array.from(fixedResult.data), [0, 1, 2, -1, 1])
     const analyzeTable = {
       rows: 4,
       columns: [new Float64Array([1, NaN, 3, NaN])]

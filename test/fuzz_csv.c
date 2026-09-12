@@ -23,8 +23,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     /* Build a simple CSV passthrough pipeline via JSON config */
     const char *config =
         "{\"steps\":["
-        "{\"type\":\"codec\",\"codec\":\"csv\",\"mode\":\"decode\"},"
-        "{\"type\":\"codec\",\"codec\":\"csv\",\"mode\":\"encode\"}"
+        "{\"op\":\"codec.csv.decode\",\"args\":{}},"
+        "{\"op\":\"codec.csv.encode\",\"args\":{}}"
         "]}";
 
     tf_pipeline *p = tf_pipeline_create(config, strlen(config));

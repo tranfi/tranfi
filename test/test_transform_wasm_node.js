@@ -136,8 +136,22 @@ async function cancelAfterSignal(flag) {
   }
 }
 
+
+function testObjectRecipePreflight(tf) {
+  const recipe = { oversized: 'é'.repeat(4096) }
+  Object.defineProperty(recipe, 'later', {
+    enumerable: true,
+    get() { throw new Error('visited after recipe byte limit') }
+  })
+  assert.throws(() => tf.TransformRecipe.fromJSON(recipe, {
+    limits: { maxRecipeBytes: 1024 }
+  }), error => error.code === 104)
+}
+
 async function main() {
   const wasm = await createTranfi()
+  assert.deepEqual(require("./fixed_transform").check(wasm), require("./fixed_transform").check(native))
+  testObjectRecipePreflight(wasm)
   function assertAllocationFailureClean(failAt, action) {
     const raw = wasm._wasm
     const originalMalloc = raw._malloc

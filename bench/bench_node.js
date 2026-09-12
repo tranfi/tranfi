@@ -10,7 +10,7 @@ import { createRequire } from 'module'
 import Stats from 'online-stats'
 
 const require = createRequire(import.meta.url)
-const native = require('../packages/js/build/Release/tranfi_napi.node')
+const native = require('../js/build/Release/tranfi_napi.node')
 
 const N = parseInt(process.argv[2] || '1000000', 10)
 

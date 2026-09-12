@@ -2752,3 +2752,13 @@ def test_spill_set_ops_chunk_boundaries_match_oracles(left_rows, lookup_rows):
                                     expected_setdiff_rows(left_rows, lookup_rows))
     assert_set_like_chunk_invariant('union', 'union', left_rows, lookup_rows,
                                     expected_union_rows(left_rows, lookup_rows))
+
+
+def test_jsonl_crlf_line_numbers_across_chunks():
+    data = b'{"x":1}\r\nnot-json\r\n{"x":2}\r\n'
+    for size in chunk_parity_sizes(data):
+        result = tf.pipeline('jsonl on_error=warn | jsonl').run(
+            input=data, chunk_size=size)
+        assert parse_jsonl_output(result.output_text) == [{'x': 1}, {'x': 2}]
+        errors = parse_jsonl_output(result.errors.decode())
+        assert [error['line'] for error in errors] == [2]

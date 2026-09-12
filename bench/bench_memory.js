@@ -11,7 +11,7 @@ import { createRequire } from 'module'
 import Stats from 'online-stats'
 
 const require = createRequire(import.meta.url)
-const native = require('../packages/js/build/Release/tranfi_napi.node')
+const native = require('../js/build/Release/tranfi_napi.node')
 
 function fmt(bytes) {
   if (bytes < 1024) return bytes + ' B'

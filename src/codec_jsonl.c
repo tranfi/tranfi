@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #define DEFAULT_BATCH_SIZE 1024
 #define DEFAULT_MAX_ERROR_BYTES 4096
@@ -62,6 +63,11 @@ static int parse_jsonl_error_action(const char *s, jsonl_error_action *out) {
 }
 
 typedef struct {
+    const char *name;
+    size_t column;
+} jsonl_field;
+
+typedef struct {
     size_t    batch_size;
     jsonl_error_action on_error;
     size_t    max_error_bytes;
@@ -69,6 +75,7 @@ typedef struct {
     size_t    line_number;
     size_t    byte_offset;
     size_t    bad_records;
+    int       pending_lf; /* A CR at the end of the previous input chunk. */
 
     /* Line accumulator */
     tf_buffer line_buf;
@@ -78,6 +85,9 @@ typedef struct {
     tf_type  *col_types;
     size_t    n_cols;
     int       schema_ready;
+    jsonl_field *fields;  /* Sorted names, with original order breaking duplicate ties. */
+    size_t *aliases;
+    cJSON **values;       /* Borrowed from the current parsed record only. */
 
     /* Current batch */
     tf_batch *batch;
@@ -88,7 +98,7 @@ static tf_type json_to_type(const cJSON *val) {
     if (cJSON_IsNumber(val)) {
         /* Check if integer */
         double d = val->valuedouble;
-        if (d == (double)(int64_t)d && d >= -9007199254740992.0 && d <= 9007199254740992.0)
+        if (d >= -9007199254740992.0 && d <= 9007199254740992.0 && d == (double)(int64_t)d)
             return TF_TYPE_INT64;
         return TF_TYPE_FLOAT64;
     }
@@ -426,7 +436,38 @@ static tf_batch *make_jsonl_batch(jsonl_decoder_state *st) {
     return b;
 }
 
-static int add_json_row(jsonl_decoder_state *st, cJSON *obj) {
+static int jsonl_field_compare(const void *a, const void *b) {
+    const jsonl_field *x = a, *y = b;
+    int cmp = strcmp(x->name, y->name);
+    return cmp ? cmp : (x->column > y->column) - (x->column < y->column);
+}
+
+static size_t jsonl_find_column(const jsonl_decoder_state *st, const char *name) {
+    size_t lo = 0, hi = st->n_cols;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (strcmp(st->fields[mid].name, name) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < st->n_cols && strcmp(st->fields[lo].name, name) == 0
+        ? st->fields[lo].column : st->n_cols;
+}
+
+static int jsonl_index_schema(jsonl_decoder_state *st) {
+    size_t n = st->n_cols ? st->n_cols : 1;
+    st->fields = tf_callocarray_checked(n, sizeof(*st->fields));
+    st->aliases = tf_callocarray_checked(n, sizeof(*st->aliases));
+    st->values = tf_callocarray_checked(n, sizeof(*st->values));
+    if (!st->fields || !st->aliases || !st->values) return TF_ERROR;
+    for (size_t c = 0; c < st->n_cols; c++)
+        st->fields[c] = (jsonl_field){st->col_names[c], c};
+    qsort(st->fields, st->n_cols, sizeof(*st->fields), jsonl_field_compare);
+    for (size_t c = 0; c < st->n_cols; c++)
+        st->aliases[c] = jsonl_find_column(st, st->col_names[c]);
+    return TF_OK;
+}
+
+static int add_json_row(jsonl_decoder_state *st) {
     if (!st->batch) {
         st->batch = make_jsonl_batch(st);
         if (!st->batch) return TF_ERROR;
@@ -439,7 +480,7 @@ static int add_json_row(jsonl_decoder_state *st, cJSON *obj) {
         return TF_ERROR;
 
     for (size_t c = 0; c < st->n_cols; c++) {
-        cJSON *val = cJSON_GetObjectItemCaseSensitive(obj, st->col_names[c]);
+        cJSON *val = st->values[st->aliases[c]];
         int rc = TF_OK;
         if (!val || cJSON_IsNull(val)) {
             rc = tf_batch_set_null(st->batch, row, c);
@@ -476,16 +517,108 @@ static int add_json_row(jsonl_decoder_state *st, cJSON *obj) {
     return TF_OK;
 }
 
+
+static int jsonl_space(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+/* cJSON owns structural parsing. Check lexemes it deliberately accepts more
+ * loosely, before its C strings can lose embedded NULs. */
+static int jsonl_valid_lexemes(const char *text, size_t n) {
+    const unsigned char *s = (const unsigned char *)text;
+    for (size_t i = 0; i < n;) {
+        unsigned char c = s[i++];
+        if (c == '"') {
+            int closed = 0;
+            while (i < n) {
+                c = s[i++];
+                if (c == '"') { closed = 1; break; }
+                if (c < 0x20) return 0;
+                if (c == '\\') {
+                    if (i == n) return 0;
+                    c = s[i++];
+                    if (c == 'u') {
+                        if (n - i < 4) return 0;
+                        unsigned value = 0;
+                        for (size_t k = 0; k < 4; k++) {
+                            unsigned char h = s[i++];
+                            if (h >= '0' && h <= '9') value = value * 16 + h - '0';
+                            else if (h >= 'a' && h <= 'f') value = value * 16 + h - 'a' + 10;
+                            else if (h >= 'A' && h <= 'F') value = value * 16 + h - 'A' + 10;
+                            else return 0;
+                        }
+                        if (!value) return 0;
+                    } else if (!strchr("\"\\/bfnrt", c)) return 0;
+                } else if (c >= 0x80) {
+                    unsigned value, minimum;
+                    size_t extra;
+                    if (c >= 0xc2 && c <= 0xdf) { value = c & 31; extra = 1; minimum = 0x80; }
+                    else if (c >= 0xe0 && c <= 0xef) { value = c & 15; extra = 2; minimum = 0x800; }
+                    else if (c >= 0xf0 && c <= 0xf4) { value = c & 7; extra = 3; minimum = 0x10000; }
+                    else return 0;
+                    if (n - i < extra) return 0;
+                    while (extra--) {
+                        if ((s[i] & 0xc0) != 0x80) return 0;
+                        value = (value << 6) | (s[i++] & 63);
+                    }
+                    if (value < minimum || value > 0x10ffff ||
+                        (value >= 0xd800 && value <= 0xdfff)) return 0;
+                }
+            }
+            if (!closed) return 0;
+        } else if (c == '-' || (c >= '0' && c <= '9')) {
+            i--;
+            if (s[i] == '-' && ++i == n) return 0;
+            if (s[i] == '0') i++;
+            else {
+                if (s[i] < '1' || s[i] > '9') return 0;
+                do { i++; } while (i < n && s[i] >= '0' && s[i] <= '9');
+            }
+            if (i < n && s[i] == '.') {
+                i++;
+                size_t start = i;
+                while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+                if (i == start) return 0;
+            }
+            if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+                i++;
+                if (i < n && (s[i] == '+' || s[i] == '-')) i++;
+                size_t start = i;
+                while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+                if (i == start) return 0;
+            }
+            if (i < n && !jsonl_space(s[i]) && s[i] != ',' && s[i] != ']' && s[i] != '}')
+                return 0;
+        } else if (c >= 0x80 || (c < 0x20 && !jsonl_space(c))) return 0;
+    }
+    return 1;
+}
+
+static int jsonl_finite_values(const cJSON *obj) {
+    for (const cJSON *v = obj; v; v = v->next) {
+        if (cJSON_IsNumber(v) && !isfinite(v->valuedouble)) return 0;
+        if (v->child && !jsonl_finite_values(v->child)) return 0;
+    }
+    return 1;
+}
+
 static int process_jsonl_line(jsonl_decoder_state *st, const char *line, size_t len,
                               size_t line_no, tf_batch ***out, size_t *n_out,
                               size_t *out_cap, tf_side_channels *side) {
     /* Skip empty lines */
     if (len == 0) return TF_OK;
 
-    /* Parse JSON */
-    cJSON *obj = cJSON_ParseWithLength(line, len);
+    if (!jsonl_valid_lexemes(line, len))
+        return handle_jsonl_malformed(st, line, len, line_no, "invalid JSON", side);
+    const char *end = NULL;
+    cJSON *obj = cJSON_ParseWithLengthOpts(line, len, &end, 0);
     if (!obj && cJSON_ParseHadAllocationFailure()) {
         return TF_ERROR;
+    }
+    while (end && end < line + len && jsonl_space((unsigned char)*end)) end++;
+    if (obj && (end != line + len || !jsonl_finite_values(obj))) {
+        cJSON_Delete(obj);
+        return handle_jsonl_malformed(st, line, len, line_no, "invalid JSON", side);
     }
     if (!obj || !cJSON_IsObject(obj)) {
         const char *reason = obj ? "JSONL record is not an object" : "invalid JSON";
@@ -547,25 +680,32 @@ static int process_jsonl_line(jsonl_decoder_state *st, const char *line, size_t 
         st->n_cols = n_cols;
         st->col_names = col_names;
         st->col_types = col_types;
+        if (jsonl_index_schema(st) != TF_OK) { cJSON_Delete(obj); return TF_ERROR; }
         st->schema_ready = 1;
-    } else {
-        /* Update types from new row */
-        cJSON *item;
-        cJSON_ArrayForEach(item, obj) {
-            if (!item->string) continue;
-            for (size_t c = 0; c < st->n_cols; c++) {
-                if (strcmp(st->col_names[c], item->string) == 0) {
-                    if (jsonl_widen_column(st, c, json_to_type(item)) != TF_OK) {
-                        cJSON_Delete(obj);
-                        return TF_ERROR;
-                    }
-                    break;
-                }
-            }
+    }
+    memset(st->values, 0, st->n_cols * sizeof(*st->values));
+    cJSON *item;
+    cJSON_ArrayForEach(item, obj) {
+        if (!item->string) continue;
+        size_t c = jsonl_find_column(st, item->string);
+        if (c == st->n_cols) continue;
+        /* cJSON lookup historically selects the first duplicate value. */
+        if (!st->values[c]) st->values[c] = item;
+        if (jsonl_widen_column(st, c, json_to_type(item)) != TF_OK) {
+            cJSON_Delete(obj);
+            return TF_ERROR;
         }
     }
-
-    int rc = add_json_row(st, obj);
+    for (size_t c = 0; c < st->n_cols; c++) {
+        cJSON *value = st->values[st->aliases[c]];
+        /* Duplicate schema names also receive that first value; ensure its
+         * numeric range is representable before a typed setter casts it. */
+        if (value && jsonl_widen_column(st, c, json_to_type(value)) != TF_OK) {
+            cJSON_Delete(obj);
+            return TF_ERROR;
+        }
+    }
+    int rc = add_json_row(st);
     cJSON_Delete(obj);
     if (rc != TF_OK) return rc;
 
@@ -585,6 +725,15 @@ static int jsonl_decode(tf_decoder *self, const uint8_t *data, size_t len,
     *out = NULL;
     *n_out = 0;
 
+    if (len && st->pending_lf) {
+        st->pending_lf = 0;
+        if (data[0] == '\n') {
+            data++;
+            len--;
+            st->byte_offset++;
+        }
+    }
+    if (!len) return TF_OK;
     if (check_jsonl_incoming_record_limit(st, data, len, side) != TF_OK) return TF_ERROR;
     if (tf_buffer_write(&st->line_buf, data, len) != TF_OK) return TF_ERROR;
 
@@ -597,7 +746,10 @@ static int jsonl_decode(tf_decoder *self, const uint8_t *data, size_t len,
         if (buf[i] == '\n' || buf[i] == '\r') {
             size_t line_len = i - line_start;
             size_t line_no = ++st->line_number;
-            if (buf[i] == '\r' && i + 1 < buf_len && buf[i + 1] == '\n') i++;
+            if (buf[i] == '\r') {
+                if (i + 1 < buf_len && buf[i + 1] == '\n') i++;
+                else if (i + 1 == buf_len) st->pending_lf = 1;
+            }
             if (line_len > 0) {
                 if (process_jsonl_line(st, (const char *)buf + line_start, line_len,
                                        line_no, out, n_out, &out_cap, side) != TF_OK)
@@ -654,6 +806,9 @@ static void jsonl_decoder_destroy(tf_decoder *self) {
         }
         free(st->col_names);
         free(st->col_types);
+        free(st->fields);
+        free(st->aliases);
+        free(st->values);
         free(st);
     }
     free(self);
@@ -865,6 +1020,10 @@ static int jsonl_encode(tf_encoder *self, tf_batch *in, tf_buffer *out) {
                     JSONL_WRITE(tf_buffer_write_str(out, numbuf));
                     break;
                 case TF_TYPE_FLOAT64:
+                    if (!isfinite(tf_batch_get_float64(in, r, c))) {
+                        tf_set_last_error("jsonl cannot encode nonfinite numbers");
+                        return TF_ERROR;
+                    }
                     if (tf_format_float64(numbuf, sizeof(numbuf),
                                           tf_batch_get_float64(in, r, c)) != TF_OK)
                         return TF_ERROR;

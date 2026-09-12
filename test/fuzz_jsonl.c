@@ -10,8 +10,8 @@
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     const char *config =
         "{\"steps\":["
-        "{\"type\":\"codec\",\"codec\":\"jsonl\",\"mode\":\"decode\"},"
-        "{\"type\":\"codec\",\"codec\":\"jsonl\",\"mode\":\"encode\"}"
+        "{\"op\":\"codec.jsonl.decode\",\"args\":{}},"
+        "{\"op\":\"codec.jsonl.encode\",\"args\":{}}"
         "]}";
 
     tf_pipeline *p = tf_pipeline_create(config, strlen(config));

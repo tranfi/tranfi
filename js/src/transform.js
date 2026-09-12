@@ -6,6 +6,7 @@
  * a second pass over the reference data or to later compatible batches.
  */
 
+const { stringifyRecipe } = require('./recipe_json.js')
 const nativeBinding = require('./native.js')
 const { TranfiTransformError } = require('./transform_error.js')
 
@@ -274,7 +275,7 @@ function normalizeSchema(schema, runtime, limits) {
   }
 }
 
-function normalizeRecipeJSON(recipe) {
+function normalizeRecipeJSON(recipe, limits) {
   if (typeof recipe === 'string') {
     return assertWellFormedUnicode(recipe, 'recipe')
   }
@@ -282,11 +283,7 @@ function normalizeRecipeJSON(recipe) {
     return recipe
   }
   assertPlainObject(recipe, 'recipe')
-  return JSON.stringify(recipe, (key, value) => {
-    assertWellFormedUnicode(key, 'recipe key')
-    if (typeof value === 'string') assertWellFormedUnicode(value, 'recipe string')
-    return value
-  })
+  return stringifyRecipe(recipe, limits)
 }
 
 class OwnedTransform {
@@ -315,8 +312,10 @@ class OwnedTransform {
 
 class TransformRecipe extends OwnedTransform {
   static fromJSON(recipe, { limits } = {}) {
+    const normalized = normalizeLimits(limits)
+    const effective = safeTransformLimits(normalized)
     return new TransformRecipe(callNative(
-      'transformRecipeFromJson', normalizeRecipeJSON(recipe), normalizeLimits(limits)
+      'transformRecipeFromJson', normalizeRecipeJSON(recipe, effective), normalized
     ))
   }
 

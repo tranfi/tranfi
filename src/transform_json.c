@@ -1321,10 +1321,66 @@ static int parse_categorical_recipe_branch(
         if (!cJSON_IsNull(categories)) return 0;
         out->categorical_discover = 0;
     } else {
-        if (!json_string_equals(categories, "discover")) return 0;
-        out->categorical_discover = 1;
+        if (!json_string_equals(categories, "discover") && !cJSON_IsArray(categories)) return 0;
+        out->categorical_discover = !cJSON_IsArray(categories);
     }
     return 1;
+}
+
+static int tagged_category_bits(
+    const cJSON *value, uint32_t expected_dtype, uint64_t *out);
+
+static tf_transform_code parse_fixed_categories(
+    const cJSON *categories, const tf_transform_runtime_copy *runtime,
+    tf_transform_resource_ledger *ledger, tf_transform_recipe_column *out,
+    tf_transform_error **error) {
+    size_t count = 0;
+    uint32_t dtype;
+    uint64_t previous = 0;
+    const cJSON *entry;
+    tf_transform_code code;
+    if (out->kind != TF_TRANSFORM_KIND_CATEGORICAL || !categories->child)
+        goto invalid;
+    dtype = json_string_equals(required_item(categories->child, "t"), "f32")
+        ? TF_VIEW_FLOAT32 : TF_VIEW_FLOAT64;
+    cJSON_ArrayForEach(entry, categories) {
+        uint64_t bits;
+        if (count % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (!tagged_category_bits(entry, dtype, &bits)
+            || (count && tf_transform_category_compare(previous, bits, dtype) >= 0))
+            goto invalid;
+        previous = bits;
+        if ((uint64_t)count >= runtime->limits.max_categories_per_column
+            || (uint64_t)count >= runtime->limits.max_total_categories
+            || count >= SIZE_MAX / sizeof(*out->categorical_fixed))
+            return tf_transform_set_error(error, TF_TRANSFORM_RESOURCE_LIMIT,
+                "fixed dictionary exceeds category limits");
+        count++;
+    }
+    out->categorical_fixed = tf_transform_resource_calloc(
+        ledger, count, sizeof(*out->categorical_fixed), error);
+    if (!out->categorical_fixed)
+        return ledger->last_code != TF_TRANSFORM_OK ? ledger->last_code
+            : tf_transform_set_error(error, TF_TRANSFORM_ALLOCATION,
+                "fixed dictionary allocation failed");
+    out->categorical_fixed_count = count;
+    out->categorical_fixed_dtype = dtype;
+    size_t i = 0;
+    cJSON_ArrayForEach(entry, categories) {
+        if (i % TF_TRANSFORM_CANCEL_ITERS_V1 == 0) {
+            code = tf_transform_poll_cancel(runtime, error);
+            if (code != TF_TRANSFORM_OK) return code;
+        }
+        if (!tagged_category_bits(entry, dtype, &out->categorical_fixed[i++].bits))
+            goto invalid;
+    }
+    return TF_TRANSFORM_OK;
+invalid:
+    return tf_transform_set_error(error, TF_TRANSFORM_INVALID_RECIPE,
+        "fixed categories require a declared categorical column and sorted unique finite matching tags");
 }
 
 static tf_transform_code parse_recipe_column(
@@ -1426,6 +1482,11 @@ static tf_transform_code parse_recipe_column(
     } else if (!cJSON_IsNull(numeric)) goto invalid;
     if (has_categorical) {
         if (!parse_categorical_recipe_branch(categorical, out)) goto invalid;
+        const cJSON *categories = required_item(required_item(categorical, "encode"), "categories");
+        if (cJSON_IsArray(categories)) {
+            code = parse_fixed_categories(categories, runtime, ledger, out, error);
+            if (code != TF_TRANSFORM_OK) goto cleanup;
+        }
     } else if (!cJSON_IsNull(categorical)) goto invalid;
     return TF_TRANSFORM_OK;
 invalid:
@@ -1434,6 +1495,9 @@ invalid:
         "invalid prepared-transform recipe column");
 cleanup:
     free(out->source_id);
+    free(out->categorical_fixed);
+    tf_transform_resource_release(ledger,
+        (uint64_t)out->categorical_fixed_count * sizeof(*out->categorical_fixed));
     tf_transform_resource_release(ledger, (uint64_t)source_len + 1);
     memset(out, 0, sizeof(*out));
     return code;
@@ -1824,11 +1888,19 @@ static int build_budget_categorical_recipe_branch(
     if (!build_budget_child(budget, "categorical")
         || !build_budget_object(budget, 2)
         || !build_budget_child(budget, "encode")
-        || !build_budget_object(budget, 4)
-        || (column->categorical_discover
-            ? !build_budget_string_property(budget, "categories", 8)
-            : !build_budget_primitive(budget, "categories"))
-        || !build_budget_string_property(
+        || !build_budget_object(budget, 4)) return 0;
+    if (column->categorical_fixed_count) {
+        if (!build_budget_child(budget, "categories") || !build_budget_array(budget)) return 0;
+        for (size_t i = 0; i < column->categorical_fixed_count; ++i)
+            if (!build_budget_object(budget, 2)
+                || !build_budget_string_property(budget, "t", 3)
+                || !build_budget_string_property(budget, "v",
+                    column->categorical_fixed_dtype == TF_VIEW_FLOAT32 ? 8 : 16)) return 0;
+        if (budget->depth < 9) budget->depth = 9;
+    } else if (column->categorical_discover
+        ? !build_budget_string_property(budget, "categories", 8)
+        : !build_budget_primitive(budget, "categories")) return 0;
+    if (!build_budget_string_property(
             budget, "op",
             column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL ? 5
             : column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT ? 6 : 4)
@@ -2179,6 +2251,23 @@ fail:
     return NULL;
 }
 
+static cJSON *recipe_categories_to_json(const tf_transform_recipe_column *column) {
+    if (!column->categorical_fixed_count)
+        return column->categorical_discover ? json_string("discover") : json_null();
+    cJSON *categories = cJSON_CreateArray();
+    if (!categories) return NULL;
+    for (size_t i = 0; i < column->categorical_fixed_count; ++i) {
+        cJSON *value = tagged_bits(column->categorical_fixed[i].bits,
+                                  column->categorical_fixed_dtype);
+        if (!value || !transfer_array_item(categories, &value)) {
+            cJSON_Delete(value);
+            cJSON_Delete(categories);
+            return NULL;
+        }
+    }
+    return categories;
+}
+
 static cJSON *recipe_categorical_branch_to_json(
     const tf_transform_recipe_column *column) {
     cJSON *categorical = cJSON_CreateObject();
@@ -2195,8 +2284,7 @@ static cJSON *recipe_categorical_branch_to_json(
                     : column->categorical_unknown == TF_TRANSFORM_UNKNOWN_ALL_ZERO
                         ? "all_zero" : "error");
     if (!categorical || !impute || !encode || !sentinel || !unknown
-        || !add_item(encode, "categories", column->categorical_discover
-            ? json_string("discover") : json_null())
+        || !add_item(encode, "categories", recipe_categories_to_json(column))
         || !add_item(encode, "op", json_string(
             column->categorical_encode == TF_TRANSFORM_ENCODE_LABEL ? "label"
             : column->categorical_encode == TF_TRANSFORM_ENCODE_ONEHOT
@@ -3148,6 +3236,9 @@ static tf_transform_code parse_categorical_step(
             || (count != 0 && tf_transform_category_compare(
                 previous_category_bits, bits, source_dtype) >= 0))
             goto corrupt;
+        if (recipe->categorical_fixed_count
+            && (count >= recipe->categorical_fixed_count
+                || bits != recipe->categorical_fixed[count].bits)) goto corrupt;
         previous_category_bits = bits;
         if (count == SIZE_MAX) return tf_transform_set_error(
             error, TF_TRANSFORM_RESOURCE_LIMIT,
@@ -3162,6 +3253,8 @@ static tf_transform_code parse_categorical_step(
     if (count != 0 && empty_categories_allowed) goto corrupt;
     if (recipe->kind == TF_TRANSFORM_KIND_INFER
         && (count < 2 || (uint64_t)count > recipe->infer_max_categories))
+        goto corrupt;
+    if (recipe->categorical_fixed_count && count != recipe->categorical_fixed_count)
         goto corrupt;
     if ((uint64_t)count > runtime->limits.max_categories_per_column
         || *total_categories > UINT64_MAX - (uint64_t)count
@@ -3446,6 +3539,8 @@ tf_transform_code tf_transform_plan_from_json(
             input->id, input->id_len, runtime, &source_equal, error);
         if (code != TF_TRANSFORM_OK) goto done;
         if (!source_equal
+            || (recipe_column->categorical_fixed_count
+                && recipe_column->categorical_fixed_dtype != input->dtype)
             || (recipe_column->kind != TF_TRANSFORM_KIND_CATEGORICAL
                 && recipe_column->impute == TF_TRANSFORM_IMPUTE_CONSTANT
                 && recipe_column->constant_dtype != input->dtype)) {
