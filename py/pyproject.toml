@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Streaming ETL language + runtime"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 keywords = ["etl", "csv", "streaming", "data", "pipeline", "transform"]
 readme = "README.md"
 

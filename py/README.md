@@ -36,6 +36,8 @@ result = tf.pipeline('csv | filter "col(age) > 25" | top-k 100 age | csv').run(i
 
 ## Install
 
+Requires Python 3.9 or newer and a C compiler to build the source distribution.
+
 ```bash
 pip install tranfi
 ```
