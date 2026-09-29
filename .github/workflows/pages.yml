@@ -7,9 +7,13 @@ on:
       - 'README.md'
       - 'js/README.md'
       - 'py/README.md'
+      - '_config.yml'
+      - '_includes/**'
+      - 'Gemfile'
+      - 'Gemfile.lock'
+      - 'CNAME'
       - 'app/**'
       - 'src/**'
-      - 'scripts/**'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -35,11 +39,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Build C core
-        run: |
-          mkdir -p build
-          cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
 
       - name: Build WASM
         run: |
@@ -67,11 +66,15 @@ jobs:
         env:
           VITE_BASE: ${{ steps.pages.outputs.base_path }}/app/
 
-      - name: Install site dependencies
-        run: npm ci
-
+      # Same Jekyll builder and theme as the branch-deployed polygrad.org and wlearn.org.
       - name: Build site
-        run: node scripts/build-site.js --out _site --base ${{ steps.pages.outputs.base_path }}/
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+
+      - name: Add app to site
+        run: sudo cp -r app/dist _site/app
 
       - uses: actions/upload-pages-artifact@v3
         with:

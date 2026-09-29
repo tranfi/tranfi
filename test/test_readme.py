@@ -115,7 +115,8 @@ def cli_examples():
         if lang != 'bash':
             continue
         for line_number, line in enumerate(code.splitlines()):
-            if not line.startswith(('tranfi ', './build/tranfi ')) and '| npx tranfi ' not in line:
+            if (not line.startswith(('tranfi ', './build/tranfi '))
+                    and not re.search(r'\| (npx )?tranfi ', line)):
                 continue
             for backend in ('C', 'npm', 'pip'):
                 if line.startswith('./build/tranfi ') and backend != 'C':

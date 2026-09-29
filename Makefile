@@ -280,10 +280,12 @@ app: build-wasm
 	@cp js/wasm/tranfi_core.js app/public/wasm/tranfi_core.js
 	@echo "  WASM copied to app/public/wasm/"
 
+# Same Jekyll theme and builder as the GitHub Pages workflow; run bundle install first.
 site: app
-	@cd app && npx vite build 2>&1 | tail -1
-	@node scripts/build-site.js --out _site --base /
-	@echo "  Site OK → _site/"
+	@cd app && VITE_BASE=/app/ npx vite build 2>&1 | tail -1
+	@bundle exec jekyll build -d _site
+	@rm -rf _site/app && cp -r app/dist _site/app
+	@echo "  Site OK -> _site/"
 
 # --- Publish targets ---
 

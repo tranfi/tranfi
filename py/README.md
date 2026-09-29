@@ -1,9 +1,10 @@
 # tranfi (Python)
 
-Streaming-first ETL in Python, powered by a native C11 core. Tranfi processes
-CSV, JSONL, and text byte streams; it is not an in-memory pandas-style DataFrame.
-Row-local operations stream, bounded operators declare their limits, and
-full-input operators require an explicit blocking or spill policy.
+Tranfi transforms CSV, JSON Lines and plain text as streams, on a native C core.
+Data flows through in chunks, so most pipelines use a small, fixed amount of
+memory however large the input is. Operations that need the whole input, such as
+`sort`, must be allowed explicitly. Tranfi works on byte streams; it is not a
+pandas-style DataFrame library.
 
 ```python
 import tranfi as tf
@@ -33,16 +34,13 @@ result = tf.pipeline('csv | filter "col(age) > 25" | top-k 100 age | csv').run(i
 
 ## Install
 
-Requires Python 3.9 or newer and a C compiler to build the source distribution.
-
 ```bash
 pip install tranfi
 ```
 
-The compiled Python package is currently built and tested on Linux. Windows and
-other native platforms are not part of the published 0.2 support contract until
-they have equivalent build-and-test lanes; JavaScript users on Windows can use
-the separately packaged WASM entry.
+Requires Python 3.9 or newer. Tranfi is distributed as source and compiled
+during installation, so you need a C compiler. The Python package is tested on
+Linux; Windows and macOS are not tested yet.
 
 Or from source:
 
@@ -154,15 +152,17 @@ for chunk in p.iter_chunks(input_files=parts, source_column='src'):
     process(chunk)
 ```
 
-`source_column` appends the path for each input row without preloading file contents. Tranfi flushes decoder input at each file boundary so an unterminated final record belongs to the correct source file. It does not remove repeated CSV headers from later files; use shards without repeated headers, `header=False`, or a pre-cleaning step when every file has its own header.
+`source_column` appends the path for each input row without preloading file contents. Tranfi flushes decoder input at each file boundary so an unterminated final record belongs to the correct source file. Repeated headers are kept by default. Use `tf.codec.csv(skip_repeated_header=True)` to skip a later file's first non-comment record when it exactly matches the original header; matching rows inside a file remain data.
 
 ### Prepared reusable transforms
 
-Prepared transforms are separate from byte-stream pipelines. They are for typed operations whose parameters must be learned from reference data: an analyzer consumes one or more bounded-memory batches, `finalize()` freezes an immutable plan and output schema, and an apply session runs that plan over either a second pass of the original data (`fit_transform`-style) or later compatible batches.
+Learn imputation, scaling or category mappings from reference data, then apply
+the same plan to new batches. Analyze the reference batches, finalize the plan,
+and apply it. Replaying the reference data through that plan gives a second-pass
+`fit_transform` workflow.
 
-The current slice accepts declared `float32`/`float64` columns and implements numeric none/zero/constant/mean/exact-median imputation plus none/standard/min-max normalization. Declared categorical columns support mode imputation with `allMissing` set to `error` or `zero`, or no imputation; encoders discover finite typed categories, while no imputation plus no encoding needs no learned dictionary. A column may instead provide both branches with `kind.op = 'infer'`, `kind.rule = 'finite-integer-cardinality-v1'`, and `kind.maxCategories >= 2`: missing/NaN values are ignored, `2..maxCategories` distinct finite integers resolve categorical, while zero/one distinct value, any noninteger, or the next distinct value resolves numeric. `impute.op = 'none'` with `encode.op = 'none'` passes every finite value through and emits canonical qNaN for missing input. Mode with `encode.op = 'none'` retains its learned dictionary and rejects unseen finite values with code `108`. `encode.op = 'label'` freezes zero-based sorted ordinals and supports unknown policies `error`, `sentinel`, and `other`; `encode.op = 'onehot'` emits source-ordered category blocks and supports `error`, `all_zero`, and `other`. Without categorical imputation, missing label/one-hot input follows that encoder's unknown policy. The label sentinel must be a safe integer outside the learned ordinal range; label/one-hot `other` appends the reserved ordinal/field after known categories. Generated output IDs/names and one-hot category metadata are deterministic, and collisions fail with code `102`. Exact median obeys configured allocation and resident-state limits; inference, categorical discovery, and output expansion obey category, output-width, allocation, and resident-state limits. Limit failures use resource code `104`. Prepared-transform host-policy and spill fields are reserved but not implemented; nonempty use fails with unsupported-runtime code `113` instead of being silently ignored.
-
-Declared categorical columns also accept a fixed, nonempty `encode.categories` array of finite, sorted, unique tags (`{ "t": "f64", "v": "4000000000000000" }` represents 2). Tags must match the input dtype; negative zero is represented as positive zero. Fixed dictionaries retain unobserved categories. Unknown training values follow the encoder policy and never vote for mode; an all-missing zero fallback must exist in the dictionary. Fixed encoding without imputation can finalize without training rows. Fixed dictionaries with kind inference, string categories, and categorical constant imputation remain unsupported.
+Inputs are typed `float32`/`float64` columns. This example learns mean imputation
+and standard scaling, applies them to the reference batch, and exports the plan:
 
 ```python
 from array import array
@@ -207,29 +207,94 @@ with tf.TransformRecipe.from_json(json.dumps(recipe_spec)) as recipe:
             recipe_sha256 = plan.recipe_sha256()
 ```
 
+<details markdown="1">
+<summary>Available methods, missing values and kind inference</summary>
+
+Recipe fields use the same names in all bindings.
+
+| Recipe field | Choices / behavior |
+|--------------|--------------------|
+| Numeric `impute.op` | `none`, `zero`, `constant`, `mean`, exact `median` |
+| Numeric `normalize.op` | `none`, `standard`, `minmax` |
+| Categorical `impute.op` | `none` or mode; mode supports `allMissing` of `error` or `zero` |
+| Categorical `encode.op` | `none`, `label`, `onehot` |
+| Label unknown policy | `error`, `sentinel`, `other` |
+| One-hot unknown policy | `error`, `all_zero`, `other` |
+
+**No imputation or encoding:** finite values pass through; missing input becomes
+canonical qNaN. This combination needs no learned category dictionary.
+Mode imputation with no encoding retains a dictionary and rejects unseen finite
+values with error `108`.
+
+**Encoding:** label ordinals are zero-based and sorted; one-hot blocks follow
+source order. A label sentinel must be a safe integer outside the known ordinal
+range. `other` appends an ordinal or field after known categories. Without
+imputation, missing input follows the encoder's unknown policy.
+
+Generated IDs, names and category metadata are deterministic. Collisions fail
+with error `102`.
+
+**Kind inference:** configure both numeric and categorical branches, set
+`kind.op` to `infer`, `kind.rule` to `finite-integer-cardinality-v1`, and
+`kind.maxCategories` to at least `2`. Missing/NaN values are ignored.
+
+| Observed reference values | Selected branch |
+|---------------------------|-----------------|
+| `2..maxCategories` distinct finite integers | Categorical |
+| Zero or one distinct value, any noninteger, or more than `maxCategories` | Numeric |
+
+</details>
+
+<details markdown="1">
+<summary>Fixed category dictionaries</summary>
+
+Set `encode.categories` to a nonempty, sorted, unique array of finite typed tags.
+For example, `{ "t": "f64", "v": "4000000000000000" }` represents `2`.
+Tags must match the input dtype; represent negative zero as positive zero.
+
+- Unobserved categories stay in the dictionary.
+- Unknown training values follow the encoder policy and never vote for mode.
+- An all-missing zero fallback must exist in the dictionary.
+- Fixed encoding without imputation can finalize without training rows.
+
+String categories, categorical constant imputation and fixed dictionaries
+combined with kind inference are not supported.
+
+</details>
+
+<details markdown="1">
+<summary>Limits, errors and cancellation</summary>
+
+Exact median obeys allocation and resident-state limits. Inference, category
+discovery and output expansion also enforce category/output-width limits.
+Resource-limit failures use error `104`.
+
+Host-policy and spill settings are reserved. A non-null host policy or nonempty
+spill path fails with unsupported-runtime error `113`.
+
 Prepared-transform failures raise `TranfiTransformError`; its numeric `code` is stable across the C and Python APIs. `TransformLimits` starts from the C-owned safe profile and applies explicit overrides.
 For cooperative cancellation, create a `TransformCancelToken`, pass it to `recipe.analyzer(..., cancel_token=token)`, `plan.apply(..., cancel_token=token)`, or `TransformPlan.from_bytes(..., cancel_token=token)`, and call `token.request()` from another Python thread. Active analyzer/apply sessions retain the token for their lifetime.
 
+</details>
+
 ## Codecs
 
-Codecs convert between raw bytes and columnar batches. Every pipeline starts with a decoder and ends with an encoder.
+Start with a decoder and finish with an encoder. Input and output formats can differ.
 
-| Method | Description |
-|--------|-------------|
-| `codec.csv(delimiter, header, batch_size, repair, mode, strict, max_error_bytes, max_record_bytes, max_columns, nulls, quoted_nulls, skip, n_max, max_rows, comment, trim_ws, skip_empty_rows, audit, audit_limit, audit_include_row, audit_columns, audit_redact, audit_hash_columns, audit_max_bytes, audit_max_cell_bytes)` | CSV decoder. `mode='strict'` fails on field-count mismatches; `repair=True` / `mode='repair'` emits repair diagnostics; `max_record_bytes` bounds buffered records; `nulls=['NA']` adds null sentinels; `skip=2`, `n_max=100`, `comment='#'`, `trim_ws=False`, and `skip_empty_rows=True` control row-local parsing; repair audit/raw diagnostics support privacy controls with pseudo-column `raw` |
-| `codec.csv_encode(delimiter)` | CSV encoder |
-| `codec.jsonl(batch_size, on_error, max_error_bytes, max_record_bytes)` | JSON Lines decoder. `on_error` is `skip`, `fail`, `warn`, or `quarantine` |
-| `codec.jsonl_encode()` | JSON Lines encoder |
-| `codec.text(batch_size, max_error_bytes, max_record_bytes)` | Line-oriented text decoder (single `_line` column) |
-| `codec.text_encode()` | Text encoder |
-| `codec.table_encode(max_width, max_rows)` | Pretty-print Markdown table |
+| Format | Decoder | Encoder |
+|--------|---------|---------|
+| CSV | `codec.csv(...)` | `codec.csv_encode(delimiter)` |
+| JSON Lines | `codec.jsonl(batch_size, on_error, max_error_bytes, max_record_bytes)` | `codec.jsonl_encode()` |
+| Text (one `_line` column) | `codec.text(batch_size, max_error_bytes, max_record_bytes)` | `codec.text_encode()` |
+| Markdown table | — | `codec.table_encode(max_width, max_rows)` |
 
-CSV treats unquoted empty fields as null by default. Pass `nulls=['NA', 'NULL']` to add sentinel strings; pass `quoted_nulls=False` when quoted sentinels like `"NA"` or `""` should remain strings. Default field-count handling is permissive for compatibility. Use `mode='strict'` or `strict=True` to fail on row/header width mismatches. Use `repair=True` or `mode='repair'` to pad/truncate and collect JSONL diagnostics in `result.errors`; `max_error_bytes` bounds raw previews, and `audit_include_row`, `audit_columns`, `audit_redact`, `audit_hash_columns`, `audit_max_bytes`, and `audit_max_cell_bytes` govern repair audit/raw payloads with the raw preview exposed as pseudo-column `raw`. `max_record_bytes` defaults to `67108864` bytes, caps the current record buffer before a newline is seen, and raises with a `csv_record_too_large` diagnostic when exceeded; pass `0` to disable the guard. `max_columns` defaults to `8192`; records above the cap raise with a bounded `csv_too_many_columns` diagnostic instead of silently dropping columns. Decoder size options are checked before execution: `batch_size` must be `1..65536`, `max_error_bytes` must be `0..67108864`, `max_record_bytes` must be `0..1073741824`, and `max_columns` must be `1..65536`. `skip=2` discards preamble records before header/schema discovery; comments are applied after skipped rows. `n_max=100` / `max_rows=100` keeps at most that many decoded data rows after skip/comment/header handling and uses only one counter; `n_max=0` preserves a header-only schema batch. `comment='#'` removes text after an unquoted marker and skips comment-only rows; quoted markers are preserved. Unquoted spaces/tabs are trimmed by default; pass `trim_ws=False` to preserve them. Blank physical rows after the header are preserved as all-null rows by default; pass `skip_empty_rows=True` to drop them.
+**CSV defaults to permissive field-count handling.** Choose `mode='strict'`
+(or `strict=True`) to reject width mismatches. Choose `repair=True`
+(or `mode='repair'`) to pad/truncate rows and collect diagnostics in `result.errors`.
 
-Malformed JSONL records are skipped by default. Set `on_error='warn'` or `on_error='quarantine'` to keep valid rows and collect JSONL diagnostics in `result.errors`; set `on_error='fail'` to raise on the first malformed line. `max_error_bytes` bounds the raw preview stored in diagnostics, and `max_record_bytes` applies the same current-line guard as CSV/text.
-
-Each JSONL record must be one complete UTF-8 JSON object. Invalid number syntax, trailing content, embedded NULs, and numbers outside the finite float64 range follow the same malformed-record policy. The encoder rejects nonfinite values. Schema order comes from the first valid record; repeated keys use their first value.
-
+**Malformed JSONL is skipped by default.** Set `on_error` to `fail` to stop,
+`warn` to keep valid rows with diagnostics, or `quarantine` to route bad records
+to error diagnostics. Read those diagnostics from `result.errors`.
 
 Cross-codec pipelines work naturally:
 
@@ -241,6 +306,57 @@ tf.pipeline([tf.codec.csv(), tf.ops.head(5), tf.codec.jsonl_encode()])
 # JSONL in, CSV out
 tf.pipeline([tf.codec.jsonl(), tf.ops.sort(['name']), tf.codec.csv_encode()])
 ```
+
+<details markdown="1">
+<summary>CSV options for nulls, row limits and whitespace</summary>
+
+| Need | Option | Behavior |
+|------|--------|----------|
+| Field separator / header | `delimiter`, `header` | Configure CSV decoding; encoder accepts `delimiter` |
+| Add null markers | `nulls=['NA', 'NULL']` | Adds to default unquoted-empty-field null handling |
+| Preserve quoted markers | `quoted_nulls=False` | Keeps quoted `"NA"` and `""` as strings |
+| Skip a preamble | `skip=2` | Before schema/header discovery; comments are handled afterward |
+| Limit rows | `n_max=100` or `max_rows=100` | One shared counter after skip/comment/header handling |
+| Keep only the schema | `n_max=0` | Preserves a header-only batch |
+| Comments | `comment='#'` | Removes text after unquoted markers and skips comment-only rows; quoted markers remain |
+| Preserve spaces/tabs | `trim_ws=False` | Disables default trimming of unquoted values |
+| Drop blank rows | `skip_empty_rows=True` | Otherwise blank physical rows after the header become all-null rows |
+| Read CSV shards | `skip_repeated_header=True` | Skips matching headers only at explicit file boundaries |
+
+</details>
+
+<details markdown="1">
+<summary>Decoder limits and repair diagnostics</summary>
+
+All decoder size options are checked integers:
+
+| Option | Range | Behavior |
+|--------|-------|----------|
+| `batch_size` | `1..65536` | Rows per batch |
+| `max_error_bytes` | `0..67108864` | Bounds raw diagnostic previews |
+| `max_record_bytes` | `0..1073741824` | Default `67108864` bytes (64 MiB); `0` disables the record guard |
+| `max_columns` (CSV) | `1..65536` | Default `8192`; overflow fails with `csv_too_many_columns` |
+
+Record limits apply before a newline is seen, including CSV, JSONL and text.
+CSV record overflow fails with `csv_record_too_large`.
+
+Repair audit/raw payloads accept `audit_include_row, audit_columns, audit_redact, audit_hash_columns, audit_max_bytes, audit_max_cell_bytes`. The raw preview is exposed to
+those controls as pseudo-column `raw`. CSV repair also accepts
+`audit, audit_limit`.
+
+</details>
+
+<details markdown="1">
+<summary>JSONL record and schema rules</summary>
+
+Each record must be one complete UTF-8 JSON object. Invalid number syntax,
+trailing content, embedded NULs and numbers outside finite float64 range follow
+the configured malformed-record policy. The encoder rejects nonfinite values.
+
+The first valid record determines schema order. Repeated keys use their first
+value. `max_error_bytes` bounds diagnostic previews, and `max_record_bytes` caps the current line.
+
+</details>
 
 ## Operators
 
@@ -535,4 +651,19 @@ p = tf.pipeline(recipe='{"steps":[{"op":"codec.csv.decode","args":{}},{"op":"hea
 
 ## Architecture
 
-The Python package is a thin ctypes wrapper around `libtranfi.so`, the same C11 core used by the CLI, Node.js, and WASM targets. Data flows through columnar batches with typed columns (`bool`, `int64`, `float64`, `string`, `date`, `timestamp`) and per-cell null bitmaps. `run(input_file=...)` streams input in chunks and drains native main output after each push; by default it still collects the final output for convenience. `.gz` input files are decompressed in the host source adapter with `gzip.open()`; use `compression='none'` to force raw bytes or `compression='gzip'` to force gzip. Use `on_output=...` with `collect_output=False` or `iter_chunks()` for large outputs. Native execution is strict by default: row-local and bounded-state operators stream, blocking operators require `allow_blocking=True` or an external engine, capped key-state plans can be checked with `memory='64MB'`, and core plan file reads require explicit host-policy options.
+Python calls `libtranfi.so` through ctypes. CLI, Node and WASM use the same C11
+engine, with typed columns (`bool`, `int64`, `float64`, `string`, `date`,
+`timestamp`) and per-cell null bitmaps.
+
+| Need | Python API behavior |
+|------|---------------------|
+| Stream input | `run(input_file=...)` reads chunks and drains native output after each push |
+| Avoid collecting all output | Use `on_output=...` with `collect_output=False`, or `iter_chunks()` |
+| Read gzip | `.gz` files use `gzip.open()`; override with `compression='none'` or `'gzip'` |
+| Permit a blocking operation | Set `allow_blocking=True` or use an external engine |
+| Cap retained key state | Supply caps and check the plan with `memory='64MB'` |
+| Allow plan file reads | Supply explicit host-policy options |
+
+Input streaming still collects the final output by default. Choose a streaming
+sink for large outputs; row-local and bounded-state operators stream under the
+default strict native memory policy.

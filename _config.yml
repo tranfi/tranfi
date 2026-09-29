@@ -1,0 +1,90 @@
+title: "tranfi"
+description: >
+  Streaming transformations for CSV, JSON Lines and text, from the command
+  line, Python, Node.js and the browser
+
+show_excerpts: false
+
+header_pages:
+  - js/README.md
+  - py/README.md
+
+minima:
+  social_links:
+    github: tranfi
+
+remote_theme: "jseeio/minima"
+
+defaults:
+  - scope:
+      path: "README.md"
+    values:
+      layout: page
+      title: tranfi
+      show_title: false
+      permalink: /
+  - scope:
+      path: "js/README.md"
+    values:
+      layout: page
+      title: Node.js and browser
+      show_title: false
+      permalink: /js/
+  - scope:
+      path: "py/README.md"
+    values:
+      layout: page
+      title: Python
+      show_title: false
+      permalink: /py/
+
+exclude:
+  - AGENTS.md
+  - CLAUDE.md
+  - FEEDBACK.md
+  - LOG.md
+  - MEMORY*.md
+  - PLAN*.md
+  - CMakeLists.txt
+  - Makefile
+  - Gemfile
+  - Gemfile.lock
+  - package.json
+  - package-lock.json
+  - app/
+  - bench/
+  - build/
+  - build-asan/
+  - build-debug/
+  - build-release/
+  - build-tsan/
+  - build-wasm/
+  - corpus/
+  - js/app/
+  - js/build/
+  - js/csrc/
+  - js/node_modules/
+  - js/scripts/
+  - js/src/
+  - js/wasm/
+  - js/binding.gyp
+  - js/napi_api.c
+  - js/napi_transform.c
+  - js/napi_transform.h
+  - js/package.json
+  - js/package-lock.json
+  - node_modules/
+  - py/csrc/
+  - py/dist/
+  - py/scripts/
+  - py/tranfi/
+  - py/tranfi.egg-info/
+  - py/MANIFEST.in
+  - py/pyproject.toml
+  - py/setup.py
+  - references/
+  - scripts/
+  - src/
+  - temp/
+  - test/
+  - third_party/

@@ -7,6 +7,8 @@ temp/
 references/
 *.gcov
 _site/
+.jekyll-cache/
+.jekyll-metadata
 build-wasm/
 build-release/
 *.o
