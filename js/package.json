@@ -1,6 +1,6 @@
 {
   "name": "tranfi",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Streaming ETL language + runtime",
   "type": "commonjs",
   "main": "src/index.js",
@@ -39,7 +39,7 @@
     "prepack": "node scripts/prepack.js",
     "install": "node scripts/install-native.js",
     "build:native": "node scripts/sync-csrc.js && node-gyp rebuild",
-    "test": "node --test ../test/test_install_native.js && node ../test/test_node.js && node ../test/test_transform_node.js && node ../test/test_transform_wasm_node.js && node ../test/test_transform_worker_node.js"
+    "test": "node --test ../test/test_install_native.js ../test/test_cli_node.js && node ../test/test_node.js && node ../test/test_transform_node.js && node ../test/test_transform_wasm_node.js && node ../test/test_transform_worker_node.js"
   },
   "peerDependencies": {
     "duckdb": ">=1.0.0",

@@ -105,6 +105,9 @@ jobs:
       - name: Node tests
         run: make test-node
 
+      - name: README examples and CLI commands
+        run: make test-readme
+
       - name: Package audits and clean install smokes
         run: make test-packaging
 

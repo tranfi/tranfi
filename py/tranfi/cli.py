@@ -14,6 +14,7 @@ import sys
 import json
 import os
 from . import _ffi
+from .memory_policy import prepare_native_plan
 
 CHUNK_SIZE = 64 * 1024
 CHAN_MAIN = 0
@@ -66,6 +67,14 @@ examples:
     parser.add_argument('-p', '--progress', action='store_true', help='show progress on stderr')
     parser.add_argument('-v', '--version', action='store_true', help='show version')
     parser.add_argument('-R', '--recipes', action='store_true', help='list built-in recipes')
+    blocking = parser.add_mutually_exclusive_group()
+    blocking.add_argument('--allow-blocking', action='store_true', help='allow full-input operations on known-small data')
+    blocking.add_argument('--fail-on-blocking', action='store_true', help='reject blocking operations (default)')
+    parser.add_argument('--memory', help='native memory policy, e.g. max:64MB')
+    parser.add_argument('--spill-dir', help='existing private spill directory')
+    parser.add_argument('--stats-json', help='write stats NDJSON to a file; - means stderr')
+    parser.add_argument('--target', choices=('native', 'json', 'sql'), default='native')
+    parser.add_argument('--dialect', default='duckdb', help='SQL dialect for --target sql')
 
     args = parser.parse_args()
 
@@ -99,19 +108,27 @@ examples:
         # Try built-in recipe
         recipe_dsl = _ffi.recipe_find_dsl(pt)
         if recipe_dsl:
+            pipeline_text = recipe_dsl
             plan_json = _ffi.compile_dsl(recipe_dsl)
         else:
             plan_json = _ffi.compile_dsl(pipeline_text)
     else:
         plan_json = _ffi.compile_dsl(pipeline_text)
 
-    # JSON mode: print and exit
-    if args.json:
+    if args.target == 'sql':
+        print(_ffi.compile_to_sql(pipeline_text, dialect=args.dialect))
+        return
+
+    # Compilation does not execute the plan or grant permission to buffer input.
+    if args.json or args.target == 'json':
         print(plan_json)
         return
 
-    # Create pipeline
-    handle = _ffi.pipeline_create_from_json(plan_json)
+    plan_json = prepare_native_plan(plan_json, allow_blocking=args.allow_blocking,
+                                    memory=args.memory, spill_dir=args.spill_dir)
+    handle = _ffi.pipeline_create(plan_json, allow_fs=True, allow_rules_file=True,
+                                  allow_spill=bool(args.spill_dir))
+    fin = fout = None
 
     try:
         # Open I/O
@@ -165,19 +182,19 @@ examples:
                 break
             sys.stderr.buffer.write(data)
 
-        # Stats to stderr (unless quiet)
-        if not args.quiet:
-            while True:
-                data = _ffi.pipeline_pull(handle, CHAN_STATS)
-                if not data:
-                    break
-                sys.stderr.buffer.write(data)
+        if args.stats_json or not args.quiet:
+            stats = _ffi.pipeline_pull(handle, CHAN_STATS)
+            if args.stats_json and args.stats_json != '-':
+                with open(args.stats_json, 'wb') as stream:
+                    stream.write(stats)
+            else:
+                sys.stderr.buffer.write(stats)
 
     finally:
         _ffi.pipeline_free(handle)
-        if args.input and fin is not sys.stdin.buffer:
+        if args.input and fin is not None:
             fin.close()
-        if args.output and fout is not sys.stdout.buffer:
+        if args.output and fout is not None:
             fout.close()
 
 

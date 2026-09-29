@@ -9,7 +9,7 @@ const consumerRequire = createRequire(resolve(process.cwd(), 'package.json'))
 async function main() {
   const createTranfi = consumerRequire('tranfi/wasm')
   const tf = await createTranfi()
-  assert.equal(tf.version(), '0.2.0')
+  assert.equal(tf.version(), '0.2.1')
 
   const streamed = tf.run(
     'csv | filter "col(age) > 25" | csv',

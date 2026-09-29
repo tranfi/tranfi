@@ -79,7 +79,7 @@ console.log('====================\n')
 await test('native runtime version', async () => {
   assert(nativeBinding, 'native binding should be built for the native test lane')
   const v = nativeBinding.version()
-  assert(v === '0.2.0', `expected 0.2.0, got ${v}`)
+  assert(v === '0.2.1', `expected 0.2.1, got ${v}`)
 })
 
 console.log('CSV:')
@@ -4754,7 +4754,7 @@ if (createTranfi) {
 
   await test('wasm version', async () => {
     const v = tf.version()
-    assert(v === '0.2.0', `expected 0.2.0, got ${v}`)
+    assert(v === '0.2.1', `expected 0.2.1, got ${v}`)
   })
 
   await test('wasm compileToSql', async () => {

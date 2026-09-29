@@ -9,8 +9,8 @@
  *   tranfi profile < data.csv
  */
 
-const { pipeline, compileDsl, recipes } = require('./index.js')
-const { readFileSync, writeFileSync, existsSync } = require('fs')
+const { pipeline, compileDsl, compileToSql, recipes } = require('./index.js')
+const { readFileSync, writeFileSync, existsSync, openSync, closeSync } = require('fs')
 const { resolve, dirname } = require('path')
 const nativeBinding = require('./native.js')
 
@@ -34,6 +34,13 @@ Options:
   -i FILE   Read input from file instead of stdin
   -o FILE   Write output to file instead of stdout
   -j        Compile only, output JSON plan
+  --target native|json|sql  Execute or compile a pipeline
+  --dialect NAME           SQL dialect (duckdb)
+  --allow-blocking         Permit full-input operations on known-small data
+  --fail-on-blocking       Reject blocking operations (default)
+  --memory SIZE            Native memory policy, e.g. max:64MB
+  --spill-dir DIR          Existing private spill directory
+  --stats-json FILE        Write stats NDJSON; - means stderr
   -q        Quiet mode (suppress stats)
   -v        Show version
   -R        List built-in recipes
@@ -102,10 +109,21 @@ async function main() {
   let outputFile = null
   let jsonMode = false
   let quiet = false
+  let allowBlocking = false
+  let failOnBlocking = false
+  let memory, spillDir, statsFile
+  let target = 'native'
+  let dialect = 'duckdb'
+  function valueAt(i, inline, flag) {
+    const value = inline === undefined ? argv[i + 1] : inline
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`)
+    return value
+  }
 
   // Parse args
   for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]
+    const [arg, ...assigned] = argv[i].split('=')
+    const inline = assigned.length ? assigned.join('=') : undefined
     if (arg === '-h' || arg === '--help') { usage(); process.exit(0) }
     else if (arg === '-v' || arg === '--version') {
       const v = nativeBinding ? nativeBinding.version() : 'unknown'
@@ -121,17 +139,34 @@ async function main() {
       }
       process.exit(0)
     }
-    else if (arg === '-j') jsonMode = true
-    else if (arg === '-q') quiet = true
-    else if (arg === '-f') { pipelineFile = argv[++i] }
-    else if (arg === '-i') { inputFile = argv[++i] }
-    else if (arg === '-o') { outputFile = argv[++i] }
-    else if (!arg.startsWith('-')) { pipelineText = arg }
+    else if (arg === '-j' || arg === '--json') jsonMode = true
+    else if (arg === '-q' || arg === '--quiet') quiet = true
+    else if (arg === '--allow-blocking') allowBlocking = true
+    else if (arg === '--fail-on-blocking') failOnBlocking = true
+    else if (['-f', '--file', '-i', '--input', '-o', '--output', '--memory', '--spill-dir', '--stats-json', '--target', '--dialect'].includes(arg)) {
+      const value = valueAt(i, inline, arg)
+      if (inline === undefined) i++
+      if (arg === '-f' || arg === '--file') pipelineFile = value
+      else if (arg === '-i' || arg === '--input') inputFile = value
+      else if (arg === '-o' || arg === '--output') outputFile = value
+      else if (arg === '--memory') memory = value
+      else if (arg === '--spill-dir') spillDir = value
+      else if (arg === '--stats-json') statsFile = value
+      else if (arg === '--target') target = value
+      else if (arg === '--dialect') dialect = value
+    }
+    else if (!argv[i].startsWith('-')) {
+      if (pipelineText !== null) throw new Error('only one pipeline argument is allowed')
+      pipelineText = argv[i]
+    }
     else {
       process.stderr.write(`error: unknown option '${arg}'\n`)
       process.exit(1)
     }
   }
+
+  if (allowBlocking && failOnBlocking) throw new Error('--allow-blocking conflicts with --fail-on-blocking')
+  if (!['native', 'json', 'sql'].includes(target)) throw new Error('unknown --target; expected native, json or sql')
 
   // Get pipeline text
   if (pipelineFile) {
@@ -143,26 +178,44 @@ async function main() {
     process.exit(1)
   }
 
-  // JSON mode
-  if (jsonMode) {
+  const named = (await recipes()).find(recipe => recipe.name === pipelineText.trim())
+  if (named) pipelineText = named.dsl
+  if (target === 'sql') {
+    process.stdout.write(await compileToSql(pipelineText, { dialect }) + '\n')
+    return
+  }
+
+  if (jsonMode || target === 'json') {
     const json = await compileDsl(pipelineText)
     process.stdout.write(json + '\n')
     process.exit(0)
   }
 
-  // Create and run pipeline
   const p = pipeline(pipelineText)
-  const input = inputFile ? undefined : await readStdin()
-  const result = await p.run({
+  const options = {
     inputFile: inputFile || undefined,
-    input
-  })
-
-  // Write output
+    inputStream: inputFile ? undefined : process.stdin,
+    allowBlocking, memory, spillDir, allowFs: true, allowRulesFile: true
+  }
+  let result
   if (outputFile) {
-    writeFileSync(outputFile, result.output)
+    let fd
+    try {
+      result = await p.run({
+        ...options,
+        collectOutput: false,
+        onOutput(chunk) {
+          // Open only after plan validation; a rejected plan must not truncate output.
+          if (fd === undefined) fd = openSync(outputFile, 'w')
+          writeFileSync(fd, chunk)
+        }
+      })
+      if (fd === undefined) fd = openSync(outputFile, 'w')
+    } finally {
+      if (fd !== undefined) closeSync(fd)
+    }
   } else {
-    process.stdout.write(result.output)
+    result = await p.writeTo(process.stdout, { ...options, end: false })
   }
 
   // Errors to stderr
@@ -170,18 +223,8 @@ async function main() {
     process.stderr.write(result.errors)
   }
 
-  // Stats to stderr (unless quiet)
-  if (!quiet && result.stats.length > 0) {
-    process.stderr.write(result.stats)
-  }
-}
-
-function readStdin() {
-  return new Promise((resolve) => {
-    const chunks = []
-    process.stdin.on('data', chunk => chunks.push(chunk))
-    process.stdin.on('end', () => resolve(Buffer.concat(chunks)))
-  })
+  if (statsFile && statsFile !== '-') writeFileSync(statsFile, result.stats)
+  else if ((statsFile || !quiet) && result.stats.length > 0) process.stderr.write(result.stats)
 }
 
 main().catch(err => {

@@ -5,10 +5,6 @@ CSV, JSONL, and text byte streams; it is not an in-memory pandas-style DataFrame
 Row-local operations stream, bounded operators declare their limits, and
 full-input operators require an explicit blocking or spill policy.
 
-> **Unreleased main:** The prepared-transform API documented below targets
-> Tranfi 0.2. Current PyPI 0.1.x installs do not include it; build this branch
-> from source until 0.2 is published.
-
 ```python
 import tranfi as tf
 
@@ -30,6 +26,7 @@ print(result.output_text)
 
 Or use the pipe DSL for one-liners:
 
+<!-- readme-test: python-api -->
 ```python
 result = tf.pipeline('csv | filter "col(age) > 25" | top-k 100 age | csv').run(input_file='data.csv')
 ```
@@ -79,7 +76,11 @@ tranfi -i input.csv -o output.csv 'csv | select name,age | csv'
 tranfi -R
 ```
 
-Run `tranfi -h` for all options.
+Run `tranfi -h` for the pip CLI options. Use `--allow-blocking` for known-small
+full-input operations, `--memory max:64MB` for a memory policy, and
+`--spill-dir DIR` for an existing private spill directory. `--stats-json FILE`
+writes the stats channel; `--target json|sql` compiles without executing.
+The detailed `--explain` report requires the standalone C CLI built from source.
 
 ## Quick start
 
@@ -87,6 +88,7 @@ Run `tranfi -h` for all options.
 
 **Builder API** -- composable and structured:
 
+<!-- readme-test: python-api -->
 ```python
 p = tf.pipeline([
     tf.codec.csv(),
@@ -100,6 +102,7 @@ result = p.run(input_file='students.csv')
 
 **DSL strings** -- compact, suitable for CLI-like use:
 
+<!-- readme-test: python-api -->
 ```python
 p = tf.pipeline('csv | filter "col(score) >= 80" | top-k 10 score | csv')
 result = p.run(input_file='students.csv')
@@ -111,6 +114,7 @@ Dataframe-style DSL aliases are accepted and normalize to canonical ops: `mutate
 
 ### Running pipelines
 
+<!-- readme-test: python-pipeline -->
 ```python
 # From bytes
 result = p.run(input=b'name,age\nAlice,30\n')
@@ -129,6 +133,7 @@ result.samples        # bytes (sample channel)
 
 For large outputs, drain chunks instead of collecting `result.output`:
 
+<!-- readme-test: python-pipeline -->
 ```python
 # Callback sink; result.output is empty when collect_output=False
 with open('out.csv', 'wb') as out:
@@ -228,6 +233,7 @@ Each JSONL record must be one complete UTF-8 JSON object. Invalid number syntax,
 
 Cross-codec pipelines work naturally:
 
+<!-- readme-test: python-api -->
 ```python
 # CSV in, JSONL out
 tf.pipeline([tf.codec.csv(), tf.ops.head(5), tf.codec.jsonl_encode()])
@@ -298,6 +304,7 @@ Example: `tf.ops.across(['starts_with(score_)'], fn='round')` replaces selected 
 | `ops.frequency(columns, max_values=None, max_state_bytes=None, overflow=None, other=None, audit=False, audit_limit=None, audit_include_row=None, audit_columns=None, audit_redact=None, audit_hash_columns=None, audit_max_bytes=None, audit_max_cell_bytes=None)` | Value counts; `overflow="other"` can emit bounded category-overflow audit records with privacy controls |
 | `ops.group_agg(group_by, aggs)` | Group by + aggregate. `count` on a column counts non-null values; `column='*'` counts rows. |
 
+<!-- readme-test: python-api -->
 ```python
 # Group aggregation
 tf.ops.group_agg(['city'], [
@@ -356,6 +363,7 @@ tf.ops.group_agg(['city'], [
 
 Used in `filter`, `derive`, `validate`, and `assert_`. Reference columns with `col('name')`.
 
+<!-- readme-test: python-api -->
 ```python
 tf.ops.filter(tf.expr("col('age') > 25 and contains(col('name'), 'A')"))
 tf.ops.derive({
@@ -379,6 +387,7 @@ tf.ops.derive({
 
 Aliases: `substr`=`slice`, `length`=`len`, `lpad`=`pad_left`, `rpad`=`pad_right`, `min`=`least`, `max`=`greatest`. Date/time functions are row-local and accept date/timestamp values plus parseable date/timestamp strings; `weekday()` returns `0=Sunday` through `6=Saturday`.
 
+<!-- readme-test: python-api -->
 ```python
 tf.ops.derive({
     'year': tf.expr("year(col('date'))"),
@@ -390,6 +399,7 @@ tf.ops.derive({
 
 Built-in named pipelines for common tasks. Use by name:
 
+<!-- readme-test: python-api -->
 ```python
 result = tf.pipeline('preview').run(input_file='data.csv')
 result = tf.pipeline('freq').run(input_file='data.csv')
@@ -422,6 +432,7 @@ result = tf.pipeline('freq').run(input_file='data.csv')
 
 List all recipes programmatically:
 
+<!-- readme-test: python-api -->
 ```python
 for r in tf.recipes():
     print(f"{r['name']:15} {r['description']}")
@@ -432,12 +443,14 @@ for r in tf.recipes():
 
 Native execution rejects full-input blocking steps such as `sort`, `pivot`, `normalize`, `acf`, and table encoding unless you opt in for known-small data:
 
+<!-- readme-test: python-api -->
 ```python
 tf.pipeline('csv | sort age | csv').run(input_file='small.csv', allow_blocking=True)
 ```
 
 For capped key-state operators, pass `memory` to validate the conservative native state estimate before execution:
 
+<!-- readme-test: python-api -->
 ```python
 tf.pipeline('csv | unique city max_keys=10000 | csv').run(input_file='data.csv', memory='64MB')
 ```
@@ -454,6 +467,7 @@ Run pipelines on DuckDB instead of the native C streaming core. The DSL is trans
 pip install tranfi[duckdb]
 ```
 
+<!-- readme-test: python-data -->
 ```python
 # Run a pipeline via DuckDB
 result = tf.pipeline('csv | filter "age > 25" | sort -age | csv', engine='duckdb')
@@ -467,6 +481,7 @@ result = tf.pipeline('csv | head 10 | csv', engine='duckdb').run(input=csv_bytes
 
 Generate SQL directly from DSL strings:
 
+<!-- readme-test: python-api -->
 ```python
 sql = tf.compile_to_sql('csv | filter "col(age) > 25" | sort -age | head 10 | csv',
                         dialect='duckdb')
@@ -485,6 +500,7 @@ separate compatibility tests and SQL-generation rules.
 
 ### DSL compilation
 
+<!-- readme-test: python-api -->
 ```python
 # Compile DSL to JSON plan
 json_plan = tf.compile_dsl('csv | filter "col(age) > 25" | sort -age | csv')
@@ -504,6 +520,7 @@ Every pipeline produces four output channels:
 - **stats** -- newline-delimited execution statistics: run summary plus per-step counters, state estimates, and warnings
 - **samples** -- reserved for sampling operators
 
+<!-- readme-test: python-pipeline -->
 ```python
 result = p.run(input_file='data.csv')
 print(result.stats_text)   # newline-delimited JSON: summary plus step_stats/state_bytes_estimate/warnings
@@ -511,6 +528,7 @@ print(result.stats_text)   # newline-delimited JSON: summary plus step_stats/sta
 
 ### Pipeline from JSON
 
+<!-- readme-test: python-api -->
 ```python
 p = tf.pipeline(recipe='{"steps":[{"op":"codec.csv.decode","args":{}},{"op":"head","args":{"n":5}},{"op":"codec.csv.encode","args":{}}]}')
 ```

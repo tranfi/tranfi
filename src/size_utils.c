@@ -104,6 +104,9 @@ char *tf_string_append_suffix_checked(const char *prefix, const char *suffix) {
     return copy;
 }
 
+/* Platforms with qsort_r do not compile the portable introsort fallback. */
+#if !defined(__GLIBC__) && !defined(__APPLE__) && !defined(__FreeBSD__) && \
+    !defined(__OpenBSD__) && !defined(__NetBSD__)
 static void tf_index_swap(size_t *a, size_t *b) {
     size_t tmp = *a;
     *a = *b;
@@ -225,6 +228,7 @@ static void tf_sort_indices_intro_loop(size_t *indices, size_t lo, size_t hi, si
     }
     tf_sort_indices_insertion_range(indices, lo, hi, compare, ctx);
 }
+#endif
 
 typedef struct {
     tf_index_compare_fn compare;

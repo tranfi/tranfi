@@ -18,7 +18,7 @@ fail() {
 }
 
 version=$("$bin" -v)
-[[ "$version" == "tranfi 0.2.0" ]] || fail "expected CLI version 0.2.0, got: $version"
+[[ "$version" == "tranfi 0.2.1" ]] || fail "expected CLI version 0.2.1, got: $version"
 
 # Native CLI is strict by default: blocking sort must not run silently.
 if "$bin" 'csv | sort age | csv' < "$input" > "$tmp/out" 2> "$tmp/err"; then

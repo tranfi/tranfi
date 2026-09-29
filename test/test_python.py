@@ -26,7 +26,7 @@ import tranfi as tf
 
 def test_version():
     v = tf.version()
-    assert v == '0.2.0'
+    assert v == '0.2.1'
     assert tf.__version__ == v
 
 
@@ -4412,3 +4412,45 @@ def test_codec_fuzz_harness_creates_pipeline(tmp_path, codec):
                     '-lm', '-pthread', '-o', str(executable)], check=True,
                    capture_output=True)
     subprocess.run([str(executable)], check=True, capture_output=True)
+
+
+def _run_python_cli(args, data=b'name,age\nBob,30\nAlice,20\n'):
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    env = dict(os.environ, PYTHONPATH=str(root / 'py'))
+    return subprocess.run([sys.executable, '-m', 'tranfi.cli', *args],
+                          input=data, capture_output=True, env=env)
+
+
+def test_cli_blocking_requires_opt_in():
+    rejected = _run_python_cli(['csv | sort age | csv'])
+    assert rejected.returncode != 0
+    assert b"blocking step 'sort'" in rejected.stderr
+    accepted = _run_python_cli(['--allow-blocking', '-q', 'csv | sort age | csv'])
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout == b'name,age\nAlice,20\nBob,30\n'
+
+
+def test_cli_memory_spill_and_stats(tmp_path):
+    capped = _run_python_cli(['--allow-blocking', '--memory', '64KB', 'csv | sort age | csv'])
+    assert capped.returncode != 0
+    assert b'byte caps' in capped.stderr
+    stats = tmp_path / 'stats.jsonl'
+    result = _run_python_cli(['--memory', '64KB', '--spill-dir', str(tmp_path),
+                              '--stats-json', str(stats), '-q', 'csv | sort age | csv'])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b'name,age\nAlice,20\nBob,30\n'
+    assert b'step_stats' in stats.read_bytes()
+    assert result.stderr == b''
+
+
+def test_cli_compile_targets_and_invalid_args():
+    result = _run_python_cli(['--target', 'sql', '--dialect', 'duckdb', 'csv | head 1 | csv'])
+    assert result.returncode == 0, result.stderr
+    assert b'SELECT' in result.stdout
+    result = _run_python_cli(['--target', 'json', 'preview'])
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['steps'][1]['op'] == 'head'
+    assert _run_python_cli(['--allow-blocking', '--fail-on-blocking', 'csv | csv']).returncode != 0
+    assert _run_python_cli(['--memory']).returncode != 0

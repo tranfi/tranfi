@@ -346,11 +346,10 @@ class TestParitySelection:
         dsl = 'csv | skip 100 | csv'
         native = tf.pipeline(dsl).run(input=CSV_CITIES)
         duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_CITIES)
-        n_lines = native.output_text.strip().split('\n')
-        d_lines = duck.output_text.strip().split('\n')
-        # Both should have only header (or be empty)
-        assert len(n_lines) <= 2
-        assert len(d_lines) <= 2
+        # Header preservation differs across backends; neither may emit a data row.
+        header = CSV_CITIES.split(b'\n', 1)[0] + b'\n'
+        assert native.output in (b'', header)
+        assert duck.output in (b'', header)
 
     def test_top(self):
         assert_parity('csv | top 3 score | csv', data=CSV_CITIES, ordered=True)
@@ -755,11 +754,10 @@ class TestParityEdgeCases:
         dsl = 'csv | filter "col(\'age\') > 100" | csv'
         native = tf.pipeline(dsl).run(input=CSV_CITIES)
         duck = tf.pipeline(dsl, engine='duckdb').run(input=CSV_CITIES)
-        n_lines = native.output_text.strip().split('\n')
-        d_lines = duck.output_text.strip().split('\n')
-        # Both should have just header
-        assert len(n_lines) <= 2  # header only (or header + empty)
-        assert len(d_lines) <= 2
+        # Header preservation differs across backends; neither may emit a data row.
+        header = CSV_CITIES.split(b'\n', 1)[0] + b'\n'
+        assert native.output in (b'', header)
+        assert duck.output in (b'', header)
 
     def test_single_row(self):
         """Single data row."""

@@ -6,10 +6,6 @@ it is not an in-memory DataFrame API. Row-local operations stream, bounded
 operators declare their limits, and full-input operators require an explicit
 blocking or spill policy.
 
-> **Unreleased main:** The prepared-transform API documented below targets
-> Tranfi 0.2. Current npm 0.1.x installs do not include it; build this branch
-> from source until 0.2 is published.
-
 Save this example as `quickstart.mjs`:
 
 ```js
@@ -35,6 +31,7 @@ console.log(result.outputText)
 
 Or use the pipe DSL for one-liners:
 
+<!-- readme-test: js-api -->
 ```js
 const result = await pipeline('csv | filter "col(age) > 25" | top-k 100 age | csv')
   .run({ inputFile: 'data.csv' })
@@ -70,7 +67,7 @@ Installing the package also provides the `tranfi` command:
 
 ```bash
 # Via npx (no install)
-echo 'name,age\nAlice,30\nBob,25' | npx tranfi -q 'csv | filter "age > 25" | csv'
+printf 'name,age\nAlice,30\nBob,25\n' | npx tranfi -q 'csv | filter "age > 25" | csv'
 
 # Or install globally
 npm i -g tranfi
@@ -79,7 +76,11 @@ tranfi profile < data.csv
 tranfi -R  # list recipes
 ```
 
-Run `tranfi -h` for all options.
+Run `tranfi -h` for the npm CLI options. Use `--allow-blocking` for known-small
+full-input operations, `--memory max:64MB` for a memory policy, and
+`--spill-dir DIR` for an existing private spill directory. `--stats-json FILE`
+writes the stats channel; `--target json|sql` compiles without executing.
+The detailed `--explain` report requires the standalone C CLI built from source.
 
 ## Quick start
 
@@ -87,6 +88,7 @@ Run `tranfi -h` for all options.
 
 **Builder API** -- composable, structured, and IDE-friendly:
 
+<!-- readme-test: js-api -->
 ```js
 const p = pipeline([
   codec.csv(),
@@ -100,6 +102,7 @@ const result = await p.run({ inputFile: 'students.csv' })
 
 **DSL strings** -- compact, suitable for CLI-like use:
 
+<!-- readme-test: js-api -->
 ```js
 const p = pipeline('csv | filter "col(score) >= 80" | top-k 10 score | csv')
 const result = await p.run({ inputFile: 'students.csv' })
@@ -111,12 +114,13 @@ Dataframe-style DSL aliases are accepted and normalize to canonical ops: `mutate
 
 ### Running pipelines
 
+<!-- readme-test: js-pipeline -->
 ```js
 // From string or Buffer
 const result = await p.run({ input: 'name,age\nAlice,30\n' })
 
 // From file (streamed in 64 KB chunks)
-const result = await p.run({ inputFile: 'data.csv' })
+const fileResult = await p.run({ inputFile: 'data.csv' })
 
 // Access results
 result.output         // Buffer
@@ -129,8 +133,9 @@ result.samples        // Buffer (sample channel)
 
 For large outputs, drain chunks instead of collecting `result.output`:
 
+<!-- readme-test: js-pipeline -->
 ```js
-const { createReadStream, createWriteStream } = require("fs")
+import { createReadStream, createWriteStream } from 'node:fs'
 
 // Write to a Node Writable and wait for `drain` when the sink applies backpressure.
 const out = createWriteStream("out.csv")
@@ -165,6 +170,7 @@ Standalone WASM exposes the same non-collecting shape for in-memory data: `tf.ru
 
 For browser UI work, keep Worker placement outside the core pipeline and use the optional WASM Worker adapter:
 
+<!-- readme-test: browser -->
 ```js
 // main thread
 import { createWorkerClient } from 'tranfi/wasm/worker'
@@ -203,7 +209,7 @@ Prepared runtime option objects reject unknown fields. Native Node accepts
 reserved as described above, and cancellation spellings are not interchangeable.
 
 ```js
-const tf = require('tranfi')
+import tf from 'tranfi'
 
 const recipeSpec = {
   format: 'tranfi.transform-recipe',
@@ -247,6 +253,7 @@ recipe.close()
 
 `tranfi/wasm` exposes the same classes on the initialized module. The Worker adapter adds `analyzeTransform()` and `applyTransform()`. With `SharedArrayBuffer`, an `AbortSignal` interrupts a synchronous C call through an atomic poll cell. Without it, cancellation terminates the whole worker and reclaims its WASM heap. Pass a worker URL directly so the client can recreate it, or supply an owned worker plus `workerFactory`:
 
+<!-- readme-test: browser -->
 ```js
 const workerUrl = new URL('./tranfi-worker.js', import.meta.url)
 const makeWorker = () => new Worker(workerUrl, { type: 'module' })
@@ -281,6 +288,7 @@ Each JSONL record must be one complete UTF-8 JSON object. Invalid number syntax,
 
 Cross-codec pipelines work naturally:
 
+<!-- readme-test: js-api -->
 ```js
 // CSV in, JSONL out
 pipeline([codec.csv(), ops.head(5), codec.jsonlEncode()])
@@ -351,6 +359,7 @@ Example: `ops.across(['starts_with(score_)'], { fn: 'round' })` replaces selecte
 | `ops.frequency(columns?, { maxValues, maxStateBytes, overflow, other, audit, auditLimit, auditIncludeRow, auditColumns, auditRedact, auditHashColumns, auditMaxBytes, auditMaxCellBytes }?)` | Value counts; `overflow: "other"` can emit bounded category-overflow audit records with privacy controls |
 | `ops.groupAgg(groupBy, aggs)` | Group by + aggregate. `count` on a column counts non-null values; `column: '*'` counts rows. |
 
+<!-- readme-test: js-api -->
 ```js
 // Group aggregation
 ops.groupAgg(['city'], [
@@ -409,6 +418,7 @@ ops.groupAgg(['city'], [
 
 Used in `filter`, `derive`, `validate`, and `assert`. Reference columns with `col('name')`.
 
+<!-- readme-test: js-api -->
 ```js
 ops.filter(expr("col('age') > 25 and contains(col('name'), 'A')"))
 ops.derive({
@@ -432,6 +442,7 @@ ops.derive({
 
 Aliases: `substr`=`slice`, `length`=`len`, `lpad`=`pad_left`, `rpad`=`pad_right`, `min`=`least`, `max`=`greatest`. Date/time functions are row-local and accept date/timestamp values plus parseable date/timestamp strings; `weekday()` returns `0=Sunday` through `6=Saturday`.
 
+<!-- readme-test: js-api -->
 ```js
 ops.derive({
   year: expr("year(col('date'))"),
@@ -443,9 +454,10 @@ ops.derive({
 
 Built-in named pipelines for common tasks. Use by name:
 
+<!-- readme-test: js-api -->
 ```js
 const result = await pipeline('preview').run({ inputFile: 'data.csv' })
-const result = await pipeline('freq').run({ inputFile: 'data.csv' })
+const frequencies = await pipeline('freq').run({ inputFile: 'data.csv' })
 ```
 
 | Recipe | Pipeline | Description |
@@ -488,12 +500,14 @@ for (const r of await recipes()) {
 
 Native Node/WASM execution rejects full-input blocking steps such as `sort`, `pivot`, `normalize`, `acf`, and table encoding unless you opt in for known-small data:
 
+<!-- readme-test: js-api -->
 ```js
 await pipeline('csv | sort age | csv').run({ inputFile: 'small.csv', allowBlocking: true })
 ```
 
 For capped key-state operators, pass `memory` to validate the conservative native state estimate before execution:
 
+<!-- readme-test: js-api -->
 ```js
 await pipeline('csv | unique city max_keys=10000 | csv').run({ inputFile: 'data.csv', memory: '64MB' })
 ```
@@ -510,6 +524,7 @@ Run pipelines on DuckDB instead of the native C streaming core. The DSL is trans
 npm install duckdb
 ```
 
+<!-- readme-test: js-data -->
 ```js
 import { pipeline, compileToSql } from 'tranfi'
 
@@ -526,6 +541,7 @@ const result2 = await pipeline('csv | head 10 | csv', { engine: 'duckdb' })
 
 Generate SQL directly from DSL strings:
 
+<!-- readme-test: js-sql -->
 ```js
 const sql = await compileToSql(
   'csv | filter "col(age) > 25" | sort -age | head 10 | csv',
@@ -546,6 +562,7 @@ their own compatibility tests and SQL-generation rules.
 
 In the browser, use `@duckdb/duckdb-wasm` with the tranfi WASM module:
 
+<!-- readme-test: browser -->
 ```js
 import createTranfi from 'tranfi/wasm'
 import * as duckdb from '@duckdb/duckdb-wasm'
@@ -571,7 +588,7 @@ console.log(result.rows)        // Array of row objects
 ### DSL compilation
 
 ```js
-import { compileDsl, saveRecipe, loadRecipe } from 'tranfi'
+import { compileDsl, saveRecipe, loadRecipe, codec, ops } from 'tranfi'
 
 // Compile DSL to JSON plan
 const json = await compileDsl('csv | filter "col(age) > 25" | sort -age | csv')
@@ -591,6 +608,7 @@ Every pipeline produces four output channels:
 - **stats** -- newline-delimited execution statistics: run summary plus per-step counters, state estimates, and warnings
 - **samples** -- reserved for sampling operators
 
+<!-- readme-test: js-pipeline -->
 ```js
 const result = await p.run({ inputFile: 'data.csv' })
 console.log(result.statsText)   // newline-delimited JSON: summary plus step_stats/state_bytes_estimate/warnings
@@ -599,6 +617,8 @@ console.log(result.statsText)   // newline-delimited JSON: summary plus step_sta
 ### Pipeline from JSON
 
 ```js
+import { loadRecipe } from 'tranfi'
+
 const p = await loadRecipe({
   steps: [
     { op: 'codec.csv.decode', args: {} },
@@ -613,7 +633,7 @@ const p = await loadRecipe({
 The package automatically selects the best backend:
 
 1. **N-API** (Node.js) -- native C addon, fastest, used when available
-2. **WASM** (browsers/fallback) -- same C core compiled to WebAssembly, ~500 KB single-file
+2. **WASM** (browsers/fallback) -- same C core compiled to WebAssembly, single-file module
 3. **DuckDB** (opt-in) -- SQL execution via `{ engine: 'duckdb' }`, requires `npm install duckdb`
 
 ```js

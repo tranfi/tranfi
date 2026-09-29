@@ -3,11 +3,6 @@
 Streaming ETL language in C11. Pipe DSL, push/pull API, columnar batches,
 built-in transforms, and seven codecs. Bindings for Python, Node.js, and WASM.
 
-> **Unreleased main:** The prepared-transform API documented below targets
-> Tranfi 0.2. Current npm/PyPI 0.1.x installs provide the byte-stream pipeline
-> API but not prepared transforms; build this branch from source until 0.2 is
-> published.
-
 ```bash
 tranfi -q "csv | filter \"age > 25\" | top-k 100 age | derive label=if(col(age)>30,'senior','junior') | csv" < people.csv
 ```
@@ -40,13 +35,6 @@ The Windows release lane installs the packed npm artifact with native compilatio
 disabled and tests `tranfi/wasm`; it does not claim Windows support for the native
 addon, Python package, or CLI. Native support on other operating systems is not a
 published 0.2 contract until it has an equivalent build-and-test lane.
-
-**Binary** (prebuilt Linux x64 CLI; no local compilation):
-
-```bash
-curl -fsSL https://github.com/tranfi/tranfi/releases/latest/download/tranfi-linux-x64.tar.gz \
-  | tar xz && sudo mv tranfi-linux-x64 /usr/local/bin/tranfi
-```
 
 ## Choose the right surface
 
@@ -81,12 +69,12 @@ tranfi -i input.csv -o output.csv 'csv | select name,age | csv'
 # Compile to JSON plan with memory/emit/schema/state metadata
 tranfi -j 'csv | head 10 | csv'
 
-# Explain whether each step streams, buffers, or blocks
-tranfi --explain 'csv | sort -score | head 100 | csv'
+# Explain with the standalone C CLI (build first: make build-c)
+./build/tranfi --explain 'csv | sort -score | head 100 | csv'
 tranfi --stats-json run.ndjson 'csv | filter "col(age) > 25" | csv' < data.csv > out.csv
 
 # Blocking native plans are rejected by default
-tranfi 'csv | sort -score | csv'
+tranfi 'csv | sort -score | csv' # readme-test: rejects-blocking
 
 # Explicitly allow full-input native execution only for known-small inputs
 tranfi --allow-blocking 'csv | sort -score | csv'
@@ -120,6 +108,7 @@ result = tf.pipeline([
 
 ### Node.js ([full docs](js/))
 
+<!-- readme-test: node-cjs -->
 ```js
 const { pipeline, codec, ops, expr } = require('tranfi')
 
@@ -183,25 +172,31 @@ are deliberately not interchangeable.
 Tranfi pipelines can run on DuckDB instead of the native C core. The DSL is transpiled to SQL in C, so it works across all targets.
 Python and Node DuckDB adapters SQL-quote local `input_file` / `inputFile` paths before `read_csv(...)`, including paths with apostrophes.
 
+```bash
+pip install 'tranfi[duckdb]'
+```
+
 ```python
-# Python
-pip install tranfi[duckdb]
+import tranfi as tf
 
 result = tf.pipeline('csv | filter "age > 25" | sort -age | csv', engine='duckdb').run(input_file='data.csv')
 ```
 
-```js
-// Node.js
-npm install duckdb
+```bash
+npm install tranfi duckdb
+```
 
-const { pipeline } = require('tranfi')
+```js
+import tranfi from 'tranfi'
+const { pipeline } = tranfi
 const result = await pipeline('csv | filter "age > 25" | sort -age | csv', { engine: 'duckdb' })
   .run({ inputFile: 'data.csv' })
 ```
 
+<!-- readme-test: browser -->
 ```js
-// Browser (WASM)
-const createTranfi = require('tranfi/wasm')
+// Browser (WASM), using an initialized DuckDB-WASM instance and CSV input.
+import createTranfi from 'tranfi/wasm'
 
 const tf = await createTranfi()
 const result = await tf.runDuckDB(duckdbInstance, 'csv | filter "age > 25" | csv', csvData)
@@ -226,6 +221,7 @@ tranfi --target sql --dialect duckdb 'csv | filter "age > 25" | sort -age | head
 
 The `compileToSql` function is available on all targets for direct SQL generation:
 
+<!-- readme-test: python-api -->
 ```python
 sql = tf.compile_to_sql('csv | filter "age > 25" | sort -age | head 10 | csv',
                         dialect='duckdb')
@@ -237,10 +233,17 @@ sql = tf.compile_to_sql('csv | filter "age > 25" | sort -age | head 10 | csv',
 
 ## Streaming and Memory Contract
 
+Spill directories must already exist, be owned by the current user, and have
+private permissions. Before running the examples below:
+
+```bash
+mkdir -m 700 -p /tmp/tranfi-spill
+```
+
 Tranfi is streaming-first, but it does not pretend every operation has the same memory behavior. Compile or explain a pipeline before running large inputs:
 
 ```bash
-tranfi --explain 'csv | sort -score | head 100 | csv'
+./build/tranfi --explain 'csv | sort -score | head 100 | csv'
 tranfi -j 'csv | top-k 100 score | csv'
 tranfi -j 'csv | slice-min score n=100 | csv'
 tranfi -j 'csv | unique city max_keys=100000 | csv'
@@ -358,6 +361,12 @@ Machine-readable CSV and JSONL output uses round-trip float formatting, so finit
 | `jsonl` | `batch_size=1024` `on_error=skip|fail|warn|quarantine` `max_error_bytes=4096` `max_record_bytes=67108864` |
 | `text` | `batch_size=1024` `max_error_bytes=4096` `max_record_bytes=67108864` |
 | `table` | `max_width=40` `max_rows=0` |
+
+Empty CSV results currently do not consistently retain a header. If a filter or
+join removes every row, or the input contains only a header, the pipeline may
+emit zero bytes. `csv n_max=0 | csv` explicitly preserves the input header.
+Consumers must handle an empty byte stream; automatic header preservation across
+all operators is not yet implemented.
 
 Cross-codec: `csv | ... | jsonl`. The `text` codec splits on newlines into a single `_line` column - no field parsing, no type detection - and uses the same record-size guard for long no-newline lines. The `table` codec outputs a Markdown-formatted table (like `csvlook`). Default CSV decode is legacy permissive for field-count mismatches inside the configured column cap: short rows are null-padded and long rows are truncated. Use `csv mode=strict` to fail on row/header field-count mismatches, or `csv repair` / `csv mode=repair` to keep repairing while emitting bounded JSONL diagnostics to the `errors` side channel with line, byte offset, expected/actual field counts, and raw preview controlled by `max_error_bytes`. `max_columns` defaults to `8192`; records above the cap fail in every mode with a bounded `csv_too_many_columns` diagnostic instead of silently dropping columns. Add `audit audit_limit=N` in repair mode to also emit bounded `row_repaired` audit records to the `stats` side channel; this is opt-in so normal repair does not create a second retained output stream. `max_record_bytes` bounds the buffered record before a terminator is seen for CSV, JSONL, and text decoders; default is `67108864`, set `0` to disable. Overflow emits bounded `csv_record_too_large`, `jsonl_record_too_large`, or `text_record_too_large` diagnostics to `errors` and then fails. Decoder size options are checked integer values before execution: `batch_size` must be `1..65536`, `max_error_bytes` must be `0..67108864`, `max_record_bytes` must be `0..1073741824`, and `max_columns` must be `1..65536`, so oversized or fractional values fail cleanly instead of wrapping native/WASM allocation sizes. Global string/schema budgets also apply: string cells are capped at `67108864` bytes, column names at `4096` bytes, and retained schema-name bytes at `16777216`. CSV follows RFC-style record boundaries for quoted fields: delimiters and newlines inside quoted fields stay in the field, doubled quotes are unescaped, and quotes inside unquoted fields are treated as data instead of changing record state. CSV treats unquoted empty fields as null by default; `nulls=NA,NULL` adds sentinel strings, and `quoted_nulls=false` preserves quoted sentinels such as `"NA"` or `""` as strings. `header=false` treats the first physical record as data and synthesizes stable column names `col1`, `col2`, ... from that record's width; those names are ordinary schema names for downstream ops. `skip=N` discards N physical records before header/schema discovery; comments are applied after skipped rows. `n_max=N` / `max_rows=N` keeps at most N decoded data rows after skip/comment/header handling and uses only one counter; `n_max=0` preserves a header-only schema batch, using synthetic names when `header=false`. `comment=#` removes text after an unquoted comment marker and skips comment-only rows; markers inside quoted fields are preserved. Unquoted leading/trailing spaces and tabs are trimmed by default; set `trim_ws=false` to preserve them. Blank physical rows after the header are preserved as all-null rows by default for compatibility; set `skip_empty_rows=true` to drop them. `skip_repeated_header=true` is an input-boundary policy for sharded CSV: after `tf_pipeline_flush_input()` marks a new source boundary, the next parsed non-comment data record is dropped only when every field exactly matches the original header. It is row-local plus schema-state, does not scan ahead, and does not remove repeated header-like rows within a single file.
 
@@ -572,7 +581,7 @@ Aliases: `substr`=`slice`, `length`=`len`, `lpad`=`pad_left`, `rpad`=`pad_right`
 tranfi 'csv | derive total=col(price)*col(qty) | csv'
 
 # Row-local date/time columns
-tranfi 'csv | derive y=year(col(date)) month_start=date_trunc(col(date),"month") | csv'
+tranfi "csv | derive y=year(col(date)) month_start=date_trunc(col(date),'month') | csv"
 
 # Combined pipeline
 tranfi 'csv | filter "col(age) > 25" | sort -score | head 10 | csv'
@@ -617,11 +626,11 @@ tranfi 'csv | ewma price 0.3 | diff price | anomaly price 3.0 | csv'
 tranfi 'csv | ewma price 0.3 on_type_error=null | bin score 10,20,30 missing=null | csv'
 
 # ML preprocessing: encode, normalize, split
-tranfi 'csv | label-encode city city_id categories=NY,LA unknown=other | onehot color categories=red,blue,green unknown=null --drop | normalize score minmax | split-data 0.8 | csv'
+tranfi --allow-blocking 'csv | label-encode city city_id categories=NY,LA unknown=other | onehot color categories=red,blue,green unknown=null --drop | normalize score minmax | split-data 0.8 | csv'
 
 # Time series: interpolate nulls, autocorrelation
-tranfi 'csv | interpolate price linear | csv'
-tranfi 'csv | acf price 20 | csv'
+tranfi --allow-blocking 'csv | interpolate price linear | csv'
+tranfi --allow-blocking 'csv | acf price 20 | csv'
 ```
 
 ## Benchmarks
@@ -727,7 +736,7 @@ make test-oom        # allocation-failure regression matrix
 make build-js        # sync/check js/csrc, build native Node + WASM
 make build-py        # sync/check py/csrc, build and audit Python sdist
 make check-csrc-sync # verify src/, py/csrc, and js/csrc are byte-identical
-make wasm            # WASM (single-file, embedded, ~500 KB)
+make wasm            # WASM (single-file, embedded)
 ```
 
 Or manually:
@@ -737,6 +746,21 @@ cd build && cmake .. -DBUILD_TESTING=ON && make && ./test_core
 ```
 
 ## CLI reference
+
+The standalone C CLI provides the complete reference below. Build it with
+`make build-c` and run `./build/tranfi`. The pip and npm packages provide their
+own `tranfi` commands; they are not copies of the standalone executable.
+
+| Option | C | pip | npm |
+|--------|---|-----|-----|
+| Pipeline/file I/O, recipes, JSON/SQL targets | yes | yes | yes |
+| `--allow-blocking`, `--fail-on-blocking`, `--memory`, `--spill-dir`, `--stats-json` | yes | yes | yes |
+| `--explain`, `--engine` planning | yes | no | no |
+| `-p` progress | yes | yes | no |
+
+All three reject blocking plans by default. `--target sql --dialect duckdb`
+prints SQL; it does not execute a DuckDB query. Use the Python or JavaScript
+API with `engine='duckdb'` for execution through that engine.
 
 ```
 tranfi [OPTIONS] PIPELINE
@@ -765,7 +789,7 @@ Options:
   -R        List built-in recipes
 ```
 
-Install via `pip install tranfi`, `npm i -g tranfi`, or download a binary from [releases](https://github.com/tranfi/tranfi/releases).
+Install the binding CLI with `pip install tranfi` or `npm i -g tranfi`; build from source for the standalone C CLI.
 
 ## C API
 
@@ -775,6 +799,7 @@ Use `tf_pipeline_error(p)` for errors after a pipeline exists. `tf_last_error()`
 
 For embedder-owned sinks, register a callback before pushing input:
 
+<!-- readme-test: c-callback -->
 ```c
 typedef int (*tf_pipeline_sink_fn)(int channel, const uint8_t *data, size_t len, void *user);
 
@@ -790,6 +815,7 @@ A registered sink drains that channel after each batch and flush boundary. `tf_p
 
 For native hosts that want transformed columnar batches instead of encoded bytes, register a batch sink:
 
+<!-- readme-test: c-callback -->
 ```c
 int batch_sink(const tf_batch *batch, void *user) {
     int age_col = tf_batch_col_index(batch, "age");
@@ -810,6 +836,7 @@ The `tf_batch` pointer and any string pointers returned by `tf_batch_get_string(
 
 For progress UI, host cancellation, or external telemetry, register a progress callback:
 
+<!-- readme-test: c-callback -->
 ```c
 int progress_cb(const tf_pipeline_progress *p, void *user) {
     fprintf(stderr, "phase=%s rows=%zu/%zu bytes=%zu/%zu\n",
@@ -824,6 +851,7 @@ tf_pipeline_set_progress_callback(p, progress_cb, user, 10000);
 
 For ordinary file-to-file embedding, use the bounded runner:
 
+<!-- readme-test: c-run -->
 ```c
 FILE *in = fopen("data.csv", "rb");
 FILE *out = fopen("out.csv", "wb");
@@ -834,6 +862,7 @@ tf_pipeline_run_file(p, in, out, 64 * 1024);
 
 POSIX embedders that already own file descriptors can use the descriptor runner instead:
 
+<!-- readme-test: c-run -->
 ```c
 tf_pipeline_run_fd(p, in_fd, out_fd, 64 * 1024);
 ```
@@ -848,6 +877,7 @@ tf_pipeline_run_fd(p, in_fd, out_fd, 64 * 1024);
 ## Testing
 
 ```bash
+make test-readme         # README Python/JS/C examples and CLI commands; browser fragments reported separately
 make test                # standard gate: C + memory + Python/DuckDB + properties + Node.js + packaging + fuzz smoke
 make verify              # full local hardening gate: test + ASan/UBSan split-outs + OOM + TSan
 make test-memory         # generated-input memory/output-draining regressions
@@ -877,7 +907,7 @@ The core/debug suites also cover checked batch setters and shared schema/row-cop
 Or individually:
 
 ```bash
-./build/test_core        # 313 C core tests
+./build/test_core        # C core tests
 ./build/test_memory      # 35 native streaming memory regression tests
 python -m pytest test/   # Python tests (inc. DuckDB engine)
 node test/test_node.js   # Node.js tests (inc. SQL transpiler, DuckDB, WASM)

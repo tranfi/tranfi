@@ -56,7 +56,7 @@ def smoke_python(python: str, sdist: Path) -> None:
             'PIP_DISABLE_PIP_VERSION_CHECK': '1',
             'PIP_NO_WARN_SCRIPT_LOCATION': '0',
         }
-        run([str(py), '-m', 'pip', 'install', '--no-deps', str(sdist)], env=env)
+        run([str(py), '-m', 'pip', 'install', '--no-cache-dir', '--no-deps', str(sdist)], env=env)
         code = r'''
 from array import array
 import ctypes
@@ -85,7 +85,29 @@ if 'B,30' not in out or 'A,20' in out:
     raise SystemExit(f'unexpected output: {out!r}')
 print('python clean install smoke OK')
 '''
-        run([str(py), '-c', code])
+        run([str(py), '-c', code], cwd=tmp_path, env={'PYTHONPATH': '', 'TRANFI_LIB_PATH': ''})
+        # Resolve extras from the installed archive's metadata in this otherwise
+        # clean venv. Manually installing pandas would mask a broken extra.
+        run([str(py), '-m', 'pip', 'install', 'tranfi[duckdb]'], cwd=tmp_path, env=env)
+        run([str(py), '-c', r'''
+import subprocess
+import sys
+from pathlib import Path
+import tranfi as tf
+assert Path(tf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()), tf.__file__
+result = tf.pipeline('csv | head 1 | csv', engine='duckdb').run(input=b'x\n1\n')
+assert result.output == b'x\n1\n', result.output
+for flags, allowed in [([], False), (['--allow-blocking'], True)]:
+    result = subprocess.run([sys.executable, '-m', 'tranfi.cli', *flags, '-q',
+                             'csv | sort age | csv'],
+                            input=b'age\n30\n20\n', capture_output=True)
+    assert (result.returncode == 0) == allowed, result.stderr
+    if allowed:
+        assert result.stdout == b'age\n20\n30\n', result.stdout
+    else:
+        assert b'blocking' in result.stderr
+print('python installed DuckDB extra and CLI policy smoke OK')
+'''], cwd=tmp_path, env={'PYTHONPATH': '', 'TRANFI_LIB_PATH': ''})
 
 
 def smoke_npm(node: str, npm: str, tarball: Path) -> None:

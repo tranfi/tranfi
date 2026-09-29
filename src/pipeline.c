@@ -16,7 +16,7 @@
 #include <unistd.h>
 #endif
 
-#define TRANFI_VERSION "0.2.0"
+#define TRANFI_VERSION "0.2.1"
 
 enum {
     TF_FINISH_PHASE_DECODER = 0,

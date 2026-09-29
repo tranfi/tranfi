@@ -3590,7 +3590,7 @@ static void test_pipeline_key_state_caps(void) {
 static void test_version(void) {
     const char *v = tf_version();
     assert(v != NULL);
-    assert(strcmp(v, "0.2.0") == 0);
+    assert(strcmp(v, "0.2.1") == 0);
 }
 
 static void test_pipeline_combined(void) {
