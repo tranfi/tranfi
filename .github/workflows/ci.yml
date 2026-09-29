@@ -85,7 +85,7 @@ jobs:
 
       - uses: mymindstorm/setup-emsdk@v14
         with:
-          version: 3.1.51
+          version: 5.0.2
 
       - name: Install Python test dependencies
         run: python -m pip install --upgrade pip build pytest hypothesis pandas duckdb

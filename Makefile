@@ -89,7 +89,7 @@ build-py: sync-py-csrc check-py-csrc-sync
 	@$(PYTHON) scripts/audit-package-artifacts.py --python-sdist "py/dist/tranfi-*.tar.gz"
 
 build-wasm:
-	@bash scripts/build-wasm.sh 2>&1 | tail -3
+	@bash scripts/build-wasm.sh
 
 wasm: build-wasm
 
