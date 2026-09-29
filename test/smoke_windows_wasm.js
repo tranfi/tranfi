@@ -11,9 +11,10 @@ async function main() {
   const tf = await createTranfi()
   assert.equal(tf.version(), '0.2.0')
 
-  const streamed = await tf.pipeline('csv | filter "col(age) > 25" | csv').run({
-    input: 'name,age\nA,20\nB,30\n'
-  })
+  const streamed = tf.run(
+    'csv | filter "col(age) > 25" | csv',
+    'name,age\nA,20\nB,30\n'
+  )
   assert.match(streamed.outputText, /B,30/)
   assert.doesNotMatch(streamed.outputText, /A,20/)
 
@@ -62,7 +63,7 @@ async function main() {
     recipe.close()
   }
 
-  console.log('Windows packed WASM smoke passed')
+  console.log('Packed WASM smoke passed')
 }
 
 main().catch(error => {

@@ -128,6 +128,7 @@ async function main () {
 main().catch(err => { console.error(err); process.exit(1) })
 '''
         run([node, '-e', code], cwd=tmp_path)
+        run([node, str(REPO_ROOT / 'test' / 'smoke_windows_wasm.js')], cwd=tmp_path)
 
 
 def main() -> int:
