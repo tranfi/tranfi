@@ -44,18 +44,20 @@ const result = await pipeline('csv | filter "col(age) > 25" | top-k 100 age | cs
 npm install tranfi
 ```
 
-Installation compiles Tranfi's C core as a native Node.js addon, so you need a C
-compiler. If that compile fails, the install fails.
+No Python or compiler is required to install the npm package. Installation tries
+an optional native build on Linux/macOS and uses packaged WebAssembly if that
+build fails. Windows uses WebAssembly. `npm run build:native` explicitly builds
+the addon and reports compilation errors.
 
-In the browser, import `tranfi/wasm`: it provides pipelines and prepared
-transforms without the native addon. To install only the WebAssembly build, run
-`TRANFI_SKIP_NATIVE_BUILD=1 npm install tranfi`. The root `tranfi` entry then
-runs pipelines through WebAssembly, but its prepared-transform classes need the
-native addon, so use `tranfi/wasm` for those.
+The root `tranfi` entry automatically falls back for ordinary pipelines. Its
+synchronous prepared-transform classes still need native support; check
+`hasNativePreparedTransforms()` before using them. For portable prepared
+transforms, use `await require('tranfi/wasm')()`. The same WASM entry works in
+browsers. `TRANFI_SKIP_NATIVE_BUILD=1` explicitly skips the optional build.
 
 | | Linux | Windows | macOS |
 |---|---|---|---|
-| Native addon | Tested | Not tested | Not tested |
+| Native addon | Tested | Not supported; use WASM | Not tested |
 | WebAssembly (`tranfi/wasm`) | Tested in Node.js and Chromium | Tested in Node.js | Not tested |
 
 Use `pipeline(...)` for byte-stream ETL. The separate

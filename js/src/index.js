@@ -899,7 +899,8 @@ const {
   TransformAnalyzer,
   TransformPlan,
   TransformApply,
-  safeTransformLimits
+  safeTransformLimits,
+  hasNativePreparedTransforms
 } = require('./transform.js')
 
 module.exports = {
@@ -921,5 +922,6 @@ module.exports = {
   TransformAnalyzer,
   TransformPlan,
   TransformApply,
-  safeTransformLimits
+  safeTransformLimits,
+  hasNativePreparedTransforms
 }

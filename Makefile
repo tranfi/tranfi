@@ -161,7 +161,7 @@ test-readme: build-node build-wasm
 	@env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 NODE="$(NODE)" $(PYTEST) test/test_readme.py -q -ra
 
 test-node: build-node build-wasm
-	@env $(TEST_NODE_ENV) $(NODE) --test test/test_cli_node.js
+	@env $(TEST_NODE_ENV) $(NODE) --test test/test_install_native.js test/test_native_prepared.js test/test_cli_node.js
 	@mkdir -p "$(TEST_TMPDIR)/node"
 	@env $(TEST_NODE_ENV) $(NODE) test/test_node.js
 	@env $(TEST_NODE_ENV) $(NODE) test/test_transform_node.js

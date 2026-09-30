@@ -110,19 +110,28 @@ print('python installed DuckDB extra and CLI policy smoke OK')
 '''], cwd=tmp_path, env={'PYTHONPATH': '', 'TRANFI_LIB_PATH': ''})
 
 
-def smoke_npm(node: str, npm: str, tarball: Path) -> None:
+def smoke_npm(node: str, npm: str, tarball: Path, mode: str = 'native') -> None:
     with tempfile.TemporaryDirectory(prefix='tranfi-npm-install-', dir=temp_root()) as tmp:
         tmp_path = Path(tmp)
         env = {
             'npm_config_cache': str(temp_root() / 'npm-cache'),
             'npm_config_audit': 'false',
             'npm_config_fund': 'false',
+            'TRANFI_SKIP_NATIVE_BUILD': '',
         }
+        if mode == 'no-toolchain':
+            env.update(NODE_GYP_FORCE_PYTHON=str(tmp_path / 'missing-python'),
+                       CC=str(tmp_path / 'missing-cc'), CXX=str(tmp_path / 'missing-cxx'))
+        if mode != 'native':
+            env['TRANFI_EXPECT_WASM'] = '1'
         run([npm, 'init', '-y'], cwd=tmp_path, env=env)
-        run([npm, 'install', '--no-audit', '--no-fund', str(tarball)], cwd=tmp_path, env=env)
+        flags = ['--ignore-scripts'] if mode == 'ignore-scripts' else []
+        run([npm, 'install', '--no-audit', '--no-fund', *flags, str(tarball)], cwd=tmp_path, env=env)
         code = r'''
-const tf = require('tranfi')
+const root = require('tranfi')
 async function main () {
+  if (process.env.TRANFI_EXPECT_WASM === '1' && root.hasNativePreparedTransforms()) throw new Error('unexpected native addon')
+  const tf = root.hasNativePreparedTransforms() ? root : await require('tranfi/wasm')()
   const recipeConfig = { columns: [{ categorical: null, kind: { maxCategories: null, op: 'declared', rule: null, value: 'numeric' }, numeric: { impute: { allMissing: null, constant: null, op: 'none' }, normalize: { ddof: null, op: 'none' } }, sourceId: 'x0' }], format: 'tranfi.transform-recipe', outputDtype: 'float64', policyVersion: 1, semanticLimits: { maxOutputColumns: 65536, maxOutputElementsPerApply: 134217728 }, version: 1 }
   const schema = [{ id: 'x0', dtype: 'float64' }]
   const recipe = tf.TransformRecipe.fromJSON(recipeConfig)
@@ -140,7 +149,7 @@ async function main () {
   plan.close()
   analyzer.close()
   recipe.close()
-  const result = await tf.pipeline('csv | filter "col(age) > 25" | csv').run({ input: 'name,age\nA,20\nB,30\n' })
+  const result = await root.pipeline('csv | filter "col(age) > 25" | csv').run({ input: 'name,age\nA,20\nB,30\n' })
   const out = result.outputText
   if (!out.includes('B,30') || out.includes('A,20')) {
     throw new Error('unexpected output: ' + JSON.stringify(out))
@@ -149,7 +158,7 @@ async function main () {
 }
 main().catch(err => { console.error(err); process.exit(1) })
 '''
-        run([node, '-e', code], cwd=tmp_path)
+        run([node, '-e', code], cwd=tmp_path, env=env)
         run([node, str(REPO_ROOT / 'test' / 'smoke_windows_wasm.js')], cwd=tmp_path)
 
 
@@ -168,7 +177,8 @@ def main() -> int:
     if args.python_sdist:
         smoke_python(args.python, expand_one(args.python_sdist))
     if args.npm_tarball:
-        smoke_npm(args.node, args.npm, expand_one(args.npm_tarball))
+        for mode in ('native', 'no-toolchain', 'ignore-scripts'):
+            smoke_npm(args.node, args.npm, expand_one(args.npm_tarball), mode)
     return 0
 
 

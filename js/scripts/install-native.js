@@ -26,12 +26,22 @@ function installNative({
   logger = console,
   packageRoot = path.resolve(__dirname, '..')
 } = {}) {
-  if (env.TRANFI_SKIP_NATIVE_BUILD === '1') {
-    logger.warn(
-      'tranfi: skipping the native addon because TRANFI_SKIP_NATIVE_BUILD=1; ' +
-      "use require('tranfi/wasm') explicitly because prepared transforms on " +
-      "require('tranfi') need the native addon"
-    )
+  // Installation must leave a working portable runtime even if native fails.
+  const wasmResult = spawn(execPath, [path.join(__dirname, 'check-wasm.js')], {
+    cwd: packageRoot,
+    encoding: 'utf8',
+    stdio: 'pipe'
+  })
+  if (!successful(wasmResult)) {
+    describeFailure('packaged WASM validation', wasmResult, logger)
+    if (wasmResult && wasmResult.stderr) logger.error(wasmResult.stderr.trim())
+    return Number.isInteger(wasmResult && wasmResult.status) && wasmResult.status !== 0
+      ? wasmResult.status
+      : 1
+  }
+
+  if (env.TRANFI_SKIP_NATIVE_BUILD === '1' || platform === 'win32') {
+    logger.warn('tranfi: using packaged WASM; native addon build skipped')
     return 0
   }
 
@@ -52,18 +62,16 @@ function installNative({
   const buildArgs = nodeGypIsScript ? [nodeGyp, 'rebuild'] : ['rebuild']
   const buildResult = spawn(buildCommand, buildArgs, {
     cwd: packageRoot,
-    stdio: 'inherit',
+    encoding: 'utf8',
+    stdio: 'pipe',
     shell: platform === 'win32' && !nodeGypIsScript
   })
   if (!successful(buildResult)) {
-    describeFailure('native addon build', buildResult, logger)
-    logger.error(
-      'tranfi: installation requires a working native toolchain for the default ' +
-      "Node entry; set TRANFI_SKIP_NATIVE_BUILD=1 only for explicit 'tranfi/wasm' use"
+    logger.warn(
+      'tranfi: native addon build unavailable; using packaged WASM. ' +
+      "Prepared transforms: require('tranfi/wasm'). Run npm run build:native for diagnostics."
     )
-    return Number.isInteger(buildResult && buildResult.status) && buildResult.status !== 0
-      ? buildResult.status
-      : 1
+    return 0
   }
 
   return 0

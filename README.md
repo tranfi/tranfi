@@ -41,11 +41,12 @@ pip install tranfi
 npm install tranfi
 ```
 
-Both packages compile Tranfi's C core during installation, so you need a C
-compiler. The Python package requires Python 3.9 or newer.
+The npm package works without Python or a compiler. It uses packaged WebAssembly
+when the optional native build is unavailable. The Python package requires
+Python 3.9 or newer and a C compiler.
 
-In the browser, import `tranfi/wasm`. If you only need the WebAssembly build,
-skip the native compile with `TRANFI_SKIP_NATIVE_BUILD=1 npm install tranfi`.
+In the browser, import `tranfi/wasm`. `TRANFI_SKIP_NATIVE_BUILD=1` skips the
+optional Node native build explicitly.
 
 A standalone C command with a few extra options, such as `--explain`, can be
 built from source; see [Build](#build) and the [CLI reference](#cli-reference).

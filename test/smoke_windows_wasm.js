@@ -2,11 +2,22 @@
 
 const assert = require('node:assert/strict')
 const { createRequire } = require('node:module')
-const { resolve } = require('node:path')
+const { resolve, dirname } = require('node:path')
+const { spawnSync } = require('node:child_process')
 
 const consumerRequire = createRequire(resolve(process.cwd(), 'package.json'))
 
 async function main() {
+  const packageDir = resolve(dirname(consumerRequire.resolve('tranfi')), '..')
+  const { version } = consumerRequire(resolve(packageDir, 'package.json'))
+  for (const flag of ['-v', '--version']) {
+    const result = spawnSync(process.execPath, [resolve(packageDir, 'src/cli.js'), flag], {
+      encoding: 'utf8'
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stdout, `tranfi ${version}\n`)
+  }
+
   const createTranfi = consumerRequire('tranfi/wasm')
   const tf = await createTranfi()
   assert.equal(tf.version(), '0.2.1')

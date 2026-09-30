@@ -141,7 +141,6 @@ jobs:
           Set-Location build/windows-consumer
           npm init --yes | Out-Null
           $package = (Get-ChildItem ../windows-package/tranfi-*.tgz).FullName
-          $env:TRANFI_SKIP_NATIVE_BUILD = '1'
           npm install $package
           node ../../test/smoke_windows_wasm.js
 

@@ -12,7 +12,7 @@
 const { pipeline, compileDsl, compileToSql, recipes } = require('./index.js')
 const { readFileSync, writeFileSync, existsSync, openSync, closeSync } = require('fs')
 const { resolve, dirname } = require('path')
-const nativeBinding = require('./native.js')
+const { version } = require('../package.json')
 
 function usage() {
   process.stderr.write(`Usage: tranfi [OPTIONS] PIPELINE
@@ -126,8 +126,7 @@ async function main() {
     const inline = assigned.length ? assigned.join('=') : undefined
     if (arg === '-h' || arg === '--help') { usage(); process.exit(0) }
     else if (arg === '-v' || arg === '--version') {
-      const v = nativeBinding ? nativeBinding.version() : 'unknown'
-      process.stdout.write(`tranfi ${v}\n`)
+      process.stdout.write(`tranfi ${version}\n`)
       process.exit(0)
     }
     else if (arg === '-R' || arg === '--recipes') {

@@ -41,9 +41,23 @@ const RUNTIME_OPTION_FIELDS = new Set([
   'limits', 'cancelFlag', 'hostPolicy', 'spillDir'
 ])
 
+// Check availability without allocating handles or swallowing runtime errors.
+const NATIVE_PREPARED_METHODS = [
+  'transformSafeLimits', 'transformDispose', 'transformRecipeFromJson',
+  'transformAnalyzerCreate', 'transformAnalyzerPush', 'transformAnalyzerFinalize',
+  'transformPlanImport', 'transformPlanExport', 'transformPlanSchemaJson',
+  'transformPlanRecipeSha256', 'transformApplyCreate', 'transformApplyRun'
+]
+
+function hasNativePreparedTransforms() {
+  return Boolean(nativeBinding) && NATIVE_PREPARED_METHODS.every(
+    name => typeof nativeBinding[name] === 'function'
+  )
+}
+
 function requireNative() {
-  if (!nativeBinding || typeof nativeBinding.transformRecipeFromJson !== 'function') {
-    throw new Error('prepared transforms require the Tranfi native addon; WASM support is not available in this build')
+  if (!hasNativePreparedTransforms()) {
+    throw new Error("prepared transforms on require('tranfi') need a compatible native addon; use await require('tranfi/wasm')()")
   }
   return nativeBinding
 }
@@ -399,5 +413,6 @@ module.exports = {
   TransformAnalyzer,
   TransformPlan,
   TransformApply,
-  safeTransformLimits
+  safeTransformLimits,
+  hasNativePreparedTransforms
 }

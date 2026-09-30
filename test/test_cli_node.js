@@ -59,3 +59,24 @@ test('CLI writes files and preserves output when policy rejects a plan', () => {
     assert.doesNotMatch(missing.stderr, /Unhandled/)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+
+for (const native of [false, true]) {
+  test(`CLI version follows npm metadata with native=${native}`, () => {
+    const cli = path.join(__dirname, '../js/src/cli.js')
+    const nativePath = path.join(__dirname, '../js/src/native.js')
+    const expected = require('../js/package.json').version
+    for (const flag of ['-v', '--version']) {
+      // Engine and npm versions can differ for a binding-only patch release.
+      const script = `
+        require.cache[${JSON.stringify(nativePath)}] = {
+          exports: ${native ? "{ version: () => '0.0.0-engine' }" : 'null'}
+        }
+        process.argv = [process.execPath, ${JSON.stringify(cli)}, ${JSON.stringify(flag)}]
+        require(${JSON.stringify(cli)})
+      `
+      const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8' })
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stdout, `tranfi ${expected}\n`)
+    }
+  })
+}
